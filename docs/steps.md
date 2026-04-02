@@ -438,3 +438,564 @@ git commit -m "init: scaffold folder structure & clean up templates"
 ✅ dotnet build 通过，无报错
 ✅ Git commit 完成
 ```
+
+
+
+## Step 03 · 配置管理与工程基础设施
+
+### 这一步做什么
+
+Step 02 把目录结构定好了。在开始写任何业务代码之前，有几件基础设施的事必须先做好——配置管理、统一的错误处理、统一的响应格式、日志。
+
+为什么要在业务代码之前做这些？
+
+以错误处理为例：如果先写了十几个 Controller，再来补统一的错误处理，就要回头逐个检查和修改。日志也一样，项目跑起来的第一天就应该有日志，不是最后才加的装饰品。这类东西越晚加，改动成本越高，所以现在一次性打好地基。
+
+
+
+### 1. 确认当前分支
+
+```bash
+git branch   # 确认显示 * develop
+```
+
+这一阶段直接在 `develop` 上工作，不需要切功能分支——这些是项目骨架，不是某个具体功能。
+
+
+
+### 2. 安装 NuGet 包
+
+先把这一阶段需要的包装好：
+
+```bash
+# Scalar：API 文档 UI
+# .NET 9 官方的 OpenAPI 库负责生成文档 JSON，Scalar 负责把它渲染成好看的界面
+dotnet add UUcars.API/UUcars.API.csproj package Scalar.AspNetCore
+
+# Serilog：结构化日志
+# Serilog.AspNetCore 是主包，内置了 Console 输出和配置文件读取
+# Serilog.Sinks.File 是额外的文件输出
+dotnet add UUcars.API/UUcars.API.csproj package Serilog.AspNetCore
+dotnet add UUcars.API/UUcars.API.csproj package Serilog.Sinks.File
+```
+
+> **`Microsoft.AspNetCore.OpenApi` 模板已经装好了，不用重复安装。** Scalar 依赖它生成 `/openapi/v1.json` 文档 JSON，两者配合使用。
+
+装完之后确认 `UUcars.API.csproj` 里的包引用：
+
+```xml
+<ItemGroup>
+  <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="9.0.x" />
+  <PackageReference Include="Scalar.AspNetCore" Version="x.x.x" />
+  <PackageReference Include="Serilog.AspNetCore" Version="x.x.x" />
+  <PackageReference Include="Serilog.Sinks.File" Version="x.x.x" />
+</ItemGroup>
+```
+
+
+
+### 3. 配置管理
+
+#### 3.1 更新 `appsettings.json`
+
+项目会用到两块外部配置：数据库连接字符串和 JWT 设置。现在把结构定好，同时加上 Serilog 的日志级别配置：
+
+打开 `UUcars.API/appsettings.json`，替换为：
+
+```json
+{
+  "ConnectionStrings": {
+    "DefaultConnection": "Server=localhost,1433;Database=UUcarsDB;User Id=sa;Password=PLACEHOLDER;TrustServerCertificate=True"
+  },
+  "JwtSettings": {
+    "Secret": "PLACEHOLDER_OVERRIDE_WITH_USER_SECRETS",
+    "ExpiresInMinutes": 60,
+    "Issuer": "UUcars",
+    "Audience": "UUcarsUsers"
+  },
+  "Serilog": {
+    "MinimumLevel": {
+      "Default": "Information",
+      "Override": {
+        "Microsoft.AspNetCore": "Warning",
+        "Microsoft.EntityFrameworkCore": "Warning"
+      }
+    }
+  },
+  "AllowedHosts": "*"
+}
+```
+
+> **密码和 Secret 为什么写占位符？** `appsettings.json` 会进入 Git。真实的数据库密码和 JWT Secret 绝不能出现在这个文件里。这里写的占位符只是占个位置，真实值通过 User Secrets 在本地覆盖（下面会配置）。
+>
+> **`Microsoft.AspNetCore` 和 `Microsoft.EntityFrameworkCore` 设为 `Warning`：** 这两个命名空间下框架自身的日志非常多，在生产环境只需要看 Warning 以上的。开发环境另外配置。
+
+
+
+#### 3.2 更新 `appsettings.Development.json`
+
+开发环境需要更详细的日志，特别是能看到 EF Core 生成的 SQL 语句，方便调试：
+
+```json
+{
+  "Serilog": {
+    "MinimumLevel": {
+      "Default": "Debug",
+      "Override": {
+        "Microsoft.AspNetCore": "Information",
+        "Microsoft.EntityFrameworkCore.Database.Command": "Information"
+      }
+    }
+  }
+}
+```
+
+> **`EntityFrameworkCore.Database.Command: Information`** 这一行会让开发时控制台输出 EF Core 执行的每一条 SQL 语句。能直接看到 ORM 在后台做什么，对调试和学习都很有帮助。生产环境不需要这个。
+
+
+
+#### 3.3 建立 JwtSettings 配置绑定类
+
+JWT 相关的配置有四个字段（Secret、过期时间、Issuer、Audience），如果每次都用 `Configuration["JwtSettings:Secret"]` 这样的字符串来读，散落在代码各处很难维护。
+
+更好的做法是建一个和配置结构对应的 C# 类，通过 ASP.NET Core 的 Options 模式注入——强类型访问，IDE 有补全，字段改名时编译器会提醒。
+
+```bash
+touch UUcars.API/Auth/JwtSettings.cs
+rm UUcars.API/Auth/.gitkeep
+namespace UUcars.API.Auth;
+
+// 对应 appsettings.json 中的 "JwtSettings" 配置节
+// 通过 Options 模式注入到需要的地方（Step 11 配置 JWT 认证时使用）
+public class JwtSettings
+{
+    public string Secret { get; set; } = string.Empty;
+    public int ExpiresInMinutes { get; set; } = 60;
+    public string Issuer { get; set; } = string.Empty;
+    public string Audience { get; set; } = string.Empty;
+}
+```
+
+
+
+#### 3.4 配置 User Secrets
+
+User Secrets 是 .NET 开发环境专门用来保护敏感信息的机制。配置值存储在系统用户目录下，**不在项目文件夹里**，所以永远不会进入 Git：
+
+```bash
+cd UUcars.API
+
+# 初始化 User Secrets（在 .csproj 里添加一个唯一的 UserSecretsId）
+dotnet user-secrets init
+
+# 设置本地开发用的数据库连接字符串（覆盖 appsettings.json 里的占位符）
+dotnet user-secrets set "ConnectionStrings:DefaultConnection" \
+  "Server=localhost,1433;Database=UUcarsDB;User Id=sa;Password=YourStrongPassw0rd;TrustServerCertificate=True"
+
+# 设置 JWT Secret（必须足够长，至少 32 个字符，否则 JWT 签名会报错）
+dotnet user-secrets set "JwtSettings:Secret" "uucars-dev-secret-key-at-least-32-chars"
+
+cd ..
+```
+
+验证设置是否生效：
+
+```bash
+cd UUcars.API && dotnet user-secrets list && cd ..
+```
+
+应该看到：
+
+```
+ConnectionStrings:DefaultConnection = Server=localhost,1433;...
+JwtSettings:Secret = uucars-dev-secret-key-at-least-32-chars
+```
+
+> **User Secrets 存在哪里？**
+>
+> - macOS / Linux：`~/.microsoft/usersecrets/<UserSecretsId>/secrets.json`
+> - Windows：`%APPDATA%\Microsoft\UserSecrets\<UserSecretsId>\secrets.json`
+>
+> ASP.NET Core 在开发环境启动时会自动读取这个文件，用里面的值覆盖 `appsettings.json` 里对应的键。生产环境不走这个机制，生产环境的密钥通过环境变量或密钥管理服务注入。
+
+
+
+### 4. 统一响应结构
+
+现在来想一个问题：API 返回的数据格式应该是什么样的？
+
+如果不约定，不同接口可能长这样：
+
+```json
+// 接口 A 成功时
+{ "id": 1, "title": "宝马3系" }
+
+// 接口 B 成功时
+{ "data": { "id": 1 }, "status": "ok" }
+
+// 接口 C 失败时
+{ "error": "Not found" }
+
+// 接口 D 失败时
+{ "message": "Car not found", "code": 404 }
+```
+
+前端要对接这四种格式，每个接口都要单独处理，非常痛苦。
+
+统一成一种格式，所有接口都长一样：
+
+```json
+// 成功
+{ "success": true, "data": { ... }, "message": null }
+
+// 失败
+{ "success": false, "data": null, "message": "Car not found" }
+```
+
+前端只需要判断 `success` 字段，就知道怎么处理。
+
+新建两个文件。先建通用响应结构：
+
+```bash
+touch UUcars.API/DTOs/ApiResponse.cs
+namespace UUcars.API.DTOs;
+
+public class ApiResponse<T>
+{
+    public bool Success { get; set; }
+    public T? Data { get; set; }
+    public string? Message { get; set; }
+    public List<string>? Errors { get; set; }
+
+    // 静态工厂方法：让 Controller 里的写法更简洁
+    // 用法：return Ok(ApiResponse<CarResponse>.Ok(car));
+    public static ApiResponse<T> Ok(T data, string? message = null) => new()
+    {
+        Success = true,
+        Data = data,
+        Message = message
+    };
+
+    public static ApiResponse<T> Fail(string message, List<string>? errors = null) => new()
+    {
+        Success = false,
+        Message = message,
+        Errors = errors
+    };
+}
+```
+
+再建分页专用结构：
+
+```bash
+touch UUcars.API/DTOs/PagedResponse.cs
+namespace UUcars.API.DTOs;
+
+// 专门用于列表接口的分页响应
+// 使用时嵌套在 ApiResponse 里：ApiResponse<PagedResponse<CarResponse>>
+public class PagedResponse<T>
+{
+    public List<T> Items { get; set; } = [];
+    public int TotalCount { get; set; }
+    public int Page { get; set; }
+    public int PageSize { get; set; }
+    public int TotalPages { get; set; }
+
+    // TotalPages 根据 TotalCount 和 PageSize 自动计算，不需要调用方传入
+    public static PagedResponse<T> Create(List<T> items, int totalCount, int page, int pageSize) => new()
+    {
+        Items = items,
+        TotalCount = totalCount,
+        Page = page,
+        PageSize = pageSize,
+        TotalPages = (int)Math.Ceiling(totalCount / (double)pageSize)
+    };
+}
+```
+
+
+
+### 5. 业务异常基类
+
+当业务规则不满足时，比如"要购买的车辆不存在"或"订单已经被取消了不能再取消"，代码需要一种方式来表达这些错误。
+
+最常见的做法是抛异常，但直接抛 `Exception` 太粗糙，没办法区分是业务错误（应该返回 4xx）还是真正的程序 bug（应该返回 500）。
+
+建一个业务异常基类，所有业务错误都继承它：
+
+```bash
+mkdir -p UUcars.API/Exceptions
+touch UUcars.API/Exceptions/AppException.cs
+namespace UUcars.API.Exceptions;
+
+// 业务异常基类
+// Service 层抛出继承自这个类的异常，
+// 中间件统一捕获并转换成对应的 HTTP 响应
+public class AppException : Exception
+{
+    public int StatusCode { get; }
+
+    public AppException(int statusCode, string message) : base(message)
+    {
+        StatusCode = statusCode;
+    }
+}
+```
+
+> **为什么 Service 层要用异常而不是返回错误码？** Service 层的方法如果要同时返回"结果"和"是否出错"，签名会变得很复杂（比如返回 `(Car? result, string? error)`）。用异常更自然——正常路径就是正常返回，出错路径直接抛出，调用方代码干净清晰。中间件在最外层统一兜住，不需要每个 Controller 都写 try-catch。
+
+
+
+### 6. 全局异常处理中间件
+
+有了异常基类，现在建中间件来统一处理它：
+
+```bash
+touch UUcars.API/Middleware/GlobalExceptionMiddleware.cs
+rm UUcars.API/Middleware/.gitkeep
+using System.Text.Json;
+using UUcars.API.DTOs;
+using UUcars.API.Exceptions;
+
+namespace UUcars.API.Middleware;
+
+public class GlobalExceptionMiddleware
+{
+    private readonly RequestDelegate _next;
+    private readonly ILogger<GlobalExceptionMiddleware> _logger;
+
+    public GlobalExceptionMiddleware(RequestDelegate next, ILogger<GlobalExceptionMiddleware> logger)
+    {
+        _next = next;
+        _logger = logger;
+    }
+
+    public async Task InvokeAsync(HttpContext context)
+    {
+        try
+        {
+            await _next(context);
+        }
+        catch (AppException ex)
+        {
+            // 业务异常：预期内的情况，记录 Warning 即可
+            _logger.LogWarning("Business exception [{StatusCode}]: {Message}",
+                ex.StatusCode, ex.Message);
+            await WriteErrorResponseAsync(context, ex.StatusCode, ex.Message);
+        }
+        catch (Exception ex)
+        {
+            // 未预期的异常：记录完整堆栈，返回 500
+            _logger.LogError(ex, "Unhandled exception on {Method} {Path}",
+                context.Request.Method, context.Request.Path);
+            await WriteErrorResponseAsync(context, StatusCodes.Status500InternalServerError,
+                "An unexpected error occurred.");
+        }
+    }
+
+    private static async Task WriteErrorResponseAsync(HttpContext context, int statusCode, string message)
+    {
+        context.Response.StatusCode = statusCode;
+        context.Response.ContentType = "application/json";
+
+        var response = ApiResponse<object>.Fail(message);
+
+        // 使用 camelCase，和 Controller 正常返回的 JSON 格式保持一致
+        var options = new JsonSerializerOptions
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+        };
+
+        await context.Response.WriteAsync(JsonSerializer.Serialize(response, options));
+    }
+}
+```
+
+> **中间件的套娃结构：** ASP.NET Core 的中间件管道像俄罗斯套娃，请求进来时从外层依次往内走，响应时再从内层往外返回。`GlobalExceptionMiddleware` 必须注册在最外层，才能兜住所有内层中间件和 Controller 抛出的异常。
+
+
+
+### 7. 把所有东西串进 Program.cs
+
+现在把前面建好的所有基础设施都接进来，更新 `Program.cs`：
+
+```csharp
+using Scalar.AspNetCore;
+using Serilog;
+using UUcars.API.Auth;
+using UUcars.API.Middleware;
+
+// =============================================
+// Bootstrap Logger
+// 在 builder 构建之前就启动一个临时 Logger
+// 用途：如果 builder 阶段本身出错（比如配置文件格式错误），
+//       也能把错误信息记录下来
+// =============================================
+Log.Logger = new LoggerConfiguration()
+    .WriteTo.Console()
+    .CreateBootstrapLogger();
+
+try
+{
+    var builder = WebApplication.CreateBuilder(args);
+
+    // =============================================
+    // 替换默认日志系统为 Serilog
+    // ReadFrom.Configuration：从 appsettings.json 读取日志级别等配置
+    // WriteTo.Console / File：输出目标
+    // =============================================
+    builder.Host.UseSerilog((context, services, configuration) =>
+        configuration
+            .ReadFrom.Configuration(context.Configuration)
+            .ReadFrom.Services(services)
+            .WriteTo.Console()
+            .WriteTo.File(
+                path: "logs/uucars-.log",
+                rollingInterval: RollingInterval.Day,  // 每天滚动一个新文件
+                retainedFileCountLimit: 30             // 最多保留 30 天
+            )
+    );
+
+    // =============================================
+    // 服务注册
+    // =============================================
+    builder.Services.AddControllers();
+
+    // OpenAPI + Scalar（API 文档）
+    builder.Services.AddOpenApi();
+
+    // 将 appsettings.json 中的 JwtSettings 节绑定到 JwtSettings 类
+    // 后续需要 JWT 配置的地方通过 IOptions<JwtSettings> 注入
+    builder.Services.Configure<JwtSettings>(
+        builder.Configuration.GetSection("JwtSettings")
+    );
+
+    // =============================================
+    // 构建应用
+    // =============================================
+    var app = builder.Build();
+
+    // =============================================
+    // 中间件管道
+    // 顺序很重要：GlobalExceptionMiddleware 必须在最外层
+    // =============================================
+
+    // 全局异常处理，放最前面，兜住所有后续中间件的异常
+    app.UseMiddleware<GlobalExceptionMiddleware>();
+
+    // 开发环境才挂载 API 文档
+    if (app.Environment.IsDevelopment())
+    {
+        app.MapOpenApi();
+        app.MapScalarApiReference(options =>
+            options
+                .WithTitle("UUcars API Documentation")
+                .WithTheme(ScalarTheme.Moon)
+        );
+    }
+
+    app.UseHttpsRedirection();
+    app.UseAuthorization();
+    app.MapControllers();
+
+    app.Run();
+}
+catch (Exception ex)
+{
+    // 捕获启动阶段的致命错误（配置错误、数据库连不上等）
+    Log.Fatal(ex, "Application terminated unexpectedly during startup");
+}
+finally
+{
+    // 确保程序退出前把缓冲区里的日志全部写出去
+    Log.CloseAndFlush();
+}
+```
+
+
+
+### 8. 验证
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+启动项目，确认 Scalar 文档页面能打开：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+打开浏览器访问（端口号看启动输出里的地址）：
+
+```
+https://localhost:{端口}/scalar/v1
+```
+
+能看到 Scalar 的 Moon 主题深色界面，说明配置正确。目前没有任何 API，界面是空的，这是正常的。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 9. 此时的目录变化
+
+```
+UUcars.API/
+├── Auth/
+│   └── JwtSettings.cs                    ← 新增
+├── DTOs/
+│   ├── ApiResponse.cs                    ← 新增
+│   ├── PagedResponse.cs                  ← 新增
+│   ├── Requests/
+│   │   └── .gitkeep
+│   └── Responses/
+│       └── .gitkeep
+├── Exceptions/                           ← 新增目录
+│   └── AppException.cs                   ← 新增
+├── Middleware/
+│   └── GlobalExceptionMiddleware.cs      ← 新增
+├── Program.cs                            ← 已更新
+├── appsettings.json                      ← 已更新
+└── appsettings.Development.json          ← 已更新
+```
+
+
+
+### 10. Git 提交
+
+```bash
+git add .
+git commit -m "feat: config management + ApiResponse + exception middleware + Serilog"
+```
+
+
+
+### Step 03 完成状态
+
+```
+✅ appsettings.json 配置结构建好（连接字符串、JWT、Serilog 级别）
+✅ appsettings.Development.json 开发环境日志更详细
+✅ User Secrets 初始化，敏感信息不进 Git
+✅ JwtSettings 配置绑定类建立
+✅ ApiResponse<T> 和 PagedResponse<T> 统一响应格式就绪
+✅ AppException 业务异常基类建立
+✅ GlobalExceptionMiddleware 挂载在管道最外层
+✅ Serilog 配置完成（控制台 + 文件按天滚动）
+✅ Scalar API 文档可访问
+✅ dotnet build 通过，无报错
+✅ Git commit 完成
+```
+
