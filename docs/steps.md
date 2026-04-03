@@ -5,7 +5,6 @@
 开始一个新项目，第一件事是把脚手架搭好——创建 Solution、建好项目文件、配置 Git。这些工作做一次就定下来了，后续所有开发都在这个基础上进行。
 
 
-
 ### 1. Solution 和 Project 的关系
 
 在 .NET 里，**Solution（.sln）** 是一个容器，它本身不包含代码，只是把多个 **Project（.csproj）** 组织在一起管理。
@@ -996,6 +995,449 @@ git commit -m "feat: config management + ApiResponse + exception middleware + Se
 ✅ Serilog 配置完成（控制台 + 文件按天滚动）
 ✅ Scalar API 文档可访问
 ✅ dotnet build 通过，无报错
+✅ Git commit 完成
+```
+
+
+
+## Step 04 · 数据库建模
+
+### 这一步做什么
+工程基础设施搭好了，现在进入数据库设计阶段。
+
+在动手写任何实体代码之前，先要把整个数据库的结构想清楚：
+
+- 需要哪些表？
+- 每张表有哪些字段？
+- 表与表之间什么关系？
+
+设计想清楚了，后面写代码才不会反复改。
+
+
+
+### 1. 切出 feature/db-setup 分支
+
+数据库相关的工作（建模、实体、DbContext、Migration）是一个完整的功能块，单独开一个分支来做：
+
+```bash
+git checkout develop
+git checkout -b feature/db-setup
+git push -u origin feature/db-setup
+```
+
+
+
+### 2. 这个系统需要哪些表
+
+UUcars 是一个二手车 C2C 平台，核心业务流程是：
+
+```
+卖家注册账号
+    ↓
+发布车辆（先是草稿）→ 提交审核 → Admin 审核通过 → 公开上架
+    ↓
+买家浏览 / 搜索 / 收藏车辆
+    ↓
+买家下单 → 交易完成
+```
+
+从这个流程出发，自然推导出需要五张表：
+
+```
+Users      所有用户（买家、卖家、Admin 都是用户，用 Role 字段区分）
+Cars       车辆信息（每辆车归属于一个卖家）
+CarImages  车辆图片（一辆车可以有多张图片，单独一张表）
+Orders     订单（买家对某辆车下单产生）
+Favorites  收藏关系（某用户收藏了某辆车）
+```
+
+表与表之间的关系：
+
+```
+Users  ──<  Cars         一个用户可以发布多辆车（一对多）
+Cars   ──<  CarImages    一辆车可以有多张图片（一对多）
+Users  ──<  Orders       一个用户可以有多个订单（一对多）
+Cars   ──<  Orders       一辆车可以有多条订单记录（一对多）
+Users  >──< Cars         用户和车辆之间有收藏关系（多对多，通过 Favorites 实现）
+```
+
+
+
+### 3. 逐表设计字段
+
+#### Users 表
+
+```
+Id                int,           PK, Identity（自增主键）
+Username          nvarchar(50),  NOT NULL
+Email             nvarchar(100), NOT NULL, UNIQUE（登录凭证，不能重复）
+PasswordHash      nvarchar(256), NOT NULL（存 Hash 后的密码，绝不存明文）
+Role              nvarchar(20),  NOT NULL（User / Admin）
+EmailConfirmed    bit,           NOT NULL, DEFAULT 0
+CreatedAt         datetime2,     NOT NULL
+UpdatedAt         datetime2,     NOT NULL
+```
+
+`Role` 决定了这个用户是普通用户还是管理员。买家和卖家都是 `User`——在这个平台上，同一个人既可以卖车也可以买车，不需要区分角色。
+
+`EmailConfirmed` 是一个**状态标记字段**，只是一个 `bool`。V1 注册时直接写入 `false`，一行代码的事，不依赖任何额外功能。它存在的价值是：
+
+- V1 的数据从第一天起就有这个标记，所有用户都是 `false`
+- V2 做邮箱验证时，功能做完直接把对应用户的这个字段改成 `true` 就行
+- 如果 V1 不加，V2 Migration 加字段时还需要考虑给存量用户设默认值，多一个麻烦
+
+
+
+#### Cars 表
+
+```
+Id            int,             PK, Identity
+Title         nvarchar(100),   NOT NULL（车辆标题，如"2020款宝马3系 里程少无事故"）
+Brand         nvarchar(50),    NOT NULL（品牌，如 BMW、Toyota）
+Model         nvarchar(50),    NOT NULL（车型，如 3 Series、Camry）
+Year          int,             NOT NULL（出厂年份）
+Price         decimal(18,2),   NOT NULL（售价）
+Mileage       int,             NOT NULL（里程，单位：公里）
+Description   nvarchar(2000),  NULL（详细描述，允许为空）
+SellerId      int,             FK → Users.Id, NOT NULL
+Status        nvarchar(20),    NOT NULL
+CreatedAt     datetime2,       NOT NULL
+UpdatedAt     datetime2,       NOT NULL
+```
+
+`Status` 是这张表里最关键的字段，贯穿整个业务流程：
+
+```
+卖家创建          → Draft          （草稿，只有卖家自己能看到）
+卖家提交审核      → PendingReview  （等待 Admin 处理）
+Admin 审核通过    → Published      （公开上架，买家可以下单）
+Admin 审核拒绝    → Draft          （退回卖家修改，重新走流程）
+买家下单成功      → Sold           （已售出，不再接受新订单）
+违规或主动删除    → Deleted        （逻辑删除，数据还在但不可见）
+```
+
+注意这个流转是有约束的——不是任意两个状态之间都能转换。比如 `Sold` 不能退回 `Published`（除非买家取消订单才恢复），`Published` 不能直接改成 `Draft`。这些业务规则后面在 Service 层用代码来保证。
+
+
+
+#### CarImages 表
+
+```
+Id          int,            PK, Identity
+CarId       int,            FK → Cars.Id, NOT NULL
+ImageUrl    nvarchar(500),  NOT NULL（V1 直接存 URL）
+SortOrder   int,            NOT NULL, DEFAULT 0（图片排列顺序）
+```
+
+图片和车辆分开存的原因：一辆车通常有多张图片，如果把图片 URL 存在 Cars 表里（比如用逗号分隔），查询和修改都很麻烦，也没法控制顺序。单独一张表，每张图片一行，`SortOrder` 控制显示顺序，第一张作为封面图。
+
+这张表没有 `CreatedAt` / `UpdatedAt`，图片是车辆的附属资源，不需要时间追踪。
+
+
+
+#### Orders 表
+
+```
+Id          int,            PK, Identity
+CarId       int,            FK → Cars.Id, NOT NULL
+BuyerId     int,            FK → Users.Id, NOT NULL
+SellerId    int,            FK → Users.Id, NOT NULL
+Price       decimal(18,2),  NOT NULL
+Status      nvarchar(20),   NOT NULL
+CreatedAt   datetime2,      NOT NULL
+UpdatedAt   datetime2,      NOT NULL
+```
+
+**`SellerId` 为什么要单独存？**
+
+`SellerId` 信息本来可以通过 `CarId` 关联 `Cars` 表查到，但我们选择在 Orders 里冗余存一份。原因是：买家查"我买的订单"和卖家查"我卖的订单"是高频操作，如果 `SellerId` 不在 Orders 表里，每次查卖家视角的订单都要先 JOIN Cars 表，多一次关联。冗余存一份，直接按 `SellerId` 过滤，查询简单高效。
+
+**`Price` 为什么要单独存？**
+
+订单创建时，把当时的成交价格锁定在订单里。如果只记录 `CarId`，卖家后来修改了车辆价格，历史订单的价格就会跟着变，这显然是错的。
+
+`Status` 的流转：
+
+```
+买家下单      → Pending    （待处理）
+交易完成      → Completed  
+买家取消      → Cancelled  （同时车辆状态恢复 Published）
+```
+
+
+
+#### Favorites 表
+
+```
+UserId       int,        FK → Users.Id, NOT NULL
+CarId        int,        FK → Cars.Id, NOT NULL
+CreatedAt    datetime2,  NOT NULL
+
+PRIMARY KEY (UserId, CarId)
+```
+
+这张表实现的是用户和车辆之间的多对多收藏关系。用 `(UserId, CarId)` 联合主键，而不是单独设一个 `Id` 字段——联合主键本身就保证了同一个用户不能重复收藏同一辆车，数据库层面天然防重。
+
+
+
+### 4. 用枚举表达 Status 字段
+
+设计里有三个字段是有限的字符串集合：`Cars.Status`、`Orders.Status`、`Users.Role`。
+
+在 C# 里用字符串常量来表达这些值，有一个根本性的问题：
+
+```csharp
+// 这样写编译器不会报错，但数据库里存进去的是一个无效值
+car.Status = "published";   // 大小写错了
+car.Status = "Pubished";    // 拼写错了
+car.Status = "Online";      // 根本不在枚举里
+```
+
+用 C# 枚举就不会有这个问题——只能传枚举里定义的值，传错了编译器直接报错。
+
+EF Core 支持把枚举以字符串形式存进数据库（存 `"Draft"` 这样可读的字符串，而不是数字 `0`），后面在 DbContext 配置时处理。
+
+先建枚举目录：
+
+```bash
+mkdir -p UUcars.API/Entities/Enums
+```
+
+#### `Entities/Enums/CarStatus.cs`
+
+```bash
+touch UUcars.API/Entities/Enums/CarStatus.cs
+namespace UUcars.API.Entities.Enums;
+
+public enum CarStatus
+{
+    Draft,          // 草稿，卖家刚创建
+    PendingReview,  // 已提交，等待 Admin 审核
+    Published,      // 审核通过，公开可见
+    Sold,           // 已售出
+    Deleted         // 逻辑删除
+}
+```
+
+#### `Entities/Enums/OrderStatus.cs`
+
+```bash
+touch UUcars.API/Entities/Enums/OrderStatus.cs
+namespace UUcars.API.Entities.Enums;
+
+public enum OrderStatus
+{
+    Pending,    // 待处理
+    Completed,  // 交易完成
+    Cancelled   // 已取消
+}
+```
+
+#### `Entities/Enums/UserRole.cs`
+
+```bash
+touch UUcars.API/Entities/Enums/UserRole.cs
+namespace UUcars.API.Entities.Enums;
+
+public enum UserRole
+{
+    User,   // 普通用户（买家 / 卖家）
+    Admin   // 管理员
+}
+```
+
+
+
+### 5. BaseEntity：提取公共字段
+
+回头看五张表，`Users`、`Cars`、`Orders` 都有相同的三个字段：
+
+```
+Id          int, PK, Identity
+CreatedAt   datetime2, NOT NULL
+UpdatedAt   datetime2, NOT NULL
+```
+
+不需要在每个实体类里重复写这三行。提取一个基类，有这三个字段的实体继承它：
+
+```bash
+touch UUcars.API/Entities/BaseEntity.cs
+rm UUcars.API/Entities/.gitkeep
+namespace UUcars.API.Entities;
+
+// 所有实体的公共基类
+// abstract：这个类本身不对应任何数据库表，
+// 不应该被直接实例化，只能被继承
+public abstract class BaseEntity
+{
+    public int Id { get; set; }
+    public DateTime CreatedAt { get; set; }
+    public DateTime UpdatedAt { get; set; }
+}
+```
+
+哪些实体会继承这个基类？
+
+```
+✅ User     有 Id / CreatedAt / UpdatedAt → 继承
+✅ Car      有 Id / CreatedAt / UpdatedAt → 继承
+✅ Order    有 Id / CreatedAt / UpdatedAt → 继承
+❌ CarImage 只有 Id，没有时间字段        → 不继承，单独写
+❌ Favorite 联合主键，没有独立 Id        → 不继承，单独写
+```
+
+
+
+### 6. 保存数据库设计文档
+
+实体类和后面的 Migration 文件是数据库结构最权威的记录，但它们分散在各个文件里，不够直观。
+
+建一份人类可读的 Schema 文档，方便随时查阅整体结构和字段的业务含义：
+
+```bash
+mkdir -p docs
+touch docs/database-schema.md
+```
+
+`docs/database-schema.md` 内容：
+
+```markdown
+# UUcars 数据库 Schema
+
+## 表关系
+
+Users  ──<  Cars         一个用户可以发布多辆车（一对多）
+Cars   ──<  CarImages    一辆车可以有多张图片（一对多）
+Users  ──<  Orders       一个用户可以有多个订单（一对多）
+Cars   ──<  Orders       一辆车可以有多条订单记录（一对多）
+Users  >──< Cars         用户和车辆之间有收藏关系（多对多，通过 Favorites 实现）
+
+## Users
+
+| 字段 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| Id | int | PK, Identity | 自增主键 |
+| Username | nvarchar(50) | NOT NULL | |
+| Email | nvarchar(100) | NOT NULL, UNIQUE | 登录凭证，不能重复 |
+| PasswordHash | nvarchar(256) | NOT NULL | Hash 后的密码，不存明文 |
+| Role | nvarchar(20) | NOT NULL | User / Admin |
+| EmailConfirmed | bit | NOT NULL, DEFAULT 0 | V2 邮箱验证时使用 |
+| CreatedAt | datetime2 | NOT NULL | |
+| UpdatedAt | datetime2 | NOT NULL | |
+
+V2 预留字段（届时通过 Migration 添加）：
+EmailConfirmationToken / ResetPasswordToken / ResetPasswordTokenExpiry
+
+## Cars
+
+| 字段         | 类型           | 约束          | 说明                            |
+|---|---|---|---|
+| Id           | int            | PK, Identity  |                                 |
+| Title        | nvarchar(100)  | NOT NULL      | 车辆标题                        |
+| Brand        | nvarchar(50)   | NOT NULL      | 品牌，如 BMW                    |
+| Model        | nvarchar(50)   | NOT NULL      | 车型，如 3 Series               |
+| Year         | int            | NOT NULL      | 出厂年份                        |
+| Price        | decimal(18,2)  | NOT NULL      | 售价                            |
+| Mileage      | int            | NOT NULL      | 里程（公里）                    |
+| Description  | nvarchar(2000) | NULL          | 详细描述，允许为空              |
+| SellerId     | int            | FK → Users.Id | 卖家                            |
+| Status       | nvarchar(20)   | NOT NULL      | 见下方状态流转                  |
+| CreatedAt    | datetime2      | NOT NULL      |                                 |
+| UpdatedAt    | datetime2      | NOT NULL      |                                 |
+
+Status 流转：
+Draft → PendingReview → Published → Sold / Deleted
+PendingReview 被拒绝 → Draft（退回修改）
+
+## CarImages
+
+| 字段      | 类型          | 约束          | 说明                        |
+|---|---|---|---|
+| Id        | int           | PK, Identity  |                             |
+| CarId     | int           | FK → Cars.Id  |                             |
+| ImageUrl  | nvarchar(500) | NOT NULL      | V1 存 URL，V2 做真实上传    |
+| SortOrder | int           | NOT NULL, DEFAULT 0 | 显示顺序，第一张为封面 |
+
+## Orders
+
+| 字段      | 类型          | 约束           | 说明                              |
+|---|---|---|---|
+| Id        | int           | PK, Identity   |                                   |
+| CarId     | int           | FK → Cars.Id   |                                   |
+| BuyerId   | int           | FK → Users.Id  |                                   |
+| SellerId  | int           | FK → Users.Id  | 从 Car 冗余存储，方便卖家查询订单 |
+| Price     | decimal(18,2) | NOT NULL       | 下单时锁定，不随车辆价格变动      |
+| Status    | nvarchar(20)  | NOT NULL       | Pending / Completed / Cancelled   |
+| CreatedAt | datetime2     | NOT NULL       |                                   |
+| UpdatedAt | datetime2     | NOT NULL       |                                   |
+
+## Favorites
+
+| 字段      | 类型      | 约束          | 说明                    |
+|---|---|---|---|
+| UserId    | int       | FK → Users.Id |                         |
+| CarId     | int       | FK → Cars.Id  |                         |
+| CreatedAt | datetime2 | NOT NULL      |                         |
+
+PRIMARY KEY (UserId, CarId)  — 联合主键，天然防重复收藏
+```
+
+> **这份文档后续怎么维护？** 每次表结构有变化（新增字段、加新表），在修改实体类的同一个 commit 里同步更新这个文档。Migration 文件是机器读的，这个文档是人读的，两者互补。
+
+
+
+### 7. 此时的目录结构
+
+```
+UUcars.API/Entities/
+├── BaseEntity.cs       ← 新增
+└── Enums/
+    ├── CarStatus.cs    ← 新增
+    ├── OrderStatus.cs  ← 新增
+    └── UserRole.cs     ← 新增
+```
+
+
+
+### 8. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 9. Git 提交
+
+```bash
+git add .
+git commit -m "feat: database schema design - base entity + status enums + schema docs"
+```
+
+
+
+### Step 04 完成状态
+
+```
+✅ 切出 feature/db-setup 分支
+✅ 五张表的字段设计全部明确
+   - Users（8 个字段）
+   - Cars（12 个字段，含完整状态流转）
+   - CarImages（4 个字段，SortOrder 预留排序）
+   - Orders（8 个字段，SellerId 冗余 + Price 锁定）
+   - Favorites（联合主键，天然防重复收藏）
+✅ CarStatus / OrderStatus / UserRole 三个枚举建立
+✅ BaseEntity 基类建立（Id / CreatedAt / UpdatedAt）
+✅ database-schema.md 文档建立
+✅ dotnet build 通过
 ✅ Git commit 完成
 ```
 
