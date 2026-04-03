@@ -2252,3 +2252,345 @@ git commit -m "feat: AppDbContext + Fluent API configurations for all entities"
 ```
 
 
+
+## Step 07 · EF Core Migration
+
+### 这一步做什么
+
+Step 06 把 DbContext 和所有实体配置写好了，但数据库里现在还是空的——什么表都没有。这一步要做两件事：
+
+1. 用 EF Core Migration 机制把 C# 实体类"翻译"成数据库表
+2. 在 Migration 里写入初始 Admin 用户数据，让系统从第一天起就有可用的管理员账号
+
+
+
+### 1. 先启动 Docker SQL Server
+
+Migration 执行时需要连接真实数据库，所以先确认数据库容器在跑：
+
+```bash
+# 启动 SQL Server 容器
+docker run -e "ACCEPT_EULA=Y" \
+  -e "MSSQL_SA_PASSWORD=YourStrongPassw0rd" \
+  -e "MSSQL_PID=Developer" \
+  -p 1433:1433 \
+  --name uucars-sqlserver \
+  -d mcr.microsoft.com/mssql/server:2022-latest
+```
+
+如果之前已经创建过这个容器，直接启动就好：
+
+```bash
+docker start uucars-sqlserver
+```
+
+确认容器正在运行：
+
+```bash
+docker ps
+```
+
+看到 `uucars-sqlserver` 在列表里且状态是 `Up`，说明数据库已经就绪。
+
+
+
+### 2. 什么是 Migration
+
+在解释命令之前，先理解 Migration 是什么。
+
+我们用的是 Code-First 开发方式：C# 实体类是"真相的唯一来源"，数据库结构由代码决定。但代码写好了，数据库不会自动变化，需要一个"翻译和执行"的机制，这就是 Migration。
+
+Migration 的工作流程分两步：
+
+```
+第一步：dotnet ef migrations add
+   EF Core 读取当前所有实体类和配置，
+   和上一次 Migration 的状态对比，
+   把"需要做哪些变更"写成一个 C# 文件（Migration 文件）
+
+第二步：dotnet ef database update
+   读取 Migration 文件，
+   连接数据库，
+   把文件里描述的变更真正执行到数据库上
+```
+
+Migration 文件是纯代码文件，会进入 Git。这意味着每一次数据库结构变更都有完整的历史记录，可以回滚，可以在不同环境（开发机、测试服务器、生产服务器）上重放同样的变更。
+
+
+
+### 3. Admin Seed 数据的问题
+
+在生成 Migration 之前，先处理一个问题：系统需要一个 Admin 用户来测试后续的审核接口，但注册接口只创建普通 `User` 角色，无法注册 Admin。
+
+解决方案是在 `AppDbContext` 里用 EF Core 的 **Seed Data** 机制写入初始数据：Seed Data 会被包含在 Migration 文件里，数据库初始化时自动插入。
+
+Seed Data 里需要存入一个已经 Hash 过的密码。这里有一个重要的细节：
+
+**不能在 Seed Data 里动态调用 `PasswordHasher.HashPassword()`。**
+
+原因是 `PasswordHasher` 每次调用都会用随机 salt，生成的 hash 值每次都不同。EF Core 9 在执行 `database update` 时会重新扫描当前模型（包括 Seed Data），发现 hash 值和 Migration 快照里记录的不一样，就认为"有未提交的变更"，直接报错拒绝执行。
+
+正确做法是**预先生成一次 hash，把结果硬编码成固定字符串**。
+
+**第一步：临时生成 hash 值**
+
+在 `Program.cs` 的 `app.Run()` 前临时加这几行，运行一次拿到 hash：
+
+```c#
+// 临时代码，获取 hash 后立刻删除
+var tempHasher = new PasswordHasher<UUcars.API.Entities.User>();
+var tempHash = tempHasher.HashPassword(new UUcars.API.Entities.User(), "Admin@123456");
+Console.WriteLine("HASH: " + tempHash);
+```
+
+运行临时脚本，拿到hash 值
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+控制台输出类似：
+
+```bash
+HASH: AQAAAAIAAYagAAAAE......（一长串 Base64 字符串）
+```
+
+复制这个 hash 值，**立刻删掉临时代码**，回到根目录：
+
+```bash
+cd ..
+```
+
+**第二步：更新 `AppDbContext.cs`，把 hash 硬编码进去**
+
+实际上更简单的做法是直接在代码里用 `PasswordHasher` 生成，但我们的 `PasswordHasher` 包还没安装。
+
+这里先用一个临时方式：直接在 `AppDbContext` 里用硬编码的方式生成一次，后面 的Step 会正式安装和使用 `PasswordHasher`。
+
+暂时先用 ASP.NET Core 内置的 `PasswordHasher<T>` 来生成 Hash。在 `AppDbContext.cs` 里做 Seed 时调用它：
+
+打开 `UUcars.API/Data/AppDbContext.cs`，更新内容：
+
+```csharp
+using Microsoft.AspNetCore.Identity;
+using Microsoft.EntityFrameworkCore;
+using UUcars.API.Entities;
+using UUcars.API.Entities.Enums;
+
+namespace UUcars.API.Data;
+
+public class AppDbContext : DbContext
+{
+    public AppDbContext(DbContextOptions<AppDbContext> options) : base(options)
+    {
+    }
+    
+    public DbSet<User> Users => Set<User>();
+    public DbSet<Car> Cars => Set<Car>();
+    public DbSet<CarImage> CarImages => Set<CarImage>();
+    public DbSet<Order> Orders => Set<Order>();
+    public DbSet<Favorite> Favorites => Set<Favorite>();
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        base.OnModelCreating(modelBuilder);
+        modelBuilder.ApplyConfigurationsFromAssembly(typeof(AppDbContext).Assembly);
+        
+        // Seed Data：在数据库初始化时插入初始 Admin 用户
+        // 为什么用固定时间（new DateTime(2025, 1, 1)）而不是 DateTime.UtcNow？
+        // 因为 Seed Data 会被写入 Migration 文件，Migration 文件进入 Git。
+        // 如果用 DateTime.UtcNow，每次生成 Migration 时时间都不一样，
+        // 导致 Migration 文件内容每次都变，Git 历史会被污染。
+        // 固定时间保证 Migration 文件的内容是稳定的、可重复的。
+        var seedDate = new DateTime(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+
+        // 使用预先计算好的固定 hash，而不是在这里动态生成
+        // 原因：PasswordHasher 每次调用会用随机 salt，导致 EF Core 9 每次
+        // 扫描模型时发现值不同，误判为"有未提交的变更"
+        const string adminPasswordHash = "这里粘贴生成的 hash 字符串";
+
+        var adminUser = new User
+        {
+            Id = 1,
+            Username = "admin",
+            Email = "admin@uucars.com",
+            PasswordHash = adminPasswordHash,
+            Role = UserRole.Admin,
+            EmailConfirmed = true,
+            CreatedAt = seedDate,
+            UpdatedAt = seedDate
+        };
+
+        // 添加种子数据给User实体
+        modelBuilder.Entity<User>().HasData(adminUser);
+    }
+}
+```
+
+> **为什么 Admin 的 Id 要固定写 `1`？** Seed Data 要求实体的主键必须是确定的固定值，不能用自增——EF Core 需要知道"这条 Seed 数据是不是已经在数据库里了"，如果 Id 不固定就无法判断。所以 Seed Data 的主键必须手动指定。
+
+
+
+### 4. 安装 Migration 命令行工具
+
+`dotnet ef` 命令需要全局工具支持，如果之前没装过：
+
+```bash
+dotnet tool install --global dotnet-ef
+```
+
+已经装过的话，确认版本和项目的 EF Core 版本匹配：
+
+```bash
+dotnet ef --version
+```
+
+
+
+### 5. 生成 Migration 文件
+
+在根目录执行：
+
+```bash
+dotnet ef migrations add InitialCreate --project UUcars.API/UUcars.API.csproj
+```
+
+> **`--project` 参数是什么？** 告诉 `dotnet ef` 命令去哪个项目里找 `DbContext`。因为我们的 Solution 里有两个项目（API 和 Tests），不指定的话工具不知道该用哪个。
+
+执行成功后，项目里会新增一个 `Migrations/` 目录：
+
+```
+UUcars.API/Migrations/
+├── 20250101000000_InitialCreate.cs        ← Migration 逻辑文件
+└── AppDbContextModelSnapshot.cs          ← 记录当前模型状态，供下次 Migration 对比用
+```
+
+打开 `InitialCreate.cs` 看一下里面的内容：
+
+```csharp
+public partial class InitialCreate : Migration
+{
+    protected override void Up(MigrationBuilder migrationBuilder)
+    {
+        // Up 方法：执行变更（创建表、加字段等）
+        migrationBuilder.CreateTable(
+            name: "Users",
+            columns: table => new
+            {
+                Id = table.Column<int>(nullable: false)
+                    .Annotation("SqlServer:Identity", "1, 1"),
+                Username = table.Column<string>(maxLength: 50, nullable: false),
+                // ...
+            });
+        // ... 其他建表语句
+    }
+
+    protected override void Down(MigrationBuilder migrationBuilder)
+    {
+        // Down 方法：回滚变更（删表、删字段等）
+        // 如果执行 dotnet ef database update [上一个版本]，就会执行这里的代码
+        migrationBuilder.DropTable(name: "Users");
+        // ...
+    }
+}
+```
+
+每个 Migration 文件都有 `Up` 和 `Down` 两个方法——`Up` 是正向变更，`Down` 是回滚。这就是 Migration 能回滚的原因。
+
+
+
+### 6. 把 Migration 应用到数据库
+
+```bash
+dotnet ef database update --project UUcars.API/UUcars.API.csproj
+```
+
+执行成功后，数据库里会建好所有表，并且 Admin 用户已经被插入 `Users` 表。
+
+可以用数据库客户端（比如 Rider 内置的 Database 工具，或 Azure Data Studio）连接到 `localhost:1433`，用 `sa` / `YourStrongPassw0rd` 登录，查看 `UUcarsDB` 数据库里的表结构，确认一切正常。
+
+连接配置：
+
+```
+Server:   localhost, 1433
+Username: sa
+Password: YourStrongPassw0rd
+Database: UUcarsDB
+```
+
+应该能看到五张表：`Users`、`Cars`、`CarImages`、`Orders`、`Favorites`，以及 EF Core 自动创建的 `__EFMigrationsHistory` 表（这张表记录了哪些 Migration 已经被执行过，EF Core 内部使用，不需要手动管理）。
+
+
+
+### 7. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 8. 此时的目录结构变化
+
+```
+UUcars.API/
+├── Data/
+│   └── AppDbContext.cs     ← 已更新（加了 Seed Data）
+└── Migrations/             ← 新增目录
+    ├── 20250101000000_InitialCreate.cs
+    └── AppDbContextModelSnapshot.cs
+```
+
+
+
+### 9. Git 提交 + 合并分支
+
+```bash
+git add .
+git commit -m "feat: initial migration + admin seed data"
+```
+
+所有数据库相关工作（Step 04 到 Step 07）都完成了，把 `feature/db-setup` 合并回 `develop`：
+
+```bash
+git checkout develop
+git merge --no-ff feature/db-setup -m "merge: feature/db-setup into develop"
+git push origin develop
+git branch -d feature/db-setup
+git push origin --delete feature/db-setup
+```
+
+这是第一个里程碑节点——数据库 + 配置 + 工程基础设施全部就绪，合并到 `main` 并打 `v0.1` tag：
+
+```bash
+git checkout main
+git merge --no-ff develop -m "release: v0.1 - infrastructure ready"
+git tag -a v0.1 -m "DB + config + middleware + logging setup complete"
+git push origin main
+git push origin v0.1
+git checkout develop
+```
+
+
+
+### Step 07 完成状态
+
+```
+✅ Docker SQL Server 启动
+✅ 理解 Migration 机制（Up/Down，两步流程）
+✅ Admin Seed Data 写入 AppDbContext（固定 Id、固定时间、PasswordHasher）
+✅ dotnet ef migrations add 生成 InitialCreate
+✅ dotnet ef database update 建表成功
+✅ 数据库里五张表可见，Admin 用户已插入
+✅ Git commit 完成
+✅ feature/db-setup 合并回 develop
+✅ v0.1 里程碑 tag 打完
+```
