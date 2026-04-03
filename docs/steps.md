@@ -1441,3 +1441,264 @@ git commit -m "feat: database schema design - base entity + status enums + schem
 ✅ Git commit 完成
 ```
 
+
+
+## Step 05 · EF Core 实体设计
+
+### 这一步做什么
+
+Step 04 把数据库结构设计清楚了，现在把它翻译成 C# 代码。
+
+EF Core 通过读取这些实体类来理解数据库结构，所以实体类的设计直接决定了最终建出来的表长什么样。
+
+
+
+### 1. 两种配置方式：Data Annotations vs Fluent API
+
+在告诉 EF Core"这个字段最大长度是多少"、"这个字段不能为空"这类信息时，有两种写法：
+
+**Data Annotations**——直接在属性上加特性标签：
+
+```csharp
+[Required]
+[MaxLength(50)]
+public string Username { get; set; }
+```
+
+**Fluent API**——在单独的配置类里用代码描述：
+
+```csharp
+builder.Property(u => u.Username)
+    .IsRequired()
+    .HasMaxLength(50);
+```
+
+两种方式功能上等价，但有明显区别：
+
+Data Annotations 写起来直接，但会把"业务属性"和"数据库配置"混在同一个类里——实体类本来只是描述业务概念的，混入数据库细节会让它越来越臃肿。而且 Data Annotations 能表达的配置有限，遇到复杂场景（比如枚举转字符串存储、联合主键、复合索引）就做不到了。
+
+Fluent API 把数据库配置单独放在 `Configurations/` 目录下，实体类保持干净，只描述业务属性和关系。我们用这种方式。
+
+所以实体类里**只写属性和导航属性**，EF Core 相关的配置（字段长度、索引、枚举转换等）统一放到 `Configurations/` 里，在注册 DbContext 时加载。
+
+
+
+### 2. 什么是导航属性
+
+在关系型数据库里，表和表之间通过外键关联。在 EF Core 里，这种关联用**导航属性**来表达：
+
+```csharp
+// Car 表里有 SellerId 外键
+public int SellerId { get; set; }
+
+// 对应的导航属性，让代码里可以直接访问 car.Seller.Username
+// 而不用手动 JOIN
+public User Seller { get; set; } = null!;
+```
+
+`null!` 是 .NET 的空值抑制符号。EF Core 在查询时会自动填充这些导航属性，但 C# 编译器不知道这件事，会警告说"这个属性可能是 null"。`null!` 告诉编译器"我知道这里不会是 null，不用警告"。
+
+
+
+### 3. 创建实体类
+
+#### `Entities/User.cs`
+
+```bash
+touch UUcars.API/Entities/User.cs
+using UUcars.API.Entities.Enums;
+
+namespace UUcars.API.Entities;
+
+public class User : BaseEntity
+{
+    public string Username { get; set; } = string.Empty;
+    public string Email { get; set; } = string.Empty;
+    public string PasswordHash { get; set; } = string.Empty;
+    public UserRole Role { get; set; } = UserRole.User;
+    public bool EmailConfirmed { get; set; } = false;
+
+    // 导航属性
+    // 一个用户可以发布多辆车
+    public ICollection<Car> Cars { get; set; } = [];
+
+    // 一个用户可以有多个"买家身份"的订单
+    public ICollection<Order> BuyerOrders { get; set; } = [];
+
+    // 一个用户可以有多个"卖家身份"的订单
+    public ICollection<Order> SellerOrders { get; set; } = [];
+
+    // 一个用户可以收藏多辆车
+    public ICollection<Favorite> Favorites { get; set; } = [];
+}
+```
+
+> **为什么订单要分 `BuyerOrders` 和 `SellerOrders` 两个导航属性？** Orders 表里有两个外键都指向 Users 表（`BuyerId` 和 `SellerId`），EF Core 需要两个独立的导航属性来区分这两种关系。如果只写一个 `Orders`，EF Core 不知道它对应的是哪个外键。
+
+
+
+#### `Entities/Car.cs`
+
+```bash
+touch UUcars.API/Entities/Car.cs
+using UUcars.API.Entities.Enums;
+
+namespace UUcars.API.Entities;
+
+public class Car : BaseEntity
+{
+    public string Title { get; set; } = string.Empty;
+    public string Brand { get; set; } = string.Empty;
+    public string Model { get; set; } = string.Empty;
+    public int Year { get; set; }
+    public decimal Price { get; set; }
+    public int Mileage { get; set; }
+    public string? Description { get; set; }   // 允许为 null
+
+    // 外键 + 导航属性
+    public int SellerId { get; set; }
+    public User Seller { get; set; } = null!;
+
+    public CarStatus Status { get; set; } = CarStatus.Draft;
+
+    // 导航属性
+    public ICollection<CarImage> Images { get; set; } = [];
+    public ICollection<Order> Orders { get; set; } = [];
+    public ICollection<Favorite> Favorites { get; set; } = [];
+}
+```
+
+> **`string?` 和 `string` 的区别：** `Description` 字段在 Step 04 设计时是 `NULL`（允许为空）。在 C# 里用 `string?` 表达这个含义，EF Core 看到 `?` 会在数据库里生成可为 NULL 的列。其他字符串字段没有 `?`，EF Core 会生成 NOT NULL 的列。
+
+
+
+#### `Entities/CarImage.cs`
+
+```bash
+touch UUcars.API/Entities/CarImage.cs
+namespace UUcars.API.Entities;
+
+// CarImage 不继承 BaseEntity
+// 因为它没有 CreatedAt / UpdatedAt，只有自己的 Id
+public class CarImage
+{
+    public int Id { get; set; }
+    public string ImageUrl { get; set; } = string.Empty;
+    public int SortOrder { get; set; } = 0;
+
+    // 外键 + 导航属性
+    public int CarId { get; set; }
+    public Car Car { get; set; } = null!;
+}
+```
+
+
+
+#### `Entities/Order.cs`
+
+```bash
+touch UUcars.API/Entities/Order.cs
+using UUcars.API.Entities.Enums;
+
+namespace UUcars.API.Entities;
+
+public class Order : BaseEntity
+{
+    public decimal Price { get; set; }   // 下单时锁定的价格
+    public OrderStatus Status { get; set; } = OrderStatus.Pending;
+
+    // 外键 + 导航属性（车辆）
+    public int CarId { get; set; }
+    public Car Car { get; set; } = null!;
+
+    // 外键 + 导航属性（买家）
+    public int BuyerId { get; set; }
+    public User Buyer { get; set; } = null!;
+
+    // 外键 + 导航属性（卖家，从 Car 冗余存储）
+    public int SellerId { get; set; }
+    public User Seller { get; set; } = null!;
+}
+```
+
+
+
+#### `Entities/Favorite.cs`
+
+```bash
+touch UUcars.API/Entities/Favorite.cs
+namespace UUcars.API.Entities;
+
+// Favorite 不继承 BaseEntity
+// 因为它用 (UserId, CarId) 联合主键，没有独立的 Id 字段
+// 联合主键需要在 DbContext 里用 Fluent API 配置，
+// 仅靠 Data Annotations 无法完整表达
+public class Favorite
+{
+    public int UserId { get; set; }
+    public User User { get; set; } = null!;
+
+    public int CarId { get; set; }
+    public Car Car { get; set; } = null!;
+
+    public DateTime CreatedAt { get; set; }
+}
+```
+
+
+
+### 4. 此时的目录结构
+
+```
+UUcars.API/Entities/
+├── BaseEntity.cs
+├── Car.cs          ← 新增
+├── CarImage.cs     ← 新增
+├── Favorite.cs     ← 新增
+├── Order.cs        ← 新增
+├── User.cs         ← 新增
+└── Enums/
+    ├── CarStatus.cs
+    ├── OrderStatus.cs
+    └── UserRole.cs
+```
+
+
+
+### 5. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 6. Git 提交
+
+```bash
+git add .
+git commit -m "feat: EF Core entities (User, Car, CarImage, Order, Favorite)"
+```
+
+
+
+### Step 05 完成状态
+
+```
+✅ User 实体（继承 BaseEntity，含 UserRole 枚举和四个导航属性）
+✅ Car 实体（继承 BaseEntity，含 CarStatus 枚举和三个导航属性）
+✅ CarImage 实体（不继承 BaseEntity，只有 Id + 两个字段）
+✅ Order 实体（继承 BaseEntity，含 OrderStatus 枚举，三个外键）
+✅ Favorite 实体（不继承 BaseEntity，联合主键待 DbContext 配置）
+✅ dotnet build 通过
+✅ Git commit 完成
+```
+
