@@ -1702,3 +1702,553 @@ git commit -m "feat: EF Core entities (User, Car, CarImage, Order, Favorite)"
 ✅ Git commit 完成
 ```
 
+
+
+## Step 06 · DbContext
+
+### 这一步做什么
+
+Step 05 把五个实体类写好了，但 EF Core 现在还不知道它们的存在。这一步要做两件事：
+
+1. 创建 `AppDbContext`——把所有实体注册进去，EF Core 才知道要管理哪些表
+2. 写 Fluent API 配置——把 Step 04 设计里的字段约束、索引、枚举转换、关系配置等细节告诉 EF Core
+
+
+
+### 1. 为什么需要单独的配置类
+
+Step 05 提到，实体类里只写属性和导航属性，数据库配置统一放在 `Configurations/` 目录下。现在来实现这些配置类。
+
+#### 如何配置？
+
+每个实体对应一个配置类，并实现 `IEntityTypeConfiguration<T>` 接口
+
+```c#
+public class UserConfiguration : IEntityTypeConfiguration<User>
+{
+    public void Configure(EntityTypeBuilder<User> builder)
+    {
+        // 所有针对 User 实体的配置都在这里
+    }
+}
+```
+
+- 这个接口是由EntityFrameworkCore提供的，专门用来把实体配置从 `AppDbContext` 里拆出去单独管理。
+
+- 这个接口只有一个方法 `Configure`，所有针对这个实体的 Fluent API 配置都在里面写。
+- 配置方法传入 `EntityTypeBuilder<T>` 配置构建器 `builder`， `builder` 上面挂了很多方法，专门用来描述实体的数据库映射规则。在这里写的每一行配置，最终都会反映在 Migration 文件和数据库表结构里。
+
+#### 配置类创建后，如何加载使用？
+
+在创建 `AppDbContext` 时，需要让它知道所有配置类的存在。最直接的写法是手动一个个添加：
+
+```c#
+protected override void OnModelCreating(ModelBuilder modelBuilder)
+{
+    modelBuilder.ApplyConfiguration(new UserConfiguration());
+    modelBuilder.ApplyConfiguration(new CarConfiguration());
+    modelBuilder.ApplyConfiguration(new CarImageConfiguration());
+    modelBuilder.ApplyConfiguration(new OrderConfiguration());
+    modelBuilder.ApplyConfiguration(new FavoriteConfiguration());
+}
+```
+
+现在只有五个实体，还好。但随着项目增长，每次新增实体都要回来改 `AppDbContext`，很容易漏掉。
+
+因此，替代 `ApplyConfiguration`单个加载的方法，EFcore提供了**统一自动加载的方法 `ApplyConfigurationsFromAssembly`。** 
+
+它会自动扫描指定程序集里所有实现了 `IEntityTypeConfiguration<T>` 的类，并全部应用：
+
+```c#
+protected override void OnModelCreating(ModelBuilder modelBuilder)
+{
+    modelBuilder.ApplyConfigurationsFromAssembly(typeof(AppDbContext).Assembly);
+}
+```
+
+参数`typeof(AppDbContext).Assembly` 的意思是"AppDbContext 这个类所在的程序集"，也就是 `UUcars.API` 这个项目。以后新增实体时，只需要新建一个配置类，`AppDbContext` 完全不需要改动。
+
+
+
+### 2. 安装 EF Core 相关包
+
+EF Core 本体和 SQL Server 驱动需要单独安装：
+
+```bash
+dotnet add UUcars.API/UUcars.API.csproj package Microsoft.EntityFrameworkCore --version 9.0.0
+dotnet add UUcars.API/UUcars.API.csproj package Microsoft.EntityFrameworkCore.SqlServer --version 9.0.0
+dotnet add UUcars.API/UUcars.API.csproj package Microsoft.EntityFrameworkCore.Tools --version 9.0.0
+```
+
+**三个包的分工：**
+
+`Microsoft.EntityFrameworkCore` 是 EF Core 的核心，提供 DbContext、DbSet、LINQ 查询等所有基础能力，和具体数据库无关。
+
+`Microsoft.EntityFrameworkCore.SqlServer` 是 SQL Server 专属驱动，负责把 EF Core 生成的通用数据库操作翻译成 SQL Server 能执行的 T-SQL。EF Core 的设计是数据库无关的——如果将来要换成 PostgreSQL 或 SQLite，只需要换掉这个驱动包，其他业务代码一行不用改。
+
+`Microsoft.EntityFrameworkCore.Tools` 提供 `dotnet ef` 命令行工具。下一步要用它来生成 Migration 文件和更新数据库，没有这个包，`dotnet ef` 命令会报错找不到。
+
+
+
+### 3. 创建各实体的配置类
+
+EF Core 理解实体结构的方式，除了step 05里提到的特性标签（Data Annotations）和Fluent API之外，还有EF Core 内置了一套默认规则，即：约定（Conventions）。
+
+当没有显式配置时，EF Core 按约定自动处理。比如常见约定有：
+
+```
+属性名叫 Id 或 类名Id（int 类型）→ 自动识别为自增主键
+属性类型是 string（无 ?）         → 数据库生成 NOT NULL
+属性类型是 string?（有 ?）        → 数据库生成 NULL
+```
+
+因此，配置类里从来不出现 `Id` 字段 （不对Id字段进行显示配置）。
+
+EF Core 看到 `int Id` 就自动把它处理成自增主键，完全不需要任何配置。
+
+**约定能自动处理的，就不写；约定处理不了或需要覆盖默认行为的，才显式配置。**
+
+
+
+先删掉占位文件：
+
+```bash
+rm UUcars.API/Configurations/.gitkeep
+```
+
+#### `Configurations/UserConfiguration.cs`
+
+```bash
+touch UUcars.API/Configurations/UserConfiguration.cs
+```
+
+```c#
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+using UUcars.API.Entities;
+
+namespace UUcars.API.Configurations;
+
+public class UserConfiguration : IEntityTypeConfiguration<User>
+{
+    public void Configure(EntityTypeBuilder<User> builder)
+    {
+        builder.Property(u => u.Username)
+            .IsRequired()
+            .HasMaxLength(50);
+
+        builder.Property(u => u.Email)
+            .IsRequired()
+            .HasMaxLength(100);
+
+        // 唯一索引：数据库层面保证同一邮箱不能注册两次
+        builder.HasIndex(u => u.Email)
+            .IsUnique();
+
+        builder.Property(u => u.PasswordHash)
+            .IsRequired()
+            .HasMaxLength(256);
+
+        // 枚举存为字符串，见下方解释
+        builder.Property(u => u.Role)
+            .IsRequired()
+            .HasMaxLength(20)
+            .HasConversion<string>();
+
+        builder.Property(u => u.EmailConfirmed)
+            .IsRequired()
+            .HasDefaultValue(false);
+
+        builder.Property(u => u.CreatedAt)
+            .IsRequired();
+
+        builder.Property(u => u.UpdatedAt)
+            .IsRequired();
+    }
+}
+```
+
+`HasConversion<string>()` 是什么 ？
+
+这一行配置决定了枚举在数据库里以什么形式存储。 如果不加这行，EF Core 默认把枚举存成**整数**： ``` UserRole.User  → 存 0 UserRole.Admin → 存 1 ``` 。直接打开数据库看到的是一堆数字，完全不知道代表什么含义，调试起来很痛苦。 
+
+加了 `HasConversion<string>()` 之后： ``` UserRole.User  → 存 "User" UserRole.Admin → 存 "Admin" ``` 。EF Core 在写入数据库时自动把枚举转成字符串，读取时再把字符串转回枚举。
+
+
+
+#### `Configurations/CarConfiguration.cs`
+
+```bash
+touch UUcars.API/Configurations/CarConfiguration.cs
+```
+
+```c#
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+using UUcars.API.Entities;
+
+namespace UUcars.API.Configurations;
+
+public class CarConfiguration : IEntityTypeConfiguration<Car>
+{
+    public void Configure(EntityTypeBuilder<Car> builder)
+    {
+        builder.Property(c => c.Title)
+            .IsRequired()
+            .HasMaxLength(100);
+
+        builder.Property(c => c.Brand)
+            .IsRequired()
+            .HasMaxLength(50);
+
+        builder.Property(c => c.Model)
+            .IsRequired()
+            .HasMaxLength(50);
+
+        builder.Property(c => c.Year)
+            .IsRequired();
+
+        // decimal 类型必须显式指定精度，约定不会自动处理
+        // decimal(18,2)：最多 18 位数字，其中 2 位小数，适合存金额
+        builder.Property(c => c.Price)
+            .IsRequired()
+            .HasColumnType("decimal(18,2)");
+
+        builder.Property(c => c.Mileage)
+            .IsRequired();
+
+        // Description 没有 IsRequired()，对应数据库的 NULL（允许为空）
+        builder.Property(c => c.Description)
+            .HasMaxLength(2000);
+
+        builder.Property(c => c.Status)
+            .IsRequired()
+            .HasMaxLength(20)
+            .HasConversion<string>();
+
+        builder.Property(c => c.CreatedAt)
+            .IsRequired();
+
+        builder.Property(c => c.UpdatedAt)
+            .IsRequired();
+
+        // 一辆车属于一个卖家（Car → User 是多对一）
+        // Restrict：用户有车辆时不能被直接删除（安全防线）
+        builder.HasOne(c => c.Seller)
+            .WithMany(u => u.Cars)
+            .HasForeignKey(c => c.SellerId)
+            .OnDelete(DeleteBehavior.Restrict);
+    }
+}
+```
+
+**`OnDelete` 的两种行为：**
+
+配置外键关系时，`OnDelete` 决定"当父记录被删除时，子记录怎么处理"：
+
+- **`DeleteBehavior.Cascade`（级联删除）**：父记录删了，子记录跟着自动删除。适合子记录完全依附于父记录、没有独立存在意义的情况。比如图片依附于车辆，车辆删了图片跟着删合理。
+- **`DeleteBehavior.Restrict`（限制删除）**：父记录有子记录时，拒绝删除父记录，直接报错。适合子记录是重要业务数据、不能随便消失的情况。
+
+项目里的选择逻辑：
+
+```
+CarImage → Car     Cascade   车删了图片跟着删，图片没有独立意义
+Favorite → User    Cascade   用户删了收藏记录跟着删
+Favorite → Car     Cascade   车删了收藏记录跟着删
+
+Car      → User    Restrict  用户有车辆时不能被直接删除
+Order    → Car     Restrict  订单是重要记录，不因车辆删除而消失
+Order    → User    Restrict  订单是重要记录，不因用户删除而消失
+```
+
+
+
+#### `Configurations/CarImageConfiguration.cs`
+
+```bash
+touch UUcars.API/Configurations/CarImageConfiguration.cs
+```
+
+```c#
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+using UUcars.API.Entities;
+
+namespace UUcars.API.Configurations;
+
+public class CarImageConfiguration : IEntityTypeConfiguration<CarImage>
+{
+    public void Configure(EntityTypeBuilder<CarImage> builder)
+    {
+        builder.Property(ci => ci.ImageUrl)
+            .IsRequired()
+            .HasMaxLength(500);
+
+        builder.Property(ci => ci.SortOrder)
+            .IsRequired()
+            .HasDefaultValue(0);
+
+        // Cascade：车辆删除时图片跟着删，图片依附于车辆没有独立意义
+        builder.HasOne(ci => ci.Car)
+            .WithMany(c => c.Images)
+            .HasForeignKey(ci => ci.CarId)
+            .OnDelete(DeleteBehavior.Cascade);
+    }
+}
+```
+
+
+
+#### `Configurations/OrderConfiguration.cs`
+
+```bash 
+touch UUcars.API/Configurations/OrderConfiguration.cs
+```
+
+```c#
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+using UUcars.API.Entities;
+
+namespace UUcars.API.Configurations;
+
+public class OrderConfiguration : IEntityTypeConfiguration<Order>
+{
+    public void Configure(EntityTypeBuilder<Order> builder)
+    {
+        builder.Property(o => o.Price)
+            .IsRequired()
+            .HasColumnType("decimal(18,2)");
+
+        // 枚举存为字符串
+        builder.Property(o => o.Status)
+            .IsRequired()
+            .HasMaxLength(20)
+            .HasConversion<string>();
+
+        builder.Property(o => o.CreatedAt)
+            .IsRequired();
+
+        builder.Property(o => o.UpdatedAt)
+            .IsRequired();
+
+        // 外键关系：订单关联车辆
+        builder.HasOne(o => o.Car)
+            .WithMany(c => c.Orders)
+            .HasForeignKey(o => o.CarId)
+            .OnDelete(DeleteBehavior.Restrict);
+
+        // 外键关系：买家
+        // 这里必须显式指定导航属性名，因为 User 有两个导航属性指向 Order
+        // （BuyerOrders 和 SellerOrders），EF Core 无法自动判断该用哪个
+        builder.HasOne(o => o.Buyer)
+            .WithMany(u => u.BuyerOrders)
+            .HasForeignKey(o => o.BuyerId)
+            .OnDelete(DeleteBehavior.Restrict);
+
+        // 外键关系：卖家
+        builder.HasOne(o => o.Seller)
+            .WithMany(u => u.SellerOrders)
+            .HasForeignKey(o => o.SellerId)
+            .OnDelete(DeleteBehavior.Restrict);
+    }
+}
+```
+
+> **Orders 表为什么三个外键都用 `Restrict`？** 订单是重要的业务记录，不应该因为用户或车辆被删除而跟着消失。业务上"删除"用户或车辆都是逻辑删除（改 Status 字段），不会真正从数据库删行，所以实际上也不会触发这个约束。加上 `Restrict` 是一道安全防线。
+
+
+
+#### `Configurations/FavoriteConfiguration.cs`
+
+```bash
+touch UUcars.API/Configurations/FavoriteConfiguration.cs
+```
+
+```c#
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+using UUcars.API.Entities;
+
+namespace UUcars.API.Configurations;
+
+public class FavoriteConfiguration : IEntityTypeConfiguration<Favorite>
+{
+    public void Configure(EntityTypeBuilder<Favorite> builder)
+    {
+        // 配置联合主键
+        // new { f.UserId, f.CarId } 是 C# 的匿名对象写法，
+        // 用来同时传入两个字段，告诉 EF Core"这两个字段一起构成主键"
+        // Data Annotations 的 [Key] 只能标记单个字段，无法表达复合主键，
+        // 这是必须用 Fluent API 的场景
+        builder.HasKey(f => new { f.UserId, f.CarId });
+
+        builder.Property(f => f.CreatedAt)
+            .IsRequired();
+
+        // 外键关系：收藏关联用户
+        builder.HasOne(f => f.User)
+            .WithMany(u => u.Favorites)
+            .HasForeignKey(f => f.UserId)
+            .OnDelete(DeleteBehavior.Cascade);
+
+        // 外键关系：收藏关联车辆
+        builder.HasOne(f => f.Car)
+            .WithMany(c => c.Favorites)
+            .HasForeignKey(f => f.CarId)
+            .OnDelete(DeleteBehavior.Cascade);
+    }
+}
+```
+
+
+
+### 4. 创建 AppDbContext
+
+```bash
+touch UUcars.API/Data/AppDbContext.cs
+rm UUcars.API/Data/.gitkeep
+```
+
+```c#
+using Microsoft.EntityFrameworkCore;
+using UUcars.API.Configurations;
+using UUcars.API.Entities;
+
+namespace UUcars.API.Data;
+
+public class AppDbContext : DbContext
+{
+    // DbContextOptions 包含数据库连接字符串等配置
+    // 通过构造函数注入，由 DI 容器在运行时传入
+    public AppDbContext(DbContextOptions<AppDbContext> options) : base(options)
+    {
+    }
+
+    // DbSet<T> 对应数据库里的一张表
+    // 通过它可以对这张表做查询、新增、修改、删除
+    public DbSet<User> Users => Set<User>();
+    public DbSet<Car> Cars => Set<Car>();
+    public DbSet<CarImage> CarImages => Set<CarImage>();
+    public DbSet<Order> Orders => Set<Order>();
+    public DbSet<Favorite> Favorites => Set<Favorite>();
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        base.OnModelCreating(modelBuilder);
+
+        // 统一加载 Configurations/ 目录下的所有配置类
+        // 每新增一个 IEntityTypeConfiguration 实现，这里自动识别，不需要手动添加
+        modelBuilder.ApplyConfigurationsFromAssembly(typeof(AppDbContext).Assembly);
+    }
+}
+```
+
+> **`ApplyConfigurationsFromAssembly` 的好处：** 它会自动扫描当前程序集里所有实现了 `IEntityTypeConfiguration<T>` 的类并应用。后续新增实体时，只需要新建一个配置类，`AppDbContext` 不需要改动。
+
+
+
+### 5. 在 Program.cs 里注册 DbContext
+
+打开 `Program.cs`，在服务注册区域加上 DbContext 的注册：
+
+```csharp
+// 在 builder.Services.AddControllers(); 下方添加
+
+// 注册 AppDbContext
+// 从配置文件读取连接字符串（开发环境从 User Secrets 读取）
+builder.Services.AddDbContext<AppDbContext>(options =>
+    options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection"))
+);
+```
+
+>`GetConnectionString("DefaultConnection")` 会从配置系统读取连接字符串。
+>
+>ASP.NET Core 的配置系统有优先级——开发环境会优先读 User Secrets，生产环境读环境变量。
+>
+>我们在 Step 03 里已经通过 User Secrets 设置了真实的连接字符串，这里的代码不需要关心具体从哪里读，框架自动处理。
+
+
+
+同时在文件顶部补上 using：
+
+```csharp
+using Microsoft.EntityFrameworkCore;
+using UUcars.API.Data;
+```
+
+此时 `Program.cs` 服务注册部分完整如下：
+
+```c#
+builder.Services.AddControllers();
+builder.Services.AddOpenApi();
+
+builder.Services.Configure<JwtSettings>(
+    builder.Configuration.GetSection("JwtSettings")
+);
+
+builder.Services.AddDbContext<AppDbContext>(options =>
+    options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection"))
+);
+```
+
+
+
+### 6. 此时的目录结构变化
+
+```
+UUcars.API/
+├── Configurations/
+│   ├── CarConfiguration.cs         ← 新增
+│   ├── CarImageConfiguration.cs    ← 新增
+│   ├── FavoriteConfiguration.cs    ← 新增
+│   ├── OrderConfiguration.cs       ← 新增
+│   └── UserConfiguration.cs        ← 新增
+├── Data/
+│   └── AppDbContext.cs             ← 新增
+```
+
+
+
+### 7. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 8. Git 提交
+
+```bash
+git add .
+git commit -m "feat: AppDbContext + Fluent API configurations for all entities"
+```
+
+
+
+### Step 06 完成状态
+
+```
+✅ 五个 Fluent API 配置类（字段约束、索引、枚举转字符串、关系配置）
+   - UserConfiguration（Email 唯一索引，UserRole 枚举转字符串）
+   - CarConfiguration（CarStatus 枚举转字符串，Seller 外键 Restrict）
+   - CarImageConfiguration（Car 外键 Cascade）
+   - OrderConfiguration（三个外键全部 Restrict，买家/卖家关系明确）
+   - FavoriteConfiguration（联合主键，两个外键 Cascade）
+✅ AppDbContext 创建（五个 DbSet，ApplyConfigurationsFromAssembly 自动加载）
+✅ EF Core + SQL Server 包安装
+✅ DbContext 注册进 Program.cs
+✅ dotnet build 通过
+✅ Git commit 完成
+```
+
+

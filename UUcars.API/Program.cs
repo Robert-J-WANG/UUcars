@@ -1,6 +1,8 @@
+using Microsoft.EntityFrameworkCore;
 using Scalar.AspNetCore;
 using Serilog;
 using UUcars.API.Auth;
+using UUcars.API.Data;
 using UUcars.API.Middleware;
 
 // =============================================
@@ -29,8 +31,8 @@ try
             .WriteTo.Console()
             .WriteTo.File(
                 path: "logs/uucars-.log",
-                rollingInterval: RollingInterval.Day,  // 每天滚动一个新文件
-                retainedFileCountLimit: 30             // 最多保留 30 天
+                rollingInterval: RollingInterval.Day, // 每天滚动一个新文件
+                retainedFileCountLimit: 30 // 最多保留 30 天
             )
     );
 
@@ -38,7 +40,7 @@ try
     // 服务注册
     // =============================================
     builder.Services.AddControllers();
-
+    
     // OpenAPI + Scalar（API 文档）
     builder.Services.AddOpenApi();
 
@@ -46,6 +48,12 @@ try
     // 后续需要 JWT 配置的地方通过 IOptions<JwtSettings> 注入
     builder.Services.Configure<JwtSettings>(
         builder.Configuration.GetSection("JwtSettings")
+    );
+    
+    // 注册 AppDbContext
+    // 从配置文件读取连接字符串（开发环境从 User Secrets 读取）
+    builder.Services.AddDbContext<AppDbContext>(options =>
+        options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection"))
     );
 
     // =============================================
