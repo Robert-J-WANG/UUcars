@@ -5,7 +5,6 @@
 开始一个新项目，第一件事是把脚手架搭好——创建 Solution、建好项目文件、配置 Git。这些工作做一次就定下来了，后续所有开发都在这个基础上进行。
 
 
-
 ### 1. Solution 和 Project 的关系
 
 在 .NET 里，**Solution（.sln）** 是一个容器，它本身不包含代码，只是把多个 **Project（.csproj）** 组织在一起管理。
@@ -999,3 +998,1599 @@ git commit -m "feat: config management + ApiResponse + exception middleware + Se
 ✅ Git commit 完成
 ```
 
+
+
+## Step 04 · 数据库建模
+
+### 这一步做什么
+工程基础设施搭好了，现在进入数据库设计阶段。
+
+在动手写任何实体代码之前，先要把整个数据库的结构想清楚：
+
+- 需要哪些表？
+- 每张表有哪些字段？
+- 表与表之间什么关系？
+
+设计想清楚了，后面写代码才不会反复改。
+
+
+
+### 1. 切出 feature/db-setup 分支
+
+数据库相关的工作（建模、实体、DbContext、Migration）是一个完整的功能块，单独开一个分支来做：
+
+```bash
+git checkout develop
+git checkout -b feature/db-setup
+git push -u origin feature/db-setup
+```
+
+
+
+### 2. 这个系统需要哪些表
+
+UUcars 是一个二手车 C2C 平台，核心业务流程是：
+
+```
+卖家注册账号
+    ↓
+发布车辆（先是草稿）→ 提交审核 → Admin 审核通过 → 公开上架
+    ↓
+买家浏览 / 搜索 / 收藏车辆
+    ↓
+买家下单 → 交易完成
+```
+
+从这个流程出发，自然推导出需要五张表：
+
+```
+Users      所有用户（买家、卖家、Admin 都是用户，用 Role 字段区分）
+Cars       车辆信息（每辆车归属于一个卖家）
+CarImages  车辆图片（一辆车可以有多张图片，单独一张表）
+Orders     订单（买家对某辆车下单产生）
+Favorites  收藏关系（某用户收藏了某辆车）
+```
+
+表与表之间的关系：
+
+```
+Users  ──<  Cars         一个用户可以发布多辆车（一对多）
+Cars   ──<  CarImages    一辆车可以有多张图片（一对多）
+Users  ──<  Orders       一个用户可以有多个订单（一对多）
+Cars   ──<  Orders       一辆车可以有多条订单记录（一对多）
+Users  >──< Cars         用户和车辆之间有收藏关系（多对多，通过 Favorites 实现）
+```
+
+
+
+### 3. 逐表设计字段
+
+#### Users 表
+
+```
+Id                int,           PK, Identity（自增主键）
+Username          nvarchar(50),  NOT NULL
+Email             nvarchar(100), NOT NULL, UNIQUE（登录凭证，不能重复）
+PasswordHash      nvarchar(256), NOT NULL（存 Hash 后的密码，绝不存明文）
+Role              nvarchar(20),  NOT NULL（User / Admin）
+EmailConfirmed    bit,           NOT NULL, DEFAULT 0
+CreatedAt         datetime2,     NOT NULL
+UpdatedAt         datetime2,     NOT NULL
+```
+
+`Role` 决定了这个用户是普通用户还是管理员。买家和卖家都是 `User`——在这个平台上，同一个人既可以卖车也可以买车，不需要区分角色。
+
+`EmailConfirmed` 是一个**状态标记字段**，只是一个 `bool`。V1 注册时直接写入 `false`，一行代码的事，不依赖任何额外功能。它存在的价值是：
+
+- V1 的数据从第一天起就有这个标记，所有用户都是 `false`
+- V2 做邮箱验证时，功能做完直接把对应用户的这个字段改成 `true` 就行
+- 如果 V1 不加，V2 Migration 加字段时还需要考虑给存量用户设默认值，多一个麻烦
+
+
+
+#### Cars 表
+
+```
+Id            int,             PK, Identity
+Title         nvarchar(100),   NOT NULL（车辆标题，如"2020款宝马3系 里程少无事故"）
+Brand         nvarchar(50),    NOT NULL（品牌，如 BMW、Toyota）
+Model         nvarchar(50),    NOT NULL（车型，如 3 Series、Camry）
+Year          int,             NOT NULL（出厂年份）
+Price         decimal(18,2),   NOT NULL（售价）
+Mileage       int,             NOT NULL（里程，单位：公里）
+Description   nvarchar(2000),  NULL（详细描述，允许为空）
+SellerId      int,             FK → Users.Id, NOT NULL
+Status        nvarchar(20),    NOT NULL
+CreatedAt     datetime2,       NOT NULL
+UpdatedAt     datetime2,       NOT NULL
+```
+
+`Status` 是这张表里最关键的字段，贯穿整个业务流程：
+
+```
+卖家创建          → Draft          （草稿，只有卖家自己能看到）
+卖家提交审核      → PendingReview  （等待 Admin 处理）
+Admin 审核通过    → Published      （公开上架，买家可以下单）
+Admin 审核拒绝    → Draft          （退回卖家修改，重新走流程）
+买家下单成功      → Sold           （已售出，不再接受新订单）
+违规或主动删除    → Deleted        （逻辑删除，数据还在但不可见）
+```
+
+注意这个流转是有约束的——不是任意两个状态之间都能转换。比如 `Sold` 不能退回 `Published`（除非买家取消订单才恢复），`Published` 不能直接改成 `Draft`。这些业务规则后面在 Service 层用代码来保证。
+
+
+
+#### CarImages 表
+
+```
+Id          int,            PK, Identity
+CarId       int,            FK → Cars.Id, NOT NULL
+ImageUrl    nvarchar(500),  NOT NULL（V1 直接存 URL）
+SortOrder   int,            NOT NULL, DEFAULT 0（图片排列顺序）
+```
+
+图片和车辆分开存的原因：一辆车通常有多张图片，如果把图片 URL 存在 Cars 表里（比如用逗号分隔），查询和修改都很麻烦，也没法控制顺序。单独一张表，每张图片一行，`SortOrder` 控制显示顺序，第一张作为封面图。
+
+这张表没有 `CreatedAt` / `UpdatedAt`，图片是车辆的附属资源，不需要时间追踪。
+
+
+
+#### Orders 表
+
+```
+Id          int,            PK, Identity
+CarId       int,            FK → Cars.Id, NOT NULL
+BuyerId     int,            FK → Users.Id, NOT NULL
+SellerId    int,            FK → Users.Id, NOT NULL
+Price       decimal(18,2),  NOT NULL
+Status      nvarchar(20),   NOT NULL
+CreatedAt   datetime2,      NOT NULL
+UpdatedAt   datetime2,      NOT NULL
+```
+
+**`SellerId` 为什么要单独存？**
+
+`SellerId` 信息本来可以通过 `CarId` 关联 `Cars` 表查到，但我们选择在 Orders 里冗余存一份。原因是：买家查"我买的订单"和卖家查"我卖的订单"是高频操作，如果 `SellerId` 不在 Orders 表里，每次查卖家视角的订单都要先 JOIN Cars 表，多一次关联。冗余存一份，直接按 `SellerId` 过滤，查询简单高效。
+
+**`Price` 为什么要单独存？**
+
+订单创建时，把当时的成交价格锁定在订单里。如果只记录 `CarId`，卖家后来修改了车辆价格，历史订单的价格就会跟着变，这显然是错的。
+
+`Status` 的流转：
+
+```
+买家下单      → Pending    （待处理）
+交易完成      → Completed  
+买家取消      → Cancelled  （同时车辆状态恢复 Published）
+```
+
+
+
+#### Favorites 表
+
+```
+UserId       int,        FK → Users.Id, NOT NULL
+CarId        int,        FK → Cars.Id, NOT NULL
+CreatedAt    datetime2,  NOT NULL
+
+PRIMARY KEY (UserId, CarId)
+```
+
+这张表实现的是用户和车辆之间的多对多收藏关系。用 `(UserId, CarId)` 联合主键，而不是单独设一个 `Id` 字段——联合主键本身就保证了同一个用户不能重复收藏同一辆车，数据库层面天然防重。
+
+
+
+### 4. 用枚举表达 Status 字段
+
+设计里有三个字段是有限的字符串集合：`Cars.Status`、`Orders.Status`、`Users.Role`。
+
+在 C# 里用字符串常量来表达这些值，有一个根本性的问题：
+
+```csharp
+// 这样写编译器不会报错，但数据库里存进去的是一个无效值
+car.Status = "published";   // 大小写错了
+car.Status = "Pubished";    // 拼写错了
+car.Status = "Online";      // 根本不在枚举里
+```
+
+用 C# 枚举就不会有这个问题——只能传枚举里定义的值，传错了编译器直接报错。
+
+EF Core 支持把枚举以字符串形式存进数据库（存 `"Draft"` 这样可读的字符串，而不是数字 `0`），后面在 DbContext 配置时处理。
+
+先建枚举目录：
+
+```bash
+mkdir -p UUcars.API/Entities/Enums
+```
+
+#### `Entities/Enums/CarStatus.cs`
+
+```bash
+touch UUcars.API/Entities/Enums/CarStatus.cs
+namespace UUcars.API.Entities.Enums;
+
+public enum CarStatus
+{
+    Draft,          // 草稿，卖家刚创建
+    PendingReview,  // 已提交，等待 Admin 审核
+    Published,      // 审核通过，公开可见
+    Sold,           // 已售出
+    Deleted         // 逻辑删除
+}
+```
+
+#### `Entities/Enums/OrderStatus.cs`
+
+```bash
+touch UUcars.API/Entities/Enums/OrderStatus.cs
+namespace UUcars.API.Entities.Enums;
+
+public enum OrderStatus
+{
+    Pending,    // 待处理
+    Completed,  // 交易完成
+    Cancelled   // 已取消
+}
+```
+
+#### `Entities/Enums/UserRole.cs`
+
+```bash
+touch UUcars.API/Entities/Enums/UserRole.cs
+namespace UUcars.API.Entities.Enums;
+
+public enum UserRole
+{
+    User,   // 普通用户（买家 / 卖家）
+    Admin   // 管理员
+}
+```
+
+
+
+### 5. BaseEntity：提取公共字段
+
+回头看五张表，`Users`、`Cars`、`Orders` 都有相同的三个字段：
+
+```
+Id          int, PK, Identity
+CreatedAt   datetime2, NOT NULL
+UpdatedAt   datetime2, NOT NULL
+```
+
+不需要在每个实体类里重复写这三行。提取一个基类，有这三个字段的实体继承它：
+
+```bash
+touch UUcars.API/Entities/BaseEntity.cs
+rm UUcars.API/Entities/.gitkeep
+namespace UUcars.API.Entities;
+
+// 所有实体的公共基类
+// abstract：这个类本身不对应任何数据库表，
+// 不应该被直接实例化，只能被继承
+public abstract class BaseEntity
+{
+    public int Id { get; set; }
+    public DateTime CreatedAt { get; set; }
+    public DateTime UpdatedAt { get; set; }
+}
+```
+
+哪些实体会继承这个基类？
+
+```
+✅ User     有 Id / CreatedAt / UpdatedAt → 继承
+✅ Car      有 Id / CreatedAt / UpdatedAt → 继承
+✅ Order    有 Id / CreatedAt / UpdatedAt → 继承
+❌ CarImage 只有 Id，没有时间字段        → 不继承，单独写
+❌ Favorite 联合主键，没有独立 Id        → 不继承，单独写
+```
+
+
+
+### 6. 保存数据库设计文档
+
+实体类和后面的 Migration 文件是数据库结构最权威的记录，但它们分散在各个文件里，不够直观。
+
+建一份人类可读的 Schema 文档，方便随时查阅整体结构和字段的业务含义：
+
+```bash
+mkdir -p docs
+touch docs/database-schema.md
+```
+
+`docs/database-schema.md` 内容：
+
+```markdown
+# UUcars 数据库 Schema
+
+## 表关系
+
+Users  ──<  Cars         一个用户可以发布多辆车（一对多）
+Cars   ──<  CarImages    一辆车可以有多张图片（一对多）
+Users  ──<  Orders       一个用户可以有多个订单（一对多）
+Cars   ──<  Orders       一辆车可以有多条订单记录（一对多）
+Users  >──< Cars         用户和车辆之间有收藏关系（多对多，通过 Favorites 实现）
+
+## Users
+
+| 字段 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| Id | int | PK, Identity | 自增主键 |
+| Username | nvarchar(50) | NOT NULL | |
+| Email | nvarchar(100) | NOT NULL, UNIQUE | 登录凭证，不能重复 |
+| PasswordHash | nvarchar(256) | NOT NULL | Hash 后的密码，不存明文 |
+| Role | nvarchar(20) | NOT NULL | User / Admin |
+| EmailConfirmed | bit | NOT NULL, DEFAULT 0 | V2 邮箱验证时使用 |
+| CreatedAt | datetime2 | NOT NULL | |
+| UpdatedAt | datetime2 | NOT NULL | |
+
+V2 预留字段（届时通过 Migration 添加）：
+EmailConfirmationToken / ResetPasswordToken / ResetPasswordTokenExpiry
+
+## Cars
+
+| 字段         | 类型           | 约束          | 说明                            |
+|---|---|---|---|
+| Id           | int            | PK, Identity  |                                 |
+| Title        | nvarchar(100)  | NOT NULL      | 车辆标题                        |
+| Brand        | nvarchar(50)   | NOT NULL      | 品牌，如 BMW                    |
+| Model        | nvarchar(50)   | NOT NULL      | 车型，如 3 Series               |
+| Year         | int            | NOT NULL      | 出厂年份                        |
+| Price        | decimal(18,2)  | NOT NULL      | 售价                            |
+| Mileage      | int            | NOT NULL      | 里程（公里）                    |
+| Description  | nvarchar(2000) | NULL          | 详细描述，允许为空              |
+| SellerId     | int            | FK → Users.Id | 卖家                            |
+| Status       | nvarchar(20)   | NOT NULL      | 见下方状态流转                  |
+| CreatedAt    | datetime2      | NOT NULL      |                                 |
+| UpdatedAt    | datetime2      | NOT NULL      |                                 |
+
+Status 流转：
+Draft → PendingReview → Published → Sold / Deleted
+PendingReview 被拒绝 → Draft（退回修改）
+
+## CarImages
+
+| 字段      | 类型          | 约束          | 说明                        |
+|---|---|---|---|
+| Id        | int           | PK, Identity  |                             |
+| CarId     | int           | FK → Cars.Id  |                             |
+| ImageUrl  | nvarchar(500) | NOT NULL      | V1 存 URL，V2 做真实上传    |
+| SortOrder | int           | NOT NULL, DEFAULT 0 | 显示顺序，第一张为封面 |
+
+## Orders
+
+| 字段      | 类型          | 约束           | 说明                              |
+|---|---|---|---|
+| Id        | int           | PK, Identity   |                                   |
+| CarId     | int           | FK → Cars.Id   |                                   |
+| BuyerId   | int           | FK → Users.Id  |                                   |
+| SellerId  | int           | FK → Users.Id  | 从 Car 冗余存储，方便卖家查询订单 |
+| Price     | decimal(18,2) | NOT NULL       | 下单时锁定，不随车辆价格变动      |
+| Status    | nvarchar(20)  | NOT NULL       | Pending / Completed / Cancelled   |
+| CreatedAt | datetime2     | NOT NULL       |                                   |
+| UpdatedAt | datetime2     | NOT NULL       |                                   |
+
+## Favorites
+
+| 字段      | 类型      | 约束          | 说明                    |
+|---|---|---|---|
+| UserId    | int       | FK → Users.Id |                         |
+| CarId     | int       | FK → Cars.Id  |                         |
+| CreatedAt | datetime2 | NOT NULL      |                         |
+
+PRIMARY KEY (UserId, CarId)  — 联合主键，天然防重复收藏
+```
+
+> **这份文档后续怎么维护？** 每次表结构有变化（新增字段、加新表），在修改实体类的同一个 commit 里同步更新这个文档。Migration 文件是机器读的，这个文档是人读的，两者互补。
+
+
+
+### 7. 此时的目录结构
+
+```
+UUcars.API/Entities/
+├── BaseEntity.cs       ← 新增
+└── Enums/
+    ├── CarStatus.cs    ← 新增
+    ├── OrderStatus.cs  ← 新增
+    └── UserRole.cs     ← 新增
+```
+
+
+
+### 8. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 9. Git 提交
+
+```bash
+git add .
+git commit -m "feat: database schema design - base entity + status enums + schema docs"
+```
+
+
+
+### Step 04 完成状态
+
+```
+✅ 切出 feature/db-setup 分支
+✅ 五张表的字段设计全部明确
+   - Users（8 个字段）
+   - Cars（12 个字段，含完整状态流转）
+   - CarImages（4 个字段，SortOrder 预留排序）
+   - Orders（8 个字段，SellerId 冗余 + Price 锁定）
+   - Favorites（联合主键，天然防重复收藏）
+✅ CarStatus / OrderStatus / UserRole 三个枚举建立
+✅ BaseEntity 基类建立（Id / CreatedAt / UpdatedAt）
+✅ database-schema.md 文档建立
+✅ dotnet build 通过
+✅ Git commit 完成
+```
+
+
+
+## Step 05 · EF Core 实体设计
+
+### 这一步做什么
+
+Step 04 把数据库结构设计清楚了，现在把它翻译成 C# 代码。
+
+EF Core 通过读取这些实体类来理解数据库结构，所以实体类的设计直接决定了最终建出来的表长什么样。
+
+
+
+### 1. 两种配置方式：Data Annotations vs Fluent API
+
+在告诉 EF Core"这个字段最大长度是多少"、"这个字段不能为空"这类信息时，有两种写法：
+
+**Data Annotations**——直接在属性上加特性标签：
+
+```csharp
+[Required]
+[MaxLength(50)]
+public string Username { get; set; }
+```
+
+**Fluent API**——在单独的配置类里用代码描述：
+
+```csharp
+builder.Property(u => u.Username)
+    .IsRequired()
+    .HasMaxLength(50);
+```
+
+两种方式功能上等价，但有明显区别：
+
+Data Annotations 写起来直接，但会把"业务属性"和"数据库配置"混在同一个类里——实体类本来只是描述业务概念的，混入数据库细节会让它越来越臃肿。而且 Data Annotations 能表达的配置有限，遇到复杂场景（比如枚举转字符串存储、联合主键、复合索引）就做不到了。
+
+Fluent API 把数据库配置单独放在 `Configurations/` 目录下，实体类保持干净，只描述业务属性和关系。我们用这种方式。
+
+所以实体类里**只写属性和导航属性**，EF Core 相关的配置（字段长度、索引、枚举转换等）统一放到 `Configurations/` 里，在注册 DbContext 时加载。
+
+
+
+### 2. 什么是导航属性
+
+在关系型数据库里，表和表之间通过外键关联。在 EF Core 里，这种关联用**导航属性**来表达：
+
+```csharp
+// Car 表里有 SellerId 外键
+public int SellerId { get; set; }
+
+// 对应的导航属性，让代码里可以直接访问 car.Seller.Username
+// 而不用手动 JOIN
+public User Seller { get; set; } = null!;
+```
+
+`null!` 是 .NET 的空值抑制符号。EF Core 在查询时会自动填充这些导航属性，但 C# 编译器不知道这件事，会警告说"这个属性可能是 null"。`null!` 告诉编译器"我知道这里不会是 null，不用警告"。
+
+
+
+### 3. 创建实体类
+
+#### `Entities/User.cs`
+
+```bash
+touch UUcars.API/Entities/User.cs
+using UUcars.API.Entities.Enums;
+
+namespace UUcars.API.Entities;
+
+public class User : BaseEntity
+{
+    public string Username { get; set; } = string.Empty;
+    public string Email { get; set; } = string.Empty;
+    public string PasswordHash { get; set; } = string.Empty;
+    public UserRole Role { get; set; } = UserRole.User;
+    public bool EmailConfirmed { get; set; } = false;
+
+    // 导航属性
+    // 一个用户可以发布多辆车
+    public ICollection<Car> Cars { get; set; } = [];
+
+    // 一个用户可以有多个"买家身份"的订单
+    public ICollection<Order> BuyerOrders { get; set; } = [];
+
+    // 一个用户可以有多个"卖家身份"的订单
+    public ICollection<Order> SellerOrders { get; set; } = [];
+
+    // 一个用户可以收藏多辆车
+    public ICollection<Favorite> Favorites { get; set; } = [];
+}
+```
+
+> **为什么订单要分 `BuyerOrders` 和 `SellerOrders` 两个导航属性？** Orders 表里有两个外键都指向 Users 表（`BuyerId` 和 `SellerId`），EF Core 需要两个独立的导航属性来区分这两种关系。如果只写一个 `Orders`，EF Core 不知道它对应的是哪个外键。
+
+
+
+#### `Entities/Car.cs`
+
+```bash
+touch UUcars.API/Entities/Car.cs
+using UUcars.API.Entities.Enums;
+
+namespace UUcars.API.Entities;
+
+public class Car : BaseEntity
+{
+    public string Title { get; set; } = string.Empty;
+    public string Brand { get; set; } = string.Empty;
+    public string Model { get; set; } = string.Empty;
+    public int Year { get; set; }
+    public decimal Price { get; set; }
+    public int Mileage { get; set; }
+    public string? Description { get; set; }   // 允许为 null
+
+    // 外键 + 导航属性
+    public int SellerId { get; set; }
+    public User Seller { get; set; } = null!;
+
+    public CarStatus Status { get; set; } = CarStatus.Draft;
+
+    // 导航属性
+    public ICollection<CarImage> Images { get; set; } = [];
+    public ICollection<Order> Orders { get; set; } = [];
+    public ICollection<Favorite> Favorites { get; set; } = [];
+}
+```
+
+> **`string?` 和 `string` 的区别：** `Description` 字段在 Step 04 设计时是 `NULL`（允许为空）。在 C# 里用 `string?` 表达这个含义，EF Core 看到 `?` 会在数据库里生成可为 NULL 的列。其他字符串字段没有 `?`，EF Core 会生成 NOT NULL 的列。
+
+
+
+#### `Entities/CarImage.cs`
+
+```bash
+touch UUcars.API/Entities/CarImage.cs
+namespace UUcars.API.Entities;
+
+// CarImage 不继承 BaseEntity
+// 因为它没有 CreatedAt / UpdatedAt，只有自己的 Id
+public class CarImage
+{
+    public int Id { get; set; }
+    public string ImageUrl { get; set; } = string.Empty;
+    public int SortOrder { get; set; } = 0;
+
+    // 外键 + 导航属性
+    public int CarId { get; set; }
+    public Car Car { get; set; } = null!;
+}
+```
+
+
+
+#### `Entities/Order.cs`
+
+```bash
+touch UUcars.API/Entities/Order.cs
+using UUcars.API.Entities.Enums;
+
+namespace UUcars.API.Entities;
+
+public class Order : BaseEntity
+{
+    public decimal Price { get; set; }   // 下单时锁定的价格
+    public OrderStatus Status { get; set; } = OrderStatus.Pending;
+
+    // 外键 + 导航属性（车辆）
+    public int CarId { get; set; }
+    public Car Car { get; set; } = null!;
+
+    // 外键 + 导航属性（买家）
+    public int BuyerId { get; set; }
+    public User Buyer { get; set; } = null!;
+
+    // 外键 + 导航属性（卖家，从 Car 冗余存储）
+    public int SellerId { get; set; }
+    public User Seller { get; set; } = null!;
+}
+```
+
+
+
+#### `Entities/Favorite.cs`
+
+```bash
+touch UUcars.API/Entities/Favorite.cs
+namespace UUcars.API.Entities;
+
+// Favorite 不继承 BaseEntity
+// 因为它用 (UserId, CarId) 联合主键，没有独立的 Id 字段
+// 联合主键需要在 DbContext 里用 Fluent API 配置，
+// 仅靠 Data Annotations 无法完整表达
+public class Favorite
+{
+    public int UserId { get; set; }
+    public User User { get; set; } = null!;
+
+    public int CarId { get; set; }
+    public Car Car { get; set; } = null!;
+
+    public DateTime CreatedAt { get; set; }
+}
+```
+
+
+
+### 4. 此时的目录结构
+
+```
+UUcars.API/Entities/
+├── BaseEntity.cs
+├── Car.cs          ← 新增
+├── CarImage.cs     ← 新增
+├── Favorite.cs     ← 新增
+├── Order.cs        ← 新增
+├── User.cs         ← 新增
+└── Enums/
+    ├── CarStatus.cs
+    ├── OrderStatus.cs
+    └── UserRole.cs
+```
+
+
+
+### 5. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 6. Git 提交
+
+```bash
+git add .
+git commit -m "feat: EF Core entities (User, Car, CarImage, Order, Favorite)"
+```
+
+
+
+### Step 05 完成状态
+
+```
+✅ User 实体（继承 BaseEntity，含 UserRole 枚举和四个导航属性）
+✅ Car 实体（继承 BaseEntity，含 CarStatus 枚举和三个导航属性）
+✅ CarImage 实体（不继承 BaseEntity，只有 Id + 两个字段）
+✅ Order 实体（继承 BaseEntity，含 OrderStatus 枚举，三个外键）
+✅ Favorite 实体（不继承 BaseEntity，联合主键待 DbContext 配置）
+✅ dotnet build 通过
+✅ Git commit 完成
+```
+
+
+
+## Step 06 · DbContext
+
+### 这一步做什么
+
+Step 05 把五个实体类写好了，但 EF Core 现在还不知道它们的存在。这一步要做两件事：
+
+1. 创建 `AppDbContext`——把所有实体注册进去，EF Core 才知道要管理哪些表
+2. 写 Fluent API 配置——把 Step 04 设计里的字段约束、索引、枚举转换、关系配置等细节告诉 EF Core
+
+
+
+### 1. 为什么需要单独的配置类
+
+Step 05 提到，实体类里只写属性和导航属性，数据库配置统一放在 `Configurations/` 目录下。现在来实现这些配置类。
+
+#### 如何配置？
+
+每个实体对应一个配置类，并实现 `IEntityTypeConfiguration<T>` 接口
+
+```c#
+public class UserConfiguration : IEntityTypeConfiguration<User>
+{
+    public void Configure(EntityTypeBuilder<User> builder)
+    {
+        // 所有针对 User 实体的配置都在这里
+    }
+}
+```
+
+- 这个接口是由EntityFrameworkCore提供的，专门用来把实体配置从 `AppDbContext` 里拆出去单独管理。
+
+- 这个接口只有一个方法 `Configure`，所有针对这个实体的 Fluent API 配置都在里面写。
+- 配置方法传入 `EntityTypeBuilder<T>` 配置构建器 `builder`， `builder` 上面挂了很多方法，专门用来描述实体的数据库映射规则。在这里写的每一行配置，最终都会反映在 Migration 文件和数据库表结构里。
+
+#### 配置类创建后，如何加载使用？
+
+在创建 `AppDbContext` 时，需要让它知道所有配置类的存在。最直接的写法是手动一个个添加：
+
+```c#
+protected override void OnModelCreating(ModelBuilder modelBuilder)
+{
+    modelBuilder.ApplyConfiguration(new UserConfiguration());
+    modelBuilder.ApplyConfiguration(new CarConfiguration());
+    modelBuilder.ApplyConfiguration(new CarImageConfiguration());
+    modelBuilder.ApplyConfiguration(new OrderConfiguration());
+    modelBuilder.ApplyConfiguration(new FavoriteConfiguration());
+}
+```
+
+现在只有五个实体，还好。但随着项目增长，每次新增实体都要回来改 `AppDbContext`，很容易漏掉。
+
+因此，替代 `ApplyConfiguration`单个加载的方法，EFcore提供了**统一自动加载的方法 `ApplyConfigurationsFromAssembly`。** 
+
+它会自动扫描指定程序集里所有实现了 `IEntityTypeConfiguration<T>` 的类，并全部应用：
+
+```c#
+protected override void OnModelCreating(ModelBuilder modelBuilder)
+{
+    modelBuilder.ApplyConfigurationsFromAssembly(typeof(AppDbContext).Assembly);
+}
+```
+
+参数`typeof(AppDbContext).Assembly` 的意思是"AppDbContext 这个类所在的程序集"，也就是 `UUcars.API` 这个项目。以后新增实体时，只需要新建一个配置类，`AppDbContext` 完全不需要改动。
+
+
+
+### 2. 安装 EF Core 相关包
+
+EF Core 本体和 SQL Server 驱动需要单独安装：
+
+```bash
+dotnet add UUcars.API/UUcars.API.csproj package Microsoft.EntityFrameworkCore --version 9.0.0
+dotnet add UUcars.API/UUcars.API.csproj package Microsoft.EntityFrameworkCore.SqlServer --version 9.0.0
+dotnet add UUcars.API/UUcars.API.csproj package Microsoft.EntityFrameworkCore.Tools --version 9.0.0
+```
+
+**三个包的分工：**
+
+`Microsoft.EntityFrameworkCore` 是 EF Core 的核心，提供 DbContext、DbSet、LINQ 查询等所有基础能力，和具体数据库无关。
+
+`Microsoft.EntityFrameworkCore.SqlServer` 是 SQL Server 专属驱动，负责把 EF Core 生成的通用数据库操作翻译成 SQL Server 能执行的 T-SQL。EF Core 的设计是数据库无关的——如果将来要换成 PostgreSQL 或 SQLite，只需要换掉这个驱动包，其他业务代码一行不用改。
+
+`Microsoft.EntityFrameworkCore.Tools` 提供 `dotnet ef` 命令行工具。下一步要用它来生成 Migration 文件和更新数据库，没有这个包，`dotnet ef` 命令会报错找不到。
+
+
+
+### 3. 创建各实体的配置类
+
+EF Core 理解实体结构的方式，除了step 05里提到的特性标签（Data Annotations）和Fluent API之外，还有EF Core 内置了一套默认规则，即：约定（Conventions）。
+
+当没有显式配置时，EF Core 按约定自动处理。比如常见约定有：
+
+```
+属性名叫 Id 或 类名Id（int 类型）→ 自动识别为自增主键
+属性类型是 string（无 ?）         → 数据库生成 NOT NULL
+属性类型是 string?（有 ?）        → 数据库生成 NULL
+```
+
+因此，配置类里从来不出现 `Id` 字段 （不对Id字段进行显示配置）。
+
+EF Core 看到 `int Id` 就自动把它处理成自增主键，完全不需要任何配置。
+
+**约定能自动处理的，就不写；约定处理不了或需要覆盖默认行为的，才显式配置。**
+
+
+
+先删掉占位文件：
+
+```bash
+rm UUcars.API/Configurations/.gitkeep
+```
+
+#### `Configurations/UserConfiguration.cs`
+
+```bash
+touch UUcars.API/Configurations/UserConfiguration.cs
+```
+
+```c#
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+using UUcars.API.Entities;
+
+namespace UUcars.API.Configurations;
+
+public class UserConfiguration : IEntityTypeConfiguration<User>
+{
+    public void Configure(EntityTypeBuilder<User> builder)
+    {
+        builder.Property(u => u.Username)
+            .IsRequired()
+            .HasMaxLength(50);
+
+        builder.Property(u => u.Email)
+            .IsRequired()
+            .HasMaxLength(100);
+
+        // 唯一索引：数据库层面保证同一邮箱不能注册两次
+        builder.HasIndex(u => u.Email)
+            .IsUnique();
+
+        builder.Property(u => u.PasswordHash)
+            .IsRequired()
+            .HasMaxLength(256);
+
+        // 枚举存为字符串，见下方解释
+        builder.Property(u => u.Role)
+            .IsRequired()
+            .HasMaxLength(20)
+            .HasConversion<string>();
+
+        builder.Property(u => u.EmailConfirmed)
+            .IsRequired()
+            .HasDefaultValue(false);
+
+        builder.Property(u => u.CreatedAt)
+            .IsRequired();
+
+        builder.Property(u => u.UpdatedAt)
+            .IsRequired();
+    }
+}
+```
+
+`HasConversion<string>()` 是什么 ？
+
+这一行配置决定了枚举在数据库里以什么形式存储。 如果不加这行，EF Core 默认把枚举存成**整数**： ``` UserRole.User  → 存 0 UserRole.Admin → 存 1 ``` 。直接打开数据库看到的是一堆数字，完全不知道代表什么含义，调试起来很痛苦。 
+
+加了 `HasConversion<string>()` 之后： ``` UserRole.User  → 存 "User" UserRole.Admin → 存 "Admin" ``` 。EF Core 在写入数据库时自动把枚举转成字符串，读取时再把字符串转回枚举。
+
+
+
+#### `Configurations/CarConfiguration.cs`
+
+```bash
+touch UUcars.API/Configurations/CarConfiguration.cs
+```
+
+```c#
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+using UUcars.API.Entities;
+
+namespace UUcars.API.Configurations;
+
+public class CarConfiguration : IEntityTypeConfiguration<Car>
+{
+    public void Configure(EntityTypeBuilder<Car> builder)
+    {
+        builder.Property(c => c.Title)
+            .IsRequired()
+            .HasMaxLength(100);
+
+        builder.Property(c => c.Brand)
+            .IsRequired()
+            .HasMaxLength(50);
+
+        builder.Property(c => c.Model)
+            .IsRequired()
+            .HasMaxLength(50);
+
+        builder.Property(c => c.Year)
+            .IsRequired();
+
+        // decimal 类型必须显式指定精度，约定不会自动处理
+        // decimal(18,2)：最多 18 位数字，其中 2 位小数，适合存金额
+        builder.Property(c => c.Price)
+            .IsRequired()
+            .HasColumnType("decimal(18,2)");
+
+        builder.Property(c => c.Mileage)
+            .IsRequired();
+
+        // Description 没有 IsRequired()，对应数据库的 NULL（允许为空）
+        builder.Property(c => c.Description)
+            .HasMaxLength(2000);
+
+        builder.Property(c => c.Status)
+            .IsRequired()
+            .HasMaxLength(20)
+            .HasConversion<string>();
+
+        builder.Property(c => c.CreatedAt)
+            .IsRequired();
+
+        builder.Property(c => c.UpdatedAt)
+            .IsRequired();
+
+        // 一辆车属于一个卖家（Car → User 是多对一）
+        // Restrict：用户有车辆时不能被直接删除（安全防线）
+        builder.HasOne(c => c.Seller)
+            .WithMany(u => u.Cars)
+            .HasForeignKey(c => c.SellerId)
+            .OnDelete(DeleteBehavior.Restrict);
+    }
+}
+```
+
+**`OnDelete` 的两种行为：**
+
+配置外键关系时，`OnDelete` 决定"当父记录被删除时，子记录怎么处理"：
+
+- **`DeleteBehavior.Cascade`（级联删除）**：父记录删了，子记录跟着自动删除。适合子记录完全依附于父记录、没有独立存在意义的情况。比如图片依附于车辆，车辆删了图片跟着删合理。
+- **`DeleteBehavior.Restrict`（限制删除）**：父记录有子记录时，拒绝删除父记录，直接报错。适合子记录是重要业务数据、不能随便消失的情况。
+
+项目里的选择逻辑：
+
+```
+CarImage → Car     Cascade   车删了图片跟着删，图片没有独立意义
+Favorite → User    Cascade   用户删了收藏记录跟着删
+Favorite → Car     Cascade   车删了收藏记录跟着删
+
+Car      → User    Restrict  用户有车辆时不能被直接删除
+Order    → Car     Restrict  订单是重要记录，不因车辆删除而消失
+Order    → User    Restrict  订单是重要记录，不因用户删除而消失
+```
+
+
+
+#### `Configurations/CarImageConfiguration.cs`
+
+```bash
+touch UUcars.API/Configurations/CarImageConfiguration.cs
+```
+
+```c#
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+using UUcars.API.Entities;
+
+namespace UUcars.API.Configurations;
+
+public class CarImageConfiguration : IEntityTypeConfiguration<CarImage>
+{
+    public void Configure(EntityTypeBuilder<CarImage> builder)
+    {
+        builder.Property(ci => ci.ImageUrl)
+            .IsRequired()
+            .HasMaxLength(500);
+
+        builder.Property(ci => ci.SortOrder)
+            .IsRequired()
+            .HasDefaultValue(0);
+
+        // Cascade：车辆删除时图片跟着删，图片依附于车辆没有独立意义
+        builder.HasOne(ci => ci.Car)
+            .WithMany(c => c.Images)
+            .HasForeignKey(ci => ci.CarId)
+            .OnDelete(DeleteBehavior.Cascade);
+    }
+}
+```
+
+
+
+#### `Configurations/OrderConfiguration.cs`
+
+```bash 
+touch UUcars.API/Configurations/OrderConfiguration.cs
+```
+
+```c#
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+using UUcars.API.Entities;
+
+namespace UUcars.API.Configurations;
+
+public class OrderConfiguration : IEntityTypeConfiguration<Order>
+{
+    public void Configure(EntityTypeBuilder<Order> builder)
+    {
+        builder.Property(o => o.Price)
+            .IsRequired()
+            .HasColumnType("decimal(18,2)");
+
+        // 枚举存为字符串
+        builder.Property(o => o.Status)
+            .IsRequired()
+            .HasMaxLength(20)
+            .HasConversion<string>();
+
+        builder.Property(o => o.CreatedAt)
+            .IsRequired();
+
+        builder.Property(o => o.UpdatedAt)
+            .IsRequired();
+
+        // 外键关系：订单关联车辆
+        builder.HasOne(o => o.Car)
+            .WithMany(c => c.Orders)
+            .HasForeignKey(o => o.CarId)
+            .OnDelete(DeleteBehavior.Restrict);
+
+        // 外键关系：买家
+        // 这里必须显式指定导航属性名，因为 User 有两个导航属性指向 Order
+        // （BuyerOrders 和 SellerOrders），EF Core 无法自动判断该用哪个
+        builder.HasOne(o => o.Buyer)
+            .WithMany(u => u.BuyerOrders)
+            .HasForeignKey(o => o.BuyerId)
+            .OnDelete(DeleteBehavior.Restrict);
+
+        // 外键关系：卖家
+        builder.HasOne(o => o.Seller)
+            .WithMany(u => u.SellerOrders)
+            .HasForeignKey(o => o.SellerId)
+            .OnDelete(DeleteBehavior.Restrict);
+    }
+}
+```
+
+> **Orders 表为什么三个外键都用 `Restrict`？** 订单是重要的业务记录，不应该因为用户或车辆被删除而跟着消失。业务上"删除"用户或车辆都是逻辑删除（改 Status 字段），不会真正从数据库删行，所以实际上也不会触发这个约束。加上 `Restrict` 是一道安全防线。
+
+
+
+#### `Configurations/FavoriteConfiguration.cs`
+
+```bash
+touch UUcars.API/Configurations/FavoriteConfiguration.cs
+```
+
+```c#
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+using UUcars.API.Entities;
+
+namespace UUcars.API.Configurations;
+
+public class FavoriteConfiguration : IEntityTypeConfiguration<Favorite>
+{
+    public void Configure(EntityTypeBuilder<Favorite> builder)
+    {
+        // 配置联合主键
+        // new { f.UserId, f.CarId } 是 C# 的匿名对象写法，
+        // 用来同时传入两个字段，告诉 EF Core"这两个字段一起构成主键"
+        // Data Annotations 的 [Key] 只能标记单个字段，无法表达复合主键，
+        // 这是必须用 Fluent API 的场景
+        builder.HasKey(f => new { f.UserId, f.CarId });
+
+        builder.Property(f => f.CreatedAt)
+            .IsRequired();
+
+        // 外键关系：收藏关联用户
+        builder.HasOne(f => f.User)
+            .WithMany(u => u.Favorites)
+            .HasForeignKey(f => f.UserId)
+            .OnDelete(DeleteBehavior.Cascade);
+
+        // 外键关系：收藏关联车辆
+        builder.HasOne(f => f.Car)
+            .WithMany(c => c.Favorites)
+            .HasForeignKey(f => f.CarId)
+            .OnDelete(DeleteBehavior.Cascade);
+    }
+}
+```
+
+
+
+### 4. 创建 AppDbContext
+
+```bash
+touch UUcars.API/Data/AppDbContext.cs
+rm UUcars.API/Data/.gitkeep
+```
+
+```c#
+using Microsoft.EntityFrameworkCore;
+using UUcars.API.Configurations;
+using UUcars.API.Entities;
+
+namespace UUcars.API.Data;
+
+public class AppDbContext : DbContext
+{
+    // DbContextOptions 包含数据库连接字符串等配置
+    // 通过构造函数注入，由 DI 容器在运行时传入
+    public AppDbContext(DbContextOptions<AppDbContext> options) : base(options)
+    {
+    }
+
+    // DbSet<T> 对应数据库里的一张表
+    // 通过它可以对这张表做查询、新增、修改、删除
+    public DbSet<User> Users => Set<User>();
+    public DbSet<Car> Cars => Set<Car>();
+    public DbSet<CarImage> CarImages => Set<CarImage>();
+    public DbSet<Order> Orders => Set<Order>();
+    public DbSet<Favorite> Favorites => Set<Favorite>();
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        base.OnModelCreating(modelBuilder);
+
+        // 统一加载 Configurations/ 目录下的所有配置类
+        // 每新增一个 IEntityTypeConfiguration 实现，这里自动识别，不需要手动添加
+        modelBuilder.ApplyConfigurationsFromAssembly(typeof(AppDbContext).Assembly);
+    }
+}
+```
+
+> **`ApplyConfigurationsFromAssembly` 的好处：** 它会自动扫描当前程序集里所有实现了 `IEntityTypeConfiguration<T>` 的类并应用。后续新增实体时，只需要新建一个配置类，`AppDbContext` 不需要改动。
+
+
+
+### 5. 在 Program.cs 里注册 DbContext
+
+打开 `Program.cs`，在服务注册区域加上 DbContext 的注册：
+
+```csharp
+// 在 builder.Services.AddControllers(); 下方添加
+
+// 注册 AppDbContext
+// 从配置文件读取连接字符串（开发环境从 User Secrets 读取）
+builder.Services.AddDbContext<AppDbContext>(options =>
+    options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection"))
+);
+```
+
+>`GetConnectionString("DefaultConnection")` 会从配置系统读取连接字符串。
+>
+>ASP.NET Core 的配置系统有优先级——开发环境会优先读 User Secrets，生产环境读环境变量。
+>
+>我们在 Step 03 里已经通过 User Secrets 设置了真实的连接字符串，这里的代码不需要关心具体从哪里读，框架自动处理。
+
+
+
+同时在文件顶部补上 using：
+
+```csharp
+using Microsoft.EntityFrameworkCore;
+using UUcars.API.Data;
+```
+
+此时 `Program.cs` 服务注册部分完整如下：
+
+```c#
+builder.Services.AddControllers();
+builder.Services.AddOpenApi();
+
+builder.Services.Configure<JwtSettings>(
+    builder.Configuration.GetSection("JwtSettings")
+);
+
+builder.Services.AddDbContext<AppDbContext>(options =>
+    options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection"))
+);
+```
+
+
+
+### 6. 此时的目录结构变化
+
+```
+UUcars.API/
+├── Configurations/
+│   ├── CarConfiguration.cs         ← 新增
+│   ├── CarImageConfiguration.cs    ← 新增
+│   ├── FavoriteConfiguration.cs    ← 新增
+│   ├── OrderConfiguration.cs       ← 新增
+│   └── UserConfiguration.cs        ← 新增
+├── Data/
+│   └── AppDbContext.cs             ← 新增
+```
+
+
+
+### 7. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 8. Git 提交
+
+```bash
+git add .
+git commit -m "feat: AppDbContext + Fluent API configurations for all entities"
+```
+
+
+
+### Step 06 完成状态
+
+```
+✅ 五个 Fluent API 配置类（字段约束、索引、枚举转字符串、关系配置）
+   - UserConfiguration（Email 唯一索引，UserRole 枚举转字符串）
+   - CarConfiguration（CarStatus 枚举转字符串，Seller 外键 Restrict）
+   - CarImageConfiguration（Car 外键 Cascade）
+   - OrderConfiguration（三个外键全部 Restrict，买家/卖家关系明确）
+   - FavoriteConfiguration（联合主键，两个外键 Cascade）
+✅ AppDbContext 创建（五个 DbSet，ApplyConfigurationsFromAssembly 自动加载）
+✅ EF Core + SQL Server 包安装
+✅ DbContext 注册进 Program.cs
+✅ dotnet build 通过
+✅ Git commit 完成
+```
+
+
+
+## Step 07 · EF Core Migration
+
+### 这一步做什么
+
+Step 06 把 DbContext 和所有实体配置写好了，但数据库里现在还是空的——什么表都没有。这一步要做两件事：
+
+1. 用 EF Core Migration 机制把 C# 实体类"翻译"成数据库表
+2. 在 Migration 里写入初始 Admin 用户数据，让系统从第一天起就有可用的管理员账号
+
+
+
+### 1. 先启动 Docker SQL Server
+
+Migration 执行时需要连接真实数据库，所以先确认数据库容器在跑：
+
+```bash
+# 启动 SQL Server 容器
+docker run -e "ACCEPT_EULA=Y" \
+  -e "MSSQL_SA_PASSWORD=YourStrongPassw0rd" \
+  -e "MSSQL_PID=Developer" \
+  -p 1433:1433 \
+  --name uucars-sqlserver \
+  -d mcr.microsoft.com/mssql/server:2022-latest
+```
+
+如果之前已经创建过这个容器，直接启动就好：
+
+```bash
+docker start uucars-sqlserver
+```
+
+确认容器正在运行：
+
+```bash
+docker ps
+```
+
+看到 `uucars-sqlserver` 在列表里且状态是 `Up`，说明数据库已经就绪。
+
+
+
+### 2. 什么是 Migration
+
+在解释命令之前，先理解 Migration 是什么。
+
+我们用的是 Code-First 开发方式：C# 实体类是"真相的唯一来源"，数据库结构由代码决定。但代码写好了，数据库不会自动变化，需要一个"翻译和执行"的机制，这就是 Migration。
+
+Migration 的工作流程分两步：
+
+```
+第一步：dotnet ef migrations add
+   EF Core 读取当前所有实体类和配置，
+   和上一次 Migration 的状态对比，
+   把"需要做哪些变更"写成一个 C# 文件（Migration 文件）
+
+第二步：dotnet ef database update
+   读取 Migration 文件，
+   连接数据库，
+   把文件里描述的变更真正执行到数据库上
+```
+
+Migration 文件是纯代码文件，会进入 Git。这意味着每一次数据库结构变更都有完整的历史记录，可以回滚，可以在不同环境（开发机、测试服务器、生产服务器）上重放同样的变更。
+
+
+
+### 3. Admin Seed 数据的问题
+
+在生成 Migration 之前，先处理一个问题：系统需要一个 Admin 用户来测试后续的审核接口，但注册接口只创建普通 `User` 角色，无法注册 Admin。
+
+解决方案是在 `AppDbContext` 里用 EF Core 的 **Seed Data** 机制写入初始数据：Seed Data 会被包含在 Migration 文件里，数据库初始化时自动插入。
+
+Seed Data 里需要存入一个已经 Hash 过的密码。这里有一个重要的细节：
+
+**不能在 Seed Data 里动态调用 `PasswordHasher.HashPassword()`。**
+
+原因是 `PasswordHasher` 每次调用都会用随机 salt，生成的 hash 值每次都不同。EF Core 9 在执行 `database update` 时会重新扫描当前模型（包括 Seed Data），发现 hash 值和 Migration 快照里记录的不一样，就认为"有未提交的变更"，直接报错拒绝执行。
+
+正确做法是**预先生成一次 hash，把结果硬编码成固定字符串**。
+
+**第一步：临时生成 hash 值**
+
+在 `Program.cs` 的 `app.Run()` 前临时加这几行，运行一次拿到 hash：
+
+```c#
+// 临时代码，获取 hash 后立刻删除
+var tempHasher = new PasswordHasher<UUcars.API.Entities.User>();
+var tempHash = tempHasher.HashPassword(new UUcars.API.Entities.User(), "Admin@123456");
+Console.WriteLine("HASH: " + tempHash);
+```
+
+运行临时脚本，拿到hash 值
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+控制台输出类似：
+
+```bash
+HASH: AQAAAAIAAYagAAAAE......（一长串 Base64 字符串）
+```
+
+复制这个 hash 值，**立刻删掉临时代码**，回到根目录：
+
+```bash
+cd ..
+```
+
+**第二步：更新 `AppDbContext.cs`，把 hash 硬编码进去**
+
+实际上更简单的做法是直接在代码里用 `PasswordHasher` 生成，但我们的 `PasswordHasher` 包还没安装。
+
+这里先用一个临时方式：直接在 `AppDbContext` 里用硬编码的方式生成一次，后面 的Step 会正式安装和使用 `PasswordHasher`。
+
+暂时先用 ASP.NET Core 内置的 `PasswordHasher<T>` 来生成 Hash。在 `AppDbContext.cs` 里做 Seed 时调用它：
+
+打开 `UUcars.API/Data/AppDbContext.cs`，更新内容：
+
+```csharp
+using Microsoft.AspNetCore.Identity;
+using Microsoft.EntityFrameworkCore;
+using UUcars.API.Entities;
+using UUcars.API.Entities.Enums;
+
+namespace UUcars.API.Data;
+
+public class AppDbContext : DbContext
+{
+    public AppDbContext(DbContextOptions<AppDbContext> options) : base(options)
+    {
+    }
+    
+    public DbSet<User> Users => Set<User>();
+    public DbSet<Car> Cars => Set<Car>();
+    public DbSet<CarImage> CarImages => Set<CarImage>();
+    public DbSet<Order> Orders => Set<Order>();
+    public DbSet<Favorite> Favorites => Set<Favorite>();
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        base.OnModelCreating(modelBuilder);
+        modelBuilder.ApplyConfigurationsFromAssembly(typeof(AppDbContext).Assembly);
+        
+        // Seed Data：在数据库初始化时插入初始 Admin 用户
+        // 为什么用固定时间（new DateTime(2025, 1, 1)）而不是 DateTime.UtcNow？
+        // 因为 Seed Data 会被写入 Migration 文件，Migration 文件进入 Git。
+        // 如果用 DateTime.UtcNow，每次生成 Migration 时时间都不一样，
+        // 导致 Migration 文件内容每次都变，Git 历史会被污染。
+        // 固定时间保证 Migration 文件的内容是稳定的、可重复的。
+        var seedDate = new DateTime(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+
+        // 使用预先计算好的固定 hash，而不是在这里动态生成
+        // 原因：PasswordHasher 每次调用会用随机 salt，导致 EF Core 9 每次
+        // 扫描模型时发现值不同，误判为"有未提交的变更"
+        const string adminPasswordHash = "这里粘贴生成的 hash 字符串";
+
+        var adminUser = new User
+        {
+            Id = 1,
+            Username = "admin",
+            Email = "admin@uucars.com",
+            PasswordHash = adminPasswordHash,
+            Role = UserRole.Admin,
+            EmailConfirmed = true,
+            CreatedAt = seedDate,
+            UpdatedAt = seedDate
+        };
+
+        // 添加种子数据给User实体
+        modelBuilder.Entity<User>().HasData(adminUser);
+    }
+}
+```
+
+> **为什么 Admin 的 Id 要固定写 `1`？** Seed Data 要求实体的主键必须是确定的固定值，不能用自增——EF Core 需要知道"这条 Seed 数据是不是已经在数据库里了"，如果 Id 不固定就无法判断。所以 Seed Data 的主键必须手动指定。
+
+
+
+### 4. 安装 Migration 命令行工具
+
+`dotnet ef` 命令需要全局工具支持，如果之前没装过：
+
+```bash
+dotnet tool install --global dotnet-ef
+```
+
+已经装过的话，确认版本和项目的 EF Core 版本匹配：
+
+```bash
+dotnet ef --version
+```
+
+
+
+### 5. 生成 Migration 文件
+
+在根目录执行：
+
+```bash
+dotnet ef migrations add InitialCreate --project UUcars.API/UUcars.API.csproj
+```
+
+> **`--project` 参数是什么？** 告诉 `dotnet ef` 命令去哪个项目里找 `DbContext`。因为我们的 Solution 里有两个项目（API 和 Tests），不指定的话工具不知道该用哪个。
+
+执行成功后，项目里会新增一个 `Migrations/` 目录：
+
+```
+UUcars.API/Migrations/
+├── 20250101000000_InitialCreate.cs        ← Migration 逻辑文件
+└── AppDbContextModelSnapshot.cs          ← 记录当前模型状态，供下次 Migration 对比用
+```
+
+打开 `InitialCreate.cs` 看一下里面的内容：
+
+```csharp
+public partial class InitialCreate : Migration
+{
+    protected override void Up(MigrationBuilder migrationBuilder)
+    {
+        // Up 方法：执行变更（创建表、加字段等）
+        migrationBuilder.CreateTable(
+            name: "Users",
+            columns: table => new
+            {
+                Id = table.Column<int>(nullable: false)
+                    .Annotation("SqlServer:Identity", "1, 1"),
+                Username = table.Column<string>(maxLength: 50, nullable: false),
+                // ...
+            });
+        // ... 其他建表语句
+    }
+
+    protected override void Down(MigrationBuilder migrationBuilder)
+    {
+        // Down 方法：回滚变更（删表、删字段等）
+        // 如果执行 dotnet ef database update [上一个版本]，就会执行这里的代码
+        migrationBuilder.DropTable(name: "Users");
+        // ...
+    }
+}
+```
+
+每个 Migration 文件都有 `Up` 和 `Down` 两个方法——`Up` 是正向变更，`Down` 是回滚。这就是 Migration 能回滚的原因。
+
+
+
+### 6. 把 Migration 应用到数据库
+
+```bash
+dotnet ef database update --project UUcars.API/UUcars.API.csproj
+```
+
+执行成功后，数据库里会建好所有表，并且 Admin 用户已经被插入 `Users` 表。
+
+可以用数据库客户端（比如 Rider 内置的 Database 工具，或 Azure Data Studio）连接到 `localhost:1433`，用 `sa` / `YourStrongPassw0rd` 登录，查看 `UUcarsDB` 数据库里的表结构，确认一切正常。
+
+连接配置：
+
+```
+Server:   localhost, 1433
+Username: sa
+Password: YourStrongPassw0rd
+Database: UUcarsDB
+```
+
+应该能看到五张表：`Users`、`Cars`、`CarImages`、`Orders`、`Favorites`，以及 EF Core 自动创建的 `__EFMigrationsHistory` 表（这张表记录了哪些 Migration 已经被执行过，EF Core 内部使用，不需要手动管理）。
+
+
+
+### 7. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 8. 此时的目录结构变化
+
+```
+UUcars.API/
+├── Data/
+│   └── AppDbContext.cs     ← 已更新（加了 Seed Data）
+└── Migrations/             ← 新增目录
+    ├── 20250101000000_InitialCreate.cs
+    └── AppDbContextModelSnapshot.cs
+```
+
+
+
+### 9. Git 提交 + 合并分支
+
+```bash
+git add .
+git commit -m "feat: initial migration + admin seed data"
+```
+
+所有数据库相关工作（Step 04 到 Step 07）都完成了，把 `feature/db-setup` 合并回 `develop`：
+
+```bash
+git checkout develop
+git merge --no-ff feature/db-setup -m "merge: feature/db-setup into develop"
+git push origin develop
+git branch -d feature/db-setup
+git push origin --delete feature/db-setup
+```
+
+这是第一个里程碑节点——数据库 + 配置 + 工程基础设施全部就绪，合并到 `main` 并打 `v0.1` tag：
+
+```bash
+git checkout main
+git merge --no-ff develop -m "release: v0.1 - infrastructure ready"
+git tag -a v0.1 -m "DB + config + middleware + logging setup complete"
+git push origin main
+git push origin v0.1
+git checkout develop
+```
+
+
+
+### Step 07 完成状态
+
+```
+✅ Docker SQL Server 启动
+✅ 理解 Migration 机制（Up/Down，两步流程）
+✅ Admin Seed Data 写入 AppDbContext（固定 Id、固定时间、PasswordHasher）
+✅ dotnet ef migrations add 生成 InitialCreate
+✅ dotnet ef database update 建表成功
+✅ 数据库里五张表可见，Admin 用户已插入
+✅ Git commit 完成
+✅ feature/db-setup 合并回 develop
+✅ v0.1 里程碑 tag 打完
+```
