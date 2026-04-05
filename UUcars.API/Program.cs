@@ -5,6 +5,8 @@ using Serilog;
 using UUcars.API.Auth;
 using UUcars.API.Data;
 using UUcars.API.Middleware;
+using UUcars.API.Repositories;
+using UUcars.API.Services;
 
 // =============================================
 // Bootstrap Logger
@@ -41,7 +43,7 @@ try
     // 服务注册
     // =============================================
     builder.Services.AddControllers();
-    
+
     // OpenAPI + Scalar（API 文档）
     builder.Services.AddOpenApi();
 
@@ -50,12 +52,18 @@ try
     builder.Services.Configure<JwtSettings>(
         builder.Configuration.GetSection("JwtSettings")
     );
-    
+
     // 注册 AppDbContext
     // 从配置文件读取连接字符串（开发环境从 User Secrets 读取）
     builder.Services.AddDbContext<AppDbContext>(options =>
         options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection"))
     );
+
+    // 用户模块
+    // AddScoped：每次 HTTP 请求创建一个新实例，请求结束后销毁
+    // Repository 和 Service 都用 Scoped，因为它们依赖 DbContext（也是 Scoped）
+    builder.Services.AddScoped<IUserRepository, EfUserRepository>();
+    builder.Services.AddScoped<UserService>();
 
     // =============================================
     // 构建应用
