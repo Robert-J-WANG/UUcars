@@ -11,13 +11,17 @@ namespace UUcars.API.Services;
 public class UserService
 {
     private readonly IUserRepository _userRepository;
-    private readonly PasswordHasher<User> _passwordHasher;
+    private readonly IPasswordHasher<User> _passwordHasher;  // 改为接口
     private readonly ILogger<UserService> _logger;
 
-    public UserService(IUserRepository userRepository, ILogger<UserService> logger)
+    // 通过构造函数注入，由 DI 容器提供
+    public UserService(
+        IUserRepository userRepository,
+        IPasswordHasher<User> passwordHasher,   // 改为接口注入
+        ILogger<UserService> logger)
     {
         _userRepository = userRepository;
-        _passwordHasher = new PasswordHasher<User>();
+        _passwordHasher = passwordHasher;
         _logger = logger;
     }
 

@@ -4,6 +4,7 @@ using Scalar.AspNetCore;
 using Serilog;
 using UUcars.API.Auth;
 using UUcars.API.Data;
+using UUcars.API.Entities;
 using UUcars.API.Middleware;
 using UUcars.API.Repositories;
 using UUcars.API.Services;
@@ -62,6 +63,7 @@ try
     // 用户模块
     // AddScoped：每次 HTTP 请求创建一个新实例，请求结束后销毁
     // Repository 和 Service 都用 Scoped，因为它们依赖 DbContext（也是 Scoped）
+    builder.Services.AddScoped<IPasswordHasher<User>, PasswordHasher<User>>();
     builder.Services.AddScoped<IUserRepository, EfUserRepository>();
     builder.Services.AddScoped<UserService>();
 

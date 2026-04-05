@@ -3328,3 +3328,378 @@ git commit -m "feat: user registration endpoint"
 ✅ Git commit 完成
 ```
 
+
+
+## Step 09 · 密码安全
+
+### 这一步做什么
+
+Step 08 在 `UserService` 里用了 `PasswordHasher<User>` 来 Hash 密码，但没有深入解释它是什么、为什么要这样用。
+
+这一步补上这块知识，同时做两件事：
+
+1. 把 `PasswordHasher` 改成通过 DI 注入（更符合架构规范，也方便测试）
+2. 为 `UserService` 的注册逻辑写单元测试
+
+
+
+### 1. 为什么不能直接存明文密码
+
+先从根本问题说起。如果数据库被拖库，存明文密码意味着所有用户的密码直接暴露。即使存 MD5 或 SHA256 这类普通 Hash，攻击者也可以用"彩虹表"（预先计算好的哈希表）快速反查出原始密码。
+
+安全的密码存储需要满足两个条件：
+
+```
+1. 不可逆：从 Hash 值无法反推出原始密码
+2. 抗彩虹表：每次 Hash 结果不同，即使两个用户密码相同，存储的值也不一样
+```
+
+第二个条件靠的是 **Salt**——每次 Hash 时随机生成一段数据混入密码一起计算。这样即使两个用户都用了 `"123456"`，因为 Salt 不同，数据库里存的 Hash 值也完全不一样，彩虹表失效。
+
+
+
+### 2. PasswordHasher 的两个核心方法
+
+`PasswordHasher<User>` 是 ASP.NET Core 内置的密码哈希工具，底层使用 **PBKDF2** 算法（业界标准，被 NIST 推荐）。它提供两个方法：
+
+**`HashPassword(user, plainPassword)`**
+
+输入明文密码，输出包含 Salt 和 Hash 的字符串。每次调用都会生成新的随机 Salt，所以同一个密码每次的输出都不同——这正是我们在 Step 07 里不能在 Seed Data 里动态调用它的原因。
+
+```csharp
+var hasher = new PasswordHasher<User>();
+string hash1 = hasher.HashPassword(user, "Test@123456");
+string hash2 = hasher.HashPassword(user, "Test@123456");
+// hash1 != hash2，每次 Salt 不同，输出不同
+// 但两个都是合法的哈希，都能验证通过
+```
+
+**`VerifyHashedPassword(user, hashedPassword, plainPassword)`**
+
+输入存储的 Hash 字符串和用户提供的明文密码，验证是否匹配。它能从 Hash 字符串里提取出当时用的 Salt，重新计算后比对。返回值是 `PasswordVerificationResult` 枚举：
+
+```
+Success          → 验证通过
+Failed           → 验证失败（密码错误）
+SuccessRehashNeeded → 验证通过，但算法版本较旧，建议重新 Hash
+```
+
+`VerifyHashedPassword` 在登录时会用到，Step 10 实现登录时再具体写。
+
+
+
+### 3. 把 PasswordHasher 改为 DI 注入
+
+Step 08 在 `UserService` 构造函数里直接 `new PasswordHasher<User>()`，这有两个问题：
+
+一是不符合 DI 原则——依赖应该从外部注入，而不是在类内部自己创建。二是给单元测试带来麻烦——如果将来需要替换 Hash 算法，要改 Service 内部代码，而不是在 DI 注册处换一个实现。
+
+`PasswordHasher<User>` 实现了 `IPasswordHasher<User>` 接口，改成注入接口：
+
+打开 `UUcars.API/Services/UserService.cs`，更新构造函数：
+
+```csharp
+using Microsoft.AspNetCore.Identity;
+using UUcars.API.DTOs.Requests;
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Entities;
+using UUcars.API.Entities.Enums;
+using UUcars.API.Exceptions;
+using UUcars.API.Repositories;
+
+namespace UUcars.API.Services;
+
+public class UserService
+{
+    private readonly IUserRepository _userRepository;
+    private readonly IPasswordHasher<User> _passwordHasher;  // 改为接口
+    private readonly ILogger<UserService> _logger;
+
+    // 通过构造函数注入，由 DI 容器提供
+    public UserService(
+        IUserRepository userRepository,
+        IPasswordHasher<User> passwordHasher,   // 改为接口注入
+        ILogger<UserService> logger)
+    {
+        _userRepository = userRepository;
+        _passwordHasher = passwordHasher;
+        _logger = logger;
+    }
+
+    public async Task<UserResponse> RegisterAsync(RegisterRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        var existing = await _userRepository.GetByEmailAsync(request.Email, cancellationToken);
+        if (existing != null)
+        {
+            throw new UserAlreadyExistsException(request.Email);
+        }
+
+        var user = new User
+        {
+            Username = request.Username,
+            Email = request.Email.ToLower(),
+            Role = UserRole.User,
+            EmailConfirmed = false,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        user.PasswordHash = _passwordHasher.HashPassword(user, request.Password);
+
+        var created = await _userRepository.AddAsync(user, cancellationToken);
+
+        _logger.LogInformation("New user registered: {Email}", created.Email);
+
+        return MapToResponse(created);
+    }
+
+    private static UserResponse MapToResponse(User user) => new()
+    {
+        Id = user.Id,
+        Username = user.Username,
+        Email = user.Email,
+        Role = user.Role.ToString(),
+        CreatedAt = user.CreatedAt
+    };
+}
+```
+
+打开 `Program.cs`，在用户模块注册那里补上 `IPasswordHasher<User>`：
+
+```csharp
+using Microsoft.AspNetCore.Identity;
+using UUcars.API.Entities;
+// 用户模块
+builder.Services.AddScoped<IPasswordHasher<User>, PasswordHasher<User>>();
+builder.Services.AddScoped<IUserRepository, EfUserRepository>();
+builder.Services.AddScoped<UserService>();
+```
+
+
+
+### 4. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 5. 单元测试
+
+#### 5.1 测什么，怎么测
+
+单元测试测的是**业务逻辑**，对应的就是 `UserService`。它承载了所有注册规则：邮箱不能重复、密码要 Hash、用户角色默认是 User 等。
+
+单元测试的核心要求是**快速、稳定、不依赖外部资源**（不连数据库、不发网络请求）。但 `UserService` 依赖 `IUserRepository`，Repository 是要操作数据库的。解决方案是用 **Fake Repository**——一个用内存模拟数据库的假实现，测试时替换真实的 Repository。
+
+#### 5.2 创建 Fake Repository
+
+```c#
+mkdir -p UUcars.Tests/Fakes
+touch UUcars.Tests/Fakes/FakeUserRepository.cs
+```
+
+```c#
+using UUcars.API.Entities;
+using UUcars.API.Repositories;
+
+namespace UUcars.Tests.Fakes;
+
+// 用内存字典模拟数据库，实现 IUserRepository 接口
+// 只用于测试，不会真正操作数据库
+public class FakeUserRepository : IUserRepository
+{
+    // 模拟数据库表，key = Email（方便按邮箱查找）
+    private readonly Dictionary<string, User> _store = new();
+
+    // 供测试用：预先插入数据，模拟"数据库里已有这条记录"
+    public void Seed(User user) => _store[user.Email.ToLower()] = user;
+
+    public Task<User?> GetByEmailAsync(string email, CancellationToken cancellationToken = default)
+    {
+        _store.TryGetValue(email.ToLower(), out var user);
+        return Task.FromResult(user);
+    }
+
+    public Task<User> AddAsync(User user, CancellationToken cancellationToken = default)
+    {
+        // 模拟数据库自增 Id
+        user.Id = _store.Count + 1;
+        _store[user.Email.ToLower()] = user;
+        return Task.FromResult(user);
+    }
+}
+```
+
+#### 5.3 编写测试用例
+
+```bash
+mkdir -p UUcars.Tests/Services
+touch UUcars.Tests/Services/UserServiceTests.cs
+```
+
+```c#
+using Microsoft.AspNetCore.Identity;
+using Microsoft.Extensions.Logging.Abstractions;
+using UUcars.API.DTOs.Requests;
+using UUcars.API.Entities;
+using UUcars.API.Entities.Enums;
+using UUcars.API.Exceptions;
+using UUcars.API.Services;
+using UUcars.Tests.Fakes;
+
+namespace UUcars.Tests.Services;
+
+public class UserServiceTests
+{
+    // 测试用的辅助方法：创建一个标准的 UserService 实例
+    // NullLogger：空日志，测试里不关心日志输出
+    // PasswordHasher<User>：用真实实现，它是纯计算，不依赖外部资源
+    private static UserService CreateService(FakeUserRepository repo) =>
+        new(repo, new PasswordHasher<User>(), NullLogger<UserService>.Instance);
+
+    [Fact]
+    public async Task RegisterAsync_WithNewEmail_ShouldReturnUserResponse()
+    {
+        // Arrange：准备一个空的 Repository（没有任何用户）
+        var repo = new FakeUserRepository();
+        var service = CreateService(repo);
+
+        var request = new RegisterRequest
+        {
+            Username = "testuser",
+            Email = "test@example.com",
+            Password = "Test@123456"
+        };
+
+        // Act：执行注册
+        var result = await service.RegisterAsync(request);
+
+        // Assert：验证返回的数据是否符合预期
+        Assert.NotNull(result);
+        Assert.Equal("testuser", result.Username);
+        Assert.Equal("test@example.com", result.Email);
+        Assert.Equal("User", result.Role);   // 默认角色是 User
+    }
+
+    [Fact]
+    public async Task RegisterAsync_WithExistingEmail_ShouldThrowUserAlreadyExistsException()
+    {
+        // Arrange：预先插入一个用户，模拟"邮箱已被注册"
+        var repo = new FakeUserRepository();
+        repo.Seed(new User
+        {
+            Id = 1,
+            Email = "existing@example.com",
+            Username = "existing",
+            PasswordHash = "somehash",
+            Role = UserRole.User
+        });
+
+        var service = CreateService(repo);
+
+        var request = new RegisterRequest
+        {
+            Username = "newuser",
+            Email = "existing@example.com",  // 用同一个邮箱
+            Password = "Test@123456"
+        };
+
+        // Act + Assert：必须抛出 UserAlreadyExistsException
+        await Assert.ThrowsAsync<UserAlreadyExistsException>(
+            () => service.RegisterAsync(request));
+    }
+
+    [Fact]
+    public async Task RegisterAsync_ShouldNotStorePasswordAsPlainText()
+    {
+        // Arrange
+        var repo = new FakeUserRepository();
+        var service = CreateService(repo);
+
+        var request = new RegisterRequest
+        {
+            Username = "testuser",
+            Email = "test@example.com",
+            Password = "Test@123456"
+        };
+
+        // Act
+        await service.RegisterAsync(request);
+
+        // Assert：数据库里存的不应该是明文密码
+        // 通过 Fake Repo 直接读取"数据库"里的记录
+        var stored = await repo.GetByEmailAsync("test@example.com");
+        Assert.NotNull(stored);
+        Assert.NotEqual("Test@123456", stored.PasswordHash);  // 不等于明文
+        Assert.True(stored.PasswordHash.Length > 20);          // Hash 字符串很长
+    }
+}
+```
+
+#### 5.4 运行测试
+
+```bash
+dotnet test
+```
+
+预期输出：
+
+```
+Test summary: total: 3, failed: 0, succeeded: 3, skipped: 0
+```
+
+
+
+### 6. 此时的目录变化
+
+```
+UUcars.API/
+├── Services/
+│   └── UserService.cs      ← 已更新（PasswordHasher 改为接口注入）
+└── Program.cs              ← 已更新（注册 IPasswordHasher<User>）
+
+UUcars.Tests/
+├── Fakes/
+│   └── FakeUserRepository.cs   ← 新增
+└── Services/
+    └── UserServiceTests.cs     ← 新增
+```
+
+
+
+### 7. Git 提交
+
+```bash
+git add .
+git commit -m "feat: password hashing with IPasswordHasher<User> DI injection"
+git commit -m "test: unit tests for UserService registration logic"
+```
+
+
+
+### Step 09 完成状态
+
+```
+✅ 理解 PasswordHasher：PBKDF2、随机 Salt、HashPassword / VerifyHashedPassword
+✅ UserService 改为注入 IPasswordHasher<User>（符合 DI 原则，方便测试）
+✅ Program.cs 注册 IPasswordHasher<User>
+✅ FakeUserRepository 实现（内存模拟数据库）
+✅ 三个单元测试通过
+   - 新邮箱注册成功，返回正确的 UserResponse
+   - 已有邮箱注册，抛出 UserAlreadyExistsException
+   - 密码不以明文存储
+✅ dotnet test 全部通过
+✅ Git commit 完成
+```
+
