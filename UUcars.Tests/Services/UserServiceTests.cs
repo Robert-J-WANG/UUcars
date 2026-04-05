@@ -1,5 +1,7 @@
 using Microsoft.AspNetCore.Identity;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
+using UUcars.API.Auth;
 using UUcars.API.DTOs.Requests;
 using UUcars.API.Entities;
 using UUcars.API.Entities.Enums;
@@ -14,8 +16,20 @@ public class UserServiceTests
     // 测试用的辅助方法：创建一个标准的 UserService 实例
     // NullLogger：空日志，测试里不关心日志输出
     // PasswordHasher<User>：用真实实现，它是纯计算，不依赖外部资源
-    private static UserService CreateService(FakeUserRepository repo) =>
-        new(repo, new PasswordHasher<User>(), NullLogger<UserService>.Instance);
+    private static UserService CreateService(FakeUserRepository repo)
+    {
+        // 给测试用的 JwtSettings，值随便填——注册测试根本不会走到生成 Token 的逻辑
+        // 但 UserService 构造函数需要这个依赖，所以必须传进去
+        var jwtSettings = Options.Create(new JwtSettings
+        {
+            Secret = "test-secret-key-at-least-32-characters!",
+            ExpiresInMinutes = 60,
+            Issuer = "TestIssuer",
+            Audience = "TestAudience"
+        });
+        return new UserService(repo, new PasswordHasher<User>(), new JwtTokenGenerator(jwtSettings),NullLogger<UserService>.Instance);
+    }
+    
     
     [Fact]
     public async Task RegisterAsync_WithNewEmail_ShouldReturnUserResponse()

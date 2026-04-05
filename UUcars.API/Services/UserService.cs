@@ -1,4 +1,6 @@
+using System.Runtime.InteropServices;
 using Microsoft.AspNetCore.Identity;
+using UUcars.API.Auth;
 using UUcars.API.DTOs.Requests;
 using UUcars.API.DTOs.Responses;
 using UUcars.API.Entities;
@@ -12,17 +14,22 @@ public class UserService
 {
     private readonly IUserRepository _userRepository;
     private readonly IPasswordHasher<User> _passwordHasher;  // 改为接口
+    private readonly JwtTokenGenerator _jwtTokenGenerator;
     private readonly ILogger<UserService> _logger;
+    
 
     // 通过构造函数注入，由 DI 容器提供
     public UserService(
         IUserRepository userRepository,
         IPasswordHasher<User> passwordHasher,   // 改为接口注入
+        JwtTokenGenerator jwtTokenGenerator,
         ILogger<UserService> logger)
     {
         _userRepository = userRepository;
         _passwordHasher = passwordHasher;
+        _jwtTokenGenerator = jwtTokenGenerator;
         _logger = logger;
+       
     }
 
     public async Task<UserResponse> RegisterAsync(RegisterRequest request,
@@ -56,6 +63,47 @@ public class UserService
 
         // 5. 返回 DTO（不包含 PasswordHash）
         return MapToResponse(created);
+    }
+
+    public async Task<LoginResponse> LoginAsync(LoginRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        // 1. 按邮箱查找用户
+        var user = await _userRepository.GetByEmailAsync(request.Email, cancellationToken);
+
+        // 2. 用户不存在：抛出和密码错误一样的异常，不透露"邮箱不存在"
+        if (user == null)
+        {
+            throw new InvalidCredentialsException();
+        }
+
+        // 3. 验证密码
+        // VerifyHashedPassword 做的事：
+        //   从 user.PasswordHash 字符串里提取出当初 HashPassword 时用的 Salt
+        //   用这个 Salt 对 request.Password（用户输入的明文）重新计算 Hash
+        //   把计算结果和 user.PasswordHash 比对
+        // 返回值是 PasswordVerificationResult 枚举：
+        //   Success             → 匹配，验证通过
+        //   Failed              → 不匹配，密码错误
+        //   SuccessRehashNeeded → 匹配，但 Hash 算法版本较旧，建议更新
+        var result = _passwordHasher.VerifyHashedPassword(user, user.PasswordHash, request.Password);
+        if (result == PasswordVerificationResult.Failed)
+        {
+            throw new InvalidCredentialsException();
+        }
+
+        // 4. 验证通过，生成 JWT Token
+        var token = _jwtTokenGenerator.GenerateToken(user);
+
+        _logger.LogInformation("User logged in: {Email}", user.Email);
+
+        return new LoginResponse
+        {
+            Token = token,
+            // ExpiresAt 和 JwtTokenGenerator 里的 expires 保持一致
+            ExpiresAt = DateTime.UtcNow.AddMinutes(60),
+            User = MapToResponse(user)
+        };
     }
 
     // 实体 → DTO 的映射方法

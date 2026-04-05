@@ -65,6 +65,7 @@ try
     // Repository 和 Service 都用 Scoped，因为它们依赖 DbContext（也是 Scoped）
     builder.Services.AddScoped<IPasswordHasher<User>, PasswordHasher<User>>();
     builder.Services.AddScoped<IUserRepository, EfUserRepository>();
+    builder.Services.AddScoped<JwtTokenGenerator>();
     builder.Services.AddScoped<UserService>();
 
     // =============================================

@@ -3703,3 +3703,661 @@ git commit -m "test: unit tests for UserService registration logic"
 ✅ Git commit 完成
 ```
 
+
+
+## Step 10 · 用户登录
+
+### 这一步做什么
+
+注册功能写好了，现在实现登录。
+
+登录的结果是返回一个 **JWT Token**，客户端拿到这个 Token 之后，后续请求需要登录才能访问的接口时，把 Token 放在请求头里带过去。
+
+这一步要做：
+
+1. 验证邮箱和密码
+2. 生成 JWT Token
+3. 返回 Token 给客户端
+
+
+
+### 1. 什么是 JWT
+
+JWT（JSON Web Token）是目前最主流的 API 认证方式。它是一个字符串，分三段，用 `.` 分隔：
+
+```
+eyJhbGciOiJIUzI1NiJ9         ← Header：声明算法类型
+.eyJ1c2VySWQiOjF9            ← Payload：存放用户信息（Claims）
+.SflKxwRJSMeKKF2QT4fwpMeJf   ← Signature：用 Secret Key 对前两段签名
+```
+
+每一段都是 Base64 编码的，不是加密的：Payload 里的内容任何人都可以解码看到。
+
+JWT 的安全性靠的是第三段 Signature：它是用服务器的 `Secret Key` 对前两段内容签名的，客户端拿不到 `Secret Key`，所以无法伪造或篡改 Token。
+
+一旦 Payload 被改动，Signature 验证就会失败，服务器会拒绝这个 Token。
+
+**JWT 和传统 Session 的区别：**
+
+```
+Session：服务器存状态，每次请求查数据库验证身份
+JWT：服务器不存状态，直接验证 Token 签名，无需查数据库
+```
+
+JWT 是"无状态"的，适合前后端分离的 API 场景。
+
+
+
+### 2. 什么是 Claims
+
+Claims（声明）是存放在 JWT Payload 里的键值对，代表"关于这个用户的一些事实"。
+
+客户端登录成功后拿到 Token，后续每次请求都带上这个 Token，服务器从 Token 里解析出 Claims，就知道是谁在发这个请求、有什么权限，不需要每次都查数据库。
+
+Claims 分两类：
+
+**标准 Claims（Registered Claims）**——JWT 规范预定义的字段，有固定的简短名字：
+
+```
+sub（Subject）    主体，通常存用户 Id
+email            用户邮箱
+exp（Expiration） 过期时间（Unix 时间戳）
+iat（Issued At）  签发时间
+jti（JWT ID）     这个 Token 的唯一标识
+iss（Issuer）     签发方（谁签发的这个 Token）
+aud（Audience）   受众（这个 Token 给谁用的）
+```
+
+这些简短名字是 JWT 规范定义的，目的是节省 Token 体积（Token 越小，每次请求携带的开销越小）。
+
+而 `System.IdentityModel.Tokens.Jwt`包已经提供了 一个静态类 `JwtRegisteredClaimNames` , 里面定义了所有 JWT 标准字段的名字, 如下：
+
+| 常量名                               | 实际值          | 存什么                |
+| ------------------------------------ | --------------- | --------------------- |
+| `JwtRegisteredClaimNames.Sub`        | `"sub"`         | 用户唯一ID            |
+| `JwtRegisteredClaimNames.Email`      | `"email"`       | 邮箱                  |
+| `JwtRegisteredClaimNames.Jti`        | `"jti"`         | Token唯一标识，防重放 |
+| `JwtRegisteredClaimNames.Name`       | `"name"`        | 用户显示名称          |
+| `JwtRegisteredClaimNames.GivenName`  | `"given_name"`  | 名字 First Name       |
+| `JwtRegisteredClaimNames.FamilyName` | `"family_name"` | 姓氏 Last Name        |
+
+**自定义 Claims**——应用程序自己定义的字段，比如 `role`（角色），或者`my_role`，而ASP.NET Core 内置有一套自己的 Claim 类型常量（`ClaimTypes.Role`、`ClaimTypes.Email` 、`ClaimTypes.DateOfBirth`、`ClaimTypes.Country`等），它们的实际值是很长的 URI 字符串，但框架内部能识别，`[Authorize(Roles = "Admin")]` 就是靠 `ClaimTypes.Role` 来判断角色的。因此，尽量这些内置的常量，避免手写错误的同时，也方便框架内部组件之间的识别。
+
+程序中Claims的设计逻辑：
+
+- 先使用标准 Claims：JWT 规范预定义的字段
+- 如果不够，再使用自定义 Claims ：优先使用框架内置的Claim 类型常量
+
+
+
+### 3. 安装 JWT 包
+
+```bash
+dotnet add UUcars.API/UUcars.API.csproj package Microsoft.AspNetCore.Authentication.JwtBearer
+dotnet add UUcars.API/UUcars.API.csproj package System.IdentityModel.Tokens.Jwt
+```
+
+两个包的分工：`Microsoft.AspNetCore.Authentication.JwtBearer` 是中间件，负责在请求进来时自动解析和验证 Token（Step 11 会用到）。`System.IdentityModel.Tokens.Jwt` 提供生成 Token 的工具类，这一步用它来签发 Token。
+
+
+
+### 4. 创建 JWT Token 生成器
+
+JWT 生成逻辑是独立的功能，单独放在 `Auth/` 目录里，不混入 Service：
+
+```bash
+touch UUcars.API/Auth/JwtTokenGenerator.cs
+```
+
+```c#
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using System.Text;
+using Microsoft.Extensions.Options;
+using Microsoft.IdentityModel.Tokens;
+using UUcars.API.Entities;
+
+namespace UUcars.API.Auth;
+
+public class JwtTokenGenerator
+{
+    private readonly JwtSettings _jwtSettings;
+
+    // IOptions<JwtSettings>：从 DI 容器中读取配置
+    // Step 03 里已经在 Program.cs 用 Configure<JwtSettings> 绑定好了
+    public JwtTokenGenerator(IOptions<JwtSettings> jwtSettings)
+    {
+        _jwtSettings = jwtSettings.Value;
+    }
+
+    public string GenerateToken(User user)
+    {
+        // =============================================
+        // 第一步：定义 Claims（Token Payload 的内容）
+        // =============================================
+        // new Claim(key, value)：每一个 Claim 就是一个键值对
+        //
+        // JwtRegisteredClaimNames 是一个静态类，由`System.IdentityModel.Tokens.Jwt`包提供
+        // 里面定义了所有 JWT 标准字段的名字
+        // 比如 JwtRegisteredClaimNames.Sub 的值就是字符串 "sub"
+        // 用这个类是为了避免手写字符串出错（写错了编译器不报错，运行时才发现）
+        var claims = new[]
+        {
+            // sub：存用户 Id（转成字符串，因为 Claim 的 value 必须是字符串）
+            new Claim(JwtRegisteredClaimNames.Sub, user.Id.ToString()),
+
+            // email：存用户邮箱
+            new Claim(JwtRegisteredClaimNames.Email, user.Email),
+
+            // ClaimTypes.Role 是 ASP.NET Core 定义的角色 Claim Key
+            // 它的实际值是一个很长的 URI：
+            // "http://schemas.microsoft.com/ws/2008/06/identity/claims/role"
+            // 必须用这个 Key（而不是随便写个 "role"），
+            // 因为 [Authorize(Roles = "Admin")] 就是靠识别这个 Key 来判断角色的
+            new Claim(ClaimTypes.Role, user.Role.ToString()),
+
+            // jti（JWT ID）：给这个 Token 一个唯一标识
+            // 用 Guid 生成，保证每个 Token 都不一样
+            // 作用：如果以后要实现"注销 Token"功能，可以把 jti 存进黑名单
+            new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString())
+        };
+
+        // =============================================
+        // 第二步：创建签名凭证
+        // =============================================
+        // SymmetricSecurityKey：对称加密的 Key 对象
+        // "对称"的意思是：签名和验证用同一个 Key（就是 appsettings 里的 JwtSettings:Secret）
+        // Encoding.UTF8.GetBytes：把字符串 Secret 转成字节数组，Key 对象需要字节数组
+        var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_jwtSettings.Secret));
+
+        // SigningCredentials：把 Key 和加密算法打包在一起
+        // SecurityAlgorithms.HmacSha256 是 HMAC-SHA256 算法，目前最常用的 JWT 签名算法
+        var credentials = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
+
+        // =============================================
+        // 第三步：组装 Token
+        // =============================================
+        // JwtSecurityToken 是表示一个 JWT 的对象，把所有参数组装进去：
+        var token = new JwtSecurityToken(
+            issuer: _jwtSettings.Issuer,              // 签发方（谁签发的）
+            audience: _jwtSettings.Audience,          // 受众（给谁用的）
+            claims: claims,                           // Payload 内容
+            expires: DateTime.UtcNow.AddMinutes(_jwtSettings.ExpiresInMinutes), // 过期时间
+            signingCredentials: credentials           // 签名凭证
+        );
+
+        // =============================================
+        // 第四步：序列化成字符串
+        // =============================================
+        // JwtSecurityTokenHandler 是处理 JWT 的工具类
+        // WriteToken：把 JwtSecurityToken 对象序列化成 "xxxxx.yyyyy.zzzzz" 格式的字符串
+        // 这个字符串就是最终返回给客户端的 Token
+        return new JwtSecurityTokenHandler().WriteToken(token);
+    }
+}
+```
+
+把整个生成过程串起来理解：
+
+```
+用户 Id / 邮箱 / 角色
+        ↓
+    打包成 Claims 数组
+        ↓
+    用 Secret Key 创建签名凭证
+        ↓
+    组装成 JwtSecurityToken 对象（含过期时间、Issuer、Audience）
+        ↓
+    WriteToken 序列化成字符串
+        ↓
+    返回给客户端
+```
+
+
+
+### 5. 创建 DTO
+
+#### `DTOs/Requests/LoginRequest.cs`
+
+```bash
+touch UUcars.API/DTOs/Requests/LoginRequest.cs
+```
+
+
+
+```c#
+using System.ComponentModel.DataAnnotations;
+
+namespace UUcars.API.DTOs.Requests;
+
+public class LoginRequest
+{
+    [Required(ErrorMessage = "Email is required.")]
+    [EmailAddress(ErrorMessage = "Invalid email format.")]
+    public string Email { get; set; } = string.Empty;
+
+    [Required(ErrorMessage = "Password is required.")]
+    public string Password { get; set; } = string.Empty;
+}
+```
+
+
+
+#### `DTOs/Responses/LoginResponse.cs`
+
+```bash
+touch UUcars.API/DTOs/Responses/LoginResponse.cs
+```
+
+```c#
+namespace UUcars.API.DTOs.Responses;
+
+public class LoginResponse
+{
+    public string Token { get; set; } = string.Empty;
+    public DateTime ExpiresAt { get; set; }
+    public UserResponse User { get; set; } = null!;
+}
+```
+
+
+
+### 6. 创建登录相关的业务异常
+
+登录失败时（邮箱不存在或密码错误），统一返回同一个错误信息——**不能区分"邮箱不存在"和"密码错误"**，否则攻击者可以通过错误信息枚举出系统里存在哪些邮箱账号。这是安全设计的基本原则。
+
+```bash
+touch UUcars.API/Exceptions/InvalidCredentialsException.cs
+```
+
+```c#
+namespace UUcars.API.Exceptions;
+
+public class InvalidCredentialsException : AppException
+{
+    public InvalidCredentialsException()
+        : base(StatusCodes.Status401Unauthorized, "Invalid email or password.")
+    {
+    }
+}
+```
+
+
+
+### 7. 在 UserService 里添加登录逻辑
+
+打开 `UUcars.API/Services/UserService.cs`，完整更新如下：
+
+```csharp
+namespace UUcars.API.Services;
+
+public class UserService
+{
+    private readonly IUserRepository _userRepository;
+    private readonly IPasswordHasher<User> _passwordHasher;
+    private readonly JwtTokenGenerator _jwtTokenGenerator;
+    private readonly ILogger<UserService> _logger;
+
+    public UserService(
+        IUserRepository userRepository,
+        IPasswordHasher<User> passwordHasher,
+        JwtTokenGenerator jwtTokenGenerator,
+        ILogger<UserService> logger)
+    {
+        _userRepository = userRepository;
+        _passwordHasher = passwordHasher;
+        _jwtTokenGenerator = jwtTokenGenerator;
+        _logger = logger;
+    }
+
+    public async Task<UserResponse> RegisterAsync(RegisterRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        var existing = await _userRepository.GetByEmailAsync(request.Email, cancellationToken);
+        if (existing != null)
+        {
+            throw new UserAlreadyExistsException(request.Email);
+        }
+
+        var user = new User
+        {
+            Username = request.Username,
+            Email = request.Email.ToLower(),
+            Role = UserRole.User,
+            EmailConfirmed = false,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        user.PasswordHash = _passwordHasher.HashPassword(user, request.Password);
+
+        var created = await _userRepository.AddAsync(user, cancellationToken);
+
+        _logger.LogInformation("New user registered: {Email}", created.Email);
+
+        return MapToResponse(created);
+    }
+
+    public async Task<LoginResponse> LoginAsync(LoginRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        // 1. 按邮箱查找用户
+        var user = await _userRepository.GetByEmailAsync(request.Email, cancellationToken);
+
+        // 2. 用户不存在：抛出和密码错误一样的异常，不透露"邮箱不存在"
+        if (user == null)
+        {
+            throw new InvalidCredentialsException();
+        }
+
+        // 3. 验证密码
+        // VerifyHashedPassword 做的事：
+        //   从 user.PasswordHash 字符串里提取出当初 HashPassword 时用的 Salt
+        //   用这个 Salt 对 request.Password（用户输入的明文）重新计算 Hash
+        //   把计算结果和 user.PasswordHash 比对
+        // 返回值是 PasswordVerificationResult 枚举：
+        //   Success             → 匹配，验证通过
+        //   Failed              → 不匹配，密码错误
+        //   SuccessRehashNeeded → 匹配，但 Hash 算法版本较旧，建议更新
+        var result = _passwordHasher.VerifyHashedPassword(user, user.PasswordHash, request.Password);
+        if (result == PasswordVerificationResult.Failed)
+        {
+            throw new InvalidCredentialsException();
+        }
+
+        // 4. 验证通过，生成 JWT Token
+        var token = _jwtTokenGenerator.GenerateToken(user);
+
+        _logger.LogInformation("User logged in: {Email}", user.Email);
+
+        return new LoginResponse
+        {
+            Token = token,
+            // ExpiresAt 和 JwtTokenGenerator 里的 expires 保持一致
+            ExpiresAt = DateTime.UtcNow.AddMinutes(60),
+            User = MapToResponse(user)
+        };
+    }
+
+    private static UserResponse MapToResponse(User user) => new()
+    {
+        Id = user.Id,
+        Username = user.Username,
+        Email = user.Email,
+        Role = user.Role.ToString(),
+        CreatedAt = user.CreatedAt
+    };
+}
+```
+
+
+
+### 8. 在 AuthController 里添加登录端点
+
+打开 `UUcars.API/Controllers/AuthController.cs`，添加 `Login` Action：
+
+```csharp
+namespace UUcars.API.Controllers;
+
+[ApiController]
+[Route("auth")]
+public class AuthController : ControllerBase
+{
+    private readonly UserService _userService;
+
+    public AuthController(UserService userService)
+    {
+        _userService = userService;
+    }
+
+    [HttpPost("register")]
+    public async Task<IActionResult> Register(
+        [FromBody] RegisterRequest request,
+        CancellationToken cancellationToken)
+    {
+        var user = await _userService.RegisterAsync(request, cancellationToken);
+        return StatusCode(StatusCodes.Status201Created,
+            ApiResponse<UserResponse>.Ok(user, "Registration successful."));
+    }
+
+    [HttpPost("login")]
+    public async Task<IActionResult> Login(
+        [FromBody] LoginRequest request,
+        CancellationToken cancellationToken)
+    {
+        var result = await _userService.LoginAsync(request, cancellationToken);
+
+        // 登录成功返回 200 OK（不是 201，登录不是"创建资源"）
+        return Ok(ApiResponse<LoginResponse>.Ok(result, "Login successful."));
+    }
+}
+```
+
+
+
+### 9. 注册依赖到 Program.cs
+
+打开 `Program.cs`，在用户模块注册区域补上 `JwtTokenGenerator`：
+
+```csharp
+// 用户模块
+builder.Services.AddScoped<IPasswordHasher<User>, PasswordHasher<User>>();
+builder.Services.AddScoped<IUserRepository, EfUserRepository>();
+builder.Services.AddScoped<JwtTokenGenerator>();
+builder.Services.AddScoped<UserService>();
+```
+
+顶部补上 using：
+
+```csharp
+using UUcars.API.Auth;
+```
+
+
+
+### 10. 更新测试用例逻辑
+
+`UserService` 的构造函数加了 `JwtTokenGenerator` 参数，但测试里的 `CreateService` 方法还是旧的签名，没有传这个参数，编译就报错了。
+
+打开 `UUcars.Tests/Services/UserServiceTests.cs`，更新 `CreateService` 方法：
+
+```c#
+...
+
+namespace UUcars.Tests.Services;
+
+public class UserServiceTests
+{
+    private static UserService CreateService(FakeUserRepository repo)
+    {
+        // 给测试用的 JwtSettings，值随便填——注册测试根本不会走到生成 Token 的逻辑
+        // 但 UserService 构造函数需要这个依赖，所以必须传进去
+        var jwtSettings = Options.Create(new JwtSettings
+        {
+            Secret = "test-secret-key-at-least-32-characters!",
+            ExpiresInMinutes = 60,
+            Issuer = "TestIssuer",
+            Audience = "TestAudience"
+        });
+
+        return new UserService(
+            repo,
+            new PasswordHasher<User>(),
+            new JwtTokenGenerator(jwtSettings),
+            NullLogger<UserService>.Instance
+        );
+    }
+
+    // 下面三个测试用例不需要改，逻辑不变
+    [Fact]
+    public async Task RegisterAsync_WithNewEmail_ShouldReturnUserResponse() { ... }
+
+    [Fact]
+    public async Task RegisterAsync_WithExistingEmail_ShouldThrowUserAlreadyExistsException() { ... }
+
+    [Fact]
+    public async Task RegisterAsync_ShouldNotStorePasswordAsPlainText() { ... }
+}
+```
+
+核心思路是：**测试注册逻辑，不需要真实的 JWT 配置，但构造函数必须满足**。所以用 `Options.Create()` 包一个假的 `JwtSettings` 传进去，`JwtTokenGenerator` 能正常实例化就行，注册测试里根本不会调用到它。
+
+
+
+### 11. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 12. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**正常登录（用 Step 08 注册的账号）：**
+
+```json
+POST /auth/login
+{
+  "email": "test@example.com",
+  "password": "Test@123456"
+}
+```
+
+预期响应（200）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "token": "eyJhbGciOiJIUzI1NiJ9......",
+    "expiresAt": "2025-xx-xx...",
+    "user": {
+      "id": 2,
+      "username": "testuser",
+      "email": "test@example.com",
+      "role": "User"
+    }
+  },
+  "message": "Login successful."
+}
+```
+
+把返回的 Token 复制到 [jwt.io](https://jwt.io/) 粘贴进去，可以直观地看到 Payload 里的 Claims 内容：
+
+```json
+{
+  "sub": "2",
+  "email": "test@example.com",
+  "http://schemas.microsoft.com/ws/2008/06/identity/claims/role": "User",
+  "jti": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+  "exp": 1234567890,
+  "iss": "UUcars",
+  "aud": "UUcarsUsers"
+}
+```
+
+注意 `role` 对应的 Key 是那个很长的 URI，这就是 `ClaimTypes.Role` 的实际值。
+
+**密码错误（应返回 401）：**
+
+```json
+{
+  "email": "test@example.com",
+  "password": "wrongpassword"
+}
+```
+
+预期：
+
+```json
+{
+  "success": false,
+  "message": "Invalid email or password."
+}
+```
+
+**邮箱不存在（也应返回 401，信息和密码错误完全一样）：**
+
+```json
+{
+  "email": "notexist@example.com",
+  "password": "Test@123456"
+}
+```
+
+两种失败情况返回的信息完全一样，攻击者无法通过错误信息判断邮箱是否存在。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 12. 此时的目录变化
+
+```
+UUcars.API/
+├── Auth/
+│   ├── JwtSettings.cs              （已有）
+│   └── JwtTokenGenerator.cs        ← 新增
+├── DTOs/
+│   ├── Requests/
+│   │   └── LoginRequest.cs         ← 新增
+│   └── Responses/
+│       └── LoginResponse.cs        ← 新增
+├── Exceptions/
+│   └── InvalidCredentialsException.cs  ← 新增
+└── Services/
+    └── UserService.cs              ← 已更新（新增 LoginAsync）
+    
+UUcars.Tests/
+├── Services/
+    └── UserServiceTests.cs              ← 已更新
+```
+
+
+
+### 13. Git 提交
+
+```bash
+git add .
+git commit -m "feat: login endpoint + JWT token generation"
+```
+
+
+
+### Step 10 完成状态
+
+```
+✅ 理解 JWT 三段结构（Header / Payload / Signature）
+✅ 理解 Claims（标准 Claims 和自定义 Claims，JwtRegisteredClaimNames 和 ClaimTypes）
+✅ 理解 Token 生成的完整流程（Claims → 签名凭证 → JwtSecurityToken → 字符串）
+✅ 安装 JWT 相关包
+✅ JwtTokenGenerator（读取 JwtSettings，生成带 Claims 的 Token）
+✅ LoginRequest / LoginResponse DTO
+✅ InvalidCredentialsException（401，邮箱不存在和密码错误返回相同信息）
+✅ UserService.LoginAsync（验证密码 → 生成 Token）
+✅ AuthController POST /auth/login（返回 200 + Token）
+✅ DI 注册完成
+✅ Scalar 测试通过（200 登录成功，401 密码错误/邮箱不存在）
+✅ jwt.io 验证 Token 结构和 Claims 内容正确
+✅ Git commit 完成
+```
+
