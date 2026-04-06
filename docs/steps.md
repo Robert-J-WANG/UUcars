@@ -3773,7 +3773,7 @@ aud（Audience）   受众（这个 Token 给谁用的）
 而 `System.IdentityModel.Tokens.Jwt`包已经提供了 一个静态类 `JwtRegisteredClaimNames` , 里面定义了所有 JWT 标准字段的名字, 如下：
 
 | 常量名                               | 实际值          | 存什么                |
-| ------------------------------------ | --------------- | --------------------- |
+|  | --- | --- |
 | `JwtRegisteredClaimNames.Sub`        | `"sub"`         | 用户唯一ID            |
 | `JwtRegisteredClaimNames.Email`      | `"email"`       | 邮箱                  |
 | `JwtRegisteredClaimNames.Jti`        | `"jti"`         | Token唯一标识，防重放 |
@@ -4358,6 +4358,438 @@ git commit -m "feat: login endpoint + JWT token generation"
 ✅ DI 注册完成
 ✅ Scalar 测试通过（200 登录成功，401 密码错误/邮箱不存在）
 ✅ jwt.io 验证 Token 结构和 Claims 内容正确
+✅ Git commit 完成
+```
+
+
+
+## Step 11 · JWT 认证配置
+
+### 这一步做什么
+
+Step 10 实现了登录并生成了 JWT Token，客户端现在可以拿到 Token 了。
+
+但服务器这边还没有配置"如何验证 Token"——目前所有接口都是公开的，就算带了 Token 也没有任何效果。
+
+这一步配置 JWT 认证中间件，让服务器能够：
+
+1. 自动解析请求头里的 Token
+2. 验证 Token 的签名和有效期
+3. 把 Token 里的 Claims 注入到请求上下文里，供后续接口使用
+
+
+
+### 1. 认证（Authentication）和授权（Authorization）的区别
+
+这两个概念经常被混淆，先说清楚：
+
+**认证（Authentication）**：你是谁？验证 Token 是否合法、是否过期，从 Token 里提取出用户身份信息。对应中间件 `UseAuthentication()`。
+
+**授权（Authorization）**：你能做什么？在认证通过的基础上，检查用户是否有权限访问这个接口。比如 `[Authorize(Roles = "Admin")]` 只允许 Admin 角色访问。对应中间件 `UseAuthorization()`。
+
+两者的关系是：**先认证，再授权**——必须先知道"你是谁"，才能判断"你能不能做这件事"。所以中间件管道里 `UseAuthentication()` 必须在 `UseAuthorization()` 之前。
+
+
+
+### 2. JWT 认证的完整流程
+
+在配置代码之前，先把整个认证流程在脑子里过一遍，这样看代码时更容易理解每一行的作用：
+
+```c#
+客户端发请求
+    ↓
+请求头携带 Token：Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......
+    ↓
+UseAuthentication() 中间件拦截请求
+    ↓
+JwtBearerHandler（框架内置）提取 Token 字符串
+    ↓
+用配置的 TokenValidationParameters 验证：
+    - 签名是否合法（用 Secret Key 重新计算签名比对）
+    - Issuer 是否匹配（是不是我们自己签发的）
+    - Audience 是否匹配（是不是给我们用的）
+    - 是否已过期（检查 exp 字段）
+    ↓
+验证通过 → 把 Token Payload 里的 Claims 解析出来
+         → 注入到 HttpContext.User（ClaimsPrincipal）里
+         → 请求继续往下走
+    ↓
+UseAuthorization() 中间件读取 HttpContext.User
+    ↓
+检查接口上的 [Authorize] 特性，判断是否有权限访问
+    ↓
+有权限 → 进入 Controller Action
+无权限 → 返回 401 / 403
+```
+
+这个流程完全是**自动的**——我们只需要配置好参数，框架内置的 `JwtBearerHandler` 会处理所有细节。我们自己不需要写任何 Token 解析代码。
+
+
+
+### 3. 配置 JWT 认证
+
+打开 `Program.cs`，顶部补上 using：
+
+```csharp
+using System.Text;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.IdentityModel.Tokens;
+```
+
+在服务注册区域，`AddDbContext` 下方添加：
+
+```csharp
+// 先从配置系统读取 JwtSettings
+// 开发环境自动从 User Secrets 读取真实值（Step 03 已配置）
+var jwtSettings = builder.Configuration.GetSection("JwtSettings").Get<JwtSettings>()!;
+
+builder.Services.AddAuthentication(options =>
+    {
+        // DefaultAuthenticateScheme：指定默认用哪种方式来"认证"请求
+        // DefaultChallengeScheme：当认证失败时，用哪种方式来"挑战"客户端
+        //   （对 JWT 来说，挑战的结果就是返回 401 Unauthorized）
+        // 两个都设为 JwtBearerDefaults.AuthenticationScheme（值是字符串 "Bearer"），
+        // 表示默认用 JWT Bearer 方式处理认证，这样 [Authorize] 特性不需要额外指定方案
+        options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
+        options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
+    })
+    .AddJwtBearer(options =>
+    {
+        // TokenValidationParameters：告诉框架"验证 Token 时要检查哪些东西"
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            // ===== 签名验证 =====
+            // ValidateIssuerSigningKey = true：必须验证签名
+            // IssuerSigningKey：用来验证签名的 Key，必须和生成 Token 时用的 Key 一样
+            // 原理：框架用这个 Key 对 Token 的 Header+Payload 重新计算签名，
+            //       和 Token 第三段比对，不一样就拒绝
+            ValidateIssuerSigningKey = true,
+            IssuerSigningKey = new SymmetricSecurityKey(
+                Encoding.UTF8.GetBytes(jwtSettings.Secret)),
+
+            // ===== Issuer 验证 =====
+            // 验证 Token 的 iss 字段是否匹配，防止接受其他系统签发的 Token
+            ValidateIssuer = true,
+            ValidIssuer = jwtSettings.Issuer,       // 值："UUcars"
+
+            // ===== Audience 验证 =====
+            // 验证 Token 的 aud 字段是否匹配，确保 Token 是给我们的系统用的
+            ValidateAudience = true,
+            ValidAudience = jwtSettings.Audience,   // 值："UUcarsUsers"
+
+            // ===== 过期时间验证 =====
+            // 验证 Token 的 exp 字段，过期的 Token 直接拒绝
+            ValidateLifetime = true,
+
+            // ===== 时钟偏差 =====
+            // 默认值是 5 分钟：即使 Token 过期了，还有 5 分钟的宽限期
+            // 设为 0 更严格：过期就是过期，没有宽限期
+            // 宽限期的存在是为了应对不同服务器之间时钟不完全同步的情况，
+            // 单机部署时设为 0 没问题
+            ClockSkew = TimeSpan.Zero
+        };
+    });
+```
+
+
+
+### 4. 在中间件管道里启用认证
+
+打开 `Program.cs` 的中间件管道部分：
+
+```csharp
+app.UseMiddleware<GlobalExceptionMiddleware>();
+
+if (app.Environment.IsDevelopment())
+{
+    app.MapOpenApi();
+    app.MapScalarApiReference(options =>
+        options
+            .WithTitle("UUcars API Documentation")
+            .WithTheme(ScalarTheme.Moon)
+    );
+}
+
+app.UseHttpsRedirection();
+
+// UseAuthentication 必须在 UseAuthorization 之前
+// 原因：Authorization 需要读取 Authentication 的结果（HttpContext.User）
+// 如果顺序反了，[Authorize] 读到的 HttpContext.User 是空的，永远判定为未认证
+app.UseAuthentication();
+app.UseAuthorization();
+
+app.MapControllers();
+```
+
+
+
+### 5. [Authorize] 特性是怎么工作的
+
+配置好认证中间件之后，保护接口只需要加一个特性标签：
+
+```csharp
+[Authorize]                         // 必须登录（任何角色都可以）
+[Authorize(Roles = "Admin")]        // 必须是 Admin 角色
+[Authorize(Roles = "Admin,User")]   // Admin 或 User 角色都可以
+[AllowAnonymous]                    // 明确允许匿名访问（即使 Controller 上有 [Authorize]）
+```
+
+`[Authorize]` 加在 Controller 类上，表示这个 Controller 里的所有接口都需要认证。加在单个 Action 方法上，只有这个方法需要认证。后面的车辆、订单等模块会大量用到这个模式——Controller 级别加 `[Authorize]`，少数公开接口再单独加 `[AllowAnonymous]`。
+
+`[Authorize(Roles = "Admin")]` 能生效，是因为 Step 10 里我们生成 Token 时用了 `ClaimTypes.Role` 这个 Key 存角色——框架认识这个 Key，`UseAuthorization()` 中间件会自动读取它来判断角色。
+
+
+
+### 6. 验证认证是否生效：临时测试接口
+
+在 `AuthController` 里加一个临时接口，验证配置是否正确：
+
+```csharp
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using UUcars.API.DTOs;
+using UUcars.API.DTOs.Requests;
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Services;
+
+namespace UUcars.API.Controllers;
+
+[ApiController]
+[Route("auth")]
+public class AuthController : ControllerBase
+{
+    private readonly UserService _userService;
+
+    public AuthController(UserService userService)
+    {
+        _userService = userService;
+    }
+
+    [HttpPost("register")]
+    public async Task<IActionResult> Register(
+        [FromBody] RegisterRequest request,
+        CancellationToken cancellationToken)
+    {
+        var user = await _userService.RegisterAsync(request, cancellationToken);
+        return StatusCode(StatusCodes.Status201Created,
+            ApiResponse<UserResponse>.Ok(user, "Registration successful."));
+    }
+
+    [HttpPost("login")]
+    public async Task<IActionResult> Login(
+        [FromBody] LoginRequest request,
+        CancellationToken cancellationToken)
+    {
+        var result = await _userService.LoginAsync(request, cancellationToken);
+        return Ok(ApiResponse<LoginResponse>.Ok(result, "Login successful."));
+    }
+
+    // 临时测试接口：验证 JWT 认证配置是否生效
+    // 测试完成后会删掉，Step 12 会建正式的 GET /users/me
+    [HttpGet("test-auth")]
+    [Authorize]
+    public IActionResult TestAuth()
+    {
+        // User 是 ControllerBase 提供的属性，类型是 ClaimsPrincipal
+        // 认证中间件在验证 Token 后，会把 Token Payload 里的所有 Claims
+        // 解析出来注入到这个对象里
+        //
+        // FindFirst(key)：在 Claims 集合里找第一个匹配 key 的 Claim，返回 Claim 对象
+        // ?.Value：取这个 Claim 的值（字符串），用 ?. 是因为找不到时返回 null
+        //
+        // 为什么要同时找 ClaimTypes.NameIdentifier 和 "sub"？
+        // 不同版本的 JWT 库对 "sub" 的处理不一样：
+        //   有些版本会把 "sub" 映射成 ClaimTypes.NameIdentifier（一个很长的 URI）
+        //   有些版本直接保留 "sub" 这个简短名字
+        // 两个都找，确保能取到值
+        var userId = User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value
+                     ?? User.FindFirst("sub")?.Value;
+        var email = User.FindFirst(System.Security.Claims.ClaimTypes.Email)?.Value;
+        var role = User.FindFirst(System.Security.Claims.ClaimTypes.Role)?.Value;
+
+        return Ok(ApiResponse<object>.Ok(new { userId, email, role }, "Token is valid."));
+    }
+}
+```
+
+
+
+### 7. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 8. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**场景一：不带 Token 访问受保护接口（应返回 401）**
+
+直接请求 `GET /auth/test-auth`，不带任何 Token。
+
+预期：返回 401。注意这个 401 不是走 `GlobalExceptionMiddleware` 返回的，而是 ASP.NET Core 的认证中间件直接处理的，格式和我们的 `ApiResponse` 不同，这是正常现象。
+
+**场景二：带有效 Token 访问（应返回 200）**
+
+先调用 `POST /auth/login` 拿到 Token
+
+```json
+POST /auth/login
+{
+  "email": "test@example.com",
+  "password": "Test@123456"
+}
+```
+
+```json
+{
+  "success": true,
+  "data": {
+    "token": "eyJhbGciOiJIUzI1NiJ9......",
+    "expiresAt": "2025-xx-xx...",
+    "user": {
+      "id": 2,
+      "username": "testuser",
+      "email": "test@example.com",
+      "role": "User"
+    }
+  },
+  "message": "Login successful."
+}
+```
+
+然后在请求头里带上：
+
+```
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......
+```
+
+Scalar 里可以在请求设置里填入 Bearer Token，不需要手动拼请求头。
+
+预期响应（200）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "userId": "1001",
+    "email": "test@example.com",
+    "role": "User"
+  },
+  "message": "Token is valid.",
+  "errors": null
+}
+```
+
+能从 Token 里正确解析出用户信息，说明认证配置完全生效。
+
+**场景三：用 Admin Token 验证角色**
+
+用 Admin 账号登录（`admin@uucars.com` / `Admin@123456`）拿到 Token，同样访问 `GET /auth/test-auth`，确认返回的 `role` 字段是 `"Admin"`。
+
+测试完成后 `Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 9. 删除临时测试接口
+
+测试通过后，把 `AuthController` 里的 `TestAuth` 方法删掉。Step 12 会建正式的 `GET /users/me` 接口来取代它：
+
+```csharp
+// 整个删掉
+[HttpGet("test-auth")]
+[Authorize]
+public IActionResult TestAuth() { ... }
+```
+
+
+
+### 10. 此时 Program.cs 服务注册部分完整如下
+
+```csharp
+builder.Services.AddControllers();
+builder.Services.AddOpenApi();
+
+builder.Services.Configure<JwtSettings>(
+    builder.Configuration.GetSection("JwtSettings")
+);
+
+builder.Services.AddDbContext<AppDbContext>(options =>
+    options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection"))
+);
+
+// JWT 认证
+var jwtSettings = builder.Configuration.GetSection("JwtSettings").Get<JwtSettings>()!;
+builder.Services.AddAuthentication(options =>
+    {
+        options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
+        options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
+    })
+    .AddJwtBearer(options =>
+    {
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuerSigningKey = true,
+            IssuerSigningKey = new SymmetricSecurityKey(
+                Encoding.UTF8.GetBytes(jwtSettings.Secret)),
+            ValidateIssuer = true,
+            ValidIssuer = jwtSettings.Issuer,
+            ValidateAudience = true,
+            ValidAudience = jwtSettings.Audience,
+            ValidateLifetime = true,
+            ClockSkew = TimeSpan.Zero
+        };
+    });
+
+// 用户模块
+builder.Services.AddScoped<IPasswordHasher<User>, PasswordHasher<User>>();
+builder.Services.AddScoped<IUserRepository, EfUserRepository>();
+builder.Services.AddScoped<JwtTokenGenerator>();
+builder.Services.AddScoped<UserService>();
+```
+
+
+
+### 11. Git 提交
+
+```bash
+git add .
+git commit -m "feat: JWT authentication middleware configuration"
+```
+
+
+
+### Step 11 完成状态
+
+```
+✅ 理解认证和授权的区别及顺序（Authentication 先于 Authorization）
+✅ 理解 JWT 认证的完整自动流程（Token 提取 → 验证 → Claims 注入）
+✅ JWT Bearer 认证配置（验证签名、Issuer、Audience、过期时间、ClockSkew）
+✅ UseAuthentication() 加入中间件管道，位置在 UseAuthorization() 之前
+✅ 理解 [Authorize] 特性的工作原理和用法
+✅ 理解 HttpContext.User（ClaimsPrincipal）和 FindFirst 的用法
+✅ 临时测试接口验证：无 Token 返回 401，有效 Token 正确解析 Claims
+✅ 临时测试接口删除，代码保持干净
+✅ dotnet build 通过
 ✅ Git commit 完成
 ```
 
