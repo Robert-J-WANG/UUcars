@@ -4793,3 +4793,507 @@ git commit -m "feat: JWT authentication middleware configuration"
 ✅ Git commit 完成
 ```
 
+
+
+## Step 12 · 当前用户信息
+
+### 这一步做什么
+
+Step 11 完成了 JWT 认证配置，但有一块遗留问题：JWT 认证那段代码直接堆在 `Program.cs` 里，将近 20 行，读起来费力。因此先把入口程序整理干净。
+
+用户登录之后，客户端（前端或 App）拿到了一个 JWT Token。Token 里确实包含了用户 Id、邮箱、角色这些基本信息，客户端理论上可以自己解码 Token 拿到这些数据。但我们需要服务端更完整的提供当前登录用户的信息。
+
+因此，本节主要完成如下功能：
+
+- 优化重构功能性配置逻辑
+- 创建获取当前登录用户信息的接口
+
+
+
+### 1. 重构：把 JWT 配置抽成扩展方法
+
+#### 什么是扩展方法
+
+扩展方法（Extension Methods）是 C# 的一个特性，允许你在不修改原有类的情况下，给它"添加"新方法。语法上只有一个要求：方法必须是静态的，第一个参数前面加 `this` 关键字：
+
+```csharp
+// 给 IServiceCollection 扩展一个新方法
+public static IServiceCollection AddJwtAuthentication(
+    this IServiceCollection services,   // this 关键字：表示这是 IServiceCollection 的扩展方法
+    IConfiguration configuration)
+{
+    // ...
+}
+```
+
+加了 `this` 之后，这个方法就可以像 `IServiceCollection` 的原生方法一样调用：
+
+```csharp
+// 调用时不需要传第一个参数，C# 自动把调用对象传进去
+builder.Services.AddJwtAuthentication(builder.Configuration);
+
+// 等价于：
+ServiceCollectionExtensions.AddJwtAuthentication(builder.Services, builder.Configuration);
+```
+
+ASP.NET Core 里大量用了这个模式——`AddControllers()`、`AddDbContext()`、`AddAuthentication()` 这些方法本质上都是扩展方法，只不过是框架写好的。我们现在做的是同样的事情，只不过是为自己的项目写。
+
+#### 为什么只抽 JWT，不抽其他的
+
+`Program.cs` 里目前有三块功能性配置：
+
+```
+UseSerilog(...)                          ← 日志，一段代码，不复杂，留着
+AddDbContext(...)                        ← 数据库，一行，留着
+AddAuthentication(...).AddJwtBearer(...) ← JWT，将近 20 行，值得抽出去
+```
+
+业务模块的 Service 和 Repository 注册继续直接写在 `Program.cs` 里，这是 .NET 社区的普遍习惯，清晰直观，不需要过度封装。
+
+#### 创建扩展方法文件
+
+`Extensions/` 目录在 Step 02 就建好了，专门用来放这类扩展方法：
+
+```bash
+touch UUcars.API/Extensions/AuthExtensions.cs
+rm UUcars.API/Extensions/.gitkeep
+```
+
+```c#
+public static class AuthExtensions
+{
+    // 不能通过 IOptions<JwtSettings> 注入的方法使用jwtSettings配置
+    // 因为AddJwtAuthentication的功能还在注册阶段，不是在运行阶段，无法通过DI创建JwtSettings对象实例
+    /*
+     public static IServiceCollection AddJwtAuthentication(this IServiceCollection services,
+        IOptions<JwtSettings> jwtSettings)
+    {
+        return services;
+    }
+    */
+
+    // 先从配置系统读取 JwtSettings
+    // // 开发环境自动从 User Secrets 读取真实值（Step 03 已配置）
+    public static IServiceCollection AddJwtAuthentication(this IServiceCollection services,
+        IConfiguration configuration)
+    {
+        var jwtSettings = configuration.GetSection("JwtSettings").Get<JwtSettings>()!;
+        services.AddAuthentication(options =>
+            options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
+            options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
+        })
+        .AddJwtBearer(options =>
+        {
+            // TokenValidationParameters：告诉框架"验证 Token 时要检查哪些东西"
+            options.TokenValidationParameters = new TokenValidationParameters
+            {
+                // ===== 签名验证 =====
+                ValidateIssuerSigningKey = true,
+                IssuerSigningKey = new SymmetricSecurityKey(
+                    Encoding.UTF8.GetBytes(jwtSettings.Secret)),
+
+                // ===== Issuer 验证 =====
+                ValidateIssuer = true,
+                ValidIssuer = jwtSettings.Issuer, // 值："UUcars"
+
+                // ===== Audience 验证 =====
+                ValidateAudience = true,
+                ValidAudience = jwtSettings.Audience, // 值："UUcarsUsers"
+
+                // ===== 过期时间验证 =====
+                ValidateLifetime = true,
+                // ===== 时钟偏差 =====
+                ClockSkew = TimeSpan.Zero
+            };
+        });
+        
+        return services;
+    }
+}
+```
+
+> **为什么 `return services`？** 返回 `IServiceCollection` 本身是为了支持**链式调用**。ASP.NET Core 里经常看到 `builder.Services.AddX().AddY().AddZ()` 这种写法，就是因为每个扩展方法都返回了 `IServiceCollection`，让下一个方法可以继续调用。我们保持这个约定。
+
+#### 更新 Program.cs
+
+顶部 using 补上：
+
+```csharp
+using UUcars.API.Extensions;
+```
+
+把原来那一大段 JWT 配置替换成一行调用，服务注册区域现在变成：
+
+```csharp
+...
+Log.Logger = new LoggerConfiguration()
+    .WriteTo.Console()
+    .CreateBootstrapLogger();
+
+try
+{
+    var builder = WebApplication.CreateBuilder(args);
+...
+
+    // =============================================
+    // 服务注册
+    // =============================================
+    builder.Services.AddControllers();
+...
+    // 配置 JWT 认证
+    // JWT 认证（细节在 Extensions/AuthExtensions.cs）
+    builder.Services.AddJwtAuthentication(builder.Configuration);
+    
+    // 用户模块
+    builder.Services.AddScoped<IPasswordHasher<User>, PasswordHasher<User>>();
+    builder.Services.AddScoped<IUserRepository, EfUserRepository>();
+    builder.Services.AddScoped<JwtTokenGenerator>();
+    builder.Services.AddScoped<UserService>();
+
+    // =============================================
+    // 构建应用
+    // =============================================
+    var app = builder.Build();
+
+...
+    app.Run();
+}
+catch (Exception ex)
+{
+   ...
+}
+finally
+{
+ ...
+}
+```
+
+**干净了很多——`Program.cs` 只看得到"做了什么"，看不到"怎么做"，细节藏在扩展方法里。**
+
+
+
+### 2. 为什么需要新接口 `GET /users/me` ？
+
+用户登录之后，客户端（前端或 App）拿到了一个 JWT Token。Token 里确实包含了用户 Id、邮箱、角色这些基本信息，客户端理论上可以自己解码 Token 拿到这些数据。但这带来几个问题：
+
+- **Token 里的信息可能已经过时**
+
+    Token 是登录时签发的，有效期内不会自动更新。如果用户在另一个设备上修改了用户名，当前设备的 Token 里存的还是旧用户名。客户端如果只靠解码 Token 来展示用户信息，就会显示过时的数据。
+
+- **Token 里存的信息是有限的**
+
+    为了控制 Token 体积，里面只存了几个关键字段（Id、邮箱、角色）。但展示用户资料时可能还需要头像、注册时间、手机号等字段——这些信息不在 Token 里，必须从数据库里查。
+
+- **不应该让客户端自己解码 Token**
+
+    解码 Token 是客户端能做的事，但不代表应该这样做。服务器提供一个专门的接口返回当前用户信息，是更标准、更清晰的做法——客户端不需要了解 Token 的内部结构，只需要调接口。
+
+所以， 需要新接口 `GET /users/me` ， 其作用是：**客户端登录后，通过这个接口从服务器获取最新、最完整的当前用户信息**。这是几乎所有需要登录的系统都会提供的标准接口。 如果不实现它，客户端只能靠解码 Token 来获取用户信息，展示的数据可能过时，且无法获取 Token 里没有的字段——用户中心页、个人资料页这些功能就没办法正常做。
+
+
+
+### 3. 封装 `CurrentUserService`服务
+
+Step 11 里提到，JWT 认证中间件会把 Token Payload 里的 Claims 注入到 `HttpContext.User`（`ClaimsPrincipal`）里。
+
+在 Controller 里可以直接通过 `this.User` 访问，但如果把读取 Claims 的逻辑直接写在 Action 里，将来每个需要当前用户的接口都要重复这段代码。更好的做法是封装成一个独立的服务：
+
+但是，不能直接在非 Controller 的地方访问当前 HTTP 请求的上下文，比如Service层。因此ASP.NET Core 提供的一个接口 `IHttpContextAccessor ` 可以间接访问。
+
+注意：这个接口默认不自动注册，需要在 Program.cs 里显式调用 `AddHttpContextAccessor()`
+
+```bash
+touch UUcars.API/Services/CurrentUserService.cs
+```
+
+```c#
+using System.Security.Claims;
+namespace UUcars.API.Services;
+
+// 封装"从当前请求的 JWT Token 里提取用户信息"的逻辑
+public class CurrentUserService
+{
+    private readonly IHttpContextAccessor _httpContextAccessor;
+
+    // 需要通过 IHttpContextAccessor 间接访问当前 HTTP 请求的上下文。
+    public CurrentUserService(IHttpContextAccessor httpContextAccessor)
+    {
+        _httpContextAccessor = httpContextAccessor;
+    }
+
+    public int? GetCurrentUserId()
+    {
+        var user = _httpContextAccessor.HttpContext?.User;
+        if (user == null) return null;
+
+        // ClaimTypes.NameIdentifier 是 ASP.NET Core 对 JWT "sub" Claim 的映射名
+        // JWT 库在解析 Token 时，会把 "sub" 这个标准 Claim
+        // 自动映射成 ClaimTypes.NameIdentifier（一个很长的 URI 字符串）
+        var value = user.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+
+        // Claim 的 value 是字符串，需要转成 int
+        // int.TryParse：转换失败时返回 false，不会抛异常（比 int.Parse 更安全）
+        if (int.TryParse(value, out var userId))
+            return userId;
+
+        return null;
+    }
+}
+```
+
+
+
+### 4. 给 IUserRepository 增加按 Id 查询的方法
+
+`GET /users/me` 拿到用户 Id 之后，需要从数据库里查出用户信息。目前 `IUserRepository` 只有按 Email 查询的方法，补上按 Id 查询：
+
+打开 `UUcars.API/Repositories/IUserRepository.cs`：
+
+```csharp
+using UUcars.API.Entities;
+
+namespace UUcars.API.Repositories;
+
+public interface IUserRepository
+{
+    Task<User?> GetByEmailAsync(string email, CancellationToken cancellationToken = default);
+    Task<User> AddAsync(User user, CancellationToken cancellationToken = default);
+
+    // 新增：按 Id 查询用户
+    Task<User?> GetByIdAsync(int id, CancellationToken cancellationToken = default);
+}
+```
+
+打开 `UUcars.API/Repositories/EfUserRepository.cs`，补充实现：
+
+```csharp
+public async Task<User?> GetByIdAsync(int id, CancellationToken cancellationToken = default)
+{
+    return await _context.Users
+        .FirstOrDefaultAsync(u => u.Id == id, cancellationToken);
+}
+```
+
+
+
+### 5. 创建业务异常
+
+用户 Id 不存在时需要返回 404：
+
+```bash
+touch UUcars.API/Exceptions/UserNotFoundException.cs
+namespace UUcars.API.Exceptions;
+
+public class UserNotFoundException : AppException
+{
+    public UserNotFoundException(int id)
+        : base(StatusCodes.Status404NotFound, $"User with id '{id}' was not found.")
+    {
+    }
+}
+```
+
+
+
+### 6. 在 UserService 里添加获取当前用户的方法
+
+打开 `UUcars.API/Services/UserService.cs`，添加 `GetCurrentUserAsync`：
+
+```csharp
+public async Task<UserResponse> GetCurrentUserAsync(
+    int userId,
+    CancellationToken cancellationToken = default)
+{
+    var user = await _userRepository.GetByIdAsync(userId, cancellationToken);
+    if (user == null)
+        throw new UserNotFoundException(userId);
+
+    return MapToResponse(user);
+}
+```
+
+
+
+### 7. 创建 UsersController
+
+```bash
+touch UUcars.API/Controllers/UsersController.cs
+```
+
+```c#
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using UUcars.API.DTOs;
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Services;
+
+namespace UUcars.API.Controllers;
+
+[ApiController]
+[Route("users")]
+[Authorize]     // Controller 级别的 [Authorize]：这个 Controller 里所有接口都需要登录
+public class UsersController : ControllerBase
+{
+    private readonly UserService _userService;
+    private readonly CurrentUserService _currentUserService;
+
+    public UsersController(UserService userService, CurrentUserService currentUserService)
+    {
+        _userService = userService;
+        _currentUserService = currentUserService;
+    }
+
+    // GET /users/me
+    [HttpGet("me")]
+    public async Task<IActionResult> GetMe(CancellationToken cancellationToken)
+    {
+        var userId = _currentUserService.GetCurrentUserId();
+
+        // 理论上不会发生（[Authorize] 已经保证了 Token 合法），
+        // 但做防御性编程，Token 里没有 sub 时返回 401
+        if (userId == null)
+            return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+        var user = await _userService.GetCurrentUserAsync(userId.Value, cancellationToken);
+        return Ok(ApiResponse<UserResponse>.Ok(user));
+    }
+}
+```
+
+
+
+### 8. 注册新依赖到 Program.cs
+
+```csharp
+	// 用户模块
+    builder.Services.AddScoped<IPasswordHasher<User>, PasswordHasher<User>>();
+    builder.Services.AddScoped<IUserRepository, EfUserRepository>();
+    builder.Services.AddScoped<JwtTokenGenerator>();
+    builder.Services.AddScoped<UserService>();
+    
+    // AddHttpContextAccessor：IHttpContextAccessor 默认不自动注册，需要显式加上
+    // 它内部用 AsyncLocal<T> 保证线程安全，每个请求有自己独立的 HttpContext
+    builder.Services.AddHttpContextAccessor();
+    builder.Services.AddScoped<CurrentUserService>();	
+```
+
+
+
+### 9. 同步更新 FakeUserRepository
+
+`IUserRepository` 新增了 `GetByIdAsync`，`FakeUserRepository` 也要补上，否则编译报错：
+
+打开 `UUcars.Tests/Fakes/FakeUserRepository.cs`，补充：
+
+```csharp
+public Task<User?> GetByIdAsync(int id, CancellationToken cancellationToken = default)
+{
+    var user = _store.Values.FirstOrDefault(u => u.Id == id);
+    return Task.FromResult(user);
+}
+```
+
+
+
+### 10. 验证编译和测试
+
+```bash
+dotnet build
+dotnet test
+```
+
+两个都应该通过。
+
+
+
+### 11. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**GET /users/me（需要带 Token）：**
+
+先登录拿到 Token，然后带上 Authorization 头：
+
+```
+GET /users/me
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......
+```
+
+预期（200）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": 2,
+    "username": "testuser",
+    "email": "test@example.com",
+    "role": "User",
+    "createdAt": "..."
+  }
+}
+```
+
+**不带 Token 访问（应返回 401）：**
+
+不带 Authorization 头直接访问，预期返回 401。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 12. 此时的目录变化
+
+```
+UUcars.API/
+├── Controllers/
+│   └── UsersController.cs          ← 新增
+├── Exceptions/
+│   └── UserNotFoundException.cs    ← 新增
+├── Extensions/
+│   └── AuthExtensions.cs          ← 新增
+└── Services/
+    ├── CurrentUserService.cs       ← 新增
+    └── UserService.cs             ← 已更新
+
+UUcars.Tests/
+└── Fakes/
+    └── FakeUserRepository.cs      ← 已更新
+```
+
+
+
+### 13. Git 提交
+
+```bash
+git add .
+git commit -m "feat: JWT config refactor + GET /users/me + CurrentUserService"
+```
+
+
+
+### Step 12 完成状态
+
+```
+✅ JWT 配置抽成扩展方法（Extensions/AuthExtensions.cs）
+✅ 理解扩展方法（this 关键字、静态类、链式调用、return services）
+✅ CurrentUserService（封装从 Token Claims 里提取用户 Id 的逻辑）
+✅ 理解 IHttpContextAccessor 的作用和注册方式
+✅ IUserRepository 新增 GetByIdAsync
+✅ UserNotFoundException（404）
+✅ UserService 新增 GetCurrentUserAsync
+✅ UsersController（GET /users/me，Controller 级别 [Authorize]）
+✅ FakeUserRepository 同步更新
+✅ dotnet build + dotnet test 全部通过
+✅ Scalar 测试通过
+✅ Git commit 完成
+```
+

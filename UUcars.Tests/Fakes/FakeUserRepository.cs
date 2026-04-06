@@ -26,4 +26,10 @@ public class FakeUserRepository : IUserRepository
         _store[user.Email.ToLower()] = user;
         return Task.FromResult(user);
     }
+
+    public Task<User?> GetByIdAsync(int id, CancellationToken cancellationToken = default)
+    {
+       var user= _store.Values.FirstOrDefault(u => u.Id == id);
+       return Task.FromResult(user);
+    }
 }

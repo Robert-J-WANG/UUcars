@@ -13,15 +13,15 @@ namespace UUcars.API.Services;
 public class UserService
 {
     private readonly IUserRepository _userRepository;
-    private readonly IPasswordHasher<User> _passwordHasher;  // 改为接口
+    private readonly IPasswordHasher<User> _passwordHasher; // 改为接口
     private readonly JwtTokenGenerator _jwtTokenGenerator;
     private readonly ILogger<UserService> _logger;
-    
+
 
     // 通过构造函数注入，由 DI 容器提供
     public UserService(
         IUserRepository userRepository,
-        IPasswordHasher<User> passwordHasher,   // 改为接口注入
+        IPasswordHasher<User> passwordHasher, // 改为接口注入
         JwtTokenGenerator jwtTokenGenerator,
         ILogger<UserService> logger)
     {
@@ -29,7 +29,6 @@ public class UserService
         _passwordHasher = passwordHasher;
         _jwtTokenGenerator = jwtTokenGenerator;
         _logger = logger;
-       
     }
 
     public async Task<UserResponse> RegisterAsync(RegisterRequest request,
@@ -104,6 +103,17 @@ public class UserService
             ExpiresAt = DateTime.UtcNow.AddMinutes(60),
             User = MapToResponse(user)
         };
+    }
+
+    public async Task<UserResponse> GetCurrentUserAsync(
+        int userId,
+        CancellationToken cancellationToken = default)
+    {
+        var user = await _userRepository.GetByIdAsync(userId, cancellationToken);
+        if (user == null)
+            throw new UserNotFoundException(userId);
+
+        return MapToResponse(user);
     }
 
     // 实体 → DTO 的映射方法

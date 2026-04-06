@@ -32,4 +32,10 @@ public class EfUserRepository : IUserRepository
 
         return user;
     }
+
+    public async Task<User?> GetByIdAsync(int id, CancellationToken cancellationToken = default)
+    {
+        return await _context.Users
+            .FirstOrDefaultAsync(u => u.Id == id, cancellationToken);
+    }
 }
