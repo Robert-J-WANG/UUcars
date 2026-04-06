@@ -81,6 +81,10 @@ try
     // 它内部用 AsyncLocal<T> 保证线程安全，每个请求有自己独立的 HttpContext
     builder.Services.AddHttpContextAccessor();
     builder.Services.AddScoped<CurrentUserService>();
+    
+    // 车辆模块
+    builder.Services.AddScoped<ICarRepository, EfCarRepository>();
+    builder.Services.AddScoped<CarService>();
 
     // =============================================
     // 构建应用

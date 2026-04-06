@@ -5761,3 +5761,490 @@ git push origin --delete feature/auth
 
 
 
+## Step 14 · 发布车辆（创建草稿）
+
+### 这一步做什么
+
+用户系统完成了，现在进入车辆模块——整个项目的核心业务。
+
+卖家发布车辆的第一步不是直接上架，而是创建一个草稿（`Draft`）。
+
+草稿只有卖家自己能看到，需要经过提交审核、Admin 审核通过后才会公开。
+
+这一步实现 `POST /cars`，让登录用户能创建一辆车的草稿。
+
+
+
+### 1. 切出 feature/cars 分支
+
+```bash
+git checkout develop
+git checkout -b feature/cars
+git push -u origin feature/cars
+```
+
+
+
+### 2. 为什么 Status 默认是 Draft 而不是直接 Published
+
+这是一个常见的设计问题，直接上架看起来更简单，为什么要多一个草稿状态？
+
+原因有两个：
+
+**第一，给卖家修改的机会。** 车辆信息（标题、价格、描述）填完之后，卖家可能还想调整。草稿状态下可以反复修改，确认没问题再提交审核。如果创建就直接上架，买家看到的可能是还没填完整的信息。
+
+**第二，平台需要审核。** UUcars 是 C2C 平台，任何人都可以注册发车，如果创建就直接公开，平台无法控制内容质量（比如虚假信息、违规车辆）。Draft → PendingReview → Published 的流程让 Admin 有机会审核，这是平台运营的基本需求。
+
+
+
+### 3. 创建业务异常
+
+后续车辆模块会用到的业务异常，现在一起建好：
+
+```bash
+touch UUcars.API/Exceptions/CarNotFoundException.cs
+touch UUcars.API/Exceptions/ForbiddenException.cs
+```
+
+```c#
+namespace UUcars.API.Exceptions;
+
+public class CarNotFoundException : AppException
+{
+    public CarNotFoundException(int id)
+        : base(StatusCodes.Status404NotFound, $"Car with id '{id}' was not found.")
+    {
+    }
+}
+```
+
+```c#
+namespace UUcars.API.Exceptions;
+
+// 已登录但无权限操作时抛出（403 Forbidden）
+// 和 401 Unauthorized 的区别：
+//   401：没有身份（没登录或 Token 无效）→ 去登录
+//   403：有身份但没权限（登录了但不是车主）→ 你没有权限做这件事
+public class ForbiddenException : AppException
+{
+    public ForbiddenException(string message = "You do not have permission to perform this action.")
+        : base(StatusCodes.Status403Forbidden, message)
+    {
+    }
+}
+```
+
+
+
+### 4. 创建 DTO
+
+#### `DTOs/Requests/CarCreateRequest.cs`
+
+```bash
+touch UUcars.API/DTOs/Requests/CarCreateRequest.cs
+```
+
+```c#
+using System.ComponentModel.DataAnnotations;
+
+namespace UUcars.API.DTOs.Requests;
+
+public class CarCreateRequest
+{
+    [Required(ErrorMessage = "Title is required.")]
+    [MaxLength(100, ErrorMessage = "Title must not exceed 100 characters.")]
+    public string Title { get; set; } = string.Empty;
+
+    [Required(ErrorMessage = "Brand is required.")]
+    [MaxLength(50, ErrorMessage = "Brand must not exceed 50 characters.")]
+    public string Brand { get; set; } = string.Empty;
+
+    [Required(ErrorMessage = "Model is required.")]
+    [MaxLength(50, ErrorMessage = "Model must not exceed 50 characters.")]
+    public string Model { get; set; } = string.Empty;
+
+    [Required(ErrorMessage = "Year is required.")]
+    [Range(1900, 2100, ErrorMessage = "Year must be between 1900 and 2100.")]
+    public int Year { get; set; }
+
+    [Required(ErrorMessage = "Price is required.")]
+    [Range(0.01, double.MaxValue, ErrorMessage = "Price must be greater than 0.")]
+    public decimal Price { get; set; }
+
+    [Required(ErrorMessage = "Mileage is required.")]
+    [Range(0, int.MaxValue, ErrorMessage = "Mileage must be 0 or greater.")]
+    public int Mileage { get; set; }
+
+    [MaxLength(2000, ErrorMessage = "Description must not exceed 2000 characters.")]
+    public string? Description { get; set; }
+}
+```
+
+#### `DTOs/Responses/CarResponse.cs`
+
+```bash
+touch UUcars.API/DTOs/Responses/CarResponse.cs
+```
+
+`CarResponse` 是车辆列表和详情接口都会用到的基础响应结构，包含车辆的核心信息：
+
+```csharp
+namespace UUcars.API.DTOs.Responses;
+
+public class CarResponse
+{
+    public int Id { get; set; }
+    public string Title { get; set; } = string.Empty;
+    public string Brand { get; set; } = string.Empty;
+    public string Model { get; set; } = string.Empty;
+    public int Year { get; set; }
+    public decimal Price { get; set; }
+    public int Mileage { get; set; }
+    public string? Description { get; set; }
+    public string Status { get; set; } = string.Empty;
+    public int SellerId { get; set; }
+    public string SellerUsername { get; set; } = string.Empty;
+    public DateTime CreatedAt { get; set; }
+    public DateTime UpdatedAt { get; set; }
+}
+```
+
+
+
+### 5. 创建 Repository
+
+#### `Repositories/ICarRepository.cs`
+
+```bash
+touch UUcars.API/Repositories/ICarRepository.cs
+```
+
+这一步只需要新增车辆，但后续步骤（修改、删除、查询）都会用到 Repository，现在把这一步需要的方法定义好，后续步骤再逐步补充：
+
+```csharp
+using UUcars.API.Entities;
+
+namespace UUcars.API.Repositories;
+
+public interface ICarRepository
+{
+    Task<Car> AddAsync(Car car, CancellationToken cancellationToken = default);
+}
+```
+
+#### `Repositories/EfCarRepository.cs`
+
+```bash
+touch UUcars.API/Repositories/EfCarRepository.cs
+```
+
+```c#
+using UUcars.API.Data;
+using UUcars.API.Entities;
+
+namespace UUcars.API.Repositories;
+
+public class EfCarRepository : ICarRepository
+{
+    private readonly AppDbContext _context;
+
+    public EfCarRepository(AppDbContext context)
+    {
+        _context = context;
+    }
+
+    public async Task<Car> AddAsync(Car car, CancellationToken cancellationToken = default)
+    {
+        _context.Cars.Add(car);
+        await _context.SaveChangesAsync(cancellationToken);
+        return car;
+    }
+}
+```
+
+
+
+### 6. 创建 CarService
+
+```bash
+touch UUcars.API/Services/CarService.cs
+```
+
+```c#
+using UUcars.API.DTOs.Requests;
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Entities;
+using UUcars.API.Entities.Enums;
+using UUcars.API.Repositories;
+
+namespace UUcars.API.Services;
+
+public class CarService
+{
+    private readonly ICarRepository _carRepository;
+    private readonly ILogger<CarService> _logger;
+
+    public CarService(ICarRepository carRepository, ILogger<CarService> logger)
+    {
+        _carRepository = carRepository;
+        _logger = logger;
+    }
+
+    public async Task<CarResponse> CreateAsync(
+        int sellerId,
+        CarCreateRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        var car = new Car
+        {
+            Title = request.Title,
+            Brand = request.Brand,
+            Model = request.Model,
+            Year = request.Year,
+            Price = request.Price,
+            Mileage = request.Mileage,
+            Description = request.Description,
+            SellerId = sellerId,            // 从 Token 里取到的当前用户 Id
+            Status = CarStatus.Draft,       // 创建时强制为 Draft，客户端无法指定
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        var created = await _carRepository.AddAsync(car, cancellationToken);
+
+        _logger.LogInformation("Car created: {CarId} by seller {SellerId}", created.Id, sellerId);
+
+        return MapToResponse(created);
+    }
+
+    // 实体 → DTO 的映射方法
+    // 注意 SellerUsername 暂时用空字符串——创建时 EF Core 不会自动加载导航属性
+    // 后续详情接口会用 Include 加载完整的 Seller 信息
+    internal static CarResponse MapToResponse(Car car) => new()
+    {
+        Id = car.Id,
+        Title = car.Title,
+        Brand = car.Brand,
+        Model = car.Model,
+        Year = car.Year,
+        Price = car.Price,
+        Mileage = car.Mileage,
+        Description = car.Description,
+        Status = car.Status.ToString(),
+        SellerId = car.SellerId,
+        SellerUsername = car.Seller?.Username ?? string.Empty,
+        CreatedAt = car.CreatedAt,
+        UpdatedAt = car.UpdatedAt
+    };
+}
+```
+
+> **为什么 `Status` 在 Service 里强制写成 `CarStatus.Draft`，而不是让客户端传入？** 因为状态流转是核心业务规则，不能由客户端控制。如果客户端能传 `Status`，就可以直接创建一个 `Published` 的车辆绕过审核流程。规则必须在服务端强制执行，`Status = CarStatus.Draft` 硬写在 Service 里，任何人都改不了。
+
+> **`MapToResponse` 为什么用 `internal` 而不是 `private`？** `private` 只有类内部能用。后续步骤里其他方法（比如列表查询）也需要把 `Car` 实体映射成 `CarResponse`，都在 `CarService` 里，用 `internal static` 让同一个类的其他方法都能复用这个映射，又不暴露给外部。
+
+
+
+### 7. 创建 CarsController
+
+```bash
+touch UUcars.API/Controllers/CarsController.cs
+```
+
+```c#
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using UUcars.API.DTOs;
+using UUcars.API.DTOs.Requests;
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Services;
+
+namespace UUcars.API.Controllers;
+
+[ApiController]
+[Route("cars")]
+public class CarsController : ControllerBase
+{
+    private readonly CarService _carService;
+    private readonly CurrentUserService _currentUserService;
+
+    public CarsController(CarService carService, CurrentUserService currentUserService)
+    {
+        _carService = carService;
+        _currentUserService = currentUserService;
+    }
+
+    // POST /cars
+    // 不在 Controller 级别加 [Authorize]，因为后续会有公开接口（车辆列表、搜索、详情）
+    // 只在需要登录的 Action 上单独加 [Authorize]
+    [HttpPost]
+    [Authorize]
+    public async Task<IActionResult> Create(
+        [FromBody] CarCreateRequest request,
+        CancellationToken cancellationToken)
+    {
+        var sellerId = _currentUserService.GetCurrentUserId();
+        if (sellerId == null)
+            return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+        var car = await _carService.CreateAsync(sellerId.Value, request, cancellationToken);
+
+        // 201 Created：创建成功，返回新建的资源
+        return StatusCode(StatusCodes.Status201Created,
+            ApiResponse<CarResponse>.Ok(car, "Car draft created successfully."));
+    }
+}
+```
+
+> **为什么这里不在 Controller 级别加 `[Authorize]`？** `UsersController` 里所有接口都需要登录，所以在 Controller 级别加。但 `CarsController` 里情况不同——车辆列表、搜索、详情这些接口是公开的（不需要登录也能浏览），而发布、修改、删除需要登录。如果在 Controller 级别加 `[Authorize]`，就要在公开接口上逐个加 `[AllowAnonymous]` 来解除限制，反而更麻烦。所以只在需要登录的 Action 上单独加 `[Authorize]`。
+
+
+
+### 8. 注册依赖到 Program.cs
+
+```csharp
+// 车辆模块
+builder.Services.AddScoped<ICarRepository, EfCarRepository>();
+builder.Services.AddScoped<CarService>();
+```
+
+顶部补上 using：
+
+```csharp
+using UUcars.API.Repositories;
+using UUcars.API.Services;
+```
+
+
+
+### 9. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 10. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**正常创建车辆草稿（需要登录）：**
+
+先登录拿到 Token，然后：
+
+```json
+POST /cars
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......
+
+{
+  "title": "2007 BMW 325i – Clean, Reliable & Drives Great !Moving abroad!",
+  "brand": "BMW",
+  "model": "3 Series",
+  "year": 2007,
+  "price": 5700,
+  "mileage": 122310,
+  "description": "Selling my well-maintained 2007 BMW 325i. This car is in great condition for its age and drives smoothly with plenty of power."
+}
+```
+
+预期（201）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": 1,
+    "title": "2007 BMW 325i – Clean, Reliable & Drives Great !Moving abroad!",
+    "brand": "BMW",
+    "model": "3 Series",
+    "year": 2007,
+    "price": 5700,
+    "mileage": 122310,
+    "description": "Selling my well-maintained 2007 BMW 325i. This car is in great condition for its age and drives smoothly with plenty of power.",
+    "status": "Draft",
+    "sellerId": 1001,
+    "sellerUsername": "",
+    "createdAt": "2026-04-06T12:34:59.243803Z",
+    "updatedAt": "2026-04-06T12:34:59.243803Z"
+  },
+  "message": "Car draft created successfully.",
+  "errors": null
+}
+```
+
+注意 `status` 字段是 `"Draft"`，不管请求里传了什么，Service 层始终强制为草稿。
+
+**不带 Token 创建（应返回 401）：**
+
+不带 Authorization 头直接请求，预期返回 401。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 11. 此时的目录变化
+
+```
+UUcars.API/
+├── Controllers/
+│   └── CarsController.cs               ← 新增
+├── DTOs/
+│   ├── Requests/
+│   │   └── CarCreateRequest.cs         ← 新增
+│   └── Responses/
+│       └── CarResponse.cs              ← 新增
+├── Exceptions/
+│   ├── CarNotFoundException.cs         ← 新增
+│   └── ForbiddenException.cs           ← 新增
+├── Repositories/
+│   ├── ICarRepository.cs               ← 新增
+│   └── EfCarRepository.cs              ← 新增
+└── Services/
+    └── CarService.cs                   ← 新增
+```
+
+
+
+### 12. Git 提交
+
+```bash
+git add .
+git commit -m "feat: POST /cars - create car draft"
+```
+
+
+
+### Step 14 完成状态
+
+```
+✅ 切出 feature/cars 分支
+✅ 理解为什么新建车辆默认是 Draft 状态
+✅ 理解 401 和 403 的区别（CarNotFoundException / ForbiddenException）
+✅ CarCreateRequest DTO（含字段验证）
+✅ CarResponse DTO
+✅ ICarRepository + EfCarRepository
+✅ CarService.CreateAsync（Status 强制为 Draft，SellerId 从 Token 取）
+✅ CarsController POST /cars（Action 级别 [Authorize]，原因清楚）
+✅ 理解 MapToResponse 用 internal 而不是 private 的原因
+✅ DI 注册完成
+✅ Scalar 测试通过（201 创建成功，401 未登录）
+✅ Git commit 完成
+```
+
