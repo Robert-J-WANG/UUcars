@@ -2,6 +2,7 @@ using UUcars.API.DTOs.Requests;
 using UUcars.API.DTOs.Responses;
 using UUcars.API.Entities;
 using UUcars.API.Entities.Enums;
+using UUcars.API.Exceptions;
 using UUcars.API.Repositories;
 
 namespace UUcars.API.Services;
@@ -42,6 +43,41 @@ public class CarService
         _logger.LogInformation("Car created: {CarId} by seller {SellerId}", created.Id, sellerId);
 
         return MapToResponse(created);
+    }
+
+
+    public async Task<CarResponse> SubmitForReviewAsync(
+        int carId,
+        int currentUserId,
+        CancellationToken cancellationToken = default)
+    {
+        var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+        // 1. 车辆不存在
+        if (car == null)
+            throw new CarNotFoundException(carId);
+
+        // 2. 不是车主
+        // 为什么要检查这个？如果不检查，任何登录用户都能提交别人的车去审核，
+        // 卖家会莫名其妙发现自己的草稿进入了审核状态
+        if (car.SellerId != currentUserId)
+            throw new ForbiddenException();
+
+        // 3. 不是 Draft 状态
+        // 为什么要检查这个？防止重复提交。已经在 PendingReview 的车再次提交没有意义，
+        // Published 的车更不应该被重新提交审核（会破坏状态机）
+        if (car.Status != CarStatus.Draft)
+            throw new CarStatusException(car.Id, car.Status, CarStatus.PendingReview);
+
+        car.Status = CarStatus.PendingReview;
+        car.UpdatedAt = DateTime.UtcNow;
+
+        var updated = await _carRepository.UpdateAsync(car, cancellationToken);
+
+        _logger.LogInformation("Car {CarId} submitted for review by seller {SellerId}",
+            car.Id, currentUserId);
+
+        return MapToResponse(updated);
     }
 
     // 实体 → DTO 的映射方法

@@ -39,4 +39,17 @@ public class CarsController : ControllerBase
         return StatusCode(StatusCodes.Status201Created,
             ApiResponse<CarResponse>.Ok(car, "Car draft created successfully."));
     }
+
+    // POST /cars/{id}/submit
+    [HttpPost("{id:int}/submit")]
+    [Authorize]
+    public async Task<IActionResult> Submit(int id, CancellationToken cancellationToken)
+    {
+        var currentUserId = _currentUserService.GetCurrentUserId();
+        if (currentUserId == null)
+            return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+        var car = await _carService.SubmitForReviewAsync(id, currentUserId.Value, cancellationToken);
+        return Ok(ApiResponse<CarResponse>.Ok(car, "Car submitted for review successfully."));
+    }
 }

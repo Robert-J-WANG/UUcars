@@ -6248,3 +6248,296 @@ git commit -m "feat: POST /cars - create car draft"
 ✅ Git commit 完成
 ```
 
+
+
+## Step 15 · 提交审核
+
+### 这一步做什么
+
+Step 14 实现了创建车辆草稿。草稿创建好之后，卖家需要一个操作来把车辆"提交给 Admin 审核"——这就是 `POST /cars/{id}/submit`。
+
+提交后车辆状态从 `Draft` 变成 `PendingReview`，Admin 才能看到并处理它。
+
+
+
+### 1. 这个接口的设计思路
+
+`POST /cars/{id}/submit` 是一个**状态变更操作**，不是创建资源也不是修改资源字段，而是触发一个业务动作。
+
+REST 里对这类操作的惯用设计是在资源 URL 后面加一个动词子路径：
+
+```
+POST /cars/{id}/submit    ← 提交审核
+POST /cars/{id}/cancel    ← 取消（后面订单模块也是这个模式）
+POST /orders/{id}/cancel  ← 取消订单
+```
+
+用 `POST` 而不是 `PUT` 的原因是：这不是"修改车辆字段"，而是"触发一个不可逆的业务动作"。
+
+`PUT` 通常用于全量更新资源字段，`POST` 更适合表达"执行一个操作"。
+
+
+
+### 2. 业务规则
+
+提交审核有两条必须在 Service 层强制执行的规则：
+
+```
+1. 只有车主可以提交（别人的车不能提交）
+2. 只有 Draft 状态可以提交（PendingReview / Published 的车不能重复提交）
+```
+
+为什么要在 Service 层而不是 Controller 层做这些检查？
+
+因为 Controller 只处理 HTTP 层面的事，业务规则应该在 Service 里。这样规则是集中管理的，单元测试也能直接测到。
+
+
+
+### 3. 给 ICarRepository 增加新方法
+
+提交审核需要先查出车辆，再更新状态，Repository 需要补上这两个方法：
+
+打开 `UUcars.API/Repositories/ICarRepository.cs`：
+
+```csharp
+using UUcars.API.Entities;
+
+namespace UUcars.API.Repositories;
+
+public interface ICarRepository
+{
+    Task<Car> AddAsync(Car car, CancellationToken cancellationToken = default);
+
+    // 新增
+    Task<Car?> GetByIdAsync(int id, CancellationToken cancellationToken = default);
+    Task<Car> UpdateAsync(Car car, CancellationToken cancellationToken = default);
+}
+```
+
+打开 `UUcars.API/Repositories/EfCarRepository.cs`，补充实现：
+
+```csharp
+public async Task<Car?> GetByIdAsync(int id, CancellationToken cancellationToken = default)
+{
+    return await _context.Cars
+        .Include(c => c.Seller)     // 同时加载 Seller 导航属性
+        .FirstOrDefaultAsync(c => c.Id == id, cancellationToken);
+}
+
+public async Task<Car> UpdateAsync(Car car, CancellationToken cancellationToken = default)
+{
+    _context.Cars.Update(car);
+    await _context.SaveChangesAsync(cancellationToken);
+    return car;
+}
+```
+
+> **`Include(c => c.Seller)` 是什么？** EF Core 默认是**懒加载关闭**的——查出 `Car` 对象时，导航属性 `Seller`（关联的 `User` 对象）默认是 `null`，不会自动去数据库查。`Include` 是**预加载（Eager Loading）**，告诉 EF Core"查 Car 的同时把关联的 Seller 也一起查出来"，生成的 SQL 会是一个 JOIN 语句。
+>
+> 为什么这里要加 `Include(c => c.Seller)`？因为 `CarResponse` 里有 `SellerUsername` 字段，需要从 `car.Seller.Username` 取值。如果不 `Include`，`car.Seller` 是 `null`，`car.Seller.Username` 会抛 `NullReferenceException`。
+
+
+
+### 4. 在 CarService 里添加提交审核的方法
+
+打开 `UUcars.API/Services/CarService.cs`，添加 `SubmitForReviewAsync`：
+
+```csharp
+public async Task<CarResponse> SubmitForReviewAsync(
+    int carId,
+    int currentUserId,
+    CancellationToken cancellationToken = default)
+{
+    var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+    // 1. 车辆不存在
+    if (car == null)
+        throw new CarNotFoundException(carId);
+
+    // 2. 不是车主
+    // 为什么要检查这个？如果不检查，任何登录用户都能提交别人的车去审核，
+    // 卖家会莫名其妙发现自己的草稿进入了审核状态
+    if (car.SellerId != currentUserId)
+        throw new ForbiddenException();
+
+    // 3. 不是 Draft 状态
+    // 为什么要检查这个？防止重复提交。已经在 PendingReview 的车再次提交没有意义，
+    // Published 的车更不应该被重新提交审核（会破坏状态机）
+    if (car.Status != CarStatus.Draft)
+        throw new CarStatusException(car.Id, car.Status, CarStatus.PendingReview);
+
+    car.Status = CarStatus.PendingReview;
+    car.UpdatedAt = DateTime.UtcNow;
+
+    var updated = await _carRepository.UpdateAsync(car, cancellationToken);
+
+    _logger.LogInformation("Car {CarId} submitted for review by seller {SellerId}",
+        car.Id, currentUserId);
+
+    return MapToResponse(updated);
+}
+```
+
+这里用到了一个新的异常 `CarStatusException`，下面创建它。
+
+
+
+### 5. 创建 CarStatusException
+
+状态不合法时，需要一个能清楚表达"当前状态是什么、期望什么状态"的异常，而不是笼统地返回 400：
+
+```bash
+touch UUcars.API/Exceptions/CarStatusException.cs
+using UUcars.API.Entities.Enums;
+
+namespace UUcars.API.Exceptions;
+
+// 车辆状态不满足操作要求时抛出
+// 比如：只有 Draft 状态才能提交审核，当前是 Published 就抛这个异常
+public class CarStatusException : AppException
+{
+    public CarStatusException(int carId, CarStatus currentStatus, CarStatus requiredStatus)
+        : base(StatusCodes.Status409Conflict,
+            $"Car '{carId}' is in '{currentStatus}' status. Required status: '{requiredStatus}'.")
+    {
+    }
+}
+```
+
+> **为什么是 409 Conflict 而不是 400 Bad Request？** 400 表示"请求格式有问题"，比如字段缺失或格式错误。409 表示"请求本身没问题，但当前资源的状态和操作冲突"——车辆已经在审核中，再次提交就是一种状态冲突。409 更准确地表达了这个业务含义。
+
+
+
+### 6. 在 CarsController 里添加提交审核端点
+
+打开 `UUcars.API/Controllers/CarsController.cs`，在 `Create` 方法下方添加：
+
+```csharp
+// POST /cars/{id}/submit
+[HttpPost("{id:int}/submit")]
+[Authorize]
+public async Task<IActionResult> Submit(int id, CancellationToken cancellationToken)
+{
+    var currentUserId = _currentUserService.GetCurrentUserId();
+    if (currentUserId == null)
+        return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+    var car = await _carService.SubmitForReviewAsync(id, currentUserId.Value, cancellationToken);
+    return Ok(ApiResponse<CarResponse>.Ok(car, "Car submitted for review successfully."));
+}
+```
+
+> **路由 `{id:int}` 里的 `:int` 是什么？** 这是路由约束（Route Constraint）。`:int` 表示这个路由参数必须能解析成整数，如果 URL 里传的是非数字（比如 `/cars/abc/submit`），框架直接返回 404，不会进入这个 Action。这是一种轻量级的输入保护，不需要在代码里手动检查。
+
+
+
+### 7. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 8. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**正常提交审核：**
+
+先登录，再创建一辆车拿到 `id`，然后提交：
+
+```
+POST /cars/1/submit
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......
+```
+
+预期（200）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": 1,
+    "status": "PendingReview",
+    ...
+  },
+  "message": "Car submitted for review successfully."
+}
+```
+
+**重复提交（应返回 409）：**
+
+对同一辆车再次调用 `/cars/1/submit`，预期：
+
+```json
+{
+  "success": false,
+  "message": "Car '1' is in 'PendingReview' status. Required status: 'Draft'."
+}
+```
+
+**提交别人的车（应返回 403）：**
+
+换一个用户登录，尝试提交不属于自己的车辆，预期返回 403。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 9. 此时的目录变化
+
+```
+UUcars.API/
+├── Exceptions/
+│   └── CarStatusException.cs       ← 新增
+└── Repositories/
+    ├── ICarRepository.cs           ← 已更新（新增 GetByIdAsync / UpdateAsync）
+    └── EfCarRepository.cs          ← 已更新（新增实现，含 Include 说明）
+```
+
+`CarService` 和 `CarsController` 已更新（新增方法），不是新文件，不在目录变化里单独列出。
+
+
+
+### 10. Git 提交
+
+```bash
+git add .
+git commit -m "feat: POST /cars/{id}/submit - submit car for review"
+git push origin feature/cars
+```
+
+
+
+### Step 15 完成状态
+
+```
+✅ 理解状态变更接口的 REST 设计（POST + 动词子路径）
+✅ 理解业务规则为什么在 Service 层而不是 Controller 层
+✅ ICarRepository 新增 GetByIdAsync（含 Include 预加载）/ UpdateAsync
+✅ EfCarRepository 实现新方法（理解 Include Eager Loading）
+✅ CarStatusException（409，清楚表达状态冲突）
+✅ 理解 409 vs 400 的语义区别
+✅ CarService.SubmitForReviewAsync（车主检查 + 状态检查）
+✅ CarsController POST /cars/{id}/submit（路由约束 :int）
+✅ Scalar 测试通过（200 成功、409 重复提交、403 非车主）
+✅ Git commit + push 完成
+```
+
