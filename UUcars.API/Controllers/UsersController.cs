@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using UUcars.API.DTOs;
+using UUcars.API.DTOs.Requests;
 using UUcars.API.DTOs.Responses;
 using UUcars.API.Services;
 
@@ -33,5 +34,18 @@ public class UsersController : ControllerBase
 
         var user = await _userService.GetCurrentUserAsync(userId.Value, cancellationToken);
         return Ok(ApiResponse<UserResponse>.Ok(user));
+    }
+
+    // PUT /users/me
+    [HttpPut("me")]
+    public async Task<IActionResult> UpdateMe([FromBody] UpdateUserRequest request, CancellationToken cancellationToken)
+    {
+        var userId= _currentUserService.GetCurrentUserId();
+        if (userId == null)
+        {
+            return Unauthorized(ApiResponse<UserResponse>.Fail("Invalid token."));
+        }
+        var user = await _userService.UpdateCurrentUserAsync(userId.Value, request, cancellationToken);
+        return Ok(ApiResponse<UserResponse>.Ok(user,"Profile updated successfully!"));
     }
 }

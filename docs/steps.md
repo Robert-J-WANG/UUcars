@@ -5297,3 +5297,467 @@ git commit -m "feat: JWT config refactor + GET /users/me + CurrentUserService"
 ✅ Git commit 完成
 ```
 
+
+
+## Step 13 · 修改用户信息
+
+### 这一步做什么
+
+Step 12 实现了查看当前用户信息，这一步实现修改——`PUT /users/me`。完成后补充登录和 Token 生成相关的单元测试，用户系统的所有功能就全部完成了。
+
+目前当前用户信息只包含 `Username` 和 `Email`，没有密码修改。
+
+这是有意为之的设计决策——**修改密码是一个独立的功能，安全要求更高**，和修改用户名/邮箱不应该放在同一个接口里。
+
+原因是：修改密码通常需要先验证旧密码（防止别人拿到你的登录态后悄悄改密码），而修改用户名/邮箱不需要这个步骤。
+
+如果把三个字段放在一个接口里，逻辑会变得混乱：旧密码填了但想改用户名怎么处理？不填旧密码但想改密码怎么处理？
+
+真实项目里通常会有一个单独的接口：
+
+```http
+PUT /users/me/password
+{
+  "currentPassword": "旧密码",
+  "newPassword": "新密码"
+}
+```
+
+我们会在之后的版本中进行密码重置的功能时完成。
+
+
+
+### 1. 创建 DTO
+
+#### `DTOs/Requests/UpdateUserRequest.cs`
+
+```bash
+touch UUcars.API/DTOs/Requests/UpdateUserRequest.cs
+```
+
+```c#
+using System.ComponentModel.DataAnnotations;
+
+namespace UUcars.API.DTOs.Requests;
+
+public class UpdateUserRequest
+{
+    [Required(ErrorMessage = "Username is required.")]
+    [MaxLength(50, ErrorMessage = "Username must not exceed 50 characters.")]
+    public string Username { get; set; } = string.Empty;
+
+    [Required(ErrorMessage = "Email is required.")]
+    [EmailAddress(ErrorMessage = "Invalid email format.")]
+    [MaxLength(100, ErrorMessage = "Email must not exceed 100 characters.")]
+    public string Email { get; set; } = string.Empty;
+}
+```
+
+
+
+### 2. 扩展 IUserRepository 和 EfUserRepository
+
+`PUT /users/me` 需要更新用户信息，`IUserRepository` 目前没有更新方法，补上：
+
+打开 `UUcars.API/Repositories/IUserRepository.cs`：
+
+```csharp
+using UUcars.API.Entities;
+
+namespace UUcars.API.Repositories;
+
+public interface IUserRepository
+{
+    Task<User?> GetByEmailAsync(string email, CancellationToken cancellationToken = default);
+    Task<User> AddAsync(User user, CancellationToken cancellationToken = default);
+    Task<User?> GetByIdAsync(int id, CancellationToken cancellationToken = default);
+
+    // 新增
+    Task<User> UpdateAsync(User user, CancellationToken cancellationToken = default);
+}
+```
+
+打开 `UUcars.API/Repositories/EfUserRepository.cs`，补充实现：
+
+```csharp
+public async Task<User> UpdateAsync(User user, CancellationToken cancellationToken = default)
+    {
+        /*
+        EF Core 的变更追踪机制：
+        从 DbContext 查出来的实体会被 EF Core "追踪"。
+        修改它的属性后调用 SaveChangesAsync，EF Core 自动检测哪些字段变了，
+        只对变化的字段生成 UPDATE 语句，不需要手动写 SQL。
+        这里的 user 对象是从 GetByIdAsync 查出来的，已经在追踪中，
+        直接改属性再 Update + SaveChanges 就行
+        */
+        _context.Users.Update(user);
+        await _context.SaveChangesAsync(cancellationToken);
+        return user;
+    }
+}
+```
+
+### 3. 在 UserService 里添加修改用户的方法
+
+打开 `UUcars.API/Services/UserService.cs`，在 `GetCurrentUserAsync` 下方添加：
+
+```csharp
+public async Task<UserResponse> UpdateCurrentUserAsync(
+    int userId,
+    UpdateUserRequest request,
+    CancellationToken cancellationToken = default)
+{
+    var user = await _userRepository.GetByIdAsync(userId, cancellationToken);
+    if (user == null)
+        throw new UserNotFoundException(userId);
+
+    // 如果邮箱发生了变化，检查新邮箱是否已被其他人使用
+    // 这里用 OrdinalIgnoreCase 做大小写不敏感的比较
+    // 原因：用户输入的邮箱大小写可能和数据库里存的不一致（数据库存的是小写）
+    // 不能直接用 == 比较，否则 "Test@example.com" 和 "test@example.com" 会被判断为不同
+    if (!string.Equals(user.Email, request.Email, StringComparison.OrdinalIgnoreCase))
+    {
+        var existing = await _userRepository.GetByEmailAsync(request.Email, cancellationToken);
+
+        // existing.Id != userId：排除自己
+        // 场景：用户只改了用户名，邮箱没变，或者邮箱大小写变了但本质一样
+        // 如果不排除自己，用原邮箱提交也会触发"邮箱已被注册"的错误
+        if (existing != null && existing.Id != userId)
+            throw new UserAlreadyExistsException(request.Email);
+    }
+
+    user.Username = request.Username;
+    user.Email = request.Email.ToLower();
+    user.UpdatedAt = DateTime.UtcNow;
+
+    var updated = await _userRepository.UpdateAsync(user, cancellationToken);
+
+    _logger.LogInformation("User updated: {Email}", updated.Email);
+
+    return MapToResponse(updated);
+}
+```
+
+同时确认 `UserService.cs` 顶部的 using 包含：
+
+```csharp
+using UUcars.API.DTOs.Requests;
+```
+
+
+
+### 4. 在 UsersController 里添加 PUT /users/me
+
+打开 `UUcars.API/Controllers/UsersController.cs`，完整更新如下：
+
+```csharp
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using UUcars.API.DTOs;
+using UUcars.API.DTOs.Requests;
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Services;
+
+namespace UUcars.API.Controllers;
+
+[ApiController]
+[Route("users")]
+[Authorize]
+public class UsersController : ControllerBase
+{
+    private readonly UserService _userService;
+    private readonly CurrentUserService _currentUserService;
+
+    public UsersController(UserService userService, CurrentUserService currentUserService)
+    {
+        _userService = userService;
+        _currentUserService = currentUserService;
+    }
+
+    [HttpGet("me")]
+    public async Task<IActionResult> GetMe(CancellationToken cancellationToken)
+    {
+        var userId = _currentUserService.GetCurrentUserId();
+        if (userId == null)
+            return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+        var user = await _userService.GetCurrentUserAsync(userId.Value, cancellationToken);
+        return Ok(ApiResponse<UserResponse>.Ok(user));
+    }
+
+    // PUT /users/me
+    [HttpPut("me")]
+    public async Task<IActionResult> UpdateMe(
+        [FromBody] UpdateUserRequest request,
+        CancellationToken cancellationToken)
+    {
+        var userId = _currentUserService.GetCurrentUserId();
+        if (userId == null)
+            return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+        var user = await _userService.UpdateCurrentUserAsync(userId.Value, request, cancellationToken);
+        return Ok(ApiResponse<UserResponse>.Ok(user, "Profile updated successfully."));
+    }
+}
+```
+
+
+
+### 5. 同步更新 FakeUserRepository
+
+`IUserRepository` 新增了 `UpdateAsync`，`FakeUserRepository` 也要补上，否则编译报错。
+
+打开 `UUcars.Tests/Fakes/FakeUserRepository.cs`：
+
+```csharp
+public Task<User> UpdateAsync(User user, CancellationToken cancellationToken = default)
+{
+    // 用更新后的对象覆盖字典里的旧数据
+    // 注意：如果邮箱改变了，旧邮箱的 key 仍然存在于字典里
+    // 在测试场景下这不影响正确性，因为 GetByEmailAsync 按新邮箱查
+    _store[user.Email.ToLower()] = user;
+    return Task.FromResult(user);
+}
+```
+
+
+
+### 6. 补充单元测试
+
+这一步要补充登录和 Token 生成相关的单元测试。
+
+判断依据是：`LoginAsync` 里有三条明确的业务规则:
+
+- 用户不存在时抛异常
+- 密码错误时抛异常
+- 成功时返回含 Token 的响应。
+
+这三条规则出错会有安全隐患，值得用测试锁定。
+
+登录测试里有一个和注册测试不同的地方：测试前需要先有一个密码被正确 Hash 过的用户。如果直接用 `repo.Seed()` 插入一个 `PasswordHash = "somehash"` 的假用户，`VerifyHashedPassword` 会验证失败——因为 `"somehash"` 不是合法的 PBKDF2 格式。
+
+所以登录测试里先调用 `RegisterAsync` 走一遍完整注册流程，让 `PasswordHasher` 生成真实的 Hash，再用同样的密码登录——这样测试最贴近真实场景。
+
+打开 `UUcars.Tests/Services/UserServiceTests.cs`，在已有的三个测试下方添加：
+
+```csharp
+[Fact]
+public async Task LoginAsync_WithValidCredentials_ShouldReturnLoginResponse()
+{
+    // Arrange：先注册一个用户，确保数据库里有正确 Hash 过的密码
+    var repo = new FakeUserRepository();
+    var service = CreateService(repo);
+
+    await service.RegisterAsync(new RegisterRequest
+    {
+        Username = "testuser",
+        Email = "test@example.com",
+        Password = "Test@123456"
+    });
+
+    // Act：用同样的密码登录
+    var result = await service.LoginAsync(new LoginRequest
+    {
+        Email = "test@example.com",
+        Password = "Test@123456"
+    });
+
+    // Assert
+    Assert.NotNull(result);
+    // Token 不为空字符串，说明 JWT 生成成功
+    Assert.NotEmpty(result.Token);
+    Assert.NotNull(result.User);
+    Assert.Equal("test@example.com", result.User.Email);
+}
+
+[Fact]
+public async Task LoginAsync_WithWrongPassword_ShouldThrowInvalidCredentialsException()
+{
+    // Arrange：先注册用户
+    var repo = new FakeUserRepository();
+    var service = CreateService(repo);
+
+    await service.RegisterAsync(new RegisterRequest
+    {
+        Username = "testuser",
+        Email = "test@example.com",
+        Password = "Test@123456"
+    });
+
+    // Act + Assert：用错误密码登录，必须抛出 InvalidCredentialsException
+    // 注意：不是 "密码错误异常"，而是 InvalidCredentialsException——
+    // 邮箱不存在和密码错误返回同一个异常，不透露具体原因
+    await Assert.ThrowsAsync<InvalidCredentialsException>(
+        () => service.LoginAsync(new LoginRequest
+        {
+            Email = "test@example.com",
+            Password = "WrongPassword"
+        }));
+}
+
+[Fact]
+public async Task LoginAsync_WithNonExistentEmail_ShouldThrowInvalidCredentialsException()
+{
+    // Arrange：空 repo，没有任何用户
+    var repo = new FakeUserRepository();
+    var service = CreateService(repo);
+
+    // Act + Assert：邮箱不存在时抛出的异常和密码错误完全一样
+    // 这是有意为之的安全设计：攻击者无法通过错误信息判断邮箱是否存在
+    await Assert.ThrowsAsync<InvalidCredentialsException>(
+        () => service.LoginAsync(new LoginRequest
+        {
+            Email = "notexist@example.com",
+            Password = "Test@123456"
+        }));
+}
+```
+
+
+
+### 7. 验证编译和测试
+
+```bash
+dotnet build
+dotnet test
+```
+
+预期：
+
+```
+Test summary: total: 6, failed: 0, succeeded: 6, skipped: 0
+```
+
+原来的 3 个注册测试 + 新增的 3 个登录测试，全部通过。
+
+
+
+### 8. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**PUT /users/me（正常修改用户名）：**
+
+先登录拿到 Token，然后：
+
+```json
+PUT /users/me
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......
+
+{
+  "username": "newname",
+  "email": "test@example.com"
+}
+```
+
+预期（200）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": 2,
+    "username": "newname",
+    "email": "test@example.com",
+    "role": "User",
+    "createdAt": "..."
+  },
+  "message": "Profile updated successfully."
+}
+```
+
+**修改成已被占用的邮箱（应返回 409）：**
+
+先注册另一个账号 `other@example.com`，再用当前用户尝试把邮箱改成它：
+
+```json
+{
+  "username": "newname",
+  "email": "other@example.com"
+}
+```
+
+预期（409）：
+
+```json
+{
+  "success": false,
+  "message": "Email 'other@example.com' is already registered."
+}
+```
+
+**用同一个邮箱更新自己（应返回 200）：**
+
+邮箱不变只改用户名，不应该触发邮箱冲突检查，应该正常返回 200。这个场景专门验证前面 `existing.Id != userId` 那个判断的正确性。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 9. 此时的目录变化
+
+```
+UUcars.API/
+├── Controllers/
+│   └── UsersController.cs          ← 已更新（新增 PUT /users/me）
+├── DTOs/
+│   └── Requests/
+│       └── UpdateUserRequest.cs    ← 新增
+└── Repositories/
+    ├── IUserRepository.cs          ← 已更新（新增 UpdateAsync）
+    └── EfUserRepository.cs         ← 已更新（新增 UpdateAsync 实现）
+
+UUcars.Tests/
+├── Fakes/
+│   └── FakeUserRepository.cs      ← 已更新（新增 UpdateAsync）
+└── Services/
+    └── UserServiceTests.cs        ← 已更新（新增 3 个登录测试）
+```
+
+
+
+### 10. Git 提交 + 合并分支
+
+```bash
+git add .
+git commit -m "feat: PUT /users/me - update user profile"
+git commit -m "test: unit tests for login / token generation"
+```
+
+用户系统全部完成，合并回 `develop`：
+
+```bash
+git checkout develop
+git merge --no-ff feature/auth -m "merge: feature/auth into develop"
+git push origin develop
+git branch -D feature/auth
+git push origin --delete feature/auth
+```
+
+
+
+### Step 13 完成状态
+
+```
+✅ UpdateUserRequest DTO
+✅ IUserRepository 新增 UpdateAsync
+✅ EfUserRepository 实现 UpdateAsync（EF Core 变更追踪）
+✅ UserService.UpdateCurrentUserAsync（邮箱冲突检查 + 更新）
+✅ UsersController 新增 PUT /users/me
+✅ FakeUserRepository 同步更新
+✅ 理解登录测试为什么要先走注册流程而不是直接 Seed 假数据
+✅ 6 个单元测试全部通过（3 个注册 + 3 个登录）
+✅ Scalar 测试通过（修改成功 200、邮箱冲突 409、用同邮箱更新自己 200）
+✅ feature/auth 合并回 develop
+```
+
+
+

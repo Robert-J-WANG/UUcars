@@ -116,6 +116,41 @@ public class UserService
         return MapToResponse(user);
     }
 
+    public async Task<UserResponse> UpdateCurrentUserAsync(
+        int userId,
+        UpdateUserRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        var user = await _userRepository.GetByIdAsync(userId, cancellationToken);
+        if (user == null)
+            throw new UserNotFoundException(userId);
+
+        // 如果邮箱发生了变化，检查新邮箱是否已被其他人使用
+        // 这里用 OrdinalIgnoreCase 做大小写不敏感的比较
+        // 原因：用户输入的邮箱大小写可能和数据库里存的不一致（数据库存的是小写）
+        // 不能直接用 == 比较，否则 "Test@example.com" 和 "test@example.com" 会被判断为不同
+        if (!string.Equals(user.Email, request.Email, StringComparison.OrdinalIgnoreCase))
+        {
+            var existing = await _userRepository.GetByEmailAsync(request.Email, cancellationToken);
+
+            // existing.Id != userId：排除自己
+            // 场景：用户只改了用户名，邮箱没变，或者邮箱大小写变了但本质一样
+            // 如果不排除自己，用原邮箱提交也会触发"邮箱已被注册"的错误
+            if (existing != null && existing.Id != userId)
+                throw new UserAlreadyExistsException(request.Email);
+        }
+
+        user.Username = request.Username;
+        user.Email = request.Email.ToLower();
+        user.UpdatedAt = DateTime.UtcNow;
+
+        var updated = await _userRepository.UpdateAsync(user, cancellationToken);
+
+        _logger.LogInformation("User updated: {Email}", updated.Email);
+
+        return MapToResponse(updated);
+    }
+
     // 实体 → DTO 的映射方法
     // 写成 private static：不依赖实例状态，也不需要从外部调用
     private static UserResponse MapToResponse(User user) => new()

@@ -108,4 +108,75 @@ public class UserServiceTests
         Assert.True(stored.PasswordHash.Length > 20);          // Hash 字符串很长
     }
     
+    [Fact]
+    public async Task LoginAsync_WithValidCredentials_ShouldReturnLoginResponse()
+    {
+        // Arrange：先注册一个用户，确保数据库里有正确 Hash 过的密码
+        var repo = new FakeUserRepository();
+        var service = CreateService(repo);
+
+        await service.RegisterAsync(new RegisterRequest
+        {
+            Username = "testuser",
+            Email = "test@example.com",
+            Password = "Test@123456"
+        });
+
+        // Act：用同样的密码登录
+        var result = await service.LoginAsync(new LoginRequest
+        {
+            Email = "test@example.com",
+            Password = "Test@123456"
+        });
+
+        // Assert
+        Assert.NotNull(result);
+        // Token 不为空字符串，说明 JWT 生成成功
+        Assert.NotEmpty(result.Token);
+        Assert.NotNull(result.User);
+        Assert.Equal("test@example.com", result.User.Email);
+    }
+
+    [Fact]
+    public async Task LoginAsync_WithWrongPassword_ShouldThrowInvalidCredentialsException()
+    {
+        // Arrange：先注册用户
+        var repo = new FakeUserRepository();
+        var service = CreateService(repo);
+
+        await service.RegisterAsync(new RegisterRequest
+        {
+            Username = "testuser",
+            Email = "test@example.com",
+            Password = "Test@123456"
+        });
+
+        // Act + Assert：用错误密码登录，必须抛出 InvalidCredentialsException
+        // 注意：不是 "密码错误异常"，而是 InvalidCredentialsException——
+        // 邮箱不存在和密码错误返回同一个异常，不透露具体原因
+        await Assert.ThrowsAsync<InvalidCredentialsException>(
+            () => service.LoginAsync(new LoginRequest
+            {
+                Email = "test@example.com",
+                Password = "WrongPassword"
+            }));
+    }
+
+    [Fact]
+    public async Task LoginAsync_WithNonExistentEmail_ShouldThrowInvalidCredentialsException()
+    {
+        // Arrange：空 repo，没有任何用户
+        var repo = new FakeUserRepository();
+        var service = CreateService(repo);
+
+        // Act + Assert：邮箱不存在时抛出的异常和密码错误完全一样
+        // 这是有意为之的安全设计：攻击者无法通过错误信息判断邮箱是否存在
+        await Assert.ThrowsAsync<InvalidCredentialsException>(
+            () => service.LoginAsync(new LoginRequest
+            {
+                Email = "notexist@example.com",
+                Password = "Test@123456"
+            }));
+    }
+    
 }

@@ -32,4 +32,13 @@ public class FakeUserRepository : IUserRepository
        var user= _store.Values.FirstOrDefault(u => u.Id == id);
        return Task.FromResult(user);
     }
+    
+    public Task<User> UpdateAsync(User user, CancellationToken cancellationToken = default)
+    {
+        // 用更新后的对象覆盖字典里的旧数据
+        // 注意：如果邮箱改变了，旧邮箱的 key 仍然存在于字典里
+        // 在测试场景下这不影响正确性，因为 GetByEmailAsync 按新邮箱查
+        _store[user.Email.ToLower()] = user;
+        return Task.FromResult(user);
+    }
 }
