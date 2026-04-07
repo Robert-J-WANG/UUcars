@@ -68,4 +68,21 @@ public class CarsController : ControllerBase
         var car = await _carService.UpdateAsync(id, currentUserId.Value, request, cancellationToken);
         return Ok(ApiResponse<CarResponse>.Ok(car, "Car updated successfully."));
     }
+    
+    // DELETE /cars/{id}
+    [HttpDelete("{id:int}")]
+    [Authorize]
+    public async Task<IActionResult> Delete(int id, CancellationToken cancellationToken)
+    {
+        var currentUserId = _currentUserService.GetCurrentUserId();
+        if (currentUserId == null)
+            return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+        await _carService.DeleteAsync(id, currentUserId.Value, cancellationToken);
+
+        // 204 No Content：删除成功，无响应体
+        // 不用 ApiResponse 包装，因为没有数据需要返回
+        return NoContent();
+    }
+    
 }

@@ -121,6 +121,22 @@ public class CarService
 
         return MapToResponse(updated);
     }
+
+    public async Task DeleteAsync(int carId,int currentUserId, CancellationToken cancellationToken = default)
+    {
+        var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+        if (car == null)
+            throw new CarNotFoundException(carId);
+        if (car.SellerId != currentUserId)
+            throw new ForbiddenException();
+        if (car.Status != CarStatus.Draft)
+            throw new CarStatusException(car.Id, car.Status, CarStatus.Draft);
+        car.Status = CarStatus.Deleted;
+        car.UpdatedAt = DateTime.UtcNow;
+        await _carRepository.UpdateAsync(car, cancellationToken);
+        
+        _logger.LogInformation("Car {CarId} deleted by seller {SellerId}", car.Id, currentUserId);
+    }
     
 
     // 实体 → DTO 的映射方法

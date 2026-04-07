@@ -6792,3 +6792,213 @@ git push origin feature/cars
 ✅ Scalar 测试通过（200 修改成功、409 非 Draft 状态、403 非车主）
 ✅ Git commit + push 完成
 ```
+
+
+
+## Step 17 · 删除车辆（逻辑删除）
+
+### 这一步做什么
+
+卖家可以删除自己发布的车辆。但"删除"在这里不是真正把数据从数据库里删掉，而是把 `Status` 改成 `Deleted`——这叫**逻辑删除**。
+
+
+
+### 1. 为什么用逻辑删除而不是真正删除
+
+真正删除（物理删除）会把数据库里的行直接删掉，带来几个问题：
+
+**第一，数据无法恢复。** 卖家误操作删了车辆，没有任何补救手段。
+
+**第二，关联数据会出问题。** 如果这辆车有历史订单记录，删掉车辆后订单里的 `CarId` 就成了悬空外键。虽然 Step 06 里配置了 `DeleteBehavior.Restrict` 会阻止这种情况，但这说明物理删除在有关联数据时根本无法执行。
+
+**第三，平台运营需要数据留存。** 即使车辆下架，平台可能仍然需要这条记录做数据分析、纠纷处理等。
+
+逻辑删除把 `Status` 改成 `Deleted`，数据还在，但对外不可见——公开列表过滤掉 `Deleted` 状态的车辆，卖家也看不到它，效果上等同于删除，但数据是安全保留的。
+
+
+
+### 2. 哪些状态的车辆可以被删除
+
+并不是所有状态都能删：
+
+```
+Draft          → 可以删除（草稿，还没提交审核）
+PendingReview  → 不能删除（正在审核中，需要先撤回）
+Published      → 不能删除（已上架，可能有买家正在查看）
+Sold           → 不能删除（已有成交订单，需要保留记录）
+Deleted        → 已经是删除状态，不需要重复操作
+```
+
+只有 `Draft` 状态的车辆允许删除。这是一个有意的约束——如果卖家想下架 `Published` 的车辆，后续会有专门的下架流程（目前 V1 不实现，V2 可以扩展）。
+
+
+
+### 3. 在 CarService 里添加删除方法
+
+打开 `UUcars.API/Services/CarService.cs`，在 `UpdateAsync` 下方添加：
+
+```csharp
+public async Task DeleteAsync(
+    int carId,
+    int currentUserId,
+    CancellationToken cancellationToken = default)
+{
+    var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+    if (car == null)
+        throw new CarNotFoundException(carId);
+
+    // 只有车主可以删除
+    if (car.SellerId != currentUserId)
+        throw new ForbiddenException();
+
+    // 只有 Draft 状态可以删除
+    // 其他状态（PendingReview / Published / Sold）有更严格的业务约束，
+    // 不允许直接逻辑删除
+    if (car.Status != CarStatus.Draft)
+        throw new CarStatusException(car.Id, car.Status, CarStatus.Draft);
+
+    // 逻辑删除：只改状态，不删行
+    car.Status = CarStatus.Deleted;
+    car.UpdatedAt = DateTime.UtcNow;
+
+    await _carRepository.UpdateAsync(car, cancellationToken);
+
+    _logger.LogInformation("Car {CarId} deleted by seller {SellerId}", car.Id, currentUserId);
+}
+```
+
+> **`DeleteAsync` 为什么不返回 `CarResponse`，而是返回 `void`（`Task`）？** 删除操作成功后，资源已经不存在了，没有有意义的数据需要返回给客户端。Controller 会返回 `204 No Content`，表示"操作成功，没有响应体"。这是 REST 规范对删除操作的标准做法——`200 OK` 带响应体，`204 No Content` 不带响应体。
+
+
+
+### 4. 在 CarsController 里添加 DELETE /cars/{id}
+
+打开 `UUcars.API/Controllers/CarsController.cs`，在 `Update` 方法下方添加：
+
+```csharp
+// DELETE /cars/{id}
+[HttpDelete("{id:int}")]
+[Authorize]
+public async Task<IActionResult> Delete(int id, CancellationToken cancellationToken)
+{
+    var currentUserId = _currentUserService.GetCurrentUserId();
+    if (currentUserId == null)
+        return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+    await _carService.DeleteAsync(id, currentUserId.Value, cancellationToken);
+
+    // 204 No Content：删除成功，无响应体
+    // 不用 ApiResponse 包装，因为没有数据需要返回
+    return NoContent();
+}
+```
+
+> **为什么这里不用 `ApiResponse<T>` 包装？** `ApiResponse<T>` 是为了统一有数据返回的接口格式。`204 No Content` 按 HTTP 规范本来就没有响应体，强行包一层 `ApiResponse` 反而违反了语义。客户端收到 204 就知道操作成功了，不需要解析响应体。
+
+
+
+### 5. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 6. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**正常删除（Draft 状态）：**
+
+先登录，创建一辆新车（此时是 Draft），然后删除：
+
+```
+DELETE /cars/2
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......
+```
+
+预期（204）：无响应体，只有状态码。
+
+可以去数据库里查一下这辆车的 `Status` 字段，应该变成了 `Deleted`，行本身还在。
+
+**删除已提交审核的车（应返回 409）：**
+
+先把车辆提交审核（`POST /cars/1/submit`），再尝试删除，预期：
+
+```json
+{
+  "success": false,
+  "message": "Car '1' is in 'PendingReview' status. Required status: 'Draft'."
+}
+```
+
+**删除别人的车（应返回 403）：**
+
+换一个用户的 Token，尝试删除不属于自己的车，预期返回 403。
+
+**删除不存在的车（应返回 404）：**
+
+```
+DELETE /cars/9999
+```
+
+预期：
+
+```json
+{
+  "success": false,
+  "message": "Car with id '9999' was not found."
+}
+```
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 7. 此时的目录变化
+
+这一步没有新增文件，只在已有的 `CarService` 和 `CarsController` 里新增了方法。
+
+
+
+### 8. Git 提交
+
+```bash
+git add .
+git commit -m "feat: DELETE /cars/{id} - soft delete car draft"
+git push origin feature/cars
+```
+
+
+
+### Step 17 完成状态
+
+```
+✅ 理解逻辑删除 vs 物理删除（数据保留、关联安全、运营需要）
+✅ 理解哪些状态可以删除（只有 Draft）及原因
+✅ CarService.DeleteAsync（车主检查 + Draft 状态检查 + 逻辑删除）
+✅ 理解 DeleteAsync 返回 Task 而不是 CarResponse 的原因
+✅ CarsController DELETE /cars/{id}（返回 204 No Content）
+✅ 理解 204 不用 ApiResponse 包装的原因
+✅ Scalar 测试通过（204 删除成功、409 非 Draft、403 非车主、404 不存在）
+✅ Git commit + push 完成
+```
+
