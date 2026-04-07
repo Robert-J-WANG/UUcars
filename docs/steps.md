@@ -6013,8 +6013,12 @@ public class CarService
         var created = await _carRepository.AddAsync(car, cancellationToken);
 
         _logger.LogInformation("Car created: {CarId} by seller {SellerId}", created.Id, sellerId);
+        
+        // Create 完之后，返回里必须要有 SellerUsername的话，Add 完 → 再查一次
+        //因为GetByIdAsync带 Include， 手动加载car.Seller（导航属性），这样car.Seller就不是null了
+        var carWithSeller= await _carRepository.GetByIdAsync(created.Id, cancellationToken);
+        return MapToResponse(carWithSeller!);
 
-        return MapToResponse(created);
     }
 
     // 实体 → DTO 的映射方法
@@ -6541,3 +6545,250 @@ git push origin feature/cars
 ✅ Git commit + push 完成
 ```
 
+
+
+## Step 16 · 修改车辆
+
+### 这一步做什么
+
+卖家创建草稿之后，可能需要修改车辆信息（比如调整价格、补充描述）。这一步实现 `PUT /cars/{id}`。
+
+但不是什么时候都能修改——已经提交审核或者已上架的车辆不允许修改。原因很直接：如果车辆正在审核中，卖家偷偷修改了信息，Admin 审核的内容就和最终上架的内容不一致；如果车辆已经公开，买家正在查看，卖家随意修改信息会造成信息不一致的问题。所以修改只允许在 `Draft` 状态进行。
+
+
+
+### 1. 创建 DTO
+
+#### `DTOs/Requests/CarUpdateRequest.cs`
+
+```bash
+touch UUcars.API/DTOs/Requests/CarUpdateRequest.cs
+```
+
+`CarUpdateRequest` 和 `CarCreateRequest` 字段基本一致——修改时可以改所有业务字段，但 `Status` 和 `SellerId` 不能改（状态由业务流程控制，卖家是创建时锁定的）：
+
+```csharp
+using System.ComponentModel.DataAnnotations;
+
+namespace UUcars.API.DTOs.Requests;
+
+public class CarUpdateRequest
+{
+    [Required(ErrorMessage = "Title is required.")]
+    [MaxLength(100, ErrorMessage = "Title must not exceed 100 characters.")]
+    public string Title { get; set; } = string.Empty;
+
+    [Required(ErrorMessage = "Brand is required.")]
+    [MaxLength(50, ErrorMessage = "Brand must not exceed 50 characters.")]
+    public string Brand { get; set; } = string.Empty;
+
+    [Required(ErrorMessage = "Model is required.")]
+    [MaxLength(50, ErrorMessage = "Model must not exceed 50 characters.")]
+    public string Model { get; set; } = string.Empty;
+
+    [Required(ErrorMessage = "Year is required.")]
+    [Range(1900, 2100, ErrorMessage = "Year must be between 1900 and 2100.")]
+    public int Year { get; set; }
+
+    [Required(ErrorMessage = "Price is required.")]
+    [Range(0.01, double.MaxValue, ErrorMessage = "Price must be greater than 0.")]
+    public decimal Price { get; set; }
+
+    [Required(ErrorMessage = "Mileage is required.")]
+    [Range(0, int.MaxValue, ErrorMessage = "Mileage must be 0 or greater.")]
+    public int Mileage { get; set; }
+
+    [MaxLength(2000, ErrorMessage = "Description must not exceed 2000 characters.")]
+    public string? Description { get; set; }
+}
+```
+
+> **`CarUpdateRequest` 和 `CarCreateRequest` 字段几乎一样，为什么不复用同一个类？** 虽然现在字段相同，但两者的语义不同——一个是"创建时传入的数据"，一个是"修改时传入的数据"。将来业务变化时，两者可能会出现差异（比如创建时必填的字段，修改时允许为空）。分开定义是为了保持灵活性，避免将来一个类的改动影响到另一个场景。这是 DTO 设计的常见原则：**按使用场景定义，而不是按字段相似度复用。**
+
+
+
+### 2. 在 CarService 里添加修改方法
+
+打开 `UUcars.API/Services/CarService.cs`，在 `SubmitForReviewAsync` 下方添加：
+
+```csharp
+public async Task<CarResponse> UpdateAsync(
+    int carId,
+    int currentUserId,
+    CarUpdateRequest request,
+    CancellationToken cancellationToken = default)
+{
+    var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+    if (car == null)
+        throw new CarNotFoundException(carId);
+
+    // 只有车主可以修改
+    if (car.SellerId != currentUserId)
+        throw new ForbiddenException();
+
+    // 只有 Draft 状态可以修改
+    // PendingReview：正在审核中，修改会导致审核内容和实际内容不一致
+    // Published：已上架，买家正在查看，不允许随意修改
+    // Sold / Deleted：已完成或已删除，修改没有意义
+    if (car.Status != CarStatus.Draft)
+        throw new CarStatusException(car.Id, car.Status, CarStatus.Draft);
+
+    car.Title = request.Title;
+    car.Brand = request.Brand;
+    car.Model = request.Model;
+    car.Year = request.Year;
+    car.Price = request.Price;
+    car.Mileage = request.Mileage;
+    car.Description = request.Description;
+    car.UpdatedAt = DateTime.UtcNow;
+
+    var updated = await _carRepository.UpdateAsync(car, cancellationToken);
+
+    _logger.LogInformation("Car {CarId} updated by seller {SellerId}", car.Id, currentUserId);
+
+    return MapToResponse(updated);
+}
+```
+
+
+
+### 3. 在 CarsController 里添加 PUT /cars/{id}
+
+打开 `UUcars.API/Controllers/CarsController.cs`，在 `Submit` 方法下方添加：
+
+```csharp
+// PUT /cars/{id}
+[HttpPut("{id:int}")]
+[Authorize]
+public async Task<IActionResult> Update(
+    int id,
+    [FromBody] CarUpdateRequest request,
+    CancellationToken cancellationToken)
+{
+    var currentUserId = _currentUserService.GetCurrentUserId();
+    if (currentUserId == null)
+        return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+    var car = await _carService.UpdateAsync(id, currentUserId.Value, request, cancellationToken);
+    return Ok(ApiResponse<CarResponse>.Ok(car, "Car updated successfully."));
+}
+```
+
+
+
+### 4. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 5. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**正常修改（Draft 状态）：**
+
+先登录，创建一辆车（此时是 Draft），然后修改：
+
+```json
+PUT /cars/1
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......
+
+{
+    "title": "2009 Nissan Murano", 
+    "brand": "Nissan", 
+    "model": "Murano", 
+    "year": 2009, 
+    "price": 3500, 
+    "mileage": 240000, 
+    "description": "Sunroof, Leather, heated, electric seats. Wof goes out this month has rego. O2 sensor has come up on vehicle scanner, however still runs and drives perfectly, has been my daily vehicle. Please note this is the only reason why the check engine light is on. PM for more details and pictures. Only selling as I’d like to downsize, car has a lot of room and is spacious."
+}
+```
+
+预期（200）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": 1,
+    "title": "2020款宝马3系 价格调整",
+    "price": 260000,
+    "status": "Draft",
+    ...
+  },
+  "message": "Car updated successfully."
+}
+```
+
+**修改已提交审核的车（应返回 409）：**
+
+先把车辆提交审核（`POST /cars/1/submit`），再尝试修改，预期：
+
+```json
+{
+  "success": false,
+  "message": "Car '1' is in 'PendingReview' status. Required status: 'Draft'."
+}
+```
+
+**修改别人的车（应返回 403）：**
+
+换一个用户的 Token，尝试修改不属于自己的车，预期返回 403。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 6. 此时的目录变化
+
+```
+UUcars.API/
+└── DTOs/
+    └── Requests/
+        └── CarUpdateRequest.cs     ← 新增
+```
+
+`CarService` 和 `CarsController` 新增了方法，不是新文件。
+
+
+
+### 7. Git 提交
+
+```bash
+git add .
+git commit -m "feat: PUT /cars/{id} - edit car draft"
+git push origin feature/cars
+```
+
+
+
+### Step 16 完成状态
+
+```
+✅ 理解为什么只有 Draft 状态可以修改（审核中和已上架的车不允许随意改）
+✅ CarUpdateRequest DTO（理解和 CarCreateRequest 分开定义的原因）
+✅ CarService.UpdateAsync（车主检查 + Draft 状态检查）
+✅ CarsController PUT /cars/{id}
+✅ Scalar 测试通过（200 修改成功、409 非 Draft 状态、403 非车主）
+✅ Git commit + push 完成
+```

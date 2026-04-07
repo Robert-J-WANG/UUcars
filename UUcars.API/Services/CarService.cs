@@ -39,10 +39,14 @@ public class CarService
         };
 
         var created = await _carRepository.AddAsync(car, cancellationToken);
+        // 再查一次，把 Seller 带出来
+        
 
         _logger.LogInformation("Car created: {CarId} by seller {SellerId}", created.Id, sellerId);
 
-        return MapToResponse(created);
+        // Create 完之后，返回里必须要有 SellerUsername的话，Add 完 → 再查一次（因为GetByIdAsync带 Include， 手动加载car.Seller（导航属性）），这样car.Seller就不是null了
+        var carWithSeller= await _carRepository.GetByIdAsync(created.Id, cancellationToken);
+        return MapToResponse(carWithSeller!);
     }
 
 
@@ -79,6 +83,45 @@ public class CarService
 
         return MapToResponse(updated);
     }
+
+    public async Task<CarResponse> UpdateAsync(
+        int carId,
+        int currentUserId,
+        CarUpdateRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+        if (car == null)
+            throw new CarNotFoundException(carId);
+
+        // 只有车主可以修改
+        if (car.SellerId != currentUserId)
+            throw new ForbiddenException();
+
+        // 只有 Draft 状态可以修改
+        // PendingReview：正在审核中，修改会导致审核内容和实际内容不一致
+        // Published：已上架，买家正在查看，不允许随意修改
+        // Sold / Deleted：已完成或已删除，修改没有意义
+        if (car.Status != CarStatus.Draft)
+            throw new CarStatusException(car.Id, car.Status, CarStatus.Draft);
+
+        car.Title = request.Title;
+        car.Brand = request.Brand;
+        car.Model = request.Model;
+        car.Year = request.Year;
+        car.Price = request.Price;
+        car.Mileage = request.Mileage;
+        car.Description = request.Description;
+        car.UpdatedAt = DateTime.UtcNow;
+
+        var updated = await _carRepository.UpdateAsync(car, cancellationToken);
+
+        _logger.LogInformation("Car {CarId} updated by seller {SellerId}", car.Id, currentUserId);
+
+        return MapToResponse(updated);
+    }
+    
 
     // 实体 → DTO 的映射方法
     // 注意 SellerUsername 暂时用空字符串——创建时 EF Core 不会自动加载导航属性

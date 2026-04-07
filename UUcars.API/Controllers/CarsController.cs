@@ -52,4 +52,20 @@ public class CarsController : ControllerBase
         var car = await _carService.SubmitForReviewAsync(id, currentUserId.Value, cancellationToken);
         return Ok(ApiResponse<CarResponse>.Ok(car, "Car submitted for review successfully."));
     }
+    
+    // PUT /cars/{id}
+    [HttpPut("{id:int}")]
+    [Authorize]
+    public async Task<IActionResult> Update(
+        int id,
+        [FromBody] CarUpdateRequest request,
+        CancellationToken cancellationToken)
+    {
+        var currentUserId = _currentUserService.GetCurrentUserId();
+        if (currentUserId == null)
+            return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+        var car = await _carService.UpdateAsync(id, currentUserId.Value, request, cancellationToken);
+        return Ok(ApiResponse<CarResponse>.Ok(car, "Car updated successfully."));
+    }
 }
