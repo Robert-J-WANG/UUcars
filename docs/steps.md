@@ -7002,3 +7002,461 @@ git push origin feature/cars
 ✅ Git commit + push 完成
 ```
 
+
+
+## Step 18 · 车辆图片管理
+
+### 这一步做什么
+
+车辆创建好之后，卖家需要给车辆添加图片。这一步实现两个接口：
+
+```
+POST   /cars/{id}/images              ← 给车辆添加一张图片
+DELETE /cars/{id}/images/{imageId}    ← 删除车辆的某张图片
+```
+
+V1 里图片以 URL 形式提交（卖家填写图片地址），不做真实文件上传。真实文件上传（上传到云存储）是 V2 的内容，但表结构和接口设计现在就按最终形态来做，V2 只需要改 URL 的生成方式，接口本身不需要变。
+
+
+
+### 1. 图片操作为什么限制在 Draft 状态
+
+和修改车辆信息的限制一样：
+
+```
+Draft         → 可以添加/删除图片（还没提交，随意调整）
+PendingReview → 不可以（正在审核，图片不能改）
+Published     → 不可以（已上架，买家正在看）
+Sold/Deleted  → 不可以（已完成或已删除）
+```
+
+图片是车辆信息的一部分，审核时 Admin 看到的图片和最终上架的图片必须一致，所以提交审核之后图片就不能再动了。
+
+
+
+### 2. 创建 DTO
+
+#### `DTOs/Requests/CarImageAddRequest.cs`
+
+```bash
+touch UUcars.API/DTOs/Requests/CarImageAddRequest.cs
+```
+
+```c#
+using System.ComponentModel.DataAnnotations;
+
+namespace UUcars.API.DTOs.Requests;
+
+public class CarImageAddRequest
+{
+    // V1 只支持提交 URL，不做真实文件上传
+    // URL 格式验证：[Url] 特性会检查是否是合法的 HTTP/HTTPS 地址
+    [Required(ErrorMessage = "ImageUrl is required.")]
+    [Url(ErrorMessage = "ImageUrl must be a valid URL.")]
+    [MaxLength(500, ErrorMessage = "ImageUrl must not exceed 500 characters.")]
+    public string ImageUrl { get; set; } = string.Empty;
+
+    // 显示顺序，默认 0（第一张图片作为封面）
+    // 客户端可以传入顺序值控制图片排列
+    public int SortOrder { get; set; } = 0;
+}
+```
+
+#### `DTOs/Responses/CarImageResponse.cs`
+
+```bash
+touch UUcars.API/DTOs/Responses/CarImageResponse.cs
+```
+
+```c#
+namespace UUcars.API.DTOs.Responses;
+
+public class CarImageResponse
+{
+    public int Id { get; set; }
+    public string ImageUrl { get; set; } = string.Empty;
+    public int SortOrder { get; set; }
+    public int CarId { get; set; }
+}
+```
+
+
+
+### 3. 创建 ICarImageRepository
+
+图片的数据访问逻辑和车辆本身分开——职责清晰，也方便后续单独扩展（比如 V2 要做图片排序、设置封面等操作）：
+
+```bash
+touch UUcars.API/Repositories/ICarImageRepository.cs
+touch UUcars.API/Repositories/EfCarImageRepository.cs
+```
+
+```c#
+using UUcars.API.Entities;
+
+namespace UUcars.API.Repositories;
+
+public interface ICarImageRepository
+{
+    Task<CarImage> AddAsync(CarImage image, CancellationToken cancellationToken = default);
+    Task<CarImage?> GetByIdAsync(int imageId, CancellationToken cancellationToken = default);
+    Task DeleteAsync(CarImage image, CancellationToken cancellationToken = default);
+}
+```
+
+```c#
+using Microsoft.EntityFrameworkCore;
+using UUcars.API.Data;
+using UUcars.API.Entities;
+
+namespace UUcars.API.Repositories;
+
+public class EfCarImageRepository : ICarImageRepository
+{
+    private readonly AppDbContext _context;
+
+    public EfCarImageRepository(AppDbContext context)
+    {
+        _context = context;
+    }
+
+    public async Task<CarImage> AddAsync(CarImage image, CancellationToken cancellationToken = default)
+    {
+        _context.CarImages.Add(image);
+        await _context.SaveChangesAsync(cancellationToken);
+        return image;
+    }
+
+    public async Task<CarImage?> GetByIdAsync(int imageId, CancellationToken cancellationToken = default)
+    {
+        return await _context.CarImages
+            .Include(ci => ci.Car)  // 加载关联的 Car，用于后续验证车主和状态
+            .FirstOrDefaultAsync(ci => ci.Id == imageId, cancellationToken);
+    }
+
+    public async Task DeleteAsync(CarImage image, CancellationToken cancellationToken = default)
+    {
+        // 图片是真正的物理删除——图片记录本身没有业务含义，删了就是删了
+        // 和车辆的逻辑删除不同：车辆有关联订单等历史数据需要保留，
+        // 图片只是附属资源，删掉不影响任何业务记录
+        _context.CarImages.Remove(image);
+        await _context.SaveChangesAsync(cancellationToken);
+    }
+}
+```
+
+> **这里图片用物理删除，和车辆的逻辑删除形成对比。** 判断依据是：这条数据删了之后，会不会有其他地方找不到它而出问题？车辆删了订单里的 CarId 就成了悬空外键，所以逻辑删除。图片删了没有任何其他表引用它，物理删除完全安全。
+
+
+
+### 4. 创建业务异常
+
+```bash
+touch UUcars.API/Exceptions/CarImageNotFoundException.cs
+namespace UUcars.API.Exceptions;
+
+public class CarImageNotFoundException : AppException
+{
+    public CarImageNotFoundException(int imageId)
+        : base(StatusCodes.Status404NotFound, $"Car image with id '{imageId}' was not found.")
+    {
+    }
+}
+```
+
+
+
+### 5. 在 CarService 里添加图片管理方法
+
+打开 `UUcars.API/Services/CarService.cs`，构造函数注入 `ICarImageRepository`，并添加两个方法：
+
+先更新构造函数：
+
+```csharp
+private readonly ICarRepository _carRepository;
+private readonly ICarImageRepository _carImageRepository;  // 新增
+private readonly ILogger<CarService> _logger;
+
+public CarService(
+    ICarRepository carRepository,
+    ICarImageRepository carImageRepository,     // 新增
+    ILogger<CarService> logger)
+{
+    _carRepository = carRepository;
+    _carImageRepository = carImageRepository;   // 新增
+    _logger = logger;
+}
+```
+
+再添加两个图片管理方法：
+
+```csharp
+public async Task<CarImageResponse> AddImageAsync(
+    int carId,
+    int currentUserId,
+    CarImageAddRequest request,
+    CancellationToken cancellationToken = default)
+{
+    var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+    if (car == null)
+        throw new CarNotFoundException(carId);
+
+    if (car.SellerId != currentUserId)
+        throw new ForbiddenException();
+
+    // 只有 Draft 状态才能添加图片
+    if (car.Status != CarStatus.Draft)
+        throw new CarStatusException(car.Id, car.Status, CarStatus.Draft);
+
+    var image = new CarImage
+    {
+        CarId = carId,
+        ImageUrl = request.ImageUrl,
+        SortOrder = request.SortOrder
+    };
+
+    var created = await _carImageRepository.AddAsync(image, cancellationToken);
+
+    _logger.LogInformation("Image added to car {CarId} by seller {SellerId}", carId, currentUserId);
+
+    return MapToImageResponse(created);
+}
+
+public async Task DeleteImageAsync(
+    int carId,
+    int imageId,
+    int currentUserId,
+    CancellationToken cancellationToken = default)
+{
+    // 先验证车辆存在（保证 carId 是合法的）
+    var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+    if (car == null)
+        throw new CarNotFoundException(carId);
+
+    if (car.SellerId != currentUserId)
+        throw new ForbiddenException();
+
+    if (car.Status != CarStatus.Draft)
+        throw new CarStatusException(car.Id, car.Status, CarStatus.Draft);
+
+    // 再验证图片存在，且属于这辆车
+    // 为什么要检查 image.CarId == carId？
+    // 防止用户构造 /cars/1/images/99 这样的请求来删除属于 car 99 的图片
+    // URL 里的 carId 和图片实际的 CarId 必须匹配
+    var image = await _carImageRepository.GetByIdAsync(imageId, cancellationToken);
+    if (image == null || image.CarId != carId)
+        throw new CarImageNotFoundException(imageId);
+
+    await _carImageRepository.DeleteAsync(image, cancellationToken);
+
+    _logger.LogInformation("Image {ImageId} deleted from car {CarId} by seller {SellerId}",
+        imageId, carId, currentUserId);
+}
+
+// 图片实体 → DTO 映射
+private static CarImageResponse MapToImageResponse(CarImage image) => new()
+{
+    Id = image.Id,
+    ImageUrl = image.ImageUrl,
+    SortOrder = image.SortOrder,
+    CarId = image.CarId
+};
+```
+
+同时在 `CarService.cs` 顶部补上 using：
+
+```csharp
+using UUcars.API.DTOs.Requests;
+```
+
+
+
+### 6. 在 CarsController 里添加图片管理端点
+
+打开 `UUcars.API/Controllers/CarsController.cs`，在 `Delete` 方法下方添加：
+
+```csharp
+// POST /cars/{id}/images
+[HttpPost("{id:int}/images")]
+[Authorize]
+public async Task<IActionResult> AddImage(
+    int id,
+    [FromBody] CarImageAddRequest request,
+    CancellationToken cancellationToken)
+{
+    var currentUserId = _currentUserService.GetCurrentUserId();
+    if (currentUserId == null)
+        return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+    var image = await _carService.AddImageAsync(id, currentUserId.Value, request, cancellationToken);
+
+    return StatusCode(StatusCodes.Status201Created,
+        ApiResponse<CarImageResponse>.Ok(image, "Image added successfully."));
+}
+
+// DELETE /cars/{id}/images/{imageId}
+[HttpDelete("{id:int}/images/{imageId:int}")]
+[Authorize]
+public async Task<IActionResult> DeleteImage(
+    int id,
+    int imageId,
+    CancellationToken cancellationToken)
+{
+    var currentUserId = _currentUserService.GetCurrentUserId();
+    if (currentUserId == null)
+        return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+    await _carService.DeleteImageAsync(id, imageId, currentUserId.Value, cancellationToken);
+
+    return NoContent();
+}
+```
+
+> **路由 `{id:int}/images/{imageId:int}` 里有两个路由参数，框架如何区分？** ASP.NET Core 路由系统按名字匹配——`{id:int}` 绑定到方法参数 `int id`，`{imageId:int}` 绑定到 `int imageId`，参数名必须和路由模板里的占位符名字一致，大小写不敏感。
+
+
+
+### 7. 注册依赖到 Program.cs
+
+```csharp
+// 车辆模块
+builder.Services.AddScoped<ICarRepository, EfCarRepository>();
+builder.Services.AddScoped<ICarImageRepository, EfCarImageRepository>();  // 新增
+builder.Services.AddScoped<CarService>();
+```
+
+
+
+### 8. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 9. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**正常添加图片：**
+
+先登录，创建一辆车（Draft 状态），然后添加图片：
+
+```json
+POST /cars/1/images
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......
+
+{
+  "imageUrl": "https://example.com/car1-front.jpg",
+  "sortOrder": 0
+}
+```
+
+预期（201）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": 1,
+    "imageUrl": "https://example.com/car1-front.jpg",
+    "sortOrder": 0,
+    "carId": 1
+  },
+  "message": "Image added successfully."
+}
+```
+
+**正常删除图片：**
+
+```
+DELETE /cars/1/images/1
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......
+```
+
+预期（204）：无响应体。
+
+**给已提交审核的车添加图片（应返回 409）：**
+
+提交车辆审核后再尝试添加图片，预期：
+
+```json
+{
+  "success": false,
+  "message": "Car '1' is in 'PendingReview' status. Required status: 'Draft'."
+}
+```
+
+**删除不属于该车辆的图片（应返回 404）：**
+
+尝试 `DELETE /cars/1/images/99`（图片 99 属于另一辆车），预期返回 404。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 10. 此时的目录变化
+
+```
+UUcars.API/
+├── DTOs/
+│   ├── Requests/
+│   │   └── CarImageAddRequest.cs       ← 新增
+│   └── Responses/
+│       └── CarImageResponse.cs         ← 新增
+├── Exceptions/
+│   └── CarImageNotFoundException.cs    ← 新增
+└── Repositories/
+    ├── ICarImageRepository.cs          ← 新增
+    └── EfCarImageRepository.cs         ← 新增
+```
+
+`CarService` 和 `CarsController` 新增了方法，不是新文件。
+
+
+
+### 11. Git 提交
+
+```bash
+git add .
+git commit -m "feat: car image management (add/delete)"
+git push origin feature/cars
+```
+
+
+
+### Step 18 完成状态
+
+```
+✅ 理解图片为什么限制在 Draft 状态操作
+✅ 理解图片用物理删除而车辆用逻辑删除的原因
+✅ CarImageAddRequest / CarImageResponse DTO
+✅ CarImageNotFoundException（404）
+✅ ICarImageRepository + EfCarImageRepository
+✅ CarService 新增 AddImageAsync / DeleteImageAsync
+✅ 理解 DeleteImageAsync 里为什么要验证 image.CarId == carId（防止跨车删图）
+✅ CarsController 新增 POST /cars/{id}/images 和 DELETE /cars/{id}/images/{imageId}
+✅ 理解双路由参数的绑定规则
+✅ DI 注册完成
+✅ Scalar 测试通过
+✅ Git commit + push 完成
+```
+

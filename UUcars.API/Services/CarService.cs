@@ -10,11 +10,13 @@ namespace UUcars.API.Services;
 public class CarService
 {
     private readonly ICarRepository _carRepository;
+    private readonly ICarImageRepository _carImageRepository;
     private readonly ILogger<CarService> _logger;
 
-    public CarService(ICarRepository carRepository, ILogger<CarService> logger)
+    public CarService(ICarRepository carRepository,ICarImageRepository carImageRepository ,ILogger<CarService> logger)
     {
         _carRepository = carRepository;
+        _carImageRepository = carImageRepository;
         _logger = logger;
     }
 
@@ -69,7 +71,7 @@ public class CarService
 
         // 3. 不是 Draft 状态
         // 为什么要检查这个？防止重复提交。已经在 PendingReview 的车再次提交没有意义，
-        // Published 的车更不应该被重新提交审核（会破坏状态机）
+        // Published 的车更不应该被重新提交审核:会破坏状态机
         if (car.Status != CarStatus.Draft)
             throw new CarStatusException(car.Id, car.Status, CarStatus.PendingReview);
 
@@ -137,6 +139,71 @@ public class CarService
         
         _logger.LogInformation("Car {CarId} deleted by seller {SellerId}", car.Id, currentUserId);
     }
+
+
+    public async Task<CarImageResponse> AddImageAsync(
+        int carId,
+        int currentUserId,
+        CarImageAddRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+        if (car == null)
+            throw new CarNotFoundException(carId);
+
+        if (car.SellerId != currentUserId)
+            throw new ForbiddenException();
+
+        // 只有 Draft 状态才能添加图片
+        if (car.Status != CarStatus.Draft)
+            throw new CarStatusException(car.Id, car.Status, CarStatus.Draft);
+
+        var image = new CarImage
+        {
+            CarId = carId,
+            ImageUrl = request.ImageUrl,
+            SortOrder = request.SortOrder
+        };
+
+        var created = await _carImageRepository.AddAsync(image, cancellationToken);
+
+        _logger.LogInformation("Image added to car {CarId} by seller {SellerId}", carId, currentUserId);
+
+        return MapToImageResponse(created);
+    }
+
+    public async Task DeleteImageAsync(
+        int carId,
+        int imageId,
+        int currentUserId,
+        CancellationToken cancellationToken = default)
+    {
+        // 先验证车辆存在（保证 carId 是合法的）
+        var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+        if (car == null)
+            throw new CarNotFoundException(carId);
+
+        if (car.SellerId != currentUserId)
+            throw new ForbiddenException();
+
+        if (car.Status != CarStatus.Draft)
+            throw new CarStatusException(car.Id, car.Status, CarStatus.Draft);
+
+        // 再验证图片存在，且属于这辆车
+        // 为什么要检查 image.CarId == carId？
+        // 防止用户构造 /cars/1/images/99 这样的请求来删除属于 car 99 的图片
+        // URL 里的 carId 和图片实际的 CarId 必须匹配
+        var image = await _carImageRepository.GetByIdAsync(imageId, cancellationToken);
+        if (image == null || image.CarId != carId)
+            throw new CarImageNotFoundException(imageId);
+
+        await _carImageRepository.DeleteAsync(image, cancellationToken);
+
+        _logger.LogInformation("Image {ImageId} deleted from car {CarId} by seller {SellerId}",
+            imageId, carId, currentUserId);
+    }
+
     
 
     // 实体 → DTO 的映射方法
@@ -157,5 +224,13 @@ public class CarService
         SellerUsername = car.Seller?.Username ?? string.Empty,
         CreatedAt = car.CreatedAt,
         UpdatedAt = car.UpdatedAt
+    };
+
+    internal static CarImageResponse MapToImageResponse(CarImage image) => new()
+    {
+        Id = image.Id,
+        ImageUrl = image.ImageUrl,
+        SortOrder = image.SortOrder,
+        CarId = image.CarId
     };
 }

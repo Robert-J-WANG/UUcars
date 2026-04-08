@@ -85,4 +85,39 @@ public class CarsController : ControllerBase
         return NoContent();
     }
     
+    // POST /cars/{id}/images
+    [HttpPost("{id:int}/images")]
+    [Authorize]
+    public async Task<IActionResult> AddImage(
+        int id,
+        [FromBody] CarImageAddRequest request,
+        CancellationToken cancellationToken)
+    {
+        var currentUserId = _currentUserService.GetCurrentUserId();
+        if (currentUserId == null)
+            return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+        var image = await _carService.AddImageAsync(id, currentUserId.Value, request, cancellationToken);
+
+        return StatusCode(StatusCodes.Status201Created,
+            ApiResponse<CarImageResponse>.Ok(image, "Image added successfully."));
+    }
+    
+    // DELETE /cars/{id}/images/{imageId}
+    [HttpDelete("{id:int}/images/{imageId:int}")]
+    [Authorize]
+    public async Task<IActionResult> DeleteImage(
+        int id,
+        int imageId,
+        CancellationToken cancellationToken)
+    {
+        var currentUserId = _currentUserService.GetCurrentUserId();
+        if (currentUserId == null)
+            return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+        await _carService.DeleteImageAsync(id, imageId, currentUserId.Value, cancellationToken);
+
+        return NoContent();
+    }
+    
 }

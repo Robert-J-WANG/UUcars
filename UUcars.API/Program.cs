@@ -85,6 +85,7 @@ try
     // 车辆模块
     builder.Services.AddScoped<ICarRepository, EfCarRepository>();
     builder.Services.AddScoped<CarService>();
+    builder.Services.AddScoped<ICarImageRepository, EfCarImageRepository>();  // 新增
 
     // =============================================
     // 构建应用
