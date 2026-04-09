@@ -7796,3 +7796,279 @@ git push origin feature/cars
 ✅ Git commit + push 完成
 ```
 
+
+
+## Step 20 · 我的车辆列表（卖家视角）
+
+### 这一步做什么
+
+Step 19 实现了公开车辆列表，只返回 `Published` 的车辆。但卖家还需要看到自己发布的所有车辆，包括还在 `Draft`、`PendingReview` 状态的——否则卖家创建了草稿之后，完全看不到自己的车在哪里，没办法管理。
+
+这一步实现 `GET /cars/my-listings`，返回当前登录用户作为卖家发布的所有车辆（含所有状态）。
+
+
+
+### 1. 为什么需要这个接口
+
+公开列表（`GET /cars`）和卖家列表（`GET /cars/my-listings`）是两个完全不同的视角：
+
+```
+GET /cars              ← 买家视角，只看 Published，不需要登录
+GET /cars/my-listings  ← 卖家视角，看自己所有状态的车，需要登录
+```
+
+如果没有 `GET /cars/my-listings`，卖家创建草稿之后就找不到它了——公开列表不会显示 `Draft` 的车，卖家无法查看、修改、提交审核，整个车辆管理流程就断掉了。
+
+
+
+### 2. 路由顺序的问题
+
+这一步有一个值得注意的路由细节。`CarsController` 里已经有：
+
+```
+GET /cars          → GetAll()
+GET /cars/{id}     → GetById()（Step 22 才实现）
+```
+
+现在要加：
+
+```
+GET /cars/my-listings → GetMyListings()
+```
+
+问题来了：框架在匹配 `GET /cars/my-listings` 时，会不会误以为 `my-listings` 是 `{id}` 的值，把请求路由到 `GetById()` 里？
+
+答案是**不会**，因为 `{id}` 有路由约束 `:int`——`my-listings` 不是整数，所以不会匹配 `GET /cars/{id:int}`。框架会继续往下找，匹配到 `GET /cars/my-listings`。
+
+但如果 `{id}` 没有 `:int` 约束（比如写成 `{id}`），`my-listings` 就会被当成字符串 id 传进去，引发错误。这也是 Step 15 里特意给路由参数加 `:int` 约束的原因之一。
+
+
+
+### 3. 给 ICarRepository 增加卖家列表查询方法
+
+打开 `UUcars.API/Repositories/ICarRepository.cs`，新增：
+
+```csharp
+using UUcars.API.Entities;
+using UUcars.API.Entities.Enums;
+
+namespace UUcars.API.Repositories;
+
+public interface ICarRepository
+{
+    Task<Car> AddAsync(Car car, CancellationToken cancellationToken = default);
+    Task<Car?> GetByIdAsync(int id, CancellationToken cancellationToken = default);
+    Task<Car> UpdateAsync(Car car, CancellationToken cancellationToken = default);
+    Task<(List<Car> Cars, int TotalCount)> GetPagedAsync(
+        CarStatus status,
+        int page,
+        int pageSize,
+        CancellationToken cancellationToken = default);
+
+    // 新增：查询某个卖家的所有车辆（不过滤状态，支持分页）
+    Task<(List<Car> Cars, int TotalCount)> GetBySellerAsync(
+        int sellerId,
+        int page,
+        int pageSize,
+        CancellationToken cancellationToken = default);
+}
+```
+
+打开 `UUcars.API/Repositories/EfCarRepository.cs`，补充实现：
+
+```csharp
+public async Task<(List<Car> Cars, int TotalCount)> GetBySellerAsync(
+    int sellerId,
+    int page,
+    int pageSize,
+    CancellationToken cancellationToken = default)
+{
+    var query = _context.Cars
+        .Include(c => c.Seller)
+        .Where(c => c.SellerId == sellerId);
+        // 注意：这里没有过滤 Status，返回卖家所有状态的车辆
+        // 但排除逻辑删除的车辆——卖家也不需要看到已删除的车
+        // 如果将来需要显示已删除的车，可以单独加一个接口
+
+    // 去掉逻辑删除的车（卖家视角也不需要看到已删除的车）
+    query = query.Where(c => c.Status != CarStatus.Deleted);
+
+    var totalCount = await query.CountAsync(cancellationToken);
+
+    var cars = await query
+        .OrderByDescending(c => c.CreatedAt)
+        .Skip((page - 1) * pageSize)
+        .Take(pageSize)
+        .ToListAsync(cancellationToken);
+
+    return (cars, totalCount);
+}
+```
+
+
+
+### 4. 在 CarService 里添加卖家列表查询方法
+
+打开 `UUcars.API/Services/CarService.cs`，添加：
+
+```csharp
+public async Task<PagedResponse<CarResponse>> GetMyListingsAsync(
+    int sellerId,
+    CarQueryRequest query,
+    CancellationToken cancellationToken = default)
+{
+    var page = query.Page < 1 ? 1 : query.Page;
+    var pageSize = query.PageSize < 1 ? 20 : query.PageSize;
+    pageSize = Math.Min(pageSize, 50);
+
+    var (cars, totalCount) = await _carRepository.GetBySellerAsync(
+        sellerId,
+        page,
+        pageSize,
+        cancellationToken);
+
+    var items = cars.Select(MapToResponse).ToList();
+
+    return PagedResponse<CarResponse>.Create(items, totalCount, page, pageSize);
+}
+```
+
+
+
+### 5. 在 CarsController 里添加 GET /cars/my-listings
+
+打开 `UUcars.API/Controllers/CarsController.cs`，在 `GetAll` 方法下方添加：
+
+```csharp
+// GET /cars/my-listings
+// 必须放在 GET /cars/{id:int} 之前定义，虽然 :int 约束已经能区分，
+// 但显式把固定路径放在参数路由之前是更好的习惯，意图更清晰
+[HttpGet("my-listings")]
+[Authorize]     // 卖家接口，必须登录
+public async Task<IActionResult> GetMyListings(
+    [FromQuery] CarQueryRequest query,
+    CancellationToken cancellationToken)
+{
+    var currentUserId = _currentUserService.GetCurrentUserId();
+    if (currentUserId == null)
+        return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+    var result = await _carService.GetMyListingsAsync(currentUserId.Value, query, cancellationToken);
+    return Ok(ApiResponse<PagedResponse<CarResponse>>.Ok(result));
+}
+```
+
+
+
+### 6. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 7. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**正常获取我的车辆列表：**
+
+登录后访问：
+
+```
+GET /cars/my-listings
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......
+```
+
+预期（200）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "items": [
+      {
+        "id": 1,
+        "title": "2020款宝马3系 低里程无事故",
+        "status": "Published",
+        ...
+      },
+      {
+        "id": 2,
+        "title": "2019款丰田凯美瑞",
+        "status": "Draft",
+        ...
+      }
+    ],
+    "totalCount": 2,
+    "page": 1,
+    "pageSize": 20,
+    "totalPages": 1
+  }
+}
+```
+
+注意结果里同时包含了 `Published` 和 `Draft` 状态的车辆，这是和公开列表的核心区别。
+
+**不带 Token 访问（应返回 401）：**
+
+不带 Authorization 头直接访问，预期返回 401。
+
+**验证只返回自己的车辆：**
+
+换另一个用户的 Token 登录，确认返回的是那个用户发布的车辆，不会看到其他人的。
+
+**验证已删除的车不出现：**
+
+删除一辆车（`DELETE /cars/{id}`），再访问 `GET /cars/my-listings`，确认被删除的车不在列表里。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 8. 此时的目录变化
+
+这一步没有新增文件，只在 `ICarRepository`、`EfCarRepository`、`CarService`、`CarsController` 里新增了方法。
+
+
+
+### 9. Git 提交
+
+```bash
+git add .
+git commit -m "feat: GET /cars/my-listings - seller's own car list"
+git push origin feature/cars
+```
+
+
+
+### Step 20 完成状态
+
+```
+✅ 理解卖家列表和公开列表的区别（视角不同、状态过滤不同、权限不同）
+✅ 理解路由顺序问题（固定路径 vs 参数路径，:int 约束的保护作用）
+✅ ICarRepository 新增 GetBySellerAsync（不过滤状态，排除 Deleted）
+✅ EfCarRepository 实现 GetBySellerAsync
+✅ CarService.GetMyListingsAsync
+✅ CarsController GET /cars/my-listings（需要登录）
+✅ Scalar 测试通过（返回所有状态车辆、只返回自己的车、删除的车不出现）
+✅ Git commit + push 完成
+```
+

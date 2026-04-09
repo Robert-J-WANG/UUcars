@@ -120,10 +120,10 @@ public class CarsController : ControllerBase
         return NoContent();
     }
     
-// GET /cars?page=1&pageSize=20
-// 这个接口不需要 [Authorize]，公开访问
-// [FromQuery]：告诉框架从 URL 的 Query 参数里绑定 CarQueryRequest 的属性
-// 比如 /cars?page=2&pageSize=10 会自动绑定成 query.Page=2, query.PageSize=10
+    // GET /cars?page=1&pageSize=20
+    // 这个接口不需要 [Authorize]，公开访问
+    // [FromQuery]：告诉框架从 URL 的 Query 参数里绑定 CarQueryRequest 的属性
+    // 比如 /cars?page=2&pageSize=10 会自动绑定成 query.Page=2, query.PageSize=10
 
     [HttpGet]
     public async Task<IActionResult> GetPaged(
@@ -134,4 +134,20 @@ public class CarsController : ControllerBase
         return StatusCode(StatusCodes.Status200OK, ApiResponse<PagedResponse<CarResponse>>.Ok(result, "Cars retrieved successfully."));
     }
     
+    // GET /cars/my-listings
+    // 必须放在 GET /cars/{id:int} 之前定义，虽然 :int 约束已经能区分，
+    // 但显式把固定路径放在参数路由之前是更好的习惯，意图更清晰
+    [HttpGet("my-listings")]
+    [Authorize]     // 卖家接口，必须登录
+    public async Task<IActionResult> GetMyListings([FromQuery] CarQueryRequest request,
+        CancellationToken cancellationToken)
+    {
+        var currentUserId = _currentUserService.GetCurrentUserId();
+        if(currentUserId==null) return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+        
+        var result= await _carService.GetSellerCarsAsync(currentUserId.Value, request, cancellationToken);
+        
+        return StatusCode(StatusCodes.Status200OK, ApiResponse<PagedResponse<CarResponse>>.Ok(result, "Cars retrieved successfully."));
+        
+    }
 }

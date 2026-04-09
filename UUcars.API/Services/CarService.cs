@@ -228,6 +228,22 @@ public class CarService
         return PagedResponse<CarResponse>.Create(items, totalCount, page, pageSize);
     }
 
+    public async Task<PagedResponse<CarResponse>> GetSellerCarsAsync(int sellerId, CarQueryRequest query, CancellationToken cancellationToken = default)
+    {
+        var page = query.Page;
+        var pageSize = Math.Min(50, query.PageSize);
+        
+        var (cars, totalCount) = await _carRepository.GetBySellerAsync(
+            sellerId,
+            page,
+            pageSize,
+            cancellationToken);
+
+        var items = cars.Select(MapToResponse).ToList();
+
+        return PagedResponse<CarResponse>.Create(items, totalCount, page, pageSize);
+    }
+
     // 实体 → DTO 的映射方法
     // 注意 SellerUsername 暂时用空字符串——创建时 EF Core 不会自动加载导航属性
     // 后续详情接口会用 Include 加载完整的 Seller 信息

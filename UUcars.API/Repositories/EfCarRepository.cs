@@ -59,4 +59,31 @@ public class EfCarRepository:ICarRepository
         // C# 元组语法：(变量名: 值, 变量名: 值)
         return (cars, totalCount);
     }
+
+    public async Task<(List<Car> Cars, int TotalCount)> GetBySellerAsync(
+        int sellerId,
+        int page,
+        int pageSize,
+        CancellationToken cancellationToken = default)
+    {
+        var query = _context.Cars
+            .Include(c => c.Seller)
+            .Where(c => c.SellerId == sellerId);
+        // 注意：这里没有过滤 Status，返回卖家所有状态的车辆
+        // 但排除逻辑删除的车辆——卖家也不需要看到已删除的车
+        // 如果将来需要显示已删除的车，可以单独加一个接口
+
+        // 去掉逻辑删除的车（卖家视角也不需要看到已删除的车）
+        query = query.Where(c => c.Status != CarStatus.Deleted);
+
+        var totalCount = await query.CountAsync(cancellationToken);
+
+        var cars = await query
+            .OrderByDescending(c => c.CreatedAt)
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .ToListAsync(cancellationToken);
+
+        return (cars, totalCount);
+    }
 }
