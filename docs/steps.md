@@ -8072,3 +8072,334 @@ git push origin feature/cars
 ✅ Git commit + push 完成
 ```
 
+
+
+## Step 21 · 车辆搜索
+
+### 这一步做什么
+
+Step 19 实现了公开车辆列表，但只有分页，没有任何过滤条件——买家想找"价格在 20 万以内的宝马"就没办法。这一步在 `GET /cars` 基础上扩展搜索能力，支持按品牌、价格区间、年份区间过滤。
+
+
+
+### 1. 搜索参数怎么和分页参数结合
+
+Step 19 已经有了 `CarQueryRequest`（包含 `Page` 和 `PageSize`），现在要往里面加搜索参数。
+
+有两种方式：
+
+**方式一：新建一个 `CarSearchRequest` 继承 `CarQueryRequest`**
+
+```csharp
+public class CarSearchRequest : CarQueryRequest
+{
+    public string? Brand { get; set; }
+    // ...
+}
+```
+
+**方式二：直接在 `CarQueryRequest` 里加搜索字段**
+
+```csharp
+public class CarQueryRequest
+{
+    public int Page { get; set; } = 1;
+    public int PageSize { get; set; } = 20;
+    public string? Brand { get; set; }
+    // ...
+}
+```
+
+我们用方式二——`GET /cars` 本来就是同一个接口，分页和过滤是同一次请求里的参数，放在同一个 DTO 里更自然。客户端可以同时传 `?brand=BMW&minPrice=10000&page=2`，不需要区分"这是搜索参数"还是"这是分页参数"。
+
+
+
+### 2. 更新 CarQueryRequest
+
+打开 `UUcars.API/DTOs/Requests/CarQueryRequest.cs`，添加搜索字段：
+
+```csharp
+namespace UUcars.API.DTOs.Requests;
+
+public class CarQueryRequest
+{
+    public int Page { get; set; } = 1;
+    public int PageSize { get; set; } = 20;
+
+    // 以下字段都是可选的（nullable），不传就不过滤
+    // 为什么用 string? 而不是 string？
+    // 过滤条件是可选的——不传 Brand 表示"不限品牌"，
+    // 用 nullable 类型，Service 层可以用 null 判断是否需要应用这个过滤条件
+
+    // 品牌过滤：精确匹配（BMW、Toyota 等）
+    public string? Brand { get; set; }
+
+    // 价格区间：minPrice / maxPrice 都是可选的，
+    // 可以只传其中一个（比如"最高 20 万"只传 maxPrice）
+    public decimal? MinPrice { get; set; }
+    public decimal? MaxPrice { get; set; }
+
+    // 年份区间：和价格区间同理
+    public int? MinYear { get; set; }
+    public int? MaxYear { get; set; }
+}
+```
+
+
+
+### 3. 更新 ICarRepository 和 EfCarRepository
+
+搜索参数需要传进 Repository 层，在数据库层面做过滤（而不是取出来再在内存里过滤）。
+
+打开 `UUcars.API/Repositories/ICarRepository.cs`，把 `GetPagedAsync` 的签名更新为接收完整的查询请求：
+
+```csharp
+using UUcars.API.DTOs.Requests;
+using UUcars.API.Entities;
+using UUcars.API.Entities.Enums;
+
+namespace UUcars.API.Repositories;
+
+public interface ICarRepository
+{
+    Task<Car> AddAsync(Car car, CancellationToken cancellationToken = default);
+    Task<Car?> GetByIdAsync(int id, CancellationToken cancellationToken = default);
+    Task<Car> UpdateAsync(Car car, CancellationToken cancellationToken = default);
+
+    // 新增：查询指定状态的车辆列表（支持分页 + 过滤）
+    // 更新：原来只接收 status / page / pageSize，现在接收完整的 query 对象
+    Task<(List<Car> Cars, int TotalCount)> GetPagedAsync(
+        CarStatus status,
+        CarQueryRequest query,
+        CancellationToken cancellationToken = default);
+
+
+    //卖家列表页更新
+    // 更新：原来只接收 status / page / pageSize，现在接收完整的 query 对象
+    Task<(List<Car> Cars, int TotalCount)> GetBySellerAsync(
+        int sellerId,
+        CarQueryRequest query,
+        CancellationToken cancellationToken = default);
+}
+```
+
+打开 `UUcars.API/Repositories/EfCarRepository.cs`，更新 `GetPagedAsync` 的实现：
+
+```csharp
+ public async Task<(List<Car> Cars, int TotalCount)> GetPagedAsync(
+        CarStatus status,
+        CarQueryRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        // 构建基础查询（此时还没有执行 SQL，只是在构建 IQueryable）
+        // 从 status 过滤开始构建 IQueryable
+        // 后续每一个 Where 都是在已有的查询基础上追加条件，
+        // 最终 EF Core 会把所有条件合并成一条 SQL 语句
+        var query = _context.Cars
+            .Include(c => c.Seller)
+            .Where(c => c.Status == status);
+
+        // 品牌过滤：只有传了 Brand 才追加这个条件
+        // string.IsNullOrWhiteSpace：同时处理 null、空字符串、纯空格的情况
+        if (!string.IsNullOrWhiteSpace(request.Brand))
+        {
+            // Contains + ToLower：大小写不敏感的模糊匹配
+            // 比如搜 "bmw" 能匹配 "BMW"、"Bmw"
+            // EF Core 会把这个翻译成 SQL 的 LIKE '%bmw%'（在 SQL Server 里不区分大小写）
+            query = query.Where(c => c.Brand.Contains(request.Brand.ToLower()));
+        }
+
+        // 价格区间：MinPrice 和 MaxPrice 各自独立，可以只传其中一个
+        if (request.MinPrice.HasValue)
+        {
+            query = query.Where(c => c.Price >= request.MinPrice.Value);
+        }
+
+        if (request.MaxPrice.HasValue)
+        {
+            query = query.Where(c => c.Price <= request.MaxPrice.Value);
+        }
+
+        if (request.MinYear.HasValue)
+        {
+            query = query.Where(c => c.Year >= request.MinYear.Value);
+        }
+
+        if (request.MaxYear.HasValue)
+        {
+            query = query.Where(c => c.Year <= request.MaxYear.Value);
+        }
+        
+        // 到这里 query 还是 IQueryable，所有 Where 条件都还没有执行 SQL
+        // CountAsync 触发第一次数据库查询：SELECT COUNT(*) WHERE ...（含所有过滤条件）
+        var totalCount = await query.CountAsync(cancellationToken);
+
+        // 在同一个 query 基础上加分页，执行第二次查询取数据
+        // 两次查询共享同一个 WHERE 条件，保证 totalCount 和数据是一致的
+        
+        var page = request.Page;
+        var pageSize = Math.Min(50, request.PageSize);
+        
+        var cars = await query
+            .OrderByDescending(c => c.CreatedAt)    // 按创建时间降序（最新发布的在前）
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .ToListAsync(cancellationToken);
+
+        // C# 元组语法：(变量名: 值, 变量名: 值)
+        return (cars, totalCount);
+    }
+```
+
+> **为什么把分页参数的保护（`page < 1`、`Math.Min`）移到 Repository 里？** 原来在 Service 里处理，但搜索参数也在 `CarQueryRequest` 里，整个 query 对象现在直接传进 Repository，分页计算放在 Repository 里更自然——数据分页是数据访问层的职责。Service 层只负责组装查询条件，不再重复处理分页边界。
+
+
+
+### 4. 更新 CarService
+
+打开 `UUcars.API/Services/CarService.cs`，更新 `GetPublishedCarsAsync`，去掉重复的分页边界处理（已移入 Repository）：
+
+```csharp
+public async Task<PagedResponse<CarResponse>> GetPublishedCarsAsync(
+        CarQueryRequest request,
+        CancellationToken cancellationToken = default)
+    {
+
+
+        var (cars, totalCount) = await _carRepository.GetPagedAsync(
+            CarStatus.Published,
+            request,
+            cancellationToken);
+
+        var items = cars.Select(MapToResponse).ToList();
+
+        // PagedResponse.Create 会自动计算 TotalPages
+        return PagedResponse<CarResponse>.Create(items, totalCount, request.Page, request.PageSize);
+    }
+```
+
+
+
+### 5. CarsController 不需要改动
+
+`CarsController` 里的 `GetAll` 方法已经把整个 `CarQueryRequest` 对象传给了 Service，搜索参数自动包含在里面，Controller 层不需要任何改动。
+
+这正是把请求参数封装成 DTO 的好处——新增字段时，Controller 层完全不受影响，只有 DTO、Service、Repository 需要更新。
+
+
+
+### 6. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 7. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+先确保数据库里有几辆 `Published` 状态、不同品牌/价格/年份的车辆（可以直接在数据库里改 Status，或者用 Admin 账号手动改）。
+
+**按品牌过滤：**
+
+```
+GET /cars?brand=BMW
+```
+
+预期：只返回品牌包含 "BMW" 的车辆。
+
+**按价格区间过滤：**
+
+```
+GET /cars?minPrice=100000&maxPrice=300000
+```
+
+预期：只返回价格在 10 万到 30 万之间的车辆。
+
+**按年份过滤：**
+
+```
+GET /cars?minYear=2019&maxYear=2022
+```
+
+预期：只返回 2019 年到 2022 年之间的车辆。
+
+**组合查询（最接近真实用法）：**
+
+```
+GET /cars?brand=BMW&maxPrice=300000&minYear=2020&page=1&pageSize=10
+```
+
+预期：过滤、分页同时生效，返回满足所有条件的车辆。
+
+**不带任何过滤参数（验证不影响原有行为）：**
+
+```
+GET /cars
+```
+
+预期：和 Step 19 一样，返回所有 `Published` 车辆，分页正常工作。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 8. 此时的目录变化
+
+这一步没有新增文件，只更新了已有的文件：
+
+```
+UUcars.API/
+├── DTOs/Requests/CarQueryRequest.cs    ← 已更新（新增搜索字段）
+├── Repositories/
+│   ├── ICarRepository.cs              ← 已更新（GetPagedAsync 签名变更）
+│   └── EfCarRepository.cs             ← 已更新（GetPagedAsync 实现搜索逻辑）
+└── Services/CarService.cs             ← 已更新（GetPublishedCarsAsync 简化）
+```
+
+
+
+### 9. Git 提交
+
+```bash
+git add .
+git commit -m "feat: car search with query filters (brand/price/year)"
+git push origin feature/cars
+```
+
+
+
+### Step 21 完成状态
+
+```
+✅ 理解搜索参数和分页参数放在同一个 DTO 里的原因
+✅ 理解 nullable 类型在可选过滤条件中的作用
+✅ CarQueryRequest 新增搜索字段（Brand / MinPrice / MaxPrice / MinYear / MaxYear）
+✅ 理解 IQueryable 链式追加 Where 条件的方式（所有条件合并成一条 SQL）
+✅ EfCarRepository.GetPagedAsync 实现搜索过滤（品牌模糊匹配 + 价格/年份区间）
+✅ 理解为什么在数据库层过滤而不是内存过滤
+✅ Controller 层无需改动（DTO 封装的好处）
+✅ Scalar 测试通过（单条件过滤、组合过滤、不带参数保持原有行为）
+✅ Git commit + push 完成
+```
+
+
+
