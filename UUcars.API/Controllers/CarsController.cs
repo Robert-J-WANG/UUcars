@@ -120,4 +120,18 @@ public class CarsController : ControllerBase
         return NoContent();
     }
     
+// GET /cars?page=1&pageSize=20
+// 这个接口不需要 [Authorize]，公开访问
+// [FromQuery]：告诉框架从 URL 的 Query 参数里绑定 CarQueryRequest 的属性
+// 比如 /cars?page=2&pageSize=10 会自动绑定成 query.Page=2, query.PageSize=10
+
+    [HttpGet]
+    public async Task<IActionResult> GetPaged(
+        [FromQuery] CarQueryRequest request ,CancellationToken cancellationToken)
+    {
+        var result = await _carService.GetPublishedCarsAsync(request, cancellationToken);
+        
+        return StatusCode(StatusCodes.Status200OK, ApiResponse<PagedResponse<CarResponse>>.Ok(result, "Cars retrieved successfully."));
+    }
+    
 }

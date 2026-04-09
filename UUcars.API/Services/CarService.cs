@@ -1,3 +1,4 @@
+using UUcars.API.DTOs;
 using UUcars.API.DTOs.Requests;
 using UUcars.API.DTOs.Responses;
 using UUcars.API.Entities;
@@ -204,7 +205,28 @@ public class CarService
             imageId, carId, currentUserId);
     }
 
-    
+
+    public async Task<PagedResponse<CarResponse>> GetPublishedCarsAsync(
+        CarQueryRequest query,
+        CancellationToken cancellationToken = default)
+    {
+
+        var page = query.Page;
+        // 只做上限保护（业务规则）
+        // 单页最多返回 50 条，防止客户端传 pageSize=99999 把服务器打垮
+        var pageSize = Math.Min(query.PageSize, 50);
+
+        var (cars, totalCount) = await _carRepository.GetPagedAsync(
+            CarStatus.Published,
+            page,
+            pageSize,
+            cancellationToken);
+
+        var items = cars.Select(MapToResponse).ToList();
+
+        // PagedResponse.Create 会自动计算 TotalPages
+        return PagedResponse<CarResponse>.Create(items, totalCount, page, pageSize);
+    }
 
     // 实体 → DTO 的映射方法
     // 注意 SellerUsername 暂时用空字符串——创建时 EF Core 不会自动加载导航属性

@@ -7460,3 +7460,339 @@ git push origin feature/cars
 ✅ Git commit + push 完成
 ```
 
+
+
+## Step 19 · 车辆列表（公开）
+
+### 这一步做什么
+
+前面几步实现了卖家侧的操作（创建、修改、删除、提交审核）。从这一步开始转向买家侧——实现公开的车辆列表接口 `GET /cars`。
+
+这个接口有一个关键过滤规则：**只返回 `Published` 状态的车辆**。`Draft`、`PendingReview`、`Sold`、`Deleted` 的车辆不出现在公开列表里。买家看到的始终是经过审核、可以购买的车辆。
+
+
+
+### 1. 为什么要在数据库层过滤，而不是取出来再过滤
+
+有两种实现思路：
+
+**思路一（错误）：取出所有车辆，在内存里过滤**
+
+```csharp
+var allCars = await _context.Cars.ToListAsync();
+return allCars.Where(c => c.Status == CarStatus.Published).ToList();
+```
+
+**思路二（正确）：在数据库层过滤，只取需要的数据**
+
+```csharp
+var cars = await _context.Cars
+    .Where(c => c.Status == CarStatus.Published)
+    .ToListAsync();
+```
+
+区别在于：思路一先把所有数据加载进内存，再在内存里筛选，数据量大时会把大量无用数据传输到应用服务器，既浪费网络带宽又占用内存。思路二让数据库执行 `WHERE` 过滤，只返回符合条件的行，这是 EF Core 的核心能力之一——**IQueryable 延迟查询**。
+
+`IQueryable` 和 `IEnumerable` 的关键区别：
+
+```
+IEnumerable：数据已经在内存里，操作在内存中执行
+IQueryable： 数据还在数据库里，操作被翻译成 SQL 在数据库执行
+```
+
+在调用 `ToListAsync()` 之前，`Where`、`OrderBy`、`Skip`、`Take` 等操作都只是在构建 SQL 语句，不会真正查询数据库。只有调用 `ToListAsync()`（或 `FirstOrDefaultAsync` 等终结方法）时，才会把构建好的 SQL 发送到数据库执行。
+
+
+
+### 2. 分页的必要性
+
+车辆列表不能一次返回所有数据。如果数据库里有 10000 辆车，一次全部返回会：
+
+- 占用大量服务器内存
+- 网络传输慢，客户端等待时间长
+- 客户端渲染压力大
+
+分页把数据切成小块，每次只取一页。`Skip` 和 `Take` 是实现分页的两个核心操作：
+
+```
+Skip((page - 1) * pageSize)  ← 跳过前面几页的数据
+Take(pageSize)               ← 只取这一页的数据
+```
+
+比如第 2 页、每页 20 条：`Skip(20).Take(20)`，跳过前 20 条，取第 21-40 条。
+
+返回数据的同时，还要返回 `TotalCount`（总数量），让客户端知道一共有多少条数据，才能计算出总页数、渲染分页控件。
+
+
+
+### 3. 创建查询请求 DTO
+
+#### `DTOs/Requests/CarQueryRequest.cs`
+
+```bash
+touch UUcars.API/DTOs/Requests/CarQueryRequest.cs
+```
+
+```c#
+namespace UUcars.API.DTOs.Requests;
+
+public class CarQueryRequest
+{
+    // 页码，默认第 1 页
+    // 为什么用属性而不是方法参数？
+    // [FromQuery] 绑定时，框架会把 Query 参数自动映射到这个类的属性上，
+    // 比 Action 方法上写一堆参数更清晰
+    
+    // 页码，默认第 1 页
+    [Range(1, int.MaxValue)]
+    public int Page { get; set; } = 1;  
+
+    // 每页条数，默认 20 条
+    [Range(1, 1000)] // 给个宽一点范围
+    public int PageSize { get; set; } = 20; 
+}
+```
+
+
+
+### 4. 给 ICarRepository 增加列表查询方法
+
+打开 `UUcars.API/Repositories/ICarRepository.cs`，新增：
+
+```csharp
+using UUcars.API.Entities;
+using UUcars.API.Entities.Enums;
+
+namespace UUcars.API.Repositories;
+
+public interface ICarRepository
+{
+    Task<Car> AddAsync(Car car, CancellationToken cancellationToken = default);
+    Task<Car?> GetByIdAsync(int id, CancellationToken cancellationToken = default);
+    Task<Car> UpdateAsync(Car car, CancellationToken cancellationToken = default);
+
+    // 新增：查询指定状态的车辆列表（支持分页）
+    // 返回 (数据列表, 总数量) 的元组
+    // 为什么同时返回 totalCount？
+    // 分页接口需要告诉客户端一共有多少条数据才能渲染分页控件，
+    // 如果分两次查询（一次取数据、一次 COUNT），会有两次数据库往返。
+    // 用元组一起返回，在 Repository 里一次性处理两个查询
+    Task<(List<Car> Cars, int TotalCount)> GetPagedAsync(
+        CarStatus status,
+        int page,
+        int pageSize,
+        CancellationToken cancellationToken = default);
+}
+```
+
+打开 `UUcars.API/Repositories/EfCarRepository.cs`，补充实现：
+
+```csharp
+public async Task<(List<Car> Cars, int TotalCount)> GetPagedAsync(
+    CarStatus status,
+    int page,
+    int pageSize,
+    CancellationToken cancellationToken = default)
+{
+    // 构建基础查询（此时还没有执行 SQL，只是在构建 IQueryable）
+    var query = _context.Cars
+        .Include(c => c.Seller)
+        .Where(c => c.Status == status);
+
+    // CountAsync：单独执行一次 COUNT(*) 查询，获取符合条件的总数
+    // 注意：这里用的是过滤后的 query，不是全表 COUNT
+    var totalCount = await query.CountAsync(cancellationToken);
+
+    // 在同一个 query 基础上加分页，执行第二次查询取数据
+    // 两次查询共享同一个 WHERE 条件，保证 totalCount 和数据是一致的
+    var cars = await query
+        .OrderByDescending(c => c.CreatedAt)    // 按创建时间降序（最新发布的在前）
+        .Skip((page - 1) * pageSize)
+        .Take(pageSize)
+        .ToListAsync(cancellationToken);
+
+    // C# 元组语法：(变量名: 值, 变量名: 值)
+    return (cars, totalCount);
+}
+```
+
+> **为什么要两次查询而不是一次？** 分页数据和总数量是两个独立的查询目标。SQL 里无法在一次查询里同时返回"第 2 页的 20 条数据"和"总共有多少条"，必须分两次：一次 `COUNT(*)`，一次 `SELECT ... LIMIT OFFSET`。EF Core 会把这两次查询分别发送到数据库，都在数据库层执行，效率远高于取全部数据再在内存里处理。
+
+
+
+### 5. 在 CarService 里添加列表查询方法
+
+打开 `UUcars.API/Services/CarService.cs`，添加：
+
+```csharp
+public async Task<PagedResponse<CarResponse>> GetPublishedCarsAsync(
+        CarQueryRequest query,
+        CancellationToken cancellationToken = default)
+    {
+
+        var page = query.Page;
+        // 只做上限保护（业务规则）
+        // 单页最多返回 50 条，防止客户端传 pageSize=99999 把服务器打垮
+        var pageSize = Math.Min(query.PageSize, 50);
+
+        var (cars, totalCount) = await _carRepository.GetPagedAsync(
+            CarStatus.Published,
+            page,
+            pageSize,
+            cancellationToken);
+
+        var items = cars.Select(MapToResponse).ToList();
+
+        // PagedResponse.Create 会自动计算 TotalPages
+        return PagedResponse<CarResponse>.Create(items, totalCount, page, pageSize);
+    }
+```
+
+同时在 `CarService.cs` 顶部补上 using：
+
+```csharp
+using UUcars.API.DTOs;
+```
+
+
+
+### 6. 在 CarsController 里添加列表接口
+
+打开 `UUcars.API/Controllers/CarsController.cs`，在 `Create` 方法**上方**添加（习惯上把公开的读接口放在前面）：
+
+```csharp
+// GET /cars?page=1&pageSize=20
+// 这个接口不需要 [Authorize]，公开访问
+// [FromQuery]：告诉框架从 URL 的 Query 参数里绑定 CarQueryRequest 的属性
+// 比如 /cars?page=2&pageSize=10 会自动绑定成 query.Page=2, query.PageSize=10
+
+    [HttpGet]
+    public async Task<IActionResult> GetPaged(
+        [FromQuery] CarQueryRequest request ,CancellationToken cancellationToken)
+    {
+        var result = await _carService.GetPublishedCarsAsync(request, cancellationToken);
+        
+        return StatusCode(StatusCodes.Status200OK, ApiResponse<PagedResponse<CarResponse>>.Ok(result, "Cars retrieved successfully."));
+    }
+```
+
+
+
+### 7. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 8. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+目前数据库里可能没有 `Published` 状态的车辆（创建的车都是 `Draft`，需要经过 Admin 审核才能变 `Published`）。Admin 审核功能在 Step 29 才实现，现在可以直接在数据库里手动把一辆车的 `Status` 改成 `Published` 来测试：
+
+用数据库客户端执行：
+
+```sql
+UPDATE Cars SET Status = 'Published' WHERE Id = 1
+```
+
+**不带参数（默认分页）：**
+
+```
+GET /cars
+```
+
+预期（200）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "items": [
+      {
+        "id": 1,
+        "title": "2020款宝马3系 低里程无事故",
+        "status": "Published",
+        ...
+      }
+    ],
+    "totalCount": 1,
+    "page": 1,
+    "pageSize": 20,
+    "totalPages": 1
+  }
+}
+```
+
+**带分页参数：**
+
+```
+GET /cars?page=1&pageSize=5
+```
+
+每页 5 条，验证分页参数生效。
+
+**验证过滤：Draft 状态的车不出现在列表里**
+
+数据库里有 `Draft` 状态的车，确认它们不出现在 `GET /cars` 的结果里。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 9. 此时的目录变化
+
+```
+UUcars.API/
+└── DTOs/
+    └── Requests/
+        └── CarQueryRequest.cs      ← 新增
+```
+
+`ICarRepository`、`EfCarRepository`、`CarService`、`CarsController` 均已更新，不是新文件。
+
+
+
+### 10. Git 提交
+
+```bash
+git add .
+git commit -m "feat: GET /cars - public car listing with pagination"
+git push origin feature/cars
+```
+
+
+
+### Step 19 完成状态
+
+```
+✅ 理解 IQueryable 延迟查询 vs IEnumerable 内存查询的区别
+✅ 理解分页的必要性（Skip / Take / TotalCount）
+✅ 理解两次查询（COUNT + 数据）的原因
+✅ CarQueryRequest DTO（Page / PageSize，含默认值）
+✅ ICarRepository 新增 GetPagedAsync（返回元组）
+✅ EfCarRepository 实现 GetPagedAsync（IQueryable 链式构建，两次查询）
+✅ CarService.GetPublishedCarsAsync（分页参数保护 + 只返回 Published）
+✅ CarsController GET /cars（[FromQuery] 绑定，无需登录）
+✅ Scalar 测试通过（分页返回、Draft 车辆被过滤）
+✅ Git commit + push 完成
+```
+
