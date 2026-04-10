@@ -1,3 +1,4 @@
+using System.ComponentModel.DataAnnotations;
 using UUcars.API.DTOs;
 using UUcars.API.DTOs.Requests;
 using UUcars.API.DTOs.Responses;
@@ -14,7 +15,7 @@ public class CarService
     private readonly ICarImageRepository _carImageRepository;
     private readonly ILogger<CarService> _logger;
 
-    public CarService(ICarRepository carRepository,ICarImageRepository carImageRepository ,ILogger<CarService> logger)
+    public CarService(ICarRepository carRepository, ICarImageRepository carImageRepository, ILogger<CarService> logger)
     {
         _carRepository = carRepository;
         _carImageRepository = carImageRepository;
@@ -35,20 +36,20 @@ public class CarService
             Price = request.Price,
             Mileage = request.Mileage,
             Description = request.Description,
-            SellerId = sellerId,            // 从 Token 里取到的当前用户 Id
-            Status = CarStatus.Draft,       // 创建时强制为 Draft，客户端无法指定
+            SellerId = sellerId, // 从 Token 里取到的当前用户 Id
+            Status = CarStatus.Draft, // 创建时强制为 Draft，客户端无法指定
             CreatedAt = DateTime.UtcNow,
             UpdatedAt = DateTime.UtcNow
         };
 
         var created = await _carRepository.AddAsync(car, cancellationToken);
         // 再查一次，把 Seller 带出来
-        
+
 
         _logger.LogInformation("Car created: {CarId} by seller {SellerId}", created.Id, sellerId);
 
         // Create 完之后，返回里必须要有 SellerUsername的话，Add 完 → 再查一次（因为GetByIdAsync带 Include， 手动加载car.Seller（导航属性）），这样car.Seller就不是null了
-        var carWithSeller= await _carRepository.GetByIdAsync(created.Id, cancellationToken);
+        var carWithSeller = await _carRepository.GetByIdAsync(created.Id, cancellationToken);
         return MapToResponse(carWithSeller!);
     }
 
@@ -125,7 +126,7 @@ public class CarService
         return MapToResponse(updated);
     }
 
-    public async Task DeleteAsync(int carId,int currentUserId, CancellationToken cancellationToken = default)
+    public async Task DeleteAsync(int carId, int currentUserId, CancellationToken cancellationToken = default)
     {
         var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
         if (car == null)
@@ -137,7 +138,7 @@ public class CarService
         car.Status = CarStatus.Deleted;
         car.UpdatedAt = DateTime.UtcNow;
         await _carRepository.UpdateAsync(car, cancellationToken);
-        
+
         _logger.LogInformation("Car {CarId} deleted by seller {SellerId}", car.Id, currentUserId);
     }
 
@@ -210,8 +211,6 @@ public class CarService
         CarQueryRequest request,
         CancellationToken cancellationToken = default)
     {
-
-
         var (cars, totalCount) = await _carRepository.GetPagedAsync(
             CarStatus.Published,
             request,
@@ -223,10 +222,9 @@ public class CarService
         return PagedResponse<CarResponse>.Create(items, totalCount, request.Page, request.PageSize);
     }
 
-    public async Task<PagedResponse<CarResponse>> GetSellerCarsAsync(int sellerId, CarQueryRequest request, CancellationToken cancellationToken = default)
+    public async Task<PagedResponse<CarResponse>> GetSellerCarsAsync(int sellerId, CarQueryRequest request,
+        CancellationToken cancellationToken = default)
     {
-       
-        
         var (cars, totalCount) = await _carRepository.GetBySellerAsync(
             sellerId,
             request,
@@ -235,6 +233,35 @@ public class CarService
         var items = cars.Select(MapToResponse).ToList();
 
         return PagedResponse<CarResponse>.Create(items, totalCount, request.Page, request.PageSize);
+    }
+
+    public async Task<CarDetailResponse> GetDetailAsync(
+        int carId,
+        int? currentUserId, // nullable：未登录时为 null
+        bool isAdmin, // 是否是 Admin 角色
+        CancellationToken cancellationToken = default)
+    {
+        var car = await _carRepository.GetDetailByIdAsync(carId, cancellationToken);
+
+        if (car == null)
+            throw new CarNotFoundException(carId);
+
+        // Published 的车是公开资源，任何人都可以直接查看，不需要权限判断
+        if (car.Status == CarStatus.Published)
+            return MapToDetailResponse(car);
+
+        // 非 Published 的车是受保护资源，需要验证身份
+        // Admin 可以查看任何状态的车辆
+        if (isAdmin)
+            return MapToDetailResponse(car);
+
+        // 车主可以查看自己发布的车辆（Draft / PendingReview 等）
+        
+        if (currentUserId.HasValue && car.SellerId == currentUserId.Value&& car.Status != CarStatus.Deleted)
+            return MapToDetailResponse(car);
+
+        // 既不是 Published，也没有对应权限，对外表现为"不存在"
+        throw new CarNotFoundException(carId);
     }
 
     // 实体 → DTO 的映射方法
@@ -263,5 +290,33 @@ public class CarService
         ImageUrl = image.ImageUrl,
         SortOrder = image.SortOrder,
         CarId = image.CarId
+    };
+
+// 详情实体 → DTO 的映射（包含图片列表）
+    private static CarDetailResponse MapToDetailResponse(Car car) => new()
+    {
+        Id = car.Id,
+        Title = car.Title,
+        Brand = car.Brand,
+        Model = car.Model,
+        Year = car.Year,
+        Price = car.Price,
+        Mileage = car.Mileage,
+        Description = car.Description,
+        Status = car.Status.ToString(),
+        SellerId = car.SellerId,
+        SellerUsername = car.Seller?.Username ?? string.Empty,
+        Images = car.Images
+            .OrderBy(i => i.SortOrder)  // 按 SortOrder 排序，确保图片顺序正确
+            .Select(i => new CarImageResponse
+            {
+                Id = i.Id,
+                ImageUrl = i.ImageUrl,
+                SortOrder = i.SortOrder,
+                CarId = i.CarId
+            })
+            .ToList(),
+        CreatedAt = car.CreatedAt,
+        UpdatedAt = car.UpdatedAt
     };
 }

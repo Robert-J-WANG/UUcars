@@ -8403,3 +8403,613 @@ git push origin feature/cars
 
 
 
+## Step 22 · 车辆详情
+
+### 这一步做什么
+
+实现 `GET /cars/{id}`，返回单辆车的完整信息，包括车辆图片列表和卖家基本信息。
+
+这个接口比列表接口复杂的地方在于**权限规则**：不同身份的用户能看到不同状态的车辆——
+
+```
+未登录用户      只能查看 Published 状态的车辆
+已登录的车主    还能看到自己的 Draft / PendingReview 状态车辆
+Admin          可以查看所有状态的车辆
+```
+
+这个设计符合真实平台的需求：买家只能看已上架的车，卖家需要能预览自己还未上架的草稿，Admin 需要能看到待审核的车辆。
+
+完成这个接口之后，还要补充 `CarService` 的单元测试——这是大纲里这一步的要求，也是前面讨论过的：车辆状态流转和权限检查有明确的业务规则，值得用测试保护起来。
+
+
+
+### 1. 详情接口为什么需要返回图片列表和卖家信息
+
+列表接口（`GET /cars`）返回的是每辆车的摘要信息，用于展示搜索结果卡片。详情接口（`GET /cars/{id}`）返回的是完整信息，用于展示车辆详情页，买家在这里决定是否下单。
+
+详情页需要的信息比列表多：
+
+```
+列表页：标题、品牌、价格、里程、封面图（一张）
+详情页：所有信息 + 全部图片 + 卖家联系信息
+```
+
+所以需要一个专门的 `CarDetailResponse`，而不是复用 `CarResponse`。
+
+
+
+### 2. 创建 CarDetailResponse
+
+```bash
+touch UUcars.API/DTOs/Responses/CarDetailResponse.cs
+```
+
+```c#
+namespace UUcars.API.DTOs.Responses;
+
+// 车辆详情响应，比 CarResponse 多了图片列表
+// 用独立的类而不是在 CarResponse 里加字段，
+// 原因：列表接口不需要图片数据，如果都用 CarDetailResponse，
+// 列表查询就要 Include Images，每辆车都加载图片列表，
+// 数据量大时会带来严重的性能问题
+public class CarDetailResponse
+{
+    public int Id { get; set; }
+    public string Title { get; set; } = string.Empty;
+    public string Brand { get; set; } = string.Empty;
+    public string Model { get; set; } = string.Empty;
+    public int Year { get; set; }
+    public decimal Price { get; set; }
+    public int Mileage { get; set; }
+    public string? Description { get; set; }
+    public string Status { get; set; } = string.Empty;
+    public int SellerId { get; set; }
+    public string SellerUsername { get; set; } = string.Empty;
+    public List<CarImageResponse> Images { get; set; } = [];
+    public DateTime CreatedAt { get; set; }
+    public DateTime UpdatedAt { get; set; }
+}
+```
+
+
+
+### 3. 更新 ICarRepository 和 EfCarRepository
+
+详情接口需要同时加载图片列表，`GetByIdAsync` 目前只 `Include` 了 `Seller`，没有 `Include` 图片。
+
+打开 `UUcars.API/Repositories/ICarRepository.cs`，新增一个专门用于详情查询的方法：
+
+```csharp
+// 新增：查询车辆详情（同时加载 Seller 和 Images）
+// 为什么不直接修改 GetByIdAsync？
+// GetByIdAsync 目前被状态变更操作（提交审核、修改、删除）使用，
+// 这些操作不需要加载图片列表，加了反而是多余的查询。
+// 用途不同的查询用不同的方法，各自只加载需要的数据
+Task<Car?> GetDetailByIdAsync(int id, CancellationToken cancellationToken = default);
+```
+
+打开 `UUcars.API/Repositories/EfCarRepository.cs`，补充实现：
+
+```csharp
+public async Task<Car?> GetDetailByIdAsync(int id, CancellationToken cancellationToken = default)
+{
+    return await _context.Cars
+        .Include(c => c.Seller)
+        .Include(c => c.Images)     // 同时加载图片列表
+        .FirstOrDefaultAsync(c => c.Id == id, cancellationToken);
+}
+```
+
+
+
+### 4. 在 CarService 里实现权限判断逻辑
+
+权限判断的核心思路：先查出车辆，再根据当前用户身份决定能不能看。
+
+打开 `UUcars.API/Services/CarService.cs`，添加 `GetDetailAsync`：
+
+```csharp
+public async Task<CarDetailResponse> GetDetailAsync(
+    int carId,
+    int? currentUserId, // nullable：未登录时为 null
+    bool isAdmin, // 是否是 Admin 角色
+    CancellationToken cancellationToken = default)
+{
+    var car = await _carRepository.GetDetailByIdAsync(carId, cancellationToken);
+
+    if (car == null)
+        throw new CarNotFoundException(carId);
+
+    // Published 的车是公开资源，任何人都可以直接查看，不需要权限判断
+    if (car.Status == CarStatus.Published)
+        return MapToDetailResponse(car);
+
+    // 非 Published 的车是受保护资源，需要验证身份
+    // Admin 可以查看任何状态的车辆
+    if (isAdmin)
+        return MapToDetailResponse(car);
+
+    // 车主可以查看自己发布的车辆（Draft / PendingReview 等）
+    var isOwner = currentUserId.HasValue && car.SellerId == currentUserId.Value;
+    if (isOwner)
+        return MapToDetailResponse(car);
+
+    // 既不是 Published，也没有对应权限，对外表现为"不存在"
+    throw new CarNotFoundException(carId);
+}
+
+// 详情实体 → DTO 的映射（包含图片列表）
+private static CarDetailResponse MapToDetailResponse(Car car) => new()
+{
+    Id = car.Id,
+    Title = car.Title,
+    Brand = car.Brand,
+    Model = car.Model,
+    Year = car.Year,
+    Price = car.Price,
+    Mileage = car.Mileage,
+    Description = car.Description,
+    Status = car.Status.ToString(),
+    SellerId = car.SellerId,
+    SellerUsername = car.Seller?.Username ?? string.Empty,
+    Images = car.Images
+        .OrderBy(i => i.SortOrder)  // 按 SortOrder 排序，确保图片顺序正确
+        .Select(i => new CarImageResponse
+        {
+            Id = i.Id,
+            ImageUrl = i.ImageUrl,
+            SortOrder = i.SortOrder,
+            CarId = i.CarId
+        })
+        .ToList(),
+    CreatedAt = car.CreatedAt,
+    UpdatedAt = car.UpdatedAt
+};
+```
+
+> **判断逻辑**
+>
+> Published 的车是公开资源，任何人都能看，不需要权限判断。 非 Published 的车是受保护资源，需要验证身份
+>
+> **为什么没有权限时返回 404 而不是 403？** 403 的语义是"我知道这个资源存在，但你没权限访问"，这会向外部透露"这辆车存在于系统里"。对于 `Draft` 状态的车来说，它的存在本身就不应该被其他人知道。返回 404，对没有权限的用户来说，这辆车"根本不存在"，更安全。
+
+
+
+### 5. 在 CarsController 里添加详情接口
+
+打开 `UUcars.API/Controllers/CarsController.cs`，在 `GetMyListings` 下方添加：
+
+```csharp
+// GET /cars/{id}
+// 不需要 [Authorize]：公开接口，但权限判断在 Service 层处理
+[HttpGet("{id:int}")]
+public async Task<IActionResult> GetById(int id, CancellationToken cancellationToken)
+{
+    // 从 Token 里获取当前用户信息（未登录时为 null）
+    var currentUserId = _currentUserService.GetCurrentUserId();
+
+    // 判断当前用户是否是 Admin
+    // User.IsInRole：ASP.NET Core 提供的方法，读取 ClaimsPrincipal 里的 Role Claim
+    // 未登录时 User.IsInRole 返回 false，不会抛异常
+    var isAdmin = User.IsInRole("Admin");
+
+    var car = await _carService.GetDetailAsync(id, currentUserId, isAdmin, cancellationToken);
+
+    return StatusCode(StatusCodes.Status200OK,
+        ApiResponse<CarDetailResponse>.Ok(car, "Car retrieved successfully."));
+}
+```
+
+
+
+### 6. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 7. 单元测试
+
+这一步要进行 `CarService` 的单元测试，重点覆盖状态流转和权限检查这两块业务规则。
+
+#### 7.1 创建 FakeCarRepository
+
+```bash
+touch UUcars.Tests/Fakes/FakeCarRepository.cs
+```
+
+```c#
+using UUcars.API.DTOs.Requests;
+using UUcars.API.Entities;
+using UUcars.API.Entities.Enums;
+using UUcars.API.Repositories;
+
+namespace UUcars.Tests.Fakes;
+
+public class FakeCarRepository : ICarRepository
+{
+    private readonly Dictionary<int, Car> _store = new();
+    private int _nextId = 1;
+
+    public void Seed(Car car)
+    {
+        if (car.Id == 0) car.Id = _nextId++;
+        _store[car.Id] = car;
+    }
+
+    public Task<Car> AddAsync(Car car, CancellationToken cancellationToken = default)
+    {
+        car.Id = _nextId++;
+        _store[car.Id] = car;
+        return Task.FromResult(car);
+    }
+
+    public Task<Car?> GetByIdAsync(int id, CancellationToken cancellationToken = default)
+    {
+        _store.TryGetValue(id, out var car);
+        return Task.FromResult(car);
+    }
+
+    public Task<Car?> GetDetailByIdAsync(int id, CancellationToken cancellationToken = default)
+    {
+        // Fake 里的 GetDetail 和 GetById 行为一致，
+        // 测试里不需要真实的 Include，导航属性直接在 Seed 时设置好
+        _store.TryGetValue(id, out var car);
+        return Task.FromResult(car);
+    }
+
+    public Task<Car> UpdateAsync(Car car, CancellationToken cancellationToken = default)
+    {
+        _store[car.Id] = car;
+        return Task.FromResult(car);
+    }
+
+    public Task<(List<Car> Cars, int TotalCount)> GetPagedAsync(
+        CarStatus status,
+        CarQueryRequest query,
+        CancellationToken cancellationToken = default)
+    {
+        var result = _store.Values
+            .Where(c => c.Status == status)
+            .ToList();
+        return Task.FromResult((result, result.Count));
+    }
+
+    public Task<(List<Car> Cars, int TotalCount)> GetBySellerAsync(
+        int sellerId,
+        int page,
+        int pageSize,
+        CancellationToken cancellationToken = default)
+    {
+        var result = _store.Values
+            .Where(c => c.SellerId == sellerId && c.Status != CarStatus.Deleted)
+            .ToList();
+        return Task.FromResult((result, result.Count));
+    }
+}
+```
+
+#### 7.2 创建 FakeCarImageRepository
+
+```bash
+touch UUcars.Tests/Fakes/FakeCarImageRepository.cs
+```
+
+```c#
+using UUcars.API.Entities;
+using UUcars.API.Repositories;
+
+namespace UUcars.Tests.Fakes;
+
+public class FakeCarImageRepository : ICarImageRepository
+{
+    private readonly Dictionary<int, CarImage> _store = new();
+    private int _nextId = 1;
+
+    public Task<CarImage> AddAsync(CarImage image, CancellationToken cancellationToken = default)
+    {
+        image.Id = _nextId++;
+        _store[image.Id] = image;
+        return Task.FromResult(image);
+    }
+
+    public Task<CarImage?> GetByIdAsync(int imageId, CancellationToken cancellationToken = default)
+    {
+        _store.TryGetValue(imageId, out var image);
+        return Task.FromResult(image);
+    }
+
+    public Task DeleteAsync(CarImage image, CancellationToken cancellationToken = default)
+    {
+        _store.Remove(image.Id);
+        return Task.CompletedTask;
+    }
+}
+```
+
+#### 7.3 编写 CarService 单元测试
+
+```bash
+mkdir -p UUcars.Tests/Services
+touch UUcars.Tests/Services/CarServiceTests.cs
+```
+
+```c#
+using Microsoft.Extensions.Logging.Abstractions;
+using UUcars.API.Entities;
+using UUcars.API.Entities.Enums;
+using UUcars.API.Exceptions;
+using UUcars.API.Services;
+using UUcars.Tests.Fakes;
+
+namespace UUcars.Tests.Services;
+
+public class CarServiceTests
+{
+    private static CarService CreateService(
+        FakeCarRepository carRepo,
+        FakeCarImageRepository? imageRepo = null)
+    {
+        return new CarService(
+            carRepo,
+            imageRepo ?? new FakeCarImageRepository(),
+            NullLogger<CarService>.Instance
+        );
+    }
+
+    // ===== 提交审核的测试 =====
+
+    [Fact]
+    public async Task SubmitForReviewAsync_WhenDraftAndOwner_ShouldChangeToPendingReview()
+    {
+        // Arrange
+        var repo = new FakeCarRepository();
+        repo.Seed(new Car { Id = 1, SellerId = 10, Status = CarStatus.Draft });
+        var service = CreateService(repo);
+
+        // Act
+        var result = await service.SubmitForReviewAsync(1, currentUserId: 10);
+
+        // Assert
+        Assert.Equal("PendingReview", result.Status);
+    }
+
+    [Fact]
+    public async Task SubmitForReviewAsync_WhenNotOwner_ShouldThrowForbiddenException()
+    {
+        // Arrange
+        var repo = new FakeCarRepository();
+        repo.Seed(new Car { Id = 1, SellerId = 10, Status = CarStatus.Draft });
+        var service = CreateService(repo);
+
+        // Act + Assert：用不同的 userId（99）操作
+        await Assert.ThrowsAsync<ForbiddenException>(
+            () => service.SubmitForReviewAsync(1, currentUserId: 99));
+    }
+
+    [Fact]
+    public async Task SubmitForReviewAsync_WhenAlreadyPendingReview_ShouldThrowCarStatusException()
+    {
+        // Arrange：车辆已经是 PendingReview 状态
+        var repo = new FakeCarRepository();
+        repo.Seed(new Car { Id = 1, SellerId = 10, Status = CarStatus.PendingReview });
+        var service = CreateService(repo);
+
+        // Act + Assert：不能重复提交
+        await Assert.ThrowsAsync<CarStatusException>(
+            () => service.SubmitForReviewAsync(1, currentUserId: 10));
+    }
+
+    // ===== 车辆详情权限的测试 =====
+
+    [Fact]
+    public async Task GetDetailAsync_WhenPublished_ShouldBeVisibleToAnyone()
+    {
+        // Arrange：Published 状态，未登录用户（currentUserId = null）
+        var repo = new FakeCarRepository();
+        repo.Seed(new Car
+        {
+            Id = 1,
+            SellerId = 10,
+            Status = CarStatus.Published,
+            Seller = new User { Id = 10, Username = "seller" },
+            Images = []
+        });
+        var service = CreateService(repo);
+
+        // Act：未登录（null），不是 Admin（false）
+        var result = await service.GetDetailAsync(1, currentUserId: null, isAdmin: false);
+
+        // Assert：Published 的车任何人都能看到
+        Assert.NotNull(result);
+        Assert.Equal("Published", result.Status);
+    }
+
+    [Fact]
+    public async Task GetDetailAsync_WhenDraftAndOwner_ShouldBeVisible()
+    {
+        // Arrange：Draft 状态，车主查看
+        var repo = new FakeCarRepository();
+        repo.Seed(new Car
+        {
+            Id = 1,
+            SellerId = 10,
+            Status = CarStatus.Draft,
+            Seller = new User { Id = 10, Username = "seller" },
+            Images = []
+        });
+        var service = CreateService(repo);
+
+        // Act：车主（currentUserId = 10）查看自己的草稿
+        var result = await service.GetDetailAsync(1, currentUserId: 10, isAdmin: false);
+
+        Assert.NotNull(result);
+        Assert.Equal("Draft", result.Status);
+    }
+
+    [Fact]
+    public async Task GetDetailAsync_WhenDraftAndNotOwner_ShouldThrowCarNotFoundException()
+    {
+        // Arrange：Draft 状态，非车主查看
+        var repo = new FakeCarRepository();
+        repo.Seed(new Car
+        {
+            Id = 1,
+            SellerId = 10,
+            Status = CarStatus.Draft,
+            Seller = new User { Id = 10, Username = "seller" },
+            Images = []
+        });
+        var service = CreateService(repo);
+
+        // Act + Assert：非车主看不到 Draft 车辆，返回 404（而不是 403）
+        await Assert.ThrowsAsync<CarNotFoundException>(
+            () => service.GetDetailAsync(1, currentUserId: 99, isAdmin: false));
+    }
+
+    [Fact]
+    public async Task GetDetailAsync_WhenDraftAndAdmin_ShouldBeVisible()
+    {
+        // Arrange：Draft 状态，Admin 查看
+        var repo = new FakeCarRepository();
+        repo.Seed(new Car
+        {
+            Id = 1,
+            SellerId = 10,
+            Status = CarStatus.Draft,
+            Seller = new User { Id = 10, Username = "seller" },
+            Images = []
+        });
+        var service = CreateService(repo);
+
+        // Act：Admin（isAdmin = true）可以看任何状态的车辆
+        var result = await service.GetDetailAsync(1, currentUserId: 99, isAdmin: true);
+
+        Assert.NotNull(result);
+    }
+}
+```
+
+#### 7.4 运行测试
+
+```bash
+dotnet test
+```
+
+预期：
+
+```
+Test summary: total: 11, failed: 0, succeeded: 11, skipped: 0
+```
+
+原来的 6 个用户测试 + 新增的 5 个车辆测试，全部通过。
+
+
+
+### 8. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**未登录查看 Published 车辆（应返回 200）：**
+
+```
+GET /cars/1
+```
+
+不带 Token，预期正常返回车辆详情，包含图片列表和卖家用户名。
+
+**未登录查看 Draft 车辆（应返回 404）：**
+
+找一辆 `Draft` 状态的车，不带 Token 访问，预期返回 404——对未登录用户来说这辆车"不存在"。
+
+**车主查看自己的 Draft 车辆（应返回 200）：**
+
+用车主账号登录，带 Token 访问自己的 Draft 车辆，预期正常返回。
+
+**Admin 查看任意状态车辆（应返回 200）：**
+
+用 Admin 账号（`admin@uucars.com`）登录，访问 `Draft` 状态的车辆，预期正常返回。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 9. 此时的目录变化
+
+```
+UUcars.API/
+└── DTOs/
+    └── Responses/
+        └── CarDetailResponse.cs            ← 新增
+
+UUcars.Tests/
+├── Fakes/
+│   ├── FakeCarRepository.cs               ← 新增
+│   └── FakeCarImageRepository.cs          ← 新增
+└── Services/
+    └── CarServiceTests.cs                 ← 新增
+```
+
+`ICarRepository`、`EfCarRepository`、`CarService`、`CarsController` 均已更新，不是新文件。
+
+
+
+### 10. Git 提交 + 合并分支
+
+车辆模块（Step 14 到 Step 22）全部完成：
+
+```bash
+git add .
+git commit -m "feat: GET /cars/{id} - car detail with permission rules + test: CarService unit tests (status transitions, permissions)"
+
+git push origin feature/cars
+```
+
+合并回 `develop`：
+
+```bash
+git checkout develop
+git merge --no-ff feature/cars -m "merge: feature/cars into develop"
+git push origin develop
+git branch -D feature/cars
+git push origin --delete feature/cars
+```
+
+
+
+### Step 22 完成状态
+
+```
+✅ 理解详情接口为什么需要独立的 CarDetailResponse（性能考虑）
+✅ 理解三种身份的权限规则（未登录 / 车主 / Admin）
+✅ 理解无权限时返回 404 而不是 403 的安全设计原因
+✅ ICarRepository 新增 GetDetailByIdAsync（Include Images）
+✅ CarService.GetDetailAsync（权限判断逻辑）
+✅ CarsController GET /cars/{id}（User.IsInRole 判断 Admin 角色）
+✅ FakeCarRepository / FakeCarImageRepository 建立
+✅ 5 个 CarService 单元测试（状态流转 + 权限检查）
+✅ 全部 11 个测试通过
+✅ Scalar 测试通过
+✅ feature/cars 合并回 develop
+```
+
+
+

@@ -150,4 +150,23 @@ public class CarsController : ControllerBase
         return StatusCode(StatusCodes.Status200OK, ApiResponse<PagedResponse<CarResponse>>.Ok(result, "Cars retrieved successfully."));
         
     }
+    
+    // GET /cars/{id}
+    // 不需要 [Authorize]：公开接口，但权限判断在 Service 层处理
+    [HttpGet("{id:int}")]
+    public async Task<IActionResult> GetById(int id, CancellationToken cancellationToken)
+    {
+        // 从 Token 里获取当前用户信息（未登录时为 null）
+        var currentUserId = _currentUserService.GetCurrentUserId();
+        
+        // 判断当前用户是否是 Admin
+        // User.IsInRole：ASP.NET Core 提供的方法，读取 ClaimsPrincipal 里的 Role Claim
+        // 未登录时 User.IsInRole 返回 false，不会抛异常
+        var isAdmin = User.IsInRole("Admin");
+        
+        var car = await _carService.GetDetailAsync(id, currentUserId, isAdmin, cancellationToken);
+
+        return StatusCode(StatusCodes.Status200OK,
+            ApiResponse<CarDetailResponse>.Ok(car, "Car retrieved successfully."));
+    }
 }
