@@ -5761,3 +5761,3255 @@ git push origin --delete feature/auth
 
 
 
+## Step 14 · 发布车辆（创建草稿）
+
+### 这一步做什么
+
+用户系统完成了，现在进入车辆模块——整个项目的核心业务。
+
+卖家发布车辆的第一步不是直接上架，而是创建一个草稿（`Draft`）。
+
+草稿只有卖家自己能看到，需要经过提交审核、Admin 审核通过后才会公开。
+
+这一步实现 `POST /cars`，让登录用户能创建一辆车的草稿。
+
+
+
+### 1. 切出 feature/cars 分支
+
+```bash
+git checkout develop
+git checkout -b feature/cars
+git push -u origin feature/cars
+```
+
+
+
+### 2. 为什么 Status 默认是 Draft 而不是直接 Published
+
+这是一个常见的设计问题，直接上架看起来更简单，为什么要多一个草稿状态？
+
+原因有两个：
+
+**第一，给卖家修改的机会。** 车辆信息（标题、价格、描述）填完之后，卖家可能还想调整。草稿状态下可以反复修改，确认没问题再提交审核。如果创建就直接上架，买家看到的可能是还没填完整的信息。
+
+**第二，平台需要审核。** UUcars 是 C2C 平台，任何人都可以注册发车，如果创建就直接公开，平台无法控制内容质量（比如虚假信息、违规车辆）。Draft → PendingReview → Published 的流程让 Admin 有机会审核，这是平台运营的基本需求。
+
+
+
+### 3. 创建业务异常
+
+后续车辆模块会用到的业务异常，现在一起建好：
+
+```bash
+touch UUcars.API/Exceptions/CarNotFoundException.cs
+touch UUcars.API/Exceptions/ForbiddenException.cs
+```
+
+```c#
+namespace UUcars.API.Exceptions;
+
+public class CarNotFoundException : AppException
+{
+    public CarNotFoundException(int id)
+        : base(StatusCodes.Status404NotFound, $"Car with id '{id}' was not found.")
+    {
+    }
+}
+```
+
+```c#
+namespace UUcars.API.Exceptions;
+
+// 已登录但无权限操作时抛出（403 Forbidden）
+// 和 401 Unauthorized 的区别：
+//   401：没有身份（没登录或 Token 无效）→ 去登录
+//   403：有身份但没权限（登录了但不是车主）→ 你没有权限做这件事
+public class ForbiddenException : AppException
+{
+    public ForbiddenException(string message = "You do not have permission to perform this action.")
+        : base(StatusCodes.Status403Forbidden, message)
+    {
+    }
+}
+```
+
+
+
+### 4. 创建 DTO
+
+#### `DTOs/Requests/CarCreateRequest.cs`
+
+```bash
+touch UUcars.API/DTOs/Requests/CarCreateRequest.cs
+```
+
+```c#
+using System.ComponentModel.DataAnnotations;
+
+namespace UUcars.API.DTOs.Requests;
+
+public class CarCreateRequest
+{
+    [Required(ErrorMessage = "Title is required.")]
+    [MaxLength(100, ErrorMessage = "Title must not exceed 100 characters.")]
+    public string Title { get; set; } = string.Empty;
+
+    [Required(ErrorMessage = "Brand is required.")]
+    [MaxLength(50, ErrorMessage = "Brand must not exceed 50 characters.")]
+    public string Brand { get; set; } = string.Empty;
+
+    [Required(ErrorMessage = "Model is required.")]
+    [MaxLength(50, ErrorMessage = "Model must not exceed 50 characters.")]
+    public string Model { get; set; } = string.Empty;
+
+    [Required(ErrorMessage = "Year is required.")]
+    [Range(1900, 2100, ErrorMessage = "Year must be between 1900 and 2100.")]
+    public int Year { get; set; }
+
+    [Required(ErrorMessage = "Price is required.")]
+    [Range(0.01, double.MaxValue, ErrorMessage = "Price must be greater than 0.")]
+    public decimal Price { get; set; }
+
+    [Required(ErrorMessage = "Mileage is required.")]
+    [Range(0, int.MaxValue, ErrorMessage = "Mileage must be 0 or greater.")]
+    public int Mileage { get; set; }
+
+    [MaxLength(2000, ErrorMessage = "Description must not exceed 2000 characters.")]
+    public string? Description { get; set; }
+}
+```
+
+#### `DTOs/Responses/CarResponse.cs`
+
+```bash
+touch UUcars.API/DTOs/Responses/CarResponse.cs
+```
+
+`CarResponse` 是车辆列表和详情接口都会用到的基础响应结构，包含车辆的核心信息：
+
+```csharp
+namespace UUcars.API.DTOs.Responses;
+
+public class CarResponse
+{
+    public int Id { get; set; }
+    public string Title { get; set; } = string.Empty;
+    public string Brand { get; set; } = string.Empty;
+    public string Model { get; set; } = string.Empty;
+    public int Year { get; set; }
+    public decimal Price { get; set; }
+    public int Mileage { get; set; }
+    public string? Description { get; set; }
+    public string Status { get; set; } = string.Empty;
+    public int SellerId { get; set; }
+    public string SellerUsername { get; set; } = string.Empty;
+    public DateTime CreatedAt { get; set; }
+    public DateTime UpdatedAt { get; set; }
+}
+```
+
+
+
+### 5. 创建 Repository
+
+#### `Repositories/ICarRepository.cs`
+
+```bash
+touch UUcars.API/Repositories/ICarRepository.cs
+```
+
+这一步只需要新增车辆，但后续步骤（修改、删除、查询）都会用到 Repository，现在把这一步需要的方法定义好，后续步骤再逐步补充：
+
+```csharp
+using UUcars.API.Entities;
+
+namespace UUcars.API.Repositories;
+
+public interface ICarRepository
+{
+    Task<Car> AddAsync(Car car, CancellationToken cancellationToken = default);
+}
+```
+
+#### `Repositories/EfCarRepository.cs`
+
+```bash
+touch UUcars.API/Repositories/EfCarRepository.cs
+```
+
+```c#
+using UUcars.API.Data;
+using UUcars.API.Entities;
+
+namespace UUcars.API.Repositories;
+
+public class EfCarRepository : ICarRepository
+{
+    private readonly AppDbContext _context;
+
+    public EfCarRepository(AppDbContext context)
+    {
+        _context = context;
+    }
+
+    public async Task<Car> AddAsync(Car car, CancellationToken cancellationToken = default)
+    {
+        _context.Cars.Add(car);
+        await _context.SaveChangesAsync(cancellationToken);
+        return car;
+    }
+}
+```
+
+
+
+### 6. 创建 CarService
+
+```bash
+touch UUcars.API/Services/CarService.cs
+```
+
+```c#
+using UUcars.API.DTOs.Requests;
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Entities;
+using UUcars.API.Entities.Enums;
+using UUcars.API.Repositories;
+
+namespace UUcars.API.Services;
+
+public class CarService
+{
+    private readonly ICarRepository _carRepository;
+    private readonly ILogger<CarService> _logger;
+
+    public CarService(ICarRepository carRepository, ILogger<CarService> logger)
+    {
+        _carRepository = carRepository;
+        _logger = logger;
+    }
+
+    public async Task<CarResponse> CreateAsync(
+        int sellerId,
+        CarCreateRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        var car = new Car
+        {
+            Title = request.Title,
+            Brand = request.Brand,
+            Model = request.Model,
+            Year = request.Year,
+            Price = request.Price,
+            Mileage = request.Mileage,
+            Description = request.Description,
+            SellerId = sellerId,            // 从 Token 里取到的当前用户 Id
+            Status = CarStatus.Draft,       // 创建时强制为 Draft，客户端无法指定
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        var created = await _carRepository.AddAsync(car, cancellationToken);
+
+        _logger.LogInformation("Car created: {CarId} by seller {SellerId}", created.Id, sellerId);
+        
+        // Create 完之后，返回里必须要有 SellerUsername的话，Add 完 → 再查一次
+        //因为GetByIdAsync带 Include， 手动加载car.Seller（导航属性），这样car.Seller就不是null了
+        var carWithSeller= await _carRepository.GetByIdAsync(created.Id, cancellationToken);
+        return MapToResponse(carWithSeller!);
+
+    }
+
+    // 实体 → DTO 的映射方法
+    // 注意 SellerUsername 暂时用空字符串——创建时 EF Core 不会自动加载导航属性
+    // 后续详情接口会用 Include 加载完整的 Seller 信息
+    internal static CarResponse MapToResponse(Car car) => new()
+    {
+        Id = car.Id,
+        Title = car.Title,
+        Brand = car.Brand,
+        Model = car.Model,
+        Year = car.Year,
+        Price = car.Price,
+        Mileage = car.Mileage,
+        Description = car.Description,
+        Status = car.Status.ToString(),
+        SellerId = car.SellerId,
+        SellerUsername = car.Seller?.Username ?? string.Empty,
+        CreatedAt = car.CreatedAt,
+        UpdatedAt = car.UpdatedAt
+    };
+}
+```
+
+> **为什么 `Status` 在 Service 里强制写成 `CarStatus.Draft`，而不是让客户端传入？** 因为状态流转是核心业务规则，不能由客户端控制。如果客户端能传 `Status`，就可以直接创建一个 `Published` 的车辆绕过审核流程。规则必须在服务端强制执行，`Status = CarStatus.Draft` 硬写在 Service 里，任何人都改不了。
+
+> **`MapToResponse` 为什么用 `internal` 而不是 `private`？** `private` 只有类内部能用。后续步骤里其他方法（比如列表查询）也需要把 `Car` 实体映射成 `CarResponse`，都在 `CarService` 里，用 `internal static` 让同一个类的其他方法都能复用这个映射，又不暴露给外部。
+
+
+
+### 7. 创建 CarsController
+
+```bash
+touch UUcars.API/Controllers/CarsController.cs
+```
+
+```c#
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using UUcars.API.DTOs;
+using UUcars.API.DTOs.Requests;
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Services;
+
+namespace UUcars.API.Controllers;
+
+[ApiController]
+[Route("cars")]
+public class CarsController : ControllerBase
+{
+    private readonly CarService _carService;
+    private readonly CurrentUserService _currentUserService;
+
+    public CarsController(CarService carService, CurrentUserService currentUserService)
+    {
+        _carService = carService;
+        _currentUserService = currentUserService;
+    }
+
+    // POST /cars
+    // 不在 Controller 级别加 [Authorize]，因为后续会有公开接口（车辆列表、搜索、详情）
+    // 只在需要登录的 Action 上单独加 [Authorize]
+    [HttpPost]
+    [Authorize]
+    public async Task<IActionResult> Create(
+        [FromBody] CarCreateRequest request,
+        CancellationToken cancellationToken)
+    {
+        var sellerId = _currentUserService.GetCurrentUserId();
+        if (sellerId == null)
+            return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+        var car = await _carService.CreateAsync(sellerId.Value, request, cancellationToken);
+
+        // 201 Created：创建成功，返回新建的资源
+        return StatusCode(StatusCodes.Status201Created,
+            ApiResponse<CarResponse>.Ok(car, "Car draft created successfully."));
+    }
+}
+```
+
+> **为什么这里不在 Controller 级别加 `[Authorize]`？** `UsersController` 里所有接口都需要登录，所以在 Controller 级别加。但 `CarsController` 里情况不同——车辆列表、搜索、详情这些接口是公开的（不需要登录也能浏览），而发布、修改、删除需要登录。如果在 Controller 级别加 `[Authorize]`，就要在公开接口上逐个加 `[AllowAnonymous]` 来解除限制，反而更麻烦。所以只在需要登录的 Action 上单独加 `[Authorize]`。
+
+
+
+### 8. 注册依赖到 Program.cs
+
+```csharp
+// 车辆模块
+builder.Services.AddScoped<ICarRepository, EfCarRepository>();
+builder.Services.AddScoped<CarService>();
+```
+
+顶部补上 using：
+
+```csharp
+using UUcars.API.Repositories;
+using UUcars.API.Services;
+```
+
+
+
+### 9. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 10. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**正常创建车辆草稿（需要登录）：**
+
+先登录拿到 Token，然后：
+
+```json
+POST /cars
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......
+
+{
+  "title": "2007 BMW 325i – Clean, Reliable & Drives Great !Moving abroad!",
+  "brand": "BMW",
+  "model": "3 Series",
+  "year": 2007,
+  "price": 5700,
+  "mileage": 122310,
+  "description": "Selling my well-maintained 2007 BMW 325i. This car is in great condition for its age and drives smoothly with plenty of power."
+}
+```
+
+预期（201）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": 1,
+    "title": "2007 BMW 325i – Clean, Reliable & Drives Great !Moving abroad!",
+    "brand": "BMW",
+    "model": "3 Series",
+    "year": 2007,
+    "price": 5700,
+    "mileage": 122310,
+    "description": "Selling my well-maintained 2007 BMW 325i. This car is in great condition for its age and drives smoothly with plenty of power.",
+    "status": "Draft",
+    "sellerId": 1001,
+    "sellerUsername": "",
+    "createdAt": "2026-04-06T12:34:59.243803Z",
+    "updatedAt": "2026-04-06T12:34:59.243803Z"
+  },
+  "message": "Car draft created successfully.",
+  "errors": null
+}
+```
+
+注意 `status` 字段是 `"Draft"`，不管请求里传了什么，Service 层始终强制为草稿。
+
+**不带 Token 创建（应返回 401）：**
+
+不带 Authorization 头直接请求，预期返回 401。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 11. 此时的目录变化
+
+```
+UUcars.API/
+├── Controllers/
+│   └── CarsController.cs               ← 新增
+├── DTOs/
+│   ├── Requests/
+│   │   └── CarCreateRequest.cs         ← 新增
+│   └── Responses/
+│       └── CarResponse.cs              ← 新增
+├── Exceptions/
+│   ├── CarNotFoundException.cs         ← 新增
+│   └── ForbiddenException.cs           ← 新增
+├── Repositories/
+│   ├── ICarRepository.cs               ← 新增
+│   └── EfCarRepository.cs              ← 新增
+└── Services/
+    └── CarService.cs                   ← 新增
+```
+
+
+
+### 12. Git 提交
+
+```bash
+git add .
+git commit -m "feat: POST /cars - create car draft"
+```
+
+
+
+### Step 14 完成状态
+
+```
+✅ 切出 feature/cars 分支
+✅ 理解为什么新建车辆默认是 Draft 状态
+✅ 理解 401 和 403 的区别（CarNotFoundException / ForbiddenException）
+✅ CarCreateRequest DTO（含字段验证）
+✅ CarResponse DTO
+✅ ICarRepository + EfCarRepository
+✅ CarService.CreateAsync（Status 强制为 Draft，SellerId 从 Token 取）
+✅ CarsController POST /cars（Action 级别 [Authorize]，原因清楚）
+✅ 理解 MapToResponse 用 internal 而不是 private 的原因
+✅ DI 注册完成
+✅ Scalar 测试通过（201 创建成功，401 未登录）
+✅ Git commit 完成
+```
+
+
+
+## Step 15 · 提交审核
+
+### 这一步做什么
+
+Step 14 实现了创建车辆草稿。草稿创建好之后，卖家需要一个操作来把车辆"提交给 Admin 审核"——这就是 `POST /cars/{id}/submit`。
+
+提交后车辆状态从 `Draft` 变成 `PendingReview`，Admin 才能看到并处理它。
+
+
+
+### 1. 这个接口的设计思路
+
+`POST /cars/{id}/submit` 是一个**状态变更操作**，不是创建资源也不是修改资源字段，而是触发一个业务动作。
+
+REST 里对这类操作的惯用设计是在资源 URL 后面加一个动词子路径：
+
+```
+POST /cars/{id}/submit    ← 提交审核
+POST /cars/{id}/cancel    ← 取消（后面订单模块也是这个模式）
+POST /orders/{id}/cancel  ← 取消订单
+```
+
+用 `POST` 而不是 `PUT` 的原因是：这不是"修改车辆字段"，而是"触发一个不可逆的业务动作"。
+
+`PUT` 通常用于全量更新资源字段，`POST` 更适合表达"执行一个操作"。
+
+
+
+### 2. 业务规则
+
+提交审核有两条必须在 Service 层强制执行的规则：
+
+```
+1. 只有车主可以提交（别人的车不能提交）
+2. 只有 Draft 状态可以提交（PendingReview / Published 的车不能重复提交）
+```
+
+为什么要在 Service 层而不是 Controller 层做这些检查？
+
+因为 Controller 只处理 HTTP 层面的事，业务规则应该在 Service 里。这样规则是集中管理的，单元测试也能直接测到。
+
+
+
+### 3. 给 ICarRepository 增加新方法
+
+提交审核需要先查出车辆，再更新状态，Repository 需要补上这两个方法：
+
+打开 `UUcars.API/Repositories/ICarRepository.cs`：
+
+```csharp
+using UUcars.API.Entities;
+
+namespace UUcars.API.Repositories;
+
+public interface ICarRepository
+{
+    Task<Car> AddAsync(Car car, CancellationToken cancellationToken = default);
+
+    // 新增
+    Task<Car?> GetByIdAsync(int id, CancellationToken cancellationToken = default);
+    Task<Car> UpdateAsync(Car car, CancellationToken cancellationToken = default);
+}
+```
+
+打开 `UUcars.API/Repositories/EfCarRepository.cs`，补充实现：
+
+```csharp
+public async Task<Car?> GetByIdAsync(int id, CancellationToken cancellationToken = default)
+{
+    return await _context.Cars
+        .Include(c => c.Seller)     // 同时加载 Seller 导航属性
+        .FirstOrDefaultAsync(c => c.Id == id, cancellationToken);
+}
+
+public async Task<Car> UpdateAsync(Car car, CancellationToken cancellationToken = default)
+{
+    _context.Cars.Update(car);
+    await _context.SaveChangesAsync(cancellationToken);
+    return car;
+}
+```
+
+> **`Include(c => c.Seller)` 是什么？** EF Core 默认是**懒加载关闭**的——查出 `Car` 对象时，导航属性 `Seller`（关联的 `User` 对象）默认是 `null`，不会自动去数据库查。`Include` 是**预加载（Eager Loading）**，告诉 EF Core"查 Car 的同时把关联的 Seller 也一起查出来"，生成的 SQL 会是一个 JOIN 语句。
+>
+> 为什么这里要加 `Include(c => c.Seller)`？因为 `CarResponse` 里有 `SellerUsername` 字段，需要从 `car.Seller.Username` 取值。如果不 `Include`，`car.Seller` 是 `null`，`car.Seller.Username` 会抛 `NullReferenceException`。
+
+
+
+### 4. 在 CarService 里添加提交审核的方法
+
+打开 `UUcars.API/Services/CarService.cs`，添加 `SubmitForReviewAsync`：
+
+```csharp
+public async Task<CarResponse> SubmitForReviewAsync(
+    int carId,
+    int currentUserId,
+    CancellationToken cancellationToken = default)
+{
+    var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+    // 1. 车辆不存在
+    if (car == null)
+        throw new CarNotFoundException(carId);
+
+    // 2. 不是车主
+    // 为什么要检查这个？如果不检查，任何登录用户都能提交别人的车去审核，
+    // 卖家会莫名其妙发现自己的草稿进入了审核状态
+    if (car.SellerId != currentUserId)
+        throw new ForbiddenException();
+
+    // 3. 不是 Draft 状态
+    // 为什么要检查这个？防止重复提交。已经在 PendingReview 的车再次提交没有意义，
+    // Published 的车更不应该被重新提交审核（会破坏状态机）
+    if (car.Status != CarStatus.Draft)
+        throw new CarStatusException(car.Id, car.Status, CarStatus.PendingReview);
+
+    car.Status = CarStatus.PendingReview;
+    car.UpdatedAt = DateTime.UtcNow;
+
+    var updated = await _carRepository.UpdateAsync(car, cancellationToken);
+
+    _logger.LogInformation("Car {CarId} submitted for review by seller {SellerId}",
+        car.Id, currentUserId);
+
+    return MapToResponse(updated);
+}
+```
+
+这里用到了一个新的异常 `CarStatusException`，下面创建它。
+
+
+
+### 5. 创建 CarStatusException
+
+状态不合法时，需要一个能清楚表达"当前状态是什么、期望什么状态"的异常，而不是笼统地返回 400：
+
+```bash
+touch UUcars.API/Exceptions/CarStatusException.cs
+using UUcars.API.Entities.Enums;
+
+namespace UUcars.API.Exceptions;
+
+// 车辆状态不满足操作要求时抛出
+// 比如：只有 Draft 状态才能提交审核，当前是 Published 就抛这个异常
+public class CarStatusException : AppException
+{
+    public CarStatusException(int carId, CarStatus currentStatus, CarStatus requiredStatus)
+        : base(StatusCodes.Status409Conflict,
+            $"Car '{carId}' is in '{currentStatus}' status. Required status: '{requiredStatus}'.")
+    {
+    }
+}
+```
+
+> **为什么是 409 Conflict 而不是 400 Bad Request？** 400 表示"请求格式有问题"，比如字段缺失或格式错误。409 表示"请求本身没问题，但当前资源的状态和操作冲突"——车辆已经在审核中，再次提交就是一种状态冲突。409 更准确地表达了这个业务含义。
+
+
+
+### 6. 在 CarsController 里添加提交审核端点
+
+打开 `UUcars.API/Controllers/CarsController.cs`，在 `Create` 方法下方添加：
+
+```csharp
+// POST /cars/{id}/submit
+[HttpPost("{id:int}/submit")]
+[Authorize]
+public async Task<IActionResult> Submit(int id, CancellationToken cancellationToken)
+{
+    var currentUserId = _currentUserService.GetCurrentUserId();
+    if (currentUserId == null)
+        return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+    var car = await _carService.SubmitForReviewAsync(id, currentUserId.Value, cancellationToken);
+    return Ok(ApiResponse<CarResponse>.Ok(car, "Car submitted for review successfully."));
+}
+```
+
+> **路由 `{id:int}` 里的 `:int` 是什么？** 这是路由约束（Route Constraint）。`:int` 表示这个路由参数必须能解析成整数，如果 URL 里传的是非数字（比如 `/cars/abc/submit`），框架直接返回 404，不会进入这个 Action。这是一种轻量级的输入保护，不需要在代码里手动检查。
+
+
+
+### 7. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 8. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**正常提交审核：**
+
+先登录，再创建一辆车拿到 `id`，然后提交：
+
+```
+POST /cars/1/submit
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......
+```
+
+预期（200）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": 1,
+    "status": "PendingReview",
+    ...
+  },
+  "message": "Car submitted for review successfully."
+}
+```
+
+**重复提交（应返回 409）：**
+
+对同一辆车再次调用 `/cars/1/submit`，预期：
+
+```json
+{
+  "success": false,
+  "message": "Car '1' is in 'PendingReview' status. Required status: 'Draft'."
+}
+```
+
+**提交别人的车（应返回 403）：**
+
+换一个用户登录，尝试提交不属于自己的车辆，预期返回 403。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 9. 此时的目录变化
+
+```
+UUcars.API/
+├── Exceptions/
+│   └── CarStatusException.cs       ← 新增
+└── Repositories/
+    ├── ICarRepository.cs           ← 已更新（新增 GetByIdAsync / UpdateAsync）
+    └── EfCarRepository.cs          ← 已更新（新增实现，含 Include 说明）
+```
+
+`CarService` 和 `CarsController` 已更新（新增方法），不是新文件，不在目录变化里单独列出。
+
+
+
+### 10. Git 提交
+
+```bash
+git add .
+git commit -m "feat: POST /cars/{id}/submit - submit car for review"
+git push origin feature/cars
+```
+
+
+
+### Step 15 完成状态
+
+```
+✅ 理解状态变更接口的 REST 设计（POST + 动词子路径）
+✅ 理解业务规则为什么在 Service 层而不是 Controller 层
+✅ ICarRepository 新增 GetByIdAsync（含 Include 预加载）/ UpdateAsync
+✅ EfCarRepository 实现新方法（理解 Include Eager Loading）
+✅ CarStatusException（409，清楚表达状态冲突）
+✅ 理解 409 vs 400 的语义区别
+✅ CarService.SubmitForReviewAsync（车主检查 + 状态检查）
+✅ CarsController POST /cars/{id}/submit（路由约束 :int）
+✅ Scalar 测试通过（200 成功、409 重复提交、403 非车主）
+✅ Git commit + push 完成
+```
+
+
+
+## Step 16 · 修改车辆
+
+### 这一步做什么
+
+卖家创建草稿之后，可能需要修改车辆信息（比如调整价格、补充描述）。这一步实现 `PUT /cars/{id}`。
+
+但不是什么时候都能修改——已经提交审核或者已上架的车辆不允许修改。原因很直接：如果车辆正在审核中，卖家偷偷修改了信息，Admin 审核的内容就和最终上架的内容不一致；如果车辆已经公开，买家正在查看，卖家随意修改信息会造成信息不一致的问题。所以修改只允许在 `Draft` 状态进行。
+
+
+
+### 1. 创建 DTO
+
+#### `DTOs/Requests/CarUpdateRequest.cs`
+
+```bash
+touch UUcars.API/DTOs/Requests/CarUpdateRequest.cs
+```
+
+`CarUpdateRequest` 和 `CarCreateRequest` 字段基本一致——修改时可以改所有业务字段，但 `Status` 和 `SellerId` 不能改（状态由业务流程控制，卖家是创建时锁定的）：
+
+```csharp
+using System.ComponentModel.DataAnnotations;
+
+namespace UUcars.API.DTOs.Requests;
+
+public class CarUpdateRequest
+{
+    [Required(ErrorMessage = "Title is required.")]
+    [MaxLength(100, ErrorMessage = "Title must not exceed 100 characters.")]
+    public string Title { get; set; } = string.Empty;
+
+    [Required(ErrorMessage = "Brand is required.")]
+    [MaxLength(50, ErrorMessage = "Brand must not exceed 50 characters.")]
+    public string Brand { get; set; } = string.Empty;
+
+    [Required(ErrorMessage = "Model is required.")]
+    [MaxLength(50, ErrorMessage = "Model must not exceed 50 characters.")]
+    public string Model { get; set; } = string.Empty;
+
+    [Required(ErrorMessage = "Year is required.")]
+    [Range(1900, 2100, ErrorMessage = "Year must be between 1900 and 2100.")]
+    public int Year { get; set; }
+
+    [Required(ErrorMessage = "Price is required.")]
+    [Range(0.01, double.MaxValue, ErrorMessage = "Price must be greater than 0.")]
+    public decimal Price { get; set; }
+
+    [Required(ErrorMessage = "Mileage is required.")]
+    [Range(0, int.MaxValue, ErrorMessage = "Mileage must be 0 or greater.")]
+    public int Mileage { get; set; }
+
+    [MaxLength(2000, ErrorMessage = "Description must not exceed 2000 characters.")]
+    public string? Description { get; set; }
+}
+```
+
+> **`CarUpdateRequest` 和 `CarCreateRequest` 字段几乎一样，为什么不复用同一个类？** 虽然现在字段相同，但两者的语义不同——一个是"创建时传入的数据"，一个是"修改时传入的数据"。将来业务变化时，两者可能会出现差异（比如创建时必填的字段，修改时允许为空）。分开定义是为了保持灵活性，避免将来一个类的改动影响到另一个场景。这是 DTO 设计的常见原则：**按使用场景定义，而不是按字段相似度复用。**
+
+
+
+### 2. 在 CarService 里添加修改方法
+
+打开 `UUcars.API/Services/CarService.cs`，在 `SubmitForReviewAsync` 下方添加：
+
+```csharp
+public async Task<CarResponse> UpdateAsync(
+    int carId,
+    int currentUserId,
+    CarUpdateRequest request,
+    CancellationToken cancellationToken = default)
+{
+    var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+    if (car == null)
+        throw new CarNotFoundException(carId);
+
+    // 只有车主可以修改
+    if (car.SellerId != currentUserId)
+        throw new ForbiddenException();
+
+    // 只有 Draft 状态可以修改
+    // PendingReview：正在审核中，修改会导致审核内容和实际内容不一致
+    // Published：已上架，买家正在查看，不允许随意修改
+    // Sold / Deleted：已完成或已删除，修改没有意义
+    if (car.Status != CarStatus.Draft)
+        throw new CarStatusException(car.Id, car.Status, CarStatus.Draft);
+
+    car.Title = request.Title;
+    car.Brand = request.Brand;
+    car.Model = request.Model;
+    car.Year = request.Year;
+    car.Price = request.Price;
+    car.Mileage = request.Mileage;
+    car.Description = request.Description;
+    car.UpdatedAt = DateTime.UtcNow;
+
+    var updated = await _carRepository.UpdateAsync(car, cancellationToken);
+
+    _logger.LogInformation("Car {CarId} updated by seller {SellerId}", car.Id, currentUserId);
+
+    return MapToResponse(updated);
+}
+```
+
+
+
+### 3. 在 CarsController 里添加 PUT /cars/{id}
+
+打开 `UUcars.API/Controllers/CarsController.cs`，在 `Submit` 方法下方添加：
+
+```csharp
+// PUT /cars/{id}
+[HttpPut("{id:int}")]
+[Authorize]
+public async Task<IActionResult> Update(
+    int id,
+    [FromBody] CarUpdateRequest request,
+    CancellationToken cancellationToken)
+{
+    var currentUserId = _currentUserService.GetCurrentUserId();
+    if (currentUserId == null)
+        return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+    var car = await _carService.UpdateAsync(id, currentUserId.Value, request, cancellationToken);
+    return Ok(ApiResponse<CarResponse>.Ok(car, "Car updated successfully."));
+}
+```
+
+
+
+### 4. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 5. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**正常修改（Draft 状态）：**
+
+先登录，创建一辆车（此时是 Draft），然后修改：
+
+```json
+PUT /cars/1
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......
+
+{
+    "title": "2009 Nissan Murano", 
+    "brand": "Nissan", 
+    "model": "Murano", 
+    "year": 2009, 
+    "price": 3500, 
+    "mileage": 240000, 
+    "description": "Sunroof, Leather, heated, electric seats. Wof goes out this month has rego. O2 sensor has come up on vehicle scanner, however still runs and drives perfectly, has been my daily vehicle. Please note this is the only reason why the check engine light is on. PM for more details and pictures. Only selling as I’d like to downsize, car has a lot of room and is spacious."
+}
+```
+
+预期（200）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": 1,
+    "title": "2020款宝马3系 价格调整",
+    "price": 260000,
+    "status": "Draft",
+    ...
+  },
+  "message": "Car updated successfully."
+}
+```
+
+**修改已提交审核的车（应返回 409）：**
+
+先把车辆提交审核（`POST /cars/1/submit`），再尝试修改，预期：
+
+```json
+{
+  "success": false,
+  "message": "Car '1' is in 'PendingReview' status. Required status: 'Draft'."
+}
+```
+
+**修改别人的车（应返回 403）：**
+
+换一个用户的 Token，尝试修改不属于自己的车，预期返回 403。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 6. 此时的目录变化
+
+```
+UUcars.API/
+└── DTOs/
+    └── Requests/
+        └── CarUpdateRequest.cs     ← 新增
+```
+
+`CarService` 和 `CarsController` 新增了方法，不是新文件。
+
+
+
+### 7. Git 提交
+
+```bash
+git add .
+git commit -m "feat: PUT /cars/{id} - edit car draft"
+git push origin feature/cars
+```
+
+
+
+### Step 16 完成状态
+
+```
+✅ 理解为什么只有 Draft 状态可以修改（审核中和已上架的车不允许随意改）
+✅ CarUpdateRequest DTO（理解和 CarCreateRequest 分开定义的原因）
+✅ CarService.UpdateAsync（车主检查 + Draft 状态检查）
+✅ CarsController PUT /cars/{id}
+✅ Scalar 测试通过（200 修改成功、409 非 Draft 状态、403 非车主）
+✅ Git commit + push 完成
+```
+
+
+
+## Step 17 · 删除车辆（逻辑删除）
+
+### 这一步做什么
+
+卖家可以删除自己发布的车辆。但"删除"在这里不是真正把数据从数据库里删掉，而是把 `Status` 改成 `Deleted`——这叫**逻辑删除**。
+
+
+
+### 1. 为什么用逻辑删除而不是真正删除
+
+真正删除（物理删除）会把数据库里的行直接删掉，带来几个问题：
+
+**第一，数据无法恢复。** 卖家误操作删了车辆，没有任何补救手段。
+
+**第二，关联数据会出问题。** 如果这辆车有历史订单记录，删掉车辆后订单里的 `CarId` 就成了悬空外键。虽然 Step 06 里配置了 `DeleteBehavior.Restrict` 会阻止这种情况，但这说明物理删除在有关联数据时根本无法执行。
+
+**第三，平台运营需要数据留存。** 即使车辆下架，平台可能仍然需要这条记录做数据分析、纠纷处理等。
+
+逻辑删除把 `Status` 改成 `Deleted`，数据还在，但对外不可见——公开列表过滤掉 `Deleted` 状态的车辆，卖家也看不到它，效果上等同于删除，但数据是安全保留的。
+
+
+
+### 2. 哪些状态的车辆可以被删除
+
+并不是所有状态都能删：
+
+```
+Draft          → 可以删除（草稿，还没提交审核）
+PendingReview  → 不能删除（正在审核中，需要先撤回）
+Published      → 不能删除（已上架，可能有买家正在查看）
+Sold           → 不能删除（已有成交订单，需要保留记录）
+Deleted        → 已经是删除状态，不需要重复操作
+```
+
+只有 `Draft` 状态的车辆允许删除。这是一个有意的约束——如果卖家想下架 `Published` 的车辆，后续会有专门的下架流程（目前 V1 不实现，V2 可以扩展）。
+
+
+
+### 3. 在 CarService 里添加删除方法
+
+打开 `UUcars.API/Services/CarService.cs`，在 `UpdateAsync` 下方添加：
+
+```csharp
+public async Task DeleteAsync(
+    int carId,
+    int currentUserId,
+    CancellationToken cancellationToken = default)
+{
+    var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+    if (car == null)
+        throw new CarNotFoundException(carId);
+
+    // 只有车主可以删除
+    if (car.SellerId != currentUserId)
+        throw new ForbiddenException();
+
+    // 只有 Draft 状态可以删除
+    // 其他状态（PendingReview / Published / Sold）有更严格的业务约束，
+    // 不允许直接逻辑删除
+    if (car.Status != CarStatus.Draft)
+        throw new CarStatusException(car.Id, car.Status, CarStatus.Draft);
+
+    // 逻辑删除：只改状态，不删行
+    car.Status = CarStatus.Deleted;
+    car.UpdatedAt = DateTime.UtcNow;
+
+    await _carRepository.UpdateAsync(car, cancellationToken);
+
+    _logger.LogInformation("Car {CarId} deleted by seller {SellerId}", car.Id, currentUserId);
+}
+```
+
+> **`DeleteAsync` 为什么不返回 `CarResponse`，而是返回 `void`（`Task`）？** 删除操作成功后，资源已经不存在了，没有有意义的数据需要返回给客户端。Controller 会返回 `204 No Content`，表示"操作成功，没有响应体"。这是 REST 规范对删除操作的标准做法——`200 OK` 带响应体，`204 No Content` 不带响应体。
+
+
+
+### 4. 在 CarsController 里添加 DELETE /cars/{id}
+
+打开 `UUcars.API/Controllers/CarsController.cs`，在 `Update` 方法下方添加：
+
+```csharp
+// DELETE /cars/{id}
+[HttpDelete("{id:int}")]
+[Authorize]
+public async Task<IActionResult> Delete(int id, CancellationToken cancellationToken)
+{
+    var currentUserId = _currentUserService.GetCurrentUserId();
+    if (currentUserId == null)
+        return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+    await _carService.DeleteAsync(id, currentUserId.Value, cancellationToken);
+
+    // 204 No Content：删除成功，无响应体
+    // 不用 ApiResponse 包装，因为没有数据需要返回
+    return NoContent();
+}
+```
+
+> **为什么这里不用 `ApiResponse<T>` 包装？** `ApiResponse<T>` 是为了统一有数据返回的接口格式。`204 No Content` 按 HTTP 规范本来就没有响应体，强行包一层 `ApiResponse` 反而违反了语义。客户端收到 204 就知道操作成功了，不需要解析响应体。
+
+
+
+### 5. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 6. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**正常删除（Draft 状态）：**
+
+先登录，创建一辆新车（此时是 Draft），然后删除：
+
+```
+DELETE /cars/2
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......
+```
+
+预期（204）：无响应体，只有状态码。
+
+可以去数据库里查一下这辆车的 `Status` 字段，应该变成了 `Deleted`，行本身还在。
+
+**删除已提交审核的车（应返回 409）：**
+
+先把车辆提交审核（`POST /cars/1/submit`），再尝试删除，预期：
+
+```json
+{
+  "success": false,
+  "message": "Car '1' is in 'PendingReview' status. Required status: 'Draft'."
+}
+```
+
+**删除别人的车（应返回 403）：**
+
+换一个用户的 Token，尝试删除不属于自己的车，预期返回 403。
+
+**删除不存在的车（应返回 404）：**
+
+```
+DELETE /cars/9999
+```
+
+预期：
+
+```json
+{
+  "success": false,
+  "message": "Car with id '9999' was not found."
+}
+```
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 7. 此时的目录变化
+
+这一步没有新增文件，只在已有的 `CarService` 和 `CarsController` 里新增了方法。
+
+
+
+### 8. Git 提交
+
+```bash
+git add .
+git commit -m "feat: DELETE /cars/{id} - soft delete car draft"
+git push origin feature/cars
+```
+
+
+
+### Step 17 完成状态
+
+```
+✅ 理解逻辑删除 vs 物理删除（数据保留、关联安全、运营需要）
+✅ 理解哪些状态可以删除（只有 Draft）及原因
+✅ CarService.DeleteAsync（车主检查 + Draft 状态检查 + 逻辑删除）
+✅ 理解 DeleteAsync 返回 Task 而不是 CarResponse 的原因
+✅ CarsController DELETE /cars/{id}（返回 204 No Content）
+✅ 理解 204 不用 ApiResponse 包装的原因
+✅ Scalar 测试通过（204 删除成功、409 非 Draft、403 非车主、404 不存在）
+✅ Git commit + push 完成
+```
+
+
+
+## Step 18 · 车辆图片管理
+
+### 这一步做什么
+
+车辆创建好之后，卖家需要给车辆添加图片。这一步实现两个接口：
+
+```
+POST   /cars/{id}/images              ← 给车辆添加一张图片
+DELETE /cars/{id}/images/{imageId}    ← 删除车辆的某张图片
+```
+
+V1 里图片以 URL 形式提交（卖家填写图片地址），不做真实文件上传。真实文件上传（上传到云存储）是 V2 的内容，但表结构和接口设计现在就按最终形态来做，V2 只需要改 URL 的生成方式，接口本身不需要变。
+
+
+
+### 1. 图片操作为什么限制在 Draft 状态
+
+和修改车辆信息的限制一样：
+
+```
+Draft         → 可以添加/删除图片（还没提交，随意调整）
+PendingReview → 不可以（正在审核，图片不能改）
+Published     → 不可以（已上架，买家正在看）
+Sold/Deleted  → 不可以（已完成或已删除）
+```
+
+图片是车辆信息的一部分，审核时 Admin 看到的图片和最终上架的图片必须一致，所以提交审核之后图片就不能再动了。
+
+
+
+### 2. 创建 DTO
+
+#### `DTOs/Requests/CarImageAddRequest.cs`
+
+```bash
+touch UUcars.API/DTOs/Requests/CarImageAddRequest.cs
+```
+
+```c#
+using System.ComponentModel.DataAnnotations;
+
+namespace UUcars.API.DTOs.Requests;
+
+public class CarImageAddRequest
+{
+    // V1 只支持提交 URL，不做真实文件上传
+    // URL 格式验证：[Url] 特性会检查是否是合法的 HTTP/HTTPS 地址
+    [Required(ErrorMessage = "ImageUrl is required.")]
+    [Url(ErrorMessage = "ImageUrl must be a valid URL.")]
+    [MaxLength(500, ErrorMessage = "ImageUrl must not exceed 500 characters.")]
+    public string ImageUrl { get; set; } = string.Empty;
+
+    // 显示顺序，默认 0（第一张图片作为封面）
+    // 客户端可以传入顺序值控制图片排列
+    public int SortOrder { get; set; } = 0;
+}
+```
+
+#### `DTOs/Responses/CarImageResponse.cs`
+
+```bash
+touch UUcars.API/DTOs/Responses/CarImageResponse.cs
+```
+
+```c#
+namespace UUcars.API.DTOs.Responses;
+
+public class CarImageResponse
+{
+    public int Id { get; set; }
+    public string ImageUrl { get; set; } = string.Empty;
+    public int SortOrder { get; set; }
+    public int CarId { get; set; }
+}
+```
+
+
+
+### 3. 创建 ICarImageRepository
+
+图片的数据访问逻辑和车辆本身分开——职责清晰，也方便后续单独扩展（比如 V2 要做图片排序、设置封面等操作）：
+
+```bash
+touch UUcars.API/Repositories/ICarImageRepository.cs
+touch UUcars.API/Repositories/EfCarImageRepository.cs
+```
+
+```c#
+using UUcars.API.Entities;
+
+namespace UUcars.API.Repositories;
+
+public interface ICarImageRepository
+{
+    Task<CarImage> AddAsync(CarImage image, CancellationToken cancellationToken = default);
+    Task<CarImage?> GetByIdAsync(int imageId, CancellationToken cancellationToken = default);
+    Task DeleteAsync(CarImage image, CancellationToken cancellationToken = default);
+}
+```
+
+```c#
+using Microsoft.EntityFrameworkCore;
+using UUcars.API.Data;
+using UUcars.API.Entities;
+
+namespace UUcars.API.Repositories;
+
+public class EfCarImageRepository : ICarImageRepository
+{
+    private readonly AppDbContext _context;
+
+    public EfCarImageRepository(AppDbContext context)
+    {
+        _context = context;
+    }
+
+    public async Task<CarImage> AddAsync(CarImage image, CancellationToken cancellationToken = default)
+    {
+        _context.CarImages.Add(image);
+        await _context.SaveChangesAsync(cancellationToken);
+        return image;
+    }
+
+    public async Task<CarImage?> GetByIdAsync(int imageId, CancellationToken cancellationToken = default)
+    {
+        return await _context.CarImages
+            .Include(ci => ci.Car)  // 加载关联的 Car，用于后续验证车主和状态
+            .FirstOrDefaultAsync(ci => ci.Id == imageId, cancellationToken);
+    }
+
+    public async Task DeleteAsync(CarImage image, CancellationToken cancellationToken = default)
+    {
+        // 图片是真正的物理删除——图片记录本身没有业务含义，删了就是删了
+        // 和车辆的逻辑删除不同：车辆有关联订单等历史数据需要保留，
+        // 图片只是附属资源，删掉不影响任何业务记录
+        _context.CarImages.Remove(image);
+        await _context.SaveChangesAsync(cancellationToken);
+    }
+}
+```
+
+> **这里图片用物理删除，和车辆的逻辑删除形成对比。** 判断依据是：这条数据删了之后，会不会有其他地方找不到它而出问题？车辆删了订单里的 CarId 就成了悬空外键，所以逻辑删除。图片删了没有任何其他表引用它，物理删除完全安全。
+
+
+
+### 4. 创建业务异常
+
+```bash
+touch UUcars.API/Exceptions/CarImageNotFoundException.cs
+namespace UUcars.API.Exceptions;
+
+public class CarImageNotFoundException : AppException
+{
+    public CarImageNotFoundException(int imageId)
+        : base(StatusCodes.Status404NotFound, $"Car image with id '{imageId}' was not found.")
+    {
+    }
+}
+```
+
+
+
+### 5. 在 CarService 里添加图片管理方法
+
+打开 `UUcars.API/Services/CarService.cs`，构造函数注入 `ICarImageRepository`，并添加两个方法：
+
+先更新构造函数：
+
+```csharp
+private readonly ICarRepository _carRepository;
+private readonly ICarImageRepository _carImageRepository;  // 新增
+private readonly ILogger<CarService> _logger;
+
+public CarService(
+    ICarRepository carRepository,
+    ICarImageRepository carImageRepository,     // 新增
+    ILogger<CarService> logger)
+{
+    _carRepository = carRepository;
+    _carImageRepository = carImageRepository;   // 新增
+    _logger = logger;
+}
+```
+
+再添加两个图片管理方法：
+
+```csharp
+public async Task<CarImageResponse> AddImageAsync(
+    int carId,
+    int currentUserId,
+    CarImageAddRequest request,
+    CancellationToken cancellationToken = default)
+{
+    var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+    if (car == null)
+        throw new CarNotFoundException(carId);
+
+    if (car.SellerId != currentUserId)
+        throw new ForbiddenException();
+
+    // 只有 Draft 状态才能添加图片
+    if (car.Status != CarStatus.Draft)
+        throw new CarStatusException(car.Id, car.Status, CarStatus.Draft);
+
+    var image = new CarImage
+    {
+        CarId = carId,
+        ImageUrl = request.ImageUrl,
+        SortOrder = request.SortOrder
+    };
+
+    var created = await _carImageRepository.AddAsync(image, cancellationToken);
+
+    _logger.LogInformation("Image added to car {CarId} by seller {SellerId}", carId, currentUserId);
+
+    return MapToImageResponse(created);
+}
+
+public async Task DeleteImageAsync(
+    int carId,
+    int imageId,
+    int currentUserId,
+    CancellationToken cancellationToken = default)
+{
+    // 先验证车辆存在（保证 carId 是合法的）
+    var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+    if (car == null)
+        throw new CarNotFoundException(carId);
+
+    if (car.SellerId != currentUserId)
+        throw new ForbiddenException();
+
+    if (car.Status != CarStatus.Draft)
+        throw new CarStatusException(car.Id, car.Status, CarStatus.Draft);
+
+    // 再验证图片存在，且属于这辆车
+    // 为什么要检查 image.CarId == carId？
+    // 防止用户构造 /cars/1/images/99 这样的请求来删除属于 car 99 的图片
+    // URL 里的 carId 和图片实际的 CarId 必须匹配
+    var image = await _carImageRepository.GetByIdAsync(imageId, cancellationToken);
+    if (image == null || image.CarId != carId)
+        throw new CarImageNotFoundException(imageId);
+
+    await _carImageRepository.DeleteAsync(image, cancellationToken);
+
+    _logger.LogInformation("Image {ImageId} deleted from car {CarId} by seller {SellerId}",
+        imageId, carId, currentUserId);
+}
+
+// 图片实体 → DTO 映射
+private static CarImageResponse MapToImageResponse(CarImage image) => new()
+{
+    Id = image.Id,
+    ImageUrl = image.ImageUrl,
+    SortOrder = image.SortOrder,
+    CarId = image.CarId
+};
+```
+
+同时在 `CarService.cs` 顶部补上 using：
+
+```csharp
+using UUcars.API.DTOs.Requests;
+```
+
+
+
+### 6. 在 CarsController 里添加图片管理端点
+
+打开 `UUcars.API/Controllers/CarsController.cs`，在 `Delete` 方法下方添加：
+
+```csharp
+// POST /cars/{id}/images
+[HttpPost("{id:int}/images")]
+[Authorize]
+public async Task<IActionResult> AddImage(
+    int id,
+    [FromBody] CarImageAddRequest request,
+    CancellationToken cancellationToken)
+{
+    var currentUserId = _currentUserService.GetCurrentUserId();
+    if (currentUserId == null)
+        return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+    var image = await _carService.AddImageAsync(id, currentUserId.Value, request, cancellationToken);
+
+    return StatusCode(StatusCodes.Status201Created,
+        ApiResponse<CarImageResponse>.Ok(image, "Image added successfully."));
+}
+
+// DELETE /cars/{id}/images/{imageId}
+[HttpDelete("{id:int}/images/{imageId:int}")]
+[Authorize]
+public async Task<IActionResult> DeleteImage(
+    int id,
+    int imageId,
+    CancellationToken cancellationToken)
+{
+    var currentUserId = _currentUserService.GetCurrentUserId();
+    if (currentUserId == null)
+        return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+    await _carService.DeleteImageAsync(id, imageId, currentUserId.Value, cancellationToken);
+
+    return NoContent();
+}
+```
+
+> **路由 `{id:int}/images/{imageId:int}` 里有两个路由参数，框架如何区分？** ASP.NET Core 路由系统按名字匹配——`{id:int}` 绑定到方法参数 `int id`，`{imageId:int}` 绑定到 `int imageId`，参数名必须和路由模板里的占位符名字一致，大小写不敏感。
+
+
+
+### 7. 注册依赖到 Program.cs
+
+```csharp
+// 车辆模块
+builder.Services.AddScoped<ICarRepository, EfCarRepository>();
+builder.Services.AddScoped<ICarImageRepository, EfCarImageRepository>();  // 新增
+builder.Services.AddScoped<CarService>();
+```
+
+
+
+### 8. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 9. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**正常添加图片：**
+
+先登录，创建一辆车（Draft 状态），然后添加图片：
+
+```json
+POST /cars/1/images
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......
+
+{
+  "imageUrl": "https://example.com/car1-front.jpg",
+  "sortOrder": 0
+}
+```
+
+预期（201）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": 1,
+    "imageUrl": "https://example.com/car1-front.jpg",
+    "sortOrder": 0,
+    "carId": 1
+  },
+  "message": "Image added successfully."
+}
+```
+
+**正常删除图片：**
+
+```
+DELETE /cars/1/images/1
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......
+```
+
+预期（204）：无响应体。
+
+**给已提交审核的车添加图片（应返回 409）：**
+
+提交车辆审核后再尝试添加图片，预期：
+
+```json
+{
+  "success": false,
+  "message": "Car '1' is in 'PendingReview' status. Required status: 'Draft'."
+}
+```
+
+**删除不属于该车辆的图片（应返回 404）：**
+
+尝试 `DELETE /cars/1/images/99`（图片 99 属于另一辆车），预期返回 404。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 10. 此时的目录变化
+
+```
+UUcars.API/
+├── DTOs/
+│   ├── Requests/
+│   │   └── CarImageAddRequest.cs       ← 新增
+│   └── Responses/
+│       └── CarImageResponse.cs         ← 新增
+├── Exceptions/
+│   └── CarImageNotFoundException.cs    ← 新增
+└── Repositories/
+    ├── ICarImageRepository.cs          ← 新增
+    └── EfCarImageRepository.cs         ← 新增
+```
+
+`CarService` 和 `CarsController` 新增了方法，不是新文件。
+
+
+
+### 11. Git 提交
+
+```bash
+git add .
+git commit -m "feat: car image management (add/delete)"
+git push origin feature/cars
+```
+
+
+
+### Step 18 完成状态
+
+```
+✅ 理解图片为什么限制在 Draft 状态操作
+✅ 理解图片用物理删除而车辆用逻辑删除的原因
+✅ CarImageAddRequest / CarImageResponse DTO
+✅ CarImageNotFoundException（404）
+✅ ICarImageRepository + EfCarImageRepository
+✅ CarService 新增 AddImageAsync / DeleteImageAsync
+✅ 理解 DeleteImageAsync 里为什么要验证 image.CarId == carId（防止跨车删图）
+✅ CarsController 新增 POST /cars/{id}/images 和 DELETE /cars/{id}/images/{imageId}
+✅ 理解双路由参数的绑定规则
+✅ DI 注册完成
+✅ Scalar 测试通过
+✅ Git commit + push 完成
+```
+
+
+
+## Step 19 · 车辆列表（公开）
+
+### 这一步做什么
+
+前面几步实现了卖家侧的操作（创建、修改、删除、提交审核）。从这一步开始转向买家侧——实现公开的车辆列表接口 `GET /cars`。
+
+这个接口有一个关键过滤规则：**只返回 `Published` 状态的车辆**。`Draft`、`PendingReview`、`Sold`、`Deleted` 的车辆不出现在公开列表里。买家看到的始终是经过审核、可以购买的车辆。
+
+
+
+### 1. 为什么要在数据库层过滤，而不是取出来再过滤
+
+有两种实现思路：
+
+**思路一（错误）：取出所有车辆，在内存里过滤**
+
+```csharp
+var allCars = await _context.Cars.ToListAsync();
+return allCars.Where(c => c.Status == CarStatus.Published).ToList();
+```
+
+**思路二（正确）：在数据库层过滤，只取需要的数据**
+
+```csharp
+var cars = await _context.Cars
+    .Where(c => c.Status == CarStatus.Published)
+    .ToListAsync();
+```
+
+区别在于：思路一先把所有数据加载进内存，再在内存里筛选，数据量大时会把大量无用数据传输到应用服务器，既浪费网络带宽又占用内存。思路二让数据库执行 `WHERE` 过滤，只返回符合条件的行，这是 EF Core 的核心能力之一——**IQueryable 延迟查询**。
+
+`IQueryable` 和 `IEnumerable` 的关键区别：
+
+```
+IEnumerable：数据已经在内存里，操作在内存中执行
+IQueryable： 数据还在数据库里，操作被翻译成 SQL 在数据库执行
+```
+
+在调用 `ToListAsync()` 之前，`Where`、`OrderBy`、`Skip`、`Take` 等操作都只是在构建 SQL 语句，不会真正查询数据库。只有调用 `ToListAsync()`（或 `FirstOrDefaultAsync` 等终结方法）时，才会把构建好的 SQL 发送到数据库执行。
+
+
+
+### 2. 分页的必要性
+
+车辆列表不能一次返回所有数据。如果数据库里有 10000 辆车，一次全部返回会：
+
+- 占用大量服务器内存
+- 网络传输慢，客户端等待时间长
+- 客户端渲染压力大
+
+分页把数据切成小块，每次只取一页。`Skip` 和 `Take` 是实现分页的两个核心操作：
+
+```
+Skip((page - 1) * pageSize)  ← 跳过前面几页的数据
+Take(pageSize)               ← 只取这一页的数据
+```
+
+比如第 2 页、每页 20 条：`Skip(20).Take(20)`，跳过前 20 条，取第 21-40 条。
+
+返回数据的同时，还要返回 `TotalCount`（总数量），让客户端知道一共有多少条数据，才能计算出总页数、渲染分页控件。
+
+
+
+### 3. 创建查询请求 DTO
+
+#### `DTOs/Requests/CarQueryRequest.cs`
+
+```bash
+touch UUcars.API/DTOs/Requests/CarQueryRequest.cs
+```
+
+```c#
+namespace UUcars.API.DTOs.Requests;
+
+public class CarQueryRequest
+{
+    // 页码，默认第 1 页
+    // 为什么用属性而不是方法参数？
+    // [FromQuery] 绑定时，框架会把 Query 参数自动映射到这个类的属性上，
+    // 比 Action 方法上写一堆参数更清晰
+    
+    // 页码，默认第 1 页
+    [Range(1, int.MaxValue)]
+    public int Page { get; set; } = 1;  
+
+    // 每页条数，默认 20 条
+    [Range(1, 1000)] // 给个宽一点范围
+    public int PageSize { get; set; } = 20; 
+}
+```
+
+
+
+### 4. 给 ICarRepository 增加列表查询方法
+
+打开 `UUcars.API/Repositories/ICarRepository.cs`，新增：
+
+```csharp
+using UUcars.API.Entities;
+using UUcars.API.Entities.Enums;
+
+namespace UUcars.API.Repositories;
+
+public interface ICarRepository
+{
+    Task<Car> AddAsync(Car car, CancellationToken cancellationToken = default);
+    Task<Car?> GetByIdAsync(int id, CancellationToken cancellationToken = default);
+    Task<Car> UpdateAsync(Car car, CancellationToken cancellationToken = default);
+
+    // 新增：查询指定状态的车辆列表（支持分页）
+    // 返回 (数据列表, 总数量) 的元组
+    // 为什么同时返回 totalCount？
+    // 分页接口需要告诉客户端一共有多少条数据才能渲染分页控件，
+    // 如果分两次查询（一次取数据、一次 COUNT），会有两次数据库往返。
+    // 用元组一起返回，在 Repository 里一次性处理两个查询
+    Task<(List<Car> Cars, int TotalCount)> GetPagedAsync(
+        CarStatus status,
+        int page,
+        int pageSize,
+        CancellationToken cancellationToken = default);
+}
+```
+
+打开 `UUcars.API/Repositories/EfCarRepository.cs`，补充实现：
+
+```csharp
+public async Task<(List<Car> Cars, int TotalCount)> GetPagedAsync(
+    CarStatus status,
+    int page,
+    int pageSize,
+    CancellationToken cancellationToken = default)
+{
+    // 构建基础查询（此时还没有执行 SQL，只是在构建 IQueryable）
+    var query = _context.Cars
+        .Include(c => c.Seller)
+        .Where(c => c.Status == status);
+
+    // CountAsync：单独执行一次 COUNT(*) 查询，获取符合条件的总数
+    // 注意：这里用的是过滤后的 query，不是全表 COUNT
+    var totalCount = await query.CountAsync(cancellationToken);
+
+    // 在同一个 query 基础上加分页，执行第二次查询取数据
+    // 两次查询共享同一个 WHERE 条件，保证 totalCount 和数据是一致的
+    var cars = await query
+        .OrderByDescending(c => c.CreatedAt)    // 按创建时间降序（最新发布的在前）
+        .Skip((page - 1) * pageSize)
+        .Take(pageSize)
+        .ToListAsync(cancellationToken);
+
+    // C# 元组语法：(变量名: 值, 变量名: 值)
+    return (cars, totalCount);
+}
+```
+
+> **为什么要两次查询而不是一次？** 分页数据和总数量是两个独立的查询目标。SQL 里无法在一次查询里同时返回"第 2 页的 20 条数据"和"总共有多少条"，必须分两次：一次 `COUNT(*)`，一次 `SELECT ... LIMIT OFFSET`。EF Core 会把这两次查询分别发送到数据库，都在数据库层执行，效率远高于取全部数据再在内存里处理。
+
+
+
+### 5. 在 CarService 里添加列表查询方法
+
+打开 `UUcars.API/Services/CarService.cs`，添加：
+
+```csharp
+public async Task<PagedResponse<CarResponse>> GetPublishedCarsAsync(
+        CarQueryRequest query,
+        CancellationToken cancellationToken = default)
+    {
+
+        var page = query.Page;
+        // 只做上限保护（业务规则）
+        // 单页最多返回 50 条，防止客户端传 pageSize=99999 把服务器打垮
+        var pageSize = Math.Min(query.PageSize, 50);
+
+        var (cars, totalCount) = await _carRepository.GetPagedAsync(
+            CarStatus.Published,
+            page,
+            pageSize,
+            cancellationToken);
+
+        var items = cars.Select(MapToResponse).ToList();
+
+        // PagedResponse.Create 会自动计算 TotalPages
+        return PagedResponse<CarResponse>.Create(items, totalCount, page, pageSize);
+    }
+```
+
+同时在 `CarService.cs` 顶部补上 using：
+
+```csharp
+using UUcars.API.DTOs;
+```
+
+
+
+### 6. 在 CarsController 里添加列表接口
+
+打开 `UUcars.API/Controllers/CarsController.cs`，在 `Create` 方法**上方**添加（习惯上把公开的读接口放在前面）：
+
+```csharp
+// GET /cars?page=1&pageSize=20
+// 这个接口不需要 [Authorize]，公开访问
+// [FromQuery]：告诉框架从 URL 的 Query 参数里绑定 CarQueryRequest 的属性
+// 比如 /cars?page=2&pageSize=10 会自动绑定成 query.Page=2, query.PageSize=10
+
+    [HttpGet]
+    public async Task<IActionResult> GetPaged(
+        [FromQuery] CarQueryRequest request ,CancellationToken cancellationToken)
+    {
+        var result = await _carService.GetPublishedCarsAsync(request, cancellationToken);
+        
+        return StatusCode(StatusCodes.Status200OK, ApiResponse<PagedResponse<CarResponse>>.Ok(result, "Cars retrieved successfully."));
+    }
+```
+
+
+
+### 7. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 8. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+目前数据库里可能没有 `Published` 状态的车辆（创建的车都是 `Draft`，需要经过 Admin 审核才能变 `Published`）。Admin 审核功能在 Step 29 才实现，现在可以直接在数据库里手动把一辆车的 `Status` 改成 `Published` 来测试：
+
+用数据库客户端执行：
+
+```sql
+UPDATE Cars SET Status = 'Published' WHERE Id = 1
+```
+
+**不带参数（默认分页）：**
+
+```
+GET /cars
+```
+
+预期（200）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "items": [
+      {
+        "id": 1,
+        "title": "2020款宝马3系 低里程无事故",
+        "status": "Published",
+        ...
+      }
+    ],
+    "totalCount": 1,
+    "page": 1,
+    "pageSize": 20,
+    "totalPages": 1
+  }
+}
+```
+
+**带分页参数：**
+
+```
+GET /cars?page=1&pageSize=5
+```
+
+每页 5 条，验证分页参数生效。
+
+**验证过滤：Draft 状态的车不出现在列表里**
+
+数据库里有 `Draft` 状态的车，确认它们不出现在 `GET /cars` 的结果里。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 9. 此时的目录变化
+
+```
+UUcars.API/
+└── DTOs/
+    └── Requests/
+        └── CarQueryRequest.cs      ← 新增
+```
+
+`ICarRepository`、`EfCarRepository`、`CarService`、`CarsController` 均已更新，不是新文件。
+
+
+
+### 10. Git 提交
+
+```bash
+git add .
+git commit -m "feat: GET /cars - public car listing with pagination"
+git push origin feature/cars
+```
+
+
+
+### Step 19 完成状态
+
+```
+✅ 理解 IQueryable 延迟查询 vs IEnumerable 内存查询的区别
+✅ 理解分页的必要性（Skip / Take / TotalCount）
+✅ 理解两次查询（COUNT + 数据）的原因
+✅ CarQueryRequest DTO（Page / PageSize，含默认值）
+✅ ICarRepository 新增 GetPagedAsync（返回元组）
+✅ EfCarRepository 实现 GetPagedAsync（IQueryable 链式构建，两次查询）
+✅ CarService.GetPublishedCarsAsync（分页参数保护 + 只返回 Published）
+✅ CarsController GET /cars（[FromQuery] 绑定，无需登录）
+✅ Scalar 测试通过（分页返回、Draft 车辆被过滤）
+✅ Git commit + push 完成
+```
+
+
+
+## Step 20 · 我的车辆列表（卖家视角）
+
+### 这一步做什么
+
+Step 19 实现了公开车辆列表，只返回 `Published` 的车辆。但卖家还需要看到自己发布的所有车辆，包括还在 `Draft`、`PendingReview` 状态的——否则卖家创建了草稿之后，完全看不到自己的车在哪里，没办法管理。
+
+这一步实现 `GET /cars/my-listings`，返回当前登录用户作为卖家发布的所有车辆（含所有状态）。
+
+
+
+### 1. 为什么需要这个接口
+
+公开列表（`GET /cars`）和卖家列表（`GET /cars/my-listings`）是两个完全不同的视角：
+
+```
+GET /cars              ← 买家视角，只看 Published，不需要登录
+GET /cars/my-listings  ← 卖家视角，看自己所有状态的车，需要登录
+```
+
+如果没有 `GET /cars/my-listings`，卖家创建草稿之后就找不到它了——公开列表不会显示 `Draft` 的车，卖家无法查看、修改、提交审核，整个车辆管理流程就断掉了。
+
+
+
+### 2. 路由顺序的问题
+
+这一步有一个值得注意的路由细节。`CarsController` 里已经有：
+
+```
+GET /cars          → GetAll()
+GET /cars/{id}     → GetById()（Step 22 才实现）
+```
+
+现在要加：
+
+```
+GET /cars/my-listings → GetMyListings()
+```
+
+问题来了：框架在匹配 `GET /cars/my-listings` 时，会不会误以为 `my-listings` 是 `{id}` 的值，把请求路由到 `GetById()` 里？
+
+答案是**不会**，因为 `{id}` 有路由约束 `:int`——`my-listings` 不是整数，所以不会匹配 `GET /cars/{id:int}`。框架会继续往下找，匹配到 `GET /cars/my-listings`。
+
+但如果 `{id}` 没有 `:int` 约束（比如写成 `{id}`），`my-listings` 就会被当成字符串 id 传进去，引发错误。这也是 Step 15 里特意给路由参数加 `:int` 约束的原因之一。
+
+
+
+### 3. 给 ICarRepository 增加卖家列表查询方法
+
+打开 `UUcars.API/Repositories/ICarRepository.cs`，新增：
+
+```csharp
+using UUcars.API.Entities;
+using UUcars.API.Entities.Enums;
+
+namespace UUcars.API.Repositories;
+
+public interface ICarRepository
+{
+    Task<Car> AddAsync(Car car, CancellationToken cancellationToken = default);
+    Task<Car?> GetByIdAsync(int id, CancellationToken cancellationToken = default);
+    Task<Car> UpdateAsync(Car car, CancellationToken cancellationToken = default);
+    Task<(List<Car> Cars, int TotalCount)> GetPagedAsync(
+        CarStatus status,
+        int page,
+        int pageSize,
+        CancellationToken cancellationToken = default);
+
+    // 新增：查询某个卖家的所有车辆（不过滤状态，支持分页）
+    Task<(List<Car> Cars, int TotalCount)> GetBySellerAsync(
+        int sellerId,
+        int page,
+        int pageSize,
+        CancellationToken cancellationToken = default);
+}
+```
+
+打开 `UUcars.API/Repositories/EfCarRepository.cs`，补充实现：
+
+```csharp
+public async Task<(List<Car> Cars, int TotalCount)> GetBySellerAsync(
+    int sellerId,
+    int page,
+    int pageSize,
+    CancellationToken cancellationToken = default)
+{
+    var query = _context.Cars
+        .Include(c => c.Seller)
+        .Where(c => c.SellerId == sellerId);
+        // 注意：这里没有过滤 Status，返回卖家所有状态的车辆
+        // 但排除逻辑删除的车辆——卖家也不需要看到已删除的车
+        // 如果将来需要显示已删除的车，可以单独加一个接口
+
+    // 去掉逻辑删除的车（卖家视角也不需要看到已删除的车）
+    query = query.Where(c => c.Status != CarStatus.Deleted);
+
+    var totalCount = await query.CountAsync(cancellationToken);
+
+    var cars = await query
+        .OrderByDescending(c => c.CreatedAt)
+        .Skip((page - 1) * pageSize)
+        .Take(pageSize)
+        .ToListAsync(cancellationToken);
+
+    return (cars, totalCount);
+}
+```
+
+
+
+### 4. 在 CarService 里添加卖家列表查询方法
+
+打开 `UUcars.API/Services/CarService.cs`，添加：
+
+```csharp
+public async Task<PagedResponse<CarResponse>> GetMyListingsAsync(
+    int sellerId,
+    CarQueryRequest query,
+    CancellationToken cancellationToken = default)
+{
+    var page = query.Page < 1 ? 1 : query.Page;
+    var pageSize = query.PageSize < 1 ? 20 : query.PageSize;
+    pageSize = Math.Min(pageSize, 50);
+
+    var (cars, totalCount) = await _carRepository.GetBySellerAsync(
+        sellerId,
+        page,
+        pageSize,
+        cancellationToken);
+
+    var items = cars.Select(MapToResponse).ToList();
+
+    return PagedResponse<CarResponse>.Create(items, totalCount, page, pageSize);
+}
+```
+
+
+
+### 5. 在 CarsController 里添加 GET /cars/my-listings
+
+打开 `UUcars.API/Controllers/CarsController.cs`，在 `GetAll` 方法下方添加：
+
+```csharp
+// GET /cars/my-listings
+// 必须放在 GET /cars/{id:int} 之前定义，虽然 :int 约束已经能区分，
+// 但显式把固定路径放在参数路由之前是更好的习惯，意图更清晰
+[HttpGet("my-listings")]
+[Authorize]     // 卖家接口，必须登录
+public async Task<IActionResult> GetMyListings(
+    [FromQuery] CarQueryRequest query,
+    CancellationToken cancellationToken)
+{
+    var currentUserId = _currentUserService.GetCurrentUserId();
+    if (currentUserId == null)
+        return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+    var result = await _carService.GetMyListingsAsync(currentUserId.Value, query, cancellationToken);
+    return Ok(ApiResponse<PagedResponse<CarResponse>>.Ok(result));
+}
+```
+
+
+
+### 6. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 7. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**正常获取我的车辆列表：**
+
+登录后访问：
+
+```
+GET /cars/my-listings
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......
+```
+
+预期（200）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "items": [
+      {
+        "id": 1,
+        "title": "2020款宝马3系 低里程无事故",
+        "status": "Published",
+        ...
+      },
+      {
+        "id": 2,
+        "title": "2019款丰田凯美瑞",
+        "status": "Draft",
+        ...
+      }
+    ],
+    "totalCount": 2,
+    "page": 1,
+    "pageSize": 20,
+    "totalPages": 1
+  }
+}
+```
+
+注意结果里同时包含了 `Published` 和 `Draft` 状态的车辆，这是和公开列表的核心区别。
+
+**不带 Token 访问（应返回 401）：**
+
+不带 Authorization 头直接访问，预期返回 401。
+
+**验证只返回自己的车辆：**
+
+换另一个用户的 Token 登录，确认返回的是那个用户发布的车辆，不会看到其他人的。
+
+**验证已删除的车不出现：**
+
+删除一辆车（`DELETE /cars/{id}`），再访问 `GET /cars/my-listings`，确认被删除的车不在列表里。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 8. 此时的目录变化
+
+这一步没有新增文件，只在 `ICarRepository`、`EfCarRepository`、`CarService`、`CarsController` 里新增了方法。
+
+
+
+### 9. Git 提交
+
+```bash
+git add .
+git commit -m "feat: GET /cars/my-listings - seller's own car list"
+git push origin feature/cars
+```
+
+
+
+### Step 20 完成状态
+
+```
+✅ 理解卖家列表和公开列表的区别（视角不同、状态过滤不同、权限不同）
+✅ 理解路由顺序问题（固定路径 vs 参数路径，:int 约束的保护作用）
+✅ ICarRepository 新增 GetBySellerAsync（不过滤状态，排除 Deleted）
+✅ EfCarRepository 实现 GetBySellerAsync
+✅ CarService.GetMyListingsAsync
+✅ CarsController GET /cars/my-listings（需要登录）
+✅ Scalar 测试通过（返回所有状态车辆、只返回自己的车、删除的车不出现）
+✅ Git commit + push 完成
+```
+
+
+
+## Step 21 · 车辆搜索
+
+### 这一步做什么
+
+Step 19 实现了公开车辆列表，但只有分页，没有任何过滤条件——买家想找"价格在 20 万以内的宝马"就没办法。这一步在 `GET /cars` 基础上扩展搜索能力，支持按品牌、价格区间、年份区间过滤。
+
+
+
+### 1. 搜索参数怎么和分页参数结合
+
+Step 19 已经有了 `CarQueryRequest`（包含 `Page` 和 `PageSize`），现在要往里面加搜索参数。
+
+有两种方式：
+
+**方式一：新建一个 `CarSearchRequest` 继承 `CarQueryRequest`**
+
+```csharp
+public class CarSearchRequest : CarQueryRequest
+{
+    public string? Brand { get; set; }
+    // ...
+}
+```
+
+**方式二：直接在 `CarQueryRequest` 里加搜索字段**
+
+```csharp
+public class CarQueryRequest
+{
+    public int Page { get; set; } = 1;
+    public int PageSize { get; set; } = 20;
+    public string? Brand { get; set; }
+    // ...
+}
+```
+
+我们用方式二——`GET /cars` 本来就是同一个接口，分页和过滤是同一次请求里的参数，放在同一个 DTO 里更自然。客户端可以同时传 `?brand=BMW&minPrice=10000&page=2`，不需要区分"这是搜索参数"还是"这是分页参数"。
+
+
+
+### 2. 更新 CarQueryRequest
+
+打开 `UUcars.API/DTOs/Requests/CarQueryRequest.cs`，添加搜索字段：
+
+```csharp
+namespace UUcars.API.DTOs.Requests;
+
+public class CarQueryRequest
+{
+    public int Page { get; set; } = 1;
+    public int PageSize { get; set; } = 20;
+
+    // 以下字段都是可选的（nullable），不传就不过滤
+    // 为什么用 string? 而不是 string？
+    // 过滤条件是可选的——不传 Brand 表示"不限品牌"，
+    // 用 nullable 类型，Service 层可以用 null 判断是否需要应用这个过滤条件
+
+    // 品牌过滤：精确匹配（BMW、Toyota 等）
+    public string? Brand { get; set; }
+
+    // 价格区间：minPrice / maxPrice 都是可选的，
+    // 可以只传其中一个（比如"最高 20 万"只传 maxPrice）
+    public decimal? MinPrice { get; set; }
+    public decimal? MaxPrice { get; set; }
+
+    // 年份区间：和价格区间同理
+    public int? MinYear { get; set; }
+    public int? MaxYear { get; set; }
+}
+```
+
+
+
+### 3. 更新 ICarRepository 和 EfCarRepository
+
+搜索参数需要传进 Repository 层，在数据库层面做过滤（而不是取出来再在内存里过滤）。
+
+打开 `UUcars.API/Repositories/ICarRepository.cs`，把 `GetPagedAsync` 的签名更新为接收完整的查询请求：
+
+```csharp
+using UUcars.API.DTOs.Requests;
+using UUcars.API.Entities;
+using UUcars.API.Entities.Enums;
+
+namespace UUcars.API.Repositories;
+
+public interface ICarRepository
+{
+    Task<Car> AddAsync(Car car, CancellationToken cancellationToken = default);
+    Task<Car?> GetByIdAsync(int id, CancellationToken cancellationToken = default);
+    Task<Car> UpdateAsync(Car car, CancellationToken cancellationToken = default);
+
+    // 新增：查询指定状态的车辆列表（支持分页 + 过滤）
+    // 更新：原来只接收 status / page / pageSize，现在接收完整的 query 对象
+    Task<(List<Car> Cars, int TotalCount)> GetPagedAsync(
+        CarStatus status,
+        CarQueryRequest query,
+        CancellationToken cancellationToken = default);
+
+
+    //卖家列表页更新
+    // 更新：原来只接收 status / page / pageSize，现在接收完整的 query 对象
+    Task<(List<Car> Cars, int TotalCount)> GetBySellerAsync(
+        int sellerId,
+        CarQueryRequest query,
+        CancellationToken cancellationToken = default);
+}
+```
+
+打开 `UUcars.API/Repositories/EfCarRepository.cs`，更新 `GetPagedAsync` 的实现：
+
+```csharp
+ public async Task<(List<Car> Cars, int TotalCount)> GetPagedAsync(
+        CarStatus status,
+        CarQueryRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        // 构建基础查询（此时还没有执行 SQL，只是在构建 IQueryable）
+        // 从 status 过滤开始构建 IQueryable
+        // 后续每一个 Where 都是在已有的查询基础上追加条件，
+        // 最终 EF Core 会把所有条件合并成一条 SQL 语句
+        var query = _context.Cars
+            .Include(c => c.Seller)
+            .Where(c => c.Status == status);
+
+        // 品牌过滤：只有传了 Brand 才追加这个条件
+        // string.IsNullOrWhiteSpace：同时处理 null、空字符串、纯空格的情况
+        if (!string.IsNullOrWhiteSpace(request.Brand))
+        {
+            // Contains + ToLower：大小写不敏感的模糊匹配
+            // 比如搜 "bmw" 能匹配 "BMW"、"Bmw"
+            // EF Core 会把这个翻译成 SQL 的 LIKE '%bmw%'（在 SQL Server 里不区分大小写）
+            query = query.Where(c => c.Brand.Contains(request.Brand.ToLower()));
+        }
+
+        // 价格区间：MinPrice 和 MaxPrice 各自独立，可以只传其中一个
+        if (request.MinPrice.HasValue)
+        {
+            query = query.Where(c => c.Price >= request.MinPrice.Value);
+        }
+
+        if (request.MaxPrice.HasValue)
+        {
+            query = query.Where(c => c.Price <= request.MaxPrice.Value);
+        }
+
+        if (request.MinYear.HasValue)
+        {
+            query = query.Where(c => c.Year >= request.MinYear.Value);
+        }
+
+        if (request.MaxYear.HasValue)
+        {
+            query = query.Where(c => c.Year <= request.MaxYear.Value);
+        }
+        
+        // 到这里 query 还是 IQueryable，所有 Where 条件都还没有执行 SQL
+        // CountAsync 触发第一次数据库查询：SELECT COUNT(*) WHERE ...（含所有过滤条件）
+        var totalCount = await query.CountAsync(cancellationToken);
+
+        // 在同一个 query 基础上加分页，执行第二次查询取数据
+        // 两次查询共享同一个 WHERE 条件，保证 totalCount 和数据是一致的
+        
+        var page = request.Page;
+        var pageSize = Math.Min(50, request.PageSize);
+        
+        var cars = await query
+            .OrderByDescending(c => c.CreatedAt)    // 按创建时间降序（最新发布的在前）
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .ToListAsync(cancellationToken);
+
+        // C# 元组语法：(变量名: 值, 变量名: 值)
+        return (cars, totalCount);
+    }
+```
+
+> **为什么把分页参数的保护（`page < 1`、`Math.Min`）移到 Repository 里？** 原来在 Service 里处理，但搜索参数也在 `CarQueryRequest` 里，整个 query 对象现在直接传进 Repository，分页计算放在 Repository 里更自然——数据分页是数据访问层的职责。Service 层只负责组装查询条件，不再重复处理分页边界。
+
+
+
+### 4. 更新 CarService
+
+打开 `UUcars.API/Services/CarService.cs`，更新 `GetPublishedCarsAsync`，去掉重复的分页边界处理（已移入 Repository）：
+
+```csharp
+public async Task<PagedResponse<CarResponse>> GetPublishedCarsAsync(
+        CarQueryRequest request,
+        CancellationToken cancellationToken = default)
+    {
+
+
+        var (cars, totalCount) = await _carRepository.GetPagedAsync(
+            CarStatus.Published,
+            request,
+            cancellationToken);
+
+        var items = cars.Select(MapToResponse).ToList();
+
+        // PagedResponse.Create 会自动计算 TotalPages
+        return PagedResponse<CarResponse>.Create(items, totalCount, request.Page, request.PageSize);
+    }
+```
+
+
+
+### 5. CarsController 不需要改动
+
+`CarsController` 里的 `GetAll` 方法已经把整个 `CarQueryRequest` 对象传给了 Service，搜索参数自动包含在里面，Controller 层不需要任何改动。
+
+这正是把请求参数封装成 DTO 的好处——新增字段时，Controller 层完全不受影响，只有 DTO、Service、Repository 需要更新。
+
+
+
+### 6. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 7. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+先确保数据库里有几辆 `Published` 状态、不同品牌/价格/年份的车辆（可以直接在数据库里改 Status，或者用 Admin 账号手动改）。
+
+**按品牌过滤：**
+
+```
+GET /cars?brand=BMW
+```
+
+预期：只返回品牌包含 "BMW" 的车辆。
+
+**按价格区间过滤：**
+
+```
+GET /cars?minPrice=100000&maxPrice=300000
+```
+
+预期：只返回价格在 10 万到 30 万之间的车辆。
+
+**按年份过滤：**
+
+```
+GET /cars?minYear=2019&maxYear=2022
+```
+
+预期：只返回 2019 年到 2022 年之间的车辆。
+
+**组合查询（最接近真实用法）：**
+
+```
+GET /cars?brand=BMW&maxPrice=300000&minYear=2020&page=1&pageSize=10
+```
+
+预期：过滤、分页同时生效，返回满足所有条件的车辆。
+
+**不带任何过滤参数（验证不影响原有行为）：**
+
+```
+GET /cars
+```
+
+预期：和 Step 19 一样，返回所有 `Published` 车辆，分页正常工作。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 8. 此时的目录变化
+
+这一步没有新增文件，只更新了已有的文件：
+
+```
+UUcars.API/
+├── DTOs/Requests/CarQueryRequest.cs    ← 已更新（新增搜索字段）
+├── Repositories/
+│   ├── ICarRepository.cs              ← 已更新（GetPagedAsync 签名变更）
+│   └── EfCarRepository.cs             ← 已更新（GetPagedAsync 实现搜索逻辑）
+└── Services/CarService.cs             ← 已更新（GetPublishedCarsAsync 简化）
+```
+
+
+
+### 9. Git 提交
+
+```bash
+git add .
+git commit -m "feat: car search with query filters (brand/price/year)"
+git push origin feature/cars
+```
+
+
+
+### Step 21 完成状态
+
+```
+✅ 理解搜索参数和分页参数放在同一个 DTO 里的原因
+✅ 理解 nullable 类型在可选过滤条件中的作用
+✅ CarQueryRequest 新增搜索字段（Brand / MinPrice / MaxPrice / MinYear / MaxYear）
+✅ 理解 IQueryable 链式追加 Where 条件的方式（所有条件合并成一条 SQL）
+✅ EfCarRepository.GetPagedAsync 实现搜索过滤（品牌模糊匹配 + 价格/年份区间）
+✅ 理解为什么在数据库层过滤而不是内存过滤
+✅ Controller 层无需改动（DTO 封装的好处）
+✅ Scalar 测试通过（单条件过滤、组合过滤、不带参数保持原有行为）
+✅ Git commit + push 完成
+```
+
+
+
+## Step 22 · 车辆详情
+
+### 这一步做什么
+
+实现 `GET /cars/{id}`，返回单辆车的完整信息，包括车辆图片列表和卖家基本信息。
+
+这个接口比列表接口复杂的地方在于**权限规则**：不同身份的用户能看到不同状态的车辆——
+
+```
+未登录用户      只能查看 Published 状态的车辆
+已登录的车主    还能看到自己的 Draft / PendingReview 状态车辆
+Admin          可以查看所有状态的车辆
+```
+
+这个设计符合真实平台的需求：买家只能看已上架的车，卖家需要能预览自己还未上架的草稿，Admin 需要能看到待审核的车辆。
+
+完成这个接口之后，还要补充 `CarService` 的单元测试——这是大纲里这一步的要求，也是前面讨论过的：车辆状态流转和权限检查有明确的业务规则，值得用测试保护起来。
+
+
+
+### 1. 详情接口为什么需要返回图片列表和卖家信息
+
+列表接口（`GET /cars`）返回的是每辆车的摘要信息，用于展示搜索结果卡片。详情接口（`GET /cars/{id}`）返回的是完整信息，用于展示车辆详情页，买家在这里决定是否下单。
+
+详情页需要的信息比列表多：
+
+```
+列表页：标题、品牌、价格、里程、封面图（一张）
+详情页：所有信息 + 全部图片 + 卖家联系信息
+```
+
+所以需要一个专门的 `CarDetailResponse`，而不是复用 `CarResponse`。
+
+
+
+### 2. 创建 CarDetailResponse
+
+```bash
+touch UUcars.API/DTOs/Responses/CarDetailResponse.cs
+```
+
+```c#
+namespace UUcars.API.DTOs.Responses;
+
+// 车辆详情响应，比 CarResponse 多了图片列表
+// 用独立的类而不是在 CarResponse 里加字段，
+// 原因：列表接口不需要图片数据，如果都用 CarDetailResponse，
+// 列表查询就要 Include Images，每辆车都加载图片列表，
+// 数据量大时会带来严重的性能问题
+public class CarDetailResponse
+{
+    public int Id { get; set; }
+    public string Title { get; set; } = string.Empty;
+    public string Brand { get; set; } = string.Empty;
+    public string Model { get; set; } = string.Empty;
+    public int Year { get; set; }
+    public decimal Price { get; set; }
+    public int Mileage { get; set; }
+    public string? Description { get; set; }
+    public string Status { get; set; } = string.Empty;
+    public int SellerId { get; set; }
+    public string SellerUsername { get; set; } = string.Empty;
+    public List<CarImageResponse> Images { get; set; } = [];
+    public DateTime CreatedAt { get; set; }
+    public DateTime UpdatedAt { get; set; }
+}
+```
+
+
+
+### 3. 更新 ICarRepository 和 EfCarRepository
+
+详情接口需要同时加载图片列表，`GetByIdAsync` 目前只 `Include` 了 `Seller`，没有 `Include` 图片。
+
+打开 `UUcars.API/Repositories/ICarRepository.cs`，新增一个专门用于详情查询的方法：
+
+```csharp
+// 新增：查询车辆详情（同时加载 Seller 和 Images）
+// 为什么不直接修改 GetByIdAsync？
+// GetByIdAsync 目前被状态变更操作（提交审核、修改、删除）使用，
+// 这些操作不需要加载图片列表，加了反而是多余的查询。
+// 用途不同的查询用不同的方法，各自只加载需要的数据
+Task<Car?> GetDetailByIdAsync(int id, CancellationToken cancellationToken = default);
+```
+
+打开 `UUcars.API/Repositories/EfCarRepository.cs`，补充实现：
+
+```csharp
+public async Task<Car?> GetDetailByIdAsync(int id, CancellationToken cancellationToken = default)
+{
+    return await _context.Cars
+        .Include(c => c.Seller)
+        .Include(c => c.Images)     // 同时加载图片列表
+        .FirstOrDefaultAsync(c => c.Id == id, cancellationToken);
+}
+```
+
+
+
+### 4. 在 CarService 里实现权限判断逻辑
+
+权限判断的核心思路：先查出车辆，再根据当前用户身份决定能不能看。
+
+打开 `UUcars.API/Services/CarService.cs`，添加 `GetDetailAsync`：
+
+```csharp
+public async Task<CarDetailResponse> GetDetailAsync(
+    int carId,
+    int? currentUserId, // nullable：未登录时为 null
+    bool isAdmin, // 是否是 Admin 角色
+    CancellationToken cancellationToken = default)
+{
+    var car = await _carRepository.GetDetailByIdAsync(carId, cancellationToken);
+
+    if (car == null)
+        throw new CarNotFoundException(carId);
+
+    // Published 的车是公开资源，任何人都可以直接查看，不需要权限判断
+    if (car.Status == CarStatus.Published)
+        return MapToDetailResponse(car);
+
+    // 非 Published 的车是受保护资源，需要验证身份
+    // Admin 可以查看任何状态的车辆
+    if (isAdmin)
+        return MapToDetailResponse(car);
+
+    // 车主可以查看自己发布的车辆（Draft / PendingReview 等）
+    var isOwner = currentUserId.HasValue && car.SellerId == currentUserId.Value;
+    if (isOwner)
+        return MapToDetailResponse(car);
+
+    // 既不是 Published，也没有对应权限，对外表现为"不存在"
+    throw new CarNotFoundException(carId);
+}
+
+// 详情实体 → DTO 的映射（包含图片列表）
+private static CarDetailResponse MapToDetailResponse(Car car) => new()
+{
+    Id = car.Id,
+    Title = car.Title,
+    Brand = car.Brand,
+    Model = car.Model,
+    Year = car.Year,
+    Price = car.Price,
+    Mileage = car.Mileage,
+    Description = car.Description,
+    Status = car.Status.ToString(),
+    SellerId = car.SellerId,
+    SellerUsername = car.Seller?.Username ?? string.Empty,
+    Images = car.Images
+        .OrderBy(i => i.SortOrder)  // 按 SortOrder 排序，确保图片顺序正确
+        .Select(i => new CarImageResponse
+        {
+            Id = i.Id,
+            ImageUrl = i.ImageUrl,
+            SortOrder = i.SortOrder,
+            CarId = i.CarId
+        })
+        .ToList(),
+    CreatedAt = car.CreatedAt,
+    UpdatedAt = car.UpdatedAt
+};
+```
+
+> **判断逻辑**
+>
+> Published 的车是公开资源，任何人都能看，不需要权限判断。 非 Published 的车是受保护资源，需要验证身份
+>
+> **为什么没有权限时返回 404 而不是 403？** 403 的语义是"我知道这个资源存在，但你没权限访问"，这会向外部透露"这辆车存在于系统里"。对于 `Draft` 状态的车来说，它的存在本身就不应该被其他人知道。返回 404，对没有权限的用户来说，这辆车"根本不存在"，更安全。
+
+
+
+### 5. 在 CarsController 里添加详情接口
+
+打开 `UUcars.API/Controllers/CarsController.cs`，在 `GetMyListings` 下方添加：
+
+```csharp
+// GET /cars/{id}
+// 不需要 [Authorize]：公开接口，但权限判断在 Service 层处理
+[HttpGet("{id:int}")]
+public async Task<IActionResult> GetById(int id, CancellationToken cancellationToken)
+{
+    // 从 Token 里获取当前用户信息（未登录时为 null）
+    var currentUserId = _currentUserService.GetCurrentUserId();
+
+    // 判断当前用户是否是 Admin
+    // User.IsInRole：ASP.NET Core 提供的方法，读取 ClaimsPrincipal 里的 Role Claim
+    // 未登录时 User.IsInRole 返回 false，不会抛异常
+    var isAdmin = User.IsInRole("Admin");
+
+    var car = await _carService.GetDetailAsync(id, currentUserId, isAdmin, cancellationToken);
+
+    return StatusCode(StatusCodes.Status200OK,
+        ApiResponse<CarDetailResponse>.Ok(car, "Car retrieved successfully."));
+}
+```
+
+
+
+### 6. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 7. 单元测试
+
+这一步要进行 `CarService` 的单元测试，重点覆盖状态流转和权限检查这两块业务规则。
+
+#### 7.1 创建 FakeCarRepository
+
+```bash
+touch UUcars.Tests/Fakes/FakeCarRepository.cs
+```
+
+```c#
+using UUcars.API.DTOs.Requests;
+using UUcars.API.Entities;
+using UUcars.API.Entities.Enums;
+using UUcars.API.Repositories;
+
+namespace UUcars.Tests.Fakes;
+
+public class FakeCarRepository : ICarRepository
+{
+    private readonly Dictionary<int, Car> _store = new();
+    private int _nextId = 1;
+
+    public void Seed(Car car)
+    {
+        if (car.Id == 0) car.Id = _nextId++;
+        _store[car.Id] = car;
+    }
+
+    public Task<Car> AddAsync(Car car, CancellationToken cancellationToken = default)
+    {
+        car.Id = _nextId++;
+        _store[car.Id] = car;
+        return Task.FromResult(car);
+    }
+
+    public Task<Car?> GetByIdAsync(int id, CancellationToken cancellationToken = default)
+    {
+        _store.TryGetValue(id, out var car);
+        return Task.FromResult(car);
+    }
+
+    public Task<Car?> GetDetailByIdAsync(int id, CancellationToken cancellationToken = default)
+    {
+        // Fake 里的 GetDetail 和 GetById 行为一致，
+        // 测试里不需要真实的 Include，导航属性直接在 Seed 时设置好
+        _store.TryGetValue(id, out var car);
+        return Task.FromResult(car);
+    }
+
+    public Task<Car> UpdateAsync(Car car, CancellationToken cancellationToken = default)
+    {
+        _store[car.Id] = car;
+        return Task.FromResult(car);
+    }
+
+    public Task<(List<Car> Cars, int TotalCount)> GetPagedAsync(
+        CarStatus status,
+        CarQueryRequest query,
+        CancellationToken cancellationToken = default)
+    {
+        var result = _store.Values
+            .Where(c => c.Status == status)
+            .ToList();
+        return Task.FromResult((result, result.Count));
+    }
+
+    public Task<(List<Car> Cars, int TotalCount)> GetBySellerAsync(
+        int sellerId,
+        int page,
+        int pageSize,
+        CancellationToken cancellationToken = default)
+    {
+        var result = _store.Values
+            .Where(c => c.SellerId == sellerId && c.Status != CarStatus.Deleted)
+            .ToList();
+        return Task.FromResult((result, result.Count));
+    }
+}
+```
+
+#### 7.2 创建 FakeCarImageRepository
+
+```bash
+touch UUcars.Tests/Fakes/FakeCarImageRepository.cs
+```
+
+```c#
+using UUcars.API.Entities;
+using UUcars.API.Repositories;
+
+namespace UUcars.Tests.Fakes;
+
+public class FakeCarImageRepository : ICarImageRepository
+{
+    private readonly Dictionary<int, CarImage> _store = new();
+    private int _nextId = 1;
+
+    public Task<CarImage> AddAsync(CarImage image, CancellationToken cancellationToken = default)
+    {
+        image.Id = _nextId++;
+        _store[image.Id] = image;
+        return Task.FromResult(image);
+    }
+
+    public Task<CarImage?> GetByIdAsync(int imageId, CancellationToken cancellationToken = default)
+    {
+        _store.TryGetValue(imageId, out var image);
+        return Task.FromResult(image);
+    }
+
+    public Task DeleteAsync(CarImage image, CancellationToken cancellationToken = default)
+    {
+        _store.Remove(image.Id);
+        return Task.CompletedTask;
+    }
+}
+```
+
+#### 7.3 编写 CarService 单元测试
+
+```bash
+mkdir -p UUcars.Tests/Services
+touch UUcars.Tests/Services/CarServiceTests.cs
+```
+
+```c#
+using Microsoft.Extensions.Logging.Abstractions;
+using UUcars.API.Entities;
+using UUcars.API.Entities.Enums;
+using UUcars.API.Exceptions;
+using UUcars.API.Services;
+using UUcars.Tests.Fakes;
+
+namespace UUcars.Tests.Services;
+
+public class CarServiceTests
+{
+    private static CarService CreateService(
+        FakeCarRepository carRepo,
+        FakeCarImageRepository? imageRepo = null)
+    {
+        return new CarService(
+            carRepo,
+            imageRepo ?? new FakeCarImageRepository(),
+            NullLogger<CarService>.Instance
+        );
+    }
+
+    // ===== 提交审核的测试 =====
+
+    [Fact]
+    public async Task SubmitForReviewAsync_WhenDraftAndOwner_ShouldChangeToPendingReview()
+    {
+        // Arrange
+        var repo = new FakeCarRepository();
+        repo.Seed(new Car { Id = 1, SellerId = 10, Status = CarStatus.Draft });
+        var service = CreateService(repo);
+
+        // Act
+        var result = await service.SubmitForReviewAsync(1, currentUserId: 10);
+
+        // Assert
+        Assert.Equal("PendingReview", result.Status);
+    }
+
+    [Fact]
+    public async Task SubmitForReviewAsync_WhenNotOwner_ShouldThrowForbiddenException()
+    {
+        // Arrange
+        var repo = new FakeCarRepository();
+        repo.Seed(new Car { Id = 1, SellerId = 10, Status = CarStatus.Draft });
+        var service = CreateService(repo);
+
+        // Act + Assert：用不同的 userId（99）操作
+        await Assert.ThrowsAsync<ForbiddenException>(
+            () => service.SubmitForReviewAsync(1, currentUserId: 99));
+    }
+
+    [Fact]
+    public async Task SubmitForReviewAsync_WhenAlreadyPendingReview_ShouldThrowCarStatusException()
+    {
+        // Arrange：车辆已经是 PendingReview 状态
+        var repo = new FakeCarRepository();
+        repo.Seed(new Car { Id = 1, SellerId = 10, Status = CarStatus.PendingReview });
+        var service = CreateService(repo);
+
+        // Act + Assert：不能重复提交
+        await Assert.ThrowsAsync<CarStatusException>(
+            () => service.SubmitForReviewAsync(1, currentUserId: 10));
+    }
+
+    // ===== 车辆详情权限的测试 =====
+
+    [Fact]
+    public async Task GetDetailAsync_WhenPublished_ShouldBeVisibleToAnyone()
+    {
+        // Arrange：Published 状态，未登录用户（currentUserId = null）
+        var repo = new FakeCarRepository();
+        repo.Seed(new Car
+        {
+            Id = 1,
+            SellerId = 10,
+            Status = CarStatus.Published,
+            Seller = new User { Id = 10, Username = "seller" },
+            Images = []
+        });
+        var service = CreateService(repo);
+
+        // Act：未登录（null），不是 Admin（false）
+        var result = await service.GetDetailAsync(1, currentUserId: null, isAdmin: false);
+
+        // Assert：Published 的车任何人都能看到
+        Assert.NotNull(result);
+        Assert.Equal("Published", result.Status);
+    }
+
+    [Fact]
+    public async Task GetDetailAsync_WhenDraftAndOwner_ShouldBeVisible()
+    {
+        // Arrange：Draft 状态，车主查看
+        var repo = new FakeCarRepository();
+        repo.Seed(new Car
+        {
+            Id = 1,
+            SellerId = 10,
+            Status = CarStatus.Draft,
+            Seller = new User { Id = 10, Username = "seller" },
+            Images = []
+        });
+        var service = CreateService(repo);
+
+        // Act：车主（currentUserId = 10）查看自己的草稿
+        var result = await service.GetDetailAsync(1, currentUserId: 10, isAdmin: false);
+
+        Assert.NotNull(result);
+        Assert.Equal("Draft", result.Status);
+    }
+
+    [Fact]
+    public async Task GetDetailAsync_WhenDraftAndNotOwner_ShouldThrowCarNotFoundException()
+    {
+        // Arrange：Draft 状态，非车主查看
+        var repo = new FakeCarRepository();
+        repo.Seed(new Car
+        {
+            Id = 1,
+            SellerId = 10,
+            Status = CarStatus.Draft,
+            Seller = new User { Id = 10, Username = "seller" },
+            Images = []
+        });
+        var service = CreateService(repo);
+
+        // Act + Assert：非车主看不到 Draft 车辆，返回 404（而不是 403）
+        await Assert.ThrowsAsync<CarNotFoundException>(
+            () => service.GetDetailAsync(1, currentUserId: 99, isAdmin: false));
+    }
+
+    [Fact]
+    public async Task GetDetailAsync_WhenDraftAndAdmin_ShouldBeVisible()
+    {
+        // Arrange：Draft 状态，Admin 查看
+        var repo = new FakeCarRepository();
+        repo.Seed(new Car
+        {
+            Id = 1,
+            SellerId = 10,
+            Status = CarStatus.Draft,
+            Seller = new User { Id = 10, Username = "seller" },
+            Images = []
+        });
+        var service = CreateService(repo);
+
+        // Act：Admin（isAdmin = true）可以看任何状态的车辆
+        var result = await service.GetDetailAsync(1, currentUserId: 99, isAdmin: true);
+
+        Assert.NotNull(result);
+    }
+}
+```
+
+#### 7.4 运行测试
+
+```bash
+dotnet test
+```
+
+预期：
+
+```
+Test summary: total: 11, failed: 0, succeeded: 11, skipped: 0
+```
+
+原来的 6 个用户测试 + 新增的 5 个车辆测试，全部通过。
+
+
+
+### 8. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**未登录查看 Published 车辆（应返回 200）：**
+
+```
+GET /cars/1
+```
+
+不带 Token，预期正常返回车辆详情，包含图片列表和卖家用户名。
+
+**未登录查看 Draft 车辆（应返回 404）：**
+
+找一辆 `Draft` 状态的车，不带 Token 访问，预期返回 404——对未登录用户来说这辆车"不存在"。
+
+**车主查看自己的 Draft 车辆（应返回 200）：**
+
+用车主账号登录，带 Token 访问自己的 Draft 车辆，预期正常返回。
+
+**Admin 查看任意状态车辆（应返回 200）：**
+
+用 Admin 账号（`admin@uucars.com`）登录，访问 `Draft` 状态的车辆，预期正常返回。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 9. 此时的目录变化
+
+```
+UUcars.API/
+└── DTOs/
+    └── Responses/
+        └── CarDetailResponse.cs            ← 新增
+
+UUcars.Tests/
+├── Fakes/
+│   ├── FakeCarRepository.cs               ← 新增
+│   └── FakeCarImageRepository.cs          ← 新增
+└── Services/
+    └── CarServiceTests.cs                 ← 新增
+```
+
+`ICarRepository`、`EfCarRepository`、`CarService`、`CarsController` 均已更新，不是新文件。
+
+
+
+### 10. Git 提交 + 合并分支
+
+车辆模块（Step 14 到 Step 22）全部完成：
+
+```bash
+git add .
+git commit -m "feat: GET /cars/{id} - car detail with permission rules + test: CarService unit tests (status transitions, permissions)"
+
+git push origin feature/cars
+```
+
+合并回 `develop`：
+
+```bash
+git checkout develop
+git merge --no-ff feature/cars -m "merge: feature/cars into develop"
+git push origin develop
+git branch -D feature/cars
+git push origin --delete feature/cars
+```
+
+
+
+### Step 22 完成状态
+
+```
+✅ 理解详情接口为什么需要独立的 CarDetailResponse（性能考虑）
+✅ 理解三种身份的权限规则（未登录 / 车主 / Admin）
+✅ 理解无权限时返回 404 而不是 403 的安全设计原因
+✅ ICarRepository 新增 GetDetailByIdAsync（Include Images）
+✅ CarService.GetDetailAsync（权限判断逻辑）
+✅ CarsController GET /cars/{id}（User.IsInRole 判断 Admin 角色）
+✅ FakeCarRepository / FakeCarImageRepository 建立
+✅ 5 个 CarService 单元测试（状态流转 + 权限检查）
+✅ 全部 11 个测试通过
+✅ Scalar 测试通过
+✅ feature/cars 合并回 develop
+```
+
+
+
