@@ -87,6 +87,59 @@ public class OrderService
         return MapToResponse(created!);
     }
 
+    public async Task<OrderResponse> CancelAsync(
+        int orderId,
+        int currentUserId,
+        CancellationToken cancellationToken = default)
+    {
+        // 1. 查询订单（含关联的 Car / Buyer / Seller）
+        var order = await _orderRepository.GetByIdAsync(orderId, cancellationToken);
+
+        if (order == null)
+            throw new OrderNotFoundException(orderId);
+
+        // 2. 只有买家可以取消订单
+        // 为什么卖家不能取消？
+        // 买家已经下单，代表买家有购买意愿。如果卖家可以随意取消，
+        // 会严重损害买家体验，也违背了平台交易的基本规则。
+        // 取消权在买家，卖家如果不想卖，应该走其他流程（平台客服介入等）
+        if (order.BuyerId != currentUserId)
+            throw new ForbiddenException();
+
+        // 3. 只有 Pending 状态可以取消
+        if (order.Status != OrderStatus.Pending)
+            throw new OrderStatusException(orderId, order.Status, OrderStatus.Pending);
+
+        // 4. 更新订单状态
+        order.Status = OrderStatus.Cancelled;
+        order.UpdatedAt = DateTime.UtcNow;
+
+        // 5. 恢复车辆状态为 Published
+        // 为什么要恢复？
+        // Step 26 里创建订单时把车辆状态改成了 Sold，
+        // 取消订单等于这笔交易没有成立，车辆应该重新上架供其他买家购买
+        var car = await _carRepository.GetByIdAsync(order.CarId, cancellationToken);
+        if (car != null)
+        {
+            car.Status = CarStatus.Published;
+            car.UpdatedAt = DateTime.UtcNow;
+        }
+
+        // 6. 在同一个事务里保存订单和车辆状态变更
+        // 原理同 Step 26：同一个 DbContext 的 SaveChangesAsync 是原子性的
+        // 订单取消和车辆恢复要么同时成功，要么同时回滚
+        _context.Orders.Update(order);
+        if (car != null)
+            _context.Cars.Update(car);
+        await _context.SaveChangesAsync(cancellationToken);
+
+        _logger.LogInformation(
+            "Order {OrderId} cancelled by buyer {BuyerId}, car {CarId} restored to Published",
+            orderId, currentUserId, order.CarId);
+
+        return MapToResponse(order);
+    }
+
     internal static OrderResponse MapToResponse(Order order) => new()
     {
         Id = order.Id,

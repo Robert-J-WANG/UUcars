@@ -35,4 +35,16 @@ public class OrdersController : ControllerBase
         return StatusCode(StatusCodes.Status201Created,
             ApiResponse<OrderResponse>.Ok(order, "Order created successfully."));
     }
+    
+    // POST /orders/{id}/cancel
+    [HttpPost("{id:int}/cancel")]
+    public async Task<IActionResult> Cancel(int id, CancellationToken cancellationToken)
+    {
+        var currentUserId = _currentUserService.GetCurrentUserId();
+        if (currentUserId == null)
+            return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+        var order = await _orderService.CancelAsync(id, currentUserId.Value, cancellationToken);
+        return Ok(ApiResponse<OrderResponse>.Ok(order, "Order cancelled successfully."));
+    }
 }
