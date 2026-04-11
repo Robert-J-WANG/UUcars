@@ -1,4 +1,6 @@
 using Microsoft.AspNetCore.Mvc;
+using UUcars.API.DTOs;
+using UUcars.API.DTOs.Requests;
 using UUcars.API.DTOs.Responses;
 using UUcars.API.Entities;
 using UUcars.API.Entities.Enums;
@@ -38,7 +40,7 @@ public class FavoriteService
 
         // 只能收藏 Published 状态的车辆
         if (car.Status != CarStatus.Published)
-            throw new CarNotFoundException(carId);  // 对用户表现为"不存在"，原因同详情接口
+            throw new CarNotFoundException(carId); // 对用户表现为"不存在"，原因同详情接口
 
         // 2. 检查是否已收藏
         var existing = await _favoriteRepository.GetAsync(userId, carId, cancellationToken);
@@ -71,8 +73,35 @@ public class FavoriteService
         var favorite = await _favoriteRepository.GetAsync(userId, carId, cancellationToken);
 
         if (favorite == null) throw new FavoriteNotFoundException(carId);
-        
+
         await _favoriteRepository.DeleteAsync(favorite, cancellationToken);
         _logger.LogInformation("User {UserId} removed car {CarId} from favorites", userId, carId);
+    }
+
+    public async Task<PagedResponse<FavoriteResponse>> GetMyFavoritesAsync(
+        int userId,
+        CarQueryRequest query,
+        CancellationToken cancellationToken = default)
+    {
+        var page = query.Page < 1 ? 1 : query.Page;
+        var pageSize = query.PageSize < 1 ? 20 : query.PageSize;
+        pageSize = Math.Min(pageSize, 50);
+
+        var (favorites, totalCount) = await _favoriteRepository.GetByUserAsync(
+            userId,
+            page,
+            pageSize,
+            cancellationToken);
+
+        var items = favorites.Select(f => new FavoriteResponse
+        {
+            CarId = f.CarId,
+            UserId = f.UserId,
+            CreatedAt = f.CreatedAt,
+            // f.Car 在 EfFavoriteRepository 里已经通过 Include + ThenInclude 加载好了
+            Car = CarService.MapToResponse(f.Car)
+        }).ToList();
+
+        return PagedResponse<FavoriteResponse>.Create(items, totalCount, page, pageSize);
     }
 }

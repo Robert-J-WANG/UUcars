@@ -9654,3 +9654,215 @@ git push origin feature/favorites
 ✅ Git commit + push 完成
 ```
 
+
+
+## Step 25 · 我的收藏列表
+
+### 这一步做什么
+
+实现 `GET /favorites`，返回当前登录用户的收藏车辆列表，支持分页。完成后收藏系统三个接口全部就绪，合并分支。
+
+
+
+### 1. 在 FavoriteService 里添加列表查询方法
+
+`IFavoriteRepository` 在 Step 23 里已经定义了 `GetByUserAsync`，`EfFavoriteRepository` 也已经实现了，这里直接在 Service 层调用：
+
+打开 `UUcars.API/Services/FavoriteService.cs`，在顶部补上 using：
+
+```csharp
+using UUcars.API.DTOs;
+using UUcars.API.DTOs.Requests;
+```
+
+然后添加 `GetMyFavoritesAsync`：
+
+```csharp
+public async Task<PagedResponse<FavoriteResponse>> GetMyFavoritesAsync(
+    int userId,
+    CarQueryRequest query,
+    CancellationToken cancellationToken = default)
+{
+    var page = query.Page < 1 ? 1 : query.Page;
+    var pageSize = query.PageSize < 1 ? 20 : query.PageSize;
+    pageSize = Math.Min(pageSize, 50);
+
+    var (favorites, totalCount) = await _favoriteRepository.GetByUserAsync(
+        userId,
+        page,
+        pageSize,
+        cancellationToken);
+
+    var items = favorites.Select(f => new FavoriteResponse
+    {
+        CarId = f.CarId,
+        UserId = f.UserId,
+        CreatedAt = f.CreatedAt,
+        // f.Car 在 EfFavoriteRepository 里已经通过 Include + ThenInclude 加载好了
+        Car = f.Car != null ? CarService.MapToResponse(f.Car) : null
+    }).ToList();
+
+    return PagedResponse<FavoriteResponse>.Create(items, totalCount, page, pageSize);
+}
+```
+
+
+
+### 2. 在 FavoritesController 里添加 GET /favorites
+
+打开 `UUcars.API/Controllers/FavoritesController.cs`，在顶部补上 using：
+
+```csharp
+using UUcars.API.DTOs.Requests;
+```
+
+在 `RemoveFavorite` 方法下方添加：
+
+```csharp
+// GET /favorites
+[HttpGet]
+public async Task<IActionResult> GetMyFavorites(
+    [FromQuery] CarQueryRequest query,
+    CancellationToken cancellationToken)
+{
+    var userId = _currentUserService.GetCurrentUserId();
+    if (userId == null)
+        return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+    var result = await _favoriteService.GetMyFavoritesAsync(userId.Value, query, cancellationToken);
+    return Ok(ApiResponse<PagedResponse<FavoriteResponse>>.Ok(result, "Favorites retrieved successfully."));
+}
+```
+
+
+
+### 3. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 4. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**获取我的收藏列表：**
+
+先收藏几辆车，然后：
+
+```
+GET /favorites
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......
+```
+
+预期（200）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "items": [
+      {
+        "carId": 1,
+        "userId": 2,
+        "createdAt": "...",
+        "car": {
+          "id": 1,
+          "title": "2020款宝马3系",
+          "status": "Published",
+          ...
+        }
+      }
+    ],
+    "totalCount": 1,
+    "page": 1,
+    "pageSize": 20,
+    "totalPages": 1
+  }
+}
+```
+
+**分页测试：**
+
+```
+GET /favorites?page=1&pageSize=2
+```
+
+收藏多辆车后，验证分页参数生效。
+
+**空收藏列表：**
+
+换一个没有收藏过任何车辆的账号登录，访问 `GET /favorites`，预期返回空列表而不是报错：
+
+```json
+{
+  "success": true,
+  "data": {
+    "items": [],
+    "totalCount": 0,
+    "page": 1,
+    "pageSize": 20,
+    "totalPages": 0
+  }
+}
+```
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 5. 此时的目录变化
+
+这一步没有新增文件，只在 `FavoriteService` 和 `FavoritesController` 里新增了方法。
+
+
+
+### 6. Git 提交 + 合并分支
+
+收藏系统三个接口全部完成：
+
+```bash
+git add .
+git commit -m "feat: GET /favorites - my favorites list with pagination"
+git push origin feature/favorites
+```
+
+合并回 `develop`：
+
+```bash
+git checkout develop
+git merge --no-ff feature/favorites -m "merge: feature/favorites into develop"
+git push origin develop
+git branch -D feature/favorites
+git push origin --delete feature/favorites
+```
+
+
+
+### Step 25 完成状态
+
+```
+✅ FavoriteService.GetMyFavoritesAsync（分页 + 映射包含车辆摘要）
+✅ FavoritesController GET /favorites（[FromQuery] 分页参数）
+✅ Scalar 测试通过（带车辆信息的收藏列表、分页、空列表）
+✅ feature/favorites 合并回 develop
+```
+
