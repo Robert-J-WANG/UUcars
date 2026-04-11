@@ -9013,3 +9013,856 @@ git push origin --delete feature/cars
 
 
 
+## Step 23 · 收藏车辆
+
+### 这一步做什么
+
+进入第六阶段——收藏系统。买家浏览车辆时，可以把感兴趣的车收藏起来，方便后续查看。这一步实现 `POST /favorites/{carId}`。
+
+收藏系统乍看简单，但有几个细节值得思考：只能收藏 `Published` 的车、同一用户不能重复收藏同一辆车、卖家不能收藏自己的车（虽然大纲里没有这条限制，但真实平台通常会有）。这一步按大纲来，重点处理前两条。
+
+
+
+### 1. 切出 feature/favorites 分支
+
+```bash
+git checkout develop
+git checkout -b feature/favorites
+git push -u origin feature/favorites
+```
+
+
+
+### 2. 为什么只能收藏 Published 的车
+
+`Draft` 和 `PendingReview` 状态的车对买家是不可见的，买家根本不应该知道这些车的存在。如果允许收藏任意状态的车，就等于变相暴露了系统里未上架的车辆 Id。
+
+`Sold` 和 `Deleted` 状态的车虽然买家可能知道它们存在，但收藏已售出或已删除的车没有实际意义，也不允许。
+
+
+
+### 3. 联合主键在收藏表里的作用
+
+Step 04 和 Step 06 里设计 `Favorites` 表时，用 `(UserId, CarId)` 作为联合主键。这带来一个直接好处：数据库层面天然防止重复收藏——同一个用户对同一辆车的收藏记录只能有一行，如果尝试插入重复记录，数据库会直接报主键冲突错误。
+
+但我们不能让数据库错误直接传给客户端，需要在 Service 层提前检查，遇到重复收藏时抛出一个有意义的业务异常（409）。
+
+
+
+### 4. 创建业务异常
+
+```bush
+touch UUcars.API/Exceptions/AlreadyFavoritedException.cs
+```
+
+```c#
+namespace UUcars.API.Exceptions;
+
+// 用户尝试重复收藏同一辆车时抛出
+public class AlreadyFavoritedException : AppException
+{
+    public AlreadyFavoritedException(int carId)
+        : base(StatusCodes.Status409Conflict,
+            $"Car '{carId}' is already in your favorites.")
+    {
+    }
+}
+```
+
+
+
+### 5. 创建 DTO
+
+收藏操作的请求不需要 Request DTO——`carId` 已经在路由里了，没有额外的请求体。只需要一个响应 DTO：
+
+```bash
+touch UUcars.API/DTOs/Responses/FavoriteResponse.cs
+```
+
+```c#
+namespace UUcars.API.DTOs.Responses;
+
+public class FavoriteResponse
+{
+    public int CarId { get; set; }
+    public int UserId { get; set; }
+    public DateTime CreatedAt { get; set; }
+
+    // 返回被收藏的车辆摘要信息，方便客户端直接展示
+    // 而不需要再发一次 GET /cars/{id} 请求
+    public CarResponse? Car { get; set; }
+}
+```
+
+
+
+### 6. 创建 IFavoriteRepository 和 EfFavoriteRepository
+
+```bash
+touch UUcars.API/Repositories/IFavoriteRepository.cs
+touch UUcars.API/Repositories/EfFavoriteRepository.cs
+```
+
+```c#
+using UUcars.API.Entities;
+
+namespace UUcars.API.Repositories;
+
+public interface IFavoriteRepository
+{
+    // 查询某用户是否已收藏某辆车
+    Task<Favorite?> GetAsync(int userId, int carId, CancellationToken cancellationToken = default);
+
+    // 添加收藏
+    Task<Favorite> AddAsync(Favorite favorite, CancellationToken cancellationToken = default);
+
+    // 删除收藏（Step 24 使用）
+    Task DeleteAsync(Favorite favorite, CancellationToken cancellationToken = default);
+
+    // 获取某用户的所有收藏（Step 25 使用）
+    Task<(List<Favorite> Favorites, int TotalCount)> GetByUserAsync(
+        int userId,
+        int page,
+        int pageSize,
+        CancellationToken cancellationToken = default);
+}
+```
+
+> **为什么把 Step 24 和 Step 25 需要的方法也一起定义了？** 收藏系统的三个操作（添加、删除、列表）是一个完整功能块，Repository 接口把它们一起定义清楚，后续步骤只需要补充实现，不需要再改接口。接口的变动成本比实现高——改接口意味着所有实现（包括测试里的 Fake）都要跟着改。
+
+```csharp
+using Microsoft.EntityFrameworkCore;
+using UUcars.API.Data;
+using UUcars.API.Entities;
+
+namespace UUcars.API.Repositories;
+
+public class EfFavoriteRepository : IFavoriteRepository
+{
+    private readonly AppDbContext _context;
+
+    public EfFavoriteRepository(AppDbContext context)
+    {
+        _context = context;
+    }
+
+    public async Task<Favorite?> GetAsync(int userId, int carId,
+        CancellationToken cancellationToken = default)
+    {
+        // Favorites 表用的是联合主键（UserId, CarId）
+        // FindAsync 支持联合主键，传入多个值按主键定义的顺序匹配
+        return await _context.Favorites
+            .FindAsync([userId, carId], cancellationToken);
+    }
+
+    public async Task<Favorite> AddAsync(Favorite favorite,
+        CancellationToken cancellationToken = default)
+    {
+        _context.Favorites.Add(favorite);
+        await _context.SaveChangesAsync(cancellationToken);
+        return favorite;
+    }
+
+    public async Task DeleteAsync(Favorite favorite,
+        CancellationToken cancellationToken = default)
+    {
+        _context.Favorites.Remove(favorite);
+        await _context.SaveChangesAsync(cancellationToken);
+    }
+
+    public async Task<(List<Favorite> Favorites, int TotalCount)> GetByUserAsync(
+        int userId,
+        int page,
+        int pageSize,
+        CancellationToken cancellationToken = default)
+    {
+        var query = _context.Favorites
+            .Include(f => f.Car)
+                .ThenInclude(c => c.Seller)  // 加载车辆的同时也加载车辆的卖家
+            .Where(f => f.UserId == userId);
+
+        var totalCount = await query.CountAsync(cancellationToken);
+
+        var favorites = await query
+            .OrderByDescending(f => f.CreatedAt)
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .ToListAsync(cancellationToken);
+
+        return (favorites, totalCount);
+    }
+}
+```
+
+> **`ThenInclude` 是什么？** `Include` 是加载直接导航属性（`Favorite → Car`），`ThenInclude` 是在 `Include` 的基础上继续加载更深层的导航属性（`Car → Seller`）。这里的查询链是：`Favorite → Car → Seller`，需要用 `Include` 再接 `ThenInclude` 来表达这个两层加载关系。
+
+
+
+### 7. 创建 FavoriteService
+
+```bash
+touch UUcars.API/Services/FavoriteService.cs
+```
+
+```c#
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Entities;
+using UUcars.API.Entities.Enums;
+using UUcars.API.Exceptions;
+using UUcars.API.Repositories;
+
+namespace UUcars.API.Services;
+
+public class FavoriteService
+{
+    private readonly IFavoriteRepository _favoriteRepository;
+    private readonly ICarRepository _carRepository;
+    private readonly ILogger<FavoriteService> _logger;
+
+    public FavoriteService(
+        IFavoriteRepository favoriteRepository,
+        ICarRepository carRepository,
+        ILogger<FavoriteService> logger)
+    {
+        _favoriteRepository = favoriteRepository;
+        _carRepository = carRepository;
+        _logger = logger;
+    }
+
+    public async Task<FavoriteResponse> AddFavoriteAsync(
+        int userId,
+        int carId,
+        CancellationToken cancellationToken = default)
+    {
+        // 1. 验证车辆存在且是 Published 状态
+        // 这里用 GetByIdAsync（不用 GetDetailByIdAsync），
+        // 因为不需要加载图片列表，只需要验证车辆状态
+        var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+        if (car == null)
+            throw new CarNotFoundException(carId);
+
+        // 只能收藏 Published 状态的车辆
+        if (car.Status != CarStatus.Published)
+            throw new CarNotFoundException(carId);  // 对用户表现为"不存在"，原因同详情接口
+
+        // 2. 检查是否已收藏
+        var existing = await _favoriteRepository.GetAsync(userId, carId, cancellationToken);
+        if (existing != null)
+            throw new AlreadyFavoritedException(carId);
+
+        // 3. 创建收藏记录
+        var favorite = new Favorite
+        {
+            UserId = userId,
+            CarId = carId,
+            CreatedAt = DateTime.UtcNow
+        };
+
+        var created = await _favoriteRepository.AddAsync(favorite, cancellationToken);
+
+        _logger.LogInformation("User {UserId} favorited car {CarId}", userId, carId);
+
+        return new FavoriteResponse
+        {
+            CarId = created.CarId,
+            UserId = created.UserId,
+            CreatedAt = created.CreatedAt,
+            Car = CarService.MapToResponse(car)
+        };
+    }
+}
+```
+
+> **为什么收藏非 Published 的车也返回 404 而不是 400？** 同样的安全考虑——买家不应该知道系统里存在一辆 `Draft` 状态的车。对买家来说，`Draft` 的车"不存在"，尝试收藏它也应该返回 404。
+
+
+
+### 8. 创建 FavoritesController
+
+```bash
+touch UUcars.API/Controllers/FavoritesController.cs
+```
+
+```c#
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using UUcars.API.DTOs;
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Services;
+
+namespace UUcars.API.Controllers;
+
+[ApiController]
+[Route("favorites")]
+[Authorize]     // 收藏系统所有接口都需要登录
+public class FavoritesController : ControllerBase
+{
+    private readonly FavoriteService _favoriteService;
+    private readonly CurrentUserService _currentUserService;
+
+    public FavoritesController(
+        FavoriteService favoriteService,
+        CurrentUserService currentUserService)
+    {
+        _favoriteService = favoriteService;
+        _currentUserService = currentUserService;
+    }
+
+    // POST /favorites/{carId}
+    [HttpPost("{carId:int}")]
+    public async Task<IActionResult> AddFavorite(int carId, CancellationToken cancellationToken)
+    {
+        var userId = _currentUserService.GetCurrentUserId();
+        if (userId == null)
+            return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+        var result = await _favoriteService.AddFavoriteAsync(userId.Value, carId, cancellationToken);
+
+        return StatusCode(StatusCodes.Status201Created,
+            ApiResponse<FavoriteResponse>.Ok(result, "Car added to favorites."));
+    }
+}
+```
+
+
+
+### 9. 注册依赖到 Program.cs
+
+```csharp
+// 收藏模块
+builder.Services.AddScoped<IFavoriteRepository, EfFavoriteRepository>();
+builder.Services.AddScoped<FavoriteService>();
+```
+
+顶部补上 using：
+
+```csharp
+using UUcars.API.Services;
+```
+
+
+
+### 10. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 11. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**正常收藏车辆：**
+
+登录后收藏一辆 `Published` 状态的车：
+
+```
+POST /favorites/1
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......
+```
+
+预期（201）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "carId": 1,
+    "userId": 2,
+    "createdAt": "...",
+    "car": {
+      "id": 1,
+      "title": "2020款宝马3系",
+      "status": "Published",
+      ...
+    }
+  },
+  "message": "Car added to favorites."
+}
+```
+
+**重复收藏同一辆车（应返回 409）：**
+
+再次发送同样的请求，预期：
+
+```json
+{
+  "success": false,
+  "message": "Car '1' is already in your favorites."
+}
+```
+
+**收藏 Draft 状态的车（应返回 404）：**
+
+尝试收藏一辆 `Draft` 状态的车，预期返回 404——对买家来说这辆车"不存在"。
+
+**不带 Token 访问（应返回 401）：**
+
+不带 Authorization 头，预期返回 401。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 12. 此时的目录变化
+
+```
+UUcars.API/
+├── Controllers/
+│   └── FavoritesController.cs          ← 新增
+├── DTOs/
+│   └── Responses/
+│       └── FavoriteResponse.cs         ← 新增
+├── Exceptions/
+│   └── AlreadyFavoritedException.cs    ← 新增
+├── Repositories/
+│   ├── IFavoriteRepository.cs          ← 新增
+│   └── EfFavoriteRepository.cs         ← 新增
+└── Services/
+    └── FavoriteService.cs              ← 新增
+```
+
+
+
+### 13. Git 提交
+
+```bash
+git add .
+git commit -m "feat: POST /favorites/{carId} - add car to favorites"
+git push origin feature/favorites
+```
+
+
+
+### Step 23 完成状态
+
+```
+✅ 切出 feature/favorites 分支
+✅ 理解只能收藏 Published 车辆的原因（安全 + 业务意义）
+✅ 理解联合主键在防重复收藏中的作用
+✅ AlreadyFavoritedException（409）
+✅ FavoriteResponse DTO（含车辆摘要）
+✅ IFavoriteRepository（一次定义完整接口，减少后续改动）
+✅ EfFavoriteRepository（FindAsync 联合主键查询，ThenInclude 两层加载）
+✅ 理解 ThenInclude 的作用（多层导航属性加载）
+✅ FavoriteService.AddFavoriteAsync（状态验证 + 重复检查）
+✅ FavoritesController POST /favorites/{carId}（Controller 级别 [Authorize]）
+✅ DI 注册完成
+✅ Scalar 测试通过（201 收藏成功、409 重复收藏、404 非 Published、401 未登录）
+✅ Git commit + push 完成
+```
+
+
+
+## Step 24 · 取消收藏
+
+### 这一步做什么
+
+实现 `DELETE /favorites/{carId}`，让买家能从收藏列表里移除一辆车。
+
+
+
+### 1. 取消收藏的业务规则
+
+取消收藏比添加收藏简单——只需要验证两件事：
+
+```
+1. 当前用户已经收藏了这辆车（没收藏过就无法取消）
+2. 操作的是自己的收藏（不能取消别人的收藏）
+```
+
+第二条不需要单独检查——`GetAsync(userId, carId)` 按 `(UserId, CarId)` 联合主键查询，本身就限定了是"当前用户对这辆车的收藏"，查不到就是没有，不存在查到别人收藏的情况。
+
+
+
+### 2. 创建业务异常
+
+```bash
+touch UUcars.API/Exceptions/FavoriteNotFoundException.cs
+```
+
+```c#
+namespace UUcars.API.Exceptions;
+
+// 用户尝试取消一个不存在的收藏时抛出
+public class FavoriteNotFoundException : AppException
+{
+    public FavoriteNotFoundException(int carId)
+        : base(StatusCodes.Status404NotFound,
+            $"Car '{carId}' is not in your favorites.")
+    {
+    }
+}
+```
+
+
+
+### 3. 在 FavoriteService 里添加取消收藏方法
+
+打开 `UUcars.API/Services/FavoriteService.cs`，添加 `RemoveFavoriteAsync`：
+
+```csharp
+public async Task RemoveFavoriteAsync(
+    int userId,
+    int carId,
+    CancellationToken cancellationToken = default)
+{
+    // 查询当前用户对这辆车的收藏记录
+    // GetAsync 按 (UserId, CarId) 联合主键查询，天然限定了是当前用户自己的收藏
+    var favorite = await _favoriteRepository.GetAsync(userId, carId, cancellationToken);
+
+    if (favorite == null)
+        throw new FavoriteNotFoundException(carId);
+
+    await _favoriteRepository.DeleteAsync(favorite, cancellationToken);
+
+    _logger.LogInformation("User {UserId} removed car {CarId} from favorites", userId, carId);
+}
+```
+
+
+
+### 4. 在 FavoritesController 里添加 DELETE /favorites/{carId}
+
+打开 `UUcars.API/Controllers/FavoritesController.cs`，在 `AddFavorite` 方法下方添加：
+
+```csharp
+// DELETE /favorites/{carId}
+[HttpDelete("{carId:int}")]
+public async Task<IActionResult> RemoveFavorite(int carId, CancellationToken cancellationToken)
+{
+    var userId = _currentUserService.GetCurrentUserId();
+    if (userId == null)
+        return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+    await _favoriteService.RemoveFavoriteAsync(userId.Value, carId, cancellationToken);
+
+    // 删除成功返回 204 No Content，和 DELETE /cars/{id} 保持一致
+    return NoContent();
+}
+```
+
+
+
+### 5. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 6. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**正常取消收藏：**
+
+先收藏一辆车（`POST /favorites/1`），然后取消：
+
+```
+DELETE /favorites/1
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......
+```
+
+预期（204）：无响应体。
+
+**取消一个没有收藏过的车（应返回 404）：**
+
+直接取消一辆从未收藏过的车：
+
+```json
+{
+  "success": false,
+  "message": "Car '2' is not in your favorites."
+}
+```
+
+**取消后重新收藏（应返回 201）：**
+
+取消收藏后再次 `POST /favorites/1`，预期能重新收藏成功，说明删除操作真正清除了记录，不是逻辑删除。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 7. 此时的目录变化
+
+```
+UUcars.API/
+└── Exceptions/
+    └── FavoriteNotFoundException.cs    ← 新增
+```
+
+`FavoriteService` 和 `FavoritesController` 新增了方法，不是新文件。
+
+
+
+### 8. Git 提交
+
+```bash
+git add .
+git commit -m "feat: DELETE /favorites/{carId} - remove car from favorites"
+git push origin feature/favorites
+```
+
+
+
+### Step 24 完成状态
+
+```
+✅ 理解取消收藏的业务规则（联合主键天然限定了操作范围）
+✅ FavoriteNotFoundException（404）
+✅ FavoriteService.RemoveFavoriteAsync
+✅ FavoritesController DELETE /favorites/{carId}（返回 204）
+✅ Scalar 测试通过（204 取消成功、404 未收藏过、取消后可重新收藏）
+✅ Git commit + push 完成
+```
+
+
+
+## Step 25 · 我的收藏列表
+
+### 这一步做什么
+
+实现 `GET /favorites`，返回当前登录用户的收藏车辆列表，支持分页。完成后收藏系统三个接口全部就绪，合并分支。
+
+
+
+### 1. 在 FavoriteService 里添加列表查询方法
+
+`IFavoriteRepository` 在 Step 23 里已经定义了 `GetByUserAsync`，`EfFavoriteRepository` 也已经实现了，这里直接在 Service 层调用：
+
+打开 `UUcars.API/Services/FavoriteService.cs`，在顶部补上 using：
+
+```csharp
+using UUcars.API.DTOs;
+using UUcars.API.DTOs.Requests;
+```
+
+然后添加 `GetMyFavoritesAsync`：
+
+```csharp
+public async Task<PagedResponse<FavoriteResponse>> GetMyFavoritesAsync(
+    int userId,
+    CarQueryRequest query,
+    CancellationToken cancellationToken = default)
+{
+    var page = query.Page < 1 ? 1 : query.Page;
+    var pageSize = query.PageSize < 1 ? 20 : query.PageSize;
+    pageSize = Math.Min(pageSize, 50);
+
+    var (favorites, totalCount) = await _favoriteRepository.GetByUserAsync(
+        userId,
+        page,
+        pageSize,
+        cancellationToken);
+
+    var items = favorites.Select(f => new FavoriteResponse
+    {
+        CarId = f.CarId,
+        UserId = f.UserId,
+        CreatedAt = f.CreatedAt,
+        // f.Car 在 EfFavoriteRepository 里已经通过 Include + ThenInclude 加载好了
+        Car = f.Car != null ? CarService.MapToResponse(f.Car) : null
+    }).ToList();
+
+    return PagedResponse<FavoriteResponse>.Create(items, totalCount, page, pageSize);
+}
+```
+
+
+
+### 2. 在 FavoritesController 里添加 GET /favorites
+
+打开 `UUcars.API/Controllers/FavoritesController.cs`，在顶部补上 using：
+
+```csharp
+using UUcars.API.DTOs.Requests;
+```
+
+在 `RemoveFavorite` 方法下方添加：
+
+```csharp
+// GET /favorites
+[HttpGet]
+public async Task<IActionResult> GetMyFavorites(
+    [FromQuery] CarQueryRequest query,
+    CancellationToken cancellationToken)
+{
+    var userId = _currentUserService.GetCurrentUserId();
+    if (userId == null)
+        return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+    var result = await _favoriteService.GetMyFavoritesAsync(userId.Value, query, cancellationToken);
+    return Ok(ApiResponse<PagedResponse<FavoriteResponse>>.Ok(result, "Favorites retrieved successfully."));
+}
+```
+
+
+
+### 3. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 4. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**获取我的收藏列表：**
+
+先收藏几辆车，然后：
+
+```
+GET /favorites
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......
+```
+
+预期（200）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "items": [
+      {
+        "carId": 1,
+        "userId": 2,
+        "createdAt": "...",
+        "car": {
+          "id": 1,
+          "title": "2020款宝马3系",
+          "status": "Published",
+          ...
+        }
+      }
+    ],
+    "totalCount": 1,
+    "page": 1,
+    "pageSize": 20,
+    "totalPages": 1
+  }
+}
+```
+
+**分页测试：**
+
+```
+GET /favorites?page=1&pageSize=2
+```
+
+收藏多辆车后，验证分页参数生效。
+
+**空收藏列表：**
+
+换一个没有收藏过任何车辆的账号登录，访问 `GET /favorites`，预期返回空列表而不是报错：
+
+```json
+{
+  "success": true,
+  "data": {
+    "items": [],
+    "totalCount": 0,
+    "page": 1,
+    "pageSize": 20,
+    "totalPages": 0
+  }
+}
+```
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 5. 此时的目录变化
+
+这一步没有新增文件，只在 `FavoriteService` 和 `FavoritesController` 里新增了方法。
+
+
+
+### 6. Git 提交 + 合并分支
+
+收藏系统三个接口全部完成：
+
+```bash
+git add .
+git commit -m "feat: GET /favorites - my favorites list with pagination"
+git push origin feature/favorites
+```
+
+合并回 `develop`：
+
+```bash
+git checkout develop
+git merge --no-ff feature/favorites -m "merge: feature/favorites into develop"
+git push origin develop
+git branch -D feature/favorites
+git push origin --delete feature/favorites
+```
+
+
+
+### Step 25 完成状态
+
+```
+✅ FavoriteService.GetMyFavoritesAsync（分页 + 映射包含车辆摘要）
+✅ FavoritesController GET /favorites（[FromQuery] 分页参数）
+✅ Scalar 测试通过（带车辆信息的收藏列表、分页、空列表）
+✅ feature/favorites 合并回 develop
+```
+
