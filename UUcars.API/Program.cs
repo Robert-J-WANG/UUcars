@@ -86,6 +86,10 @@ try
     builder.Services.AddScoped<ICarRepository, EfCarRepository>();
     builder.Services.AddScoped<CarService>();
     builder.Services.AddScoped<ICarImageRepository, EfCarImageRepository>();  // 新增
+    
+    // 收藏模块
+    builder.Services.AddScoped<IFavoriteRepository, EfFavoriteRepository>();
+    builder.Services.AddScoped<FavoriteService>();
 
     // =============================================
     // 构建应用
