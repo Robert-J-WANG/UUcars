@@ -9866,3 +9866,615 @@ git push origin --delete feature/favorites
 ✅ feature/favorites 合并回 develop
 ```
 
+
+
+## Step 26 · 创建订单
+
+### 这一步做什么
+
+进入第七阶段——订单系统。
+
+买家看中一辆车之后，通过下单来发起购买。这一步实现 `POST /orders`。
+
+订单系统是整个平台业务闭环的关键一环，涉及的业务规则比前面几个模块都多，而且有一个重要的联动操作：创建订单的同时，车辆状态从 `Published` 变成 `Sold`。
+
+
+
+### 1. 切出 feature/orders 分支
+
+```bash
+git checkout develop
+git checkout -b feature/orders
+git push -u origin feature/orders
+```
+
+
+
+### 2. 创建订单的业务规则
+
+```
+1. 车辆必须存在且是 Published 状态（不能对未上架的车下单）
+2. 买家不能是卖家本人（不能自己买自己的车）
+3. 创建订单时锁定当前车辆价格（防止卖家事后改价）
+4. 创建订单时记录 SellerId（方便后续查询"我卖出的订单"）
+5. 创建订单后车辆状态变为 Sold（一辆车只能卖给一个买家）
+```
+
+规则 3 和 4 在 Step 04 设计数据库时已经解释过，这里是真正落地的地方。
+
+规则 5 是一个**跨实体的联动操作**——创建订单和更新车辆状态必须同时成功或同时失败，这就需要用到**数据库事务**。
+
+
+
+### 3. 什么是数据库事务
+
+事务（Transaction）是数据库的一个核心概念，保证一组操作**要么全部成功，要么全部回滚**，不会出现"订单创建成功但车辆状态没更新"的中间状态。
+
+```
+没有事务的风险：
+  第一步：创建订单（成功）
+  第二步：更新车辆状态为 Sold（失败，比如网络抖动）
+  结果：订单存在，但车辆还是 Published 状态
+       → 另一个买家可能同时也在下单，数据不一致
+
+有事务的保证：
+  BEGIN TRANSACTION
+    第一步：创建订单
+    第二步：更新车辆状态为 Sold
+  COMMIT（两步都成功才提交）
+  或 ROLLBACK（任何一步失败则全部回滚）
+```
+
+在 EF Core 里，同一个 `DbContext` 实例的 `SaveChangesAsync()` 默认就是事务性的——一次 `SaveChangesAsync` 里的所有变更，要么全部写入，要么全部回滚。所以我们只需要把"创建订单"和"更新车辆状态"放在同一次 `SaveChangesAsync` 里，事务就自动生效了。
+
+
+
+### 4. 创建业务异常
+
+```bash
+touch UUcars.API/Exceptions/OrderNotFoundException.cs
+touch UUcars.API/Exceptions/CarNotAvailableException.cs
+touch UUcars.API/Exceptions/CannotOrderOwnCarException.cs
+```
+
+```c#
+
+namespace UUcars.API.Exceptions;
+
+public class OrderNotFoundException : AppException
+{
+    public OrderNotFoundException(int id)
+        : base(StatusCodes.Status404NotFound, $"Order with id '{id}' was not found.")
+    {
+    }
+}
+namespace UUcars.API.Exceptions;
+
+// 车辆不是 Published 状态，无法下单
+// 用专门的异常而不是复用 CarNotFoundException，
+// 原因：这辆车是存在的，只是状态不对，语义上不是"找不到"
+public class CarNotAvailableException : AppException
+{
+    public CarNotAvailableException(int carId)
+        : base(StatusCodes.Status409Conflict,
+            $"Car '{carId}' is not available for purchase.")
+    {
+    }
+}
+namespace UUcars.API.Exceptions;
+
+// 买家尝试购买自己的车
+public class CannotOrderOwnCarException : AppException
+{
+    public CannotOrderOwnCarException()
+        : base(StatusCodes.Status400BadRequest,
+            "You cannot purchase your own car.")
+    {
+    }
+}
+```
+
+
+
+### 5. 创建 DTO
+
+#### `DTOs/Requests/OrderCreateRequest.cs`
+
+```bash
+touch UUcars.API/DTOs/Requests/OrderCreateRequest.cs
+```
+
+```c#
+using System.ComponentModel.DataAnnotations;
+
+namespace UUcars.API.DTOs.Requests;
+
+public class OrderCreateRequest
+{
+    // 买家只需要传 CarId，其他信息（Price、SellerId）由服务端从车辆信息里取
+    // 不让客户端传 Price，防止客户端篡改价格
+    [Required(ErrorMessage = "CarId is required.")]
+    public int CarId { get; set; }
+}
+```
+
+#### `DTOs/Responses/OrderResponse.cs`
+
+```bash
+touch UUcars.API/DTOs/Responses/OrderResponse.cs
+```
+
+```c#
+namespace UUcars.API.DTOs.Responses;
+
+public class OrderResponse
+{
+    public int Id { get; set; }
+    public int CarId { get; set; }
+    public string CarTitle { get; set; } = string.Empty;
+    public int BuyerId { get; set; }
+    public string BuyerUsername { get; set; } = string.Empty;
+    public int SellerId { get; set; }
+    public string SellerUsername { get; set; } = string.Empty;
+
+    // 锁定的成交价格（创建订单时从车辆复制过来）
+    public decimal Price { get; set; }
+    public string Status { get; set; } = string.Empty;
+    public DateTime CreatedAt { get; set; }
+    public DateTime UpdatedAt { get; set; }
+}
+```
+
+
+
+### 6. 创建 IOrderRepository 和 EfOrderRepository
+
+```bash
+touch UUcars.API/Repositories/IOrderRepository.cs
+touch UUcars.API/Repositories/EfOrderRepository.cs
+```
+
+和 `IFavoriteRepository` 一样，把这个阶段所有方法一次性定义好，减少后续改接口的成本：
+
+```csharp
+using UUcars.API.Entities;
+
+namespace UUcars.API.Repositories;
+
+public interface IOrderRepository
+{
+    Task<Order> AddAsync(Order order, CancellationToken cancellationToken = default);
+    Task<Order?> GetByIdAsync(int id, CancellationToken cancellationToken = default);
+    Task<Order> UpdateAsync(Order order, CancellationToken cancellationToken = default);
+
+    // 买家视角：查询某用户作为买家的订单列表
+    Task<(List<Order> Orders, int TotalCount)> GetByBuyerAsync(
+        int buyerId,
+        int page,
+        int pageSize,
+        CancellationToken cancellationToken = default);
+
+    // 卖家视角：查询某用户作为卖家的订单列表
+    Task<(List<Order> Orders, int TotalCount)> GetBySellerAsync(
+        int sellerId,
+        int page,
+        int pageSize,
+        CancellationToken cancellationToken = default);
+}
+using Microsoft.EntityFrameworkCore;
+using UUcars.API.Data;
+using UUcars.API.Entities;
+
+namespace UUcars.API.Repositories;
+
+public class EfOrderRepository : IOrderRepository
+{
+    private readonly AppDbContext _context;
+
+    public EfOrderRepository(AppDbContext context)
+    {
+        _context = context;
+    }
+
+    public async Task<Order> AddAsync(Order order, CancellationToken cancellationToken = default)
+    {
+        _context.Orders.Add(order);
+        await _context.SaveChangesAsync(cancellationToken);
+        return order;
+    }
+
+    public async Task<Order?> GetByIdAsync(int id, CancellationToken cancellationToken = default)
+    {
+        return await _context.Orders
+            .Include(o => o.Car)
+            .Include(o => o.Buyer)
+            .Include(o => o.Seller)
+            .FirstOrDefaultAsync(o => o.Id == id, cancellationToken);
+    }
+
+    public async Task<Order> UpdateAsync(Order order, CancellationToken cancellationToken = default)
+    {
+        _context.Orders.Update(order);
+        await _context.SaveChangesAsync(cancellationToken);
+        return order;
+    }
+
+    public async Task<(List<Order> Orders, int TotalCount)> GetByBuyerAsync(
+        int buyerId,
+        int page,
+        int pageSize,
+        CancellationToken cancellationToken = default)
+    {
+        var query = _context.Orders
+            .Include(o => o.Car)
+            .Include(o => o.Seller)
+            .Where(o => o.BuyerId == buyerId);
+
+        var totalCount = await query.CountAsync(cancellationToken);
+
+        var orders = await query
+            .OrderByDescending(o => o.CreatedAt)
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .ToListAsync(cancellationToken);
+
+        return (orders, totalCount);
+    }
+
+    public async Task<(List<Order> Orders, int TotalCount)> GetBySellerAsync(
+        int sellerId,
+        int page,
+        int pageSize,
+        CancellationToken cancellationToken = default)
+    {
+        var query = _context.Orders
+            .Include(o => o.Car)
+            .Include(o => o.Buyer)
+            .Where(o => o.SellerId == sellerId);
+
+        var totalCount = await query.CountAsync(cancellationToken);
+
+        var orders = await query
+            .OrderByDescending(o => o.CreatedAt)
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .ToListAsync(cancellationToken);
+
+        return (orders, totalCount);
+    }
+}
+```
+
+> **买家视角和卖家视角的查询为什么 Include 的字段不一样？** 买家查"我买的订单"，关心的是"我买的是什么车、卖家是谁"，所以 Include `Car` 和 `Seller`，不需要 `Buyer`（买家就是自己）。卖家查"我卖的订单"，关心的是"谁买了我的哪辆车"，所以 Include `Car` 和 `Buyer`，不需要 `Seller`（卖家就是自己）。只加载需要的数据，避免多余的 JOIN。
+
+
+
+### 7. 创建 OrderService
+
+这里有一个关键点：创建订单和更新车辆状态需要在同一个事务里完成。前面说过 EF Core 同一个 `DbContext` 的 `SaveChangesAsync` 是事务性的，所以 `OrderService` 需要直接访问 `AppDbContext`，在一次 `SaveChangesAsync` 里同时保存订单和车辆变更。
+
+```bash
+touch UUcars.API/Services/OrderService.cs
+```
+
+```c#
+using UUcars.API.Data;
+using UUcars.API.DTOs.Requests;
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Entities;
+using UUcars.API.Entities.Enums;
+using UUcars.API.Exceptions;
+using UUcars.API.Repositories;
+
+namespace UUcars.API.Services;
+
+public class OrderService
+{
+    private readonly IOrderRepository _orderRepository;
+    private readonly ICarRepository _carRepository;
+    private readonly AppDbContext _context;
+    private readonly ILogger<OrderService> _logger;
+
+    public OrderService(
+        IOrderRepository orderRepository,
+        ICarRepository carRepository,
+        AppDbContext context,
+        ILogger<OrderService> logger)
+    {
+        _orderRepository = orderRepository;
+        _carRepository = carRepository;
+        _context = context;
+        _logger = logger;
+    }
+
+    public async Task<OrderResponse> CreateAsync(
+        int buyerId,
+        OrderCreateRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        // 1. 验证车辆存在
+        var car = await _carRepository.GetByIdAsync(request.CarId, cancellationToken);
+        if (car == null)
+            throw new CarNotFoundException(request.CarId);
+
+        // 2. 验证车辆是 Published 状态（只有上架的车才能下单）
+        if (car.Status != CarStatus.Published)
+            throw new CarNotAvailableException(request.CarId);
+
+        // 3. 验证买家不是卖家本人
+        if (car.SellerId == buyerId)
+            throw new CannotOrderOwnCarException();
+
+        // 4. 创建订单实体
+        // Price 从车辆当前价格复制过来并锁定，后续卖家改价不影响这个订单
+        // SellerId 从车辆冗余存储，方便后续"我卖出的订单"查询
+        var order = new Order
+        {
+            CarId = car.Id,
+            BuyerId = buyerId,
+            SellerId = car.SellerId,    // 从车辆冗余存储
+            Price = car.Price,          // 锁定当前价格
+            Status = OrderStatus.Pending,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        // 5. 更新车辆状态为 Sold
+        car.Status = CarStatus.Sold;
+        car.UpdatedAt = DateTime.UtcNow;
+
+        // 6. 在同一个事务里保存订单和车辆状态变更
+        // 为什么能保证事务性？
+        // _context 是同一个 DbContext 实例，Add 和 Update 都只是把变更记录到追踪器里，
+        // 只有调用 SaveChangesAsync 时才真正写数据库。
+        // EF Core 会把所有待写入的变更包在一个数据库事务里一起提交，
+        // 任何一步失败都会全部回滚。
+        _context.Orders.Add(order);
+        _context.Cars.Update(car);
+        await _context.SaveChangesAsync(cancellationToken);
+
+        _logger.LogInformation(
+            "Order {OrderId} created: buyer {BuyerId} purchased car {CarId} from seller {SellerId}",
+            order.Id, buyerId, car.Id, car.SellerId);
+
+        // 7. 查出完整订单（含关联的 Car / Buyer / Seller 信息）用于响应
+        // 为什么要重新查一次？
+        // 刚创建的 order 对象里，导航属性（Car、Buyer、Seller）是 null，
+        // 因为 EF Core 在 Add 时不会自动加载关联对象。
+        // 重新查一次，通过 Include 把所有关联数据加载进来，
+        // 才能正确映射出 CarTitle、BuyerUsername、SellerUsername 等字段
+        var created = await _orderRepository.GetByIdAsync(order.Id, cancellationToken);
+        return MapToResponse(created!);
+    }
+
+    internal static OrderResponse MapToResponse(Order order) => new()
+    {
+        Id = order.Id,
+        CarId = order.CarId,
+        CarTitle = order.Car?.Title ?? string.Empty,
+        BuyerId = order.BuyerId,
+        BuyerUsername = order.Buyer?.Username ?? string.Empty,
+        SellerId = order.SellerId,
+        SellerUsername = order.Seller?.Username ?? string.Empty,
+        Price = order.Price,
+        Status = order.Status.ToString(),
+        CreatedAt = order.CreatedAt,
+        UpdatedAt = order.UpdatedAt
+    };
+}
+```
+
+
+
+### 8. 创建 OrdersController
+
+```bash
+touch UUcars.API/Controllers/OrdersController.cs
+```
+
+```c#
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using UUcars.API.DTOs;
+using UUcars.API.DTOs.Requests;
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Services;
+
+namespace UUcars.API.Controllers;
+
+[ApiController]
+[Route("orders")]
+[Authorize]     // 订单系统所有接口都需要登录
+public class OrdersController : ControllerBase
+{
+    private readonly OrderService _orderService;
+    private readonly CurrentUserService _currentUserService;
+
+    public OrdersController(OrderService orderService, CurrentUserService currentUserService)
+    {
+        _orderService = orderService;
+        _currentUserService = currentUserService;
+    }
+
+    // POST /orders
+    [HttpPost]
+    public async Task<IActionResult> Create(
+        [FromBody] OrderCreateRequest request,
+        CancellationToken cancellationToken)
+    {
+        var buyerId = _currentUserService.GetCurrentUserId();
+        if (buyerId == null)
+            return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+        var order = await _orderService.CreateAsync(buyerId.Value, request, cancellationToken);
+
+        return StatusCode(StatusCodes.Status201Created,
+            ApiResponse<OrderResponse>.Ok(order, "Order created successfully."));
+    }
+}
+```
+
+
+
+### 9. 注册依赖到 Program.cs
+
+```csharp
+// 订单模块
+builder.Services.AddScoped<IOrderRepository, EfOrderRepository>();
+builder.Services.AddScoped<OrderService>();
+```
+
+
+
+### 10. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 11. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**正常下单：**
+
+用买家账号登录，对一辆 `Published` 的车下单：
+
+```json
+POST /orders
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......
+
+{
+  "carId": 1
+}
+```
+
+预期（201）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": 1,
+    "carId": 1,
+    "carTitle": "2020款宝马3系",
+    "buyerId": 2,
+    "buyerUsername": "testuser",
+    "sellerId": 3,
+    "sellerUsername": "seller",
+    "price": 260000,
+    "status": "Pending",
+    "createdAt": "..."
+  },
+  "message": "Order created successfully."
+}
+```
+
+去数据库里确认：`Cars` 表里这辆车的 `Status` 应该已经变成了 `Sold`。
+
+**再次对同一辆车下单（应返回 409）：**
+
+车辆已经变成 `Sold` 状态，再次下单预期：
+
+```json
+{
+  "success": false,
+  "message": "Car '1' is not available for purchase."
+}
+```
+
+**买家尝试购买自己的车（应返回 400）：**
+
+用卖家账号登录，对自己发布的车下单，预期：
+
+```json
+{
+  "success": false,
+  "message": "You cannot purchase your own car."
+}
+```
+
+**对不存在的车下单（应返回 404）：**
+
+```json
+{
+  "carId": 9999
+}
+```
+
+预期返回 404。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 12. 此时的目录变化
+
+```
+UUcars.API/
+├── Controllers/
+│   └── OrdersController.cs             ← 新增
+├── DTOs/
+│   ├── Requests/
+│   │   └── OrderCreateRequest.cs       ← 新增
+│   └── Responses/
+│       └── OrderResponse.cs            ← 新增
+├── Exceptions/
+│   ├── OrderNotFoundException.cs       ← 新增
+│   ├── CarNotAvailableException.cs     ← 新增
+│   └── CannotOrderOwnCarException.cs   ← 新增
+├── Repositories/
+│   ├── IOrderRepository.cs             ← 新增
+│   └── EfOrderRepository.cs            ← 新增
+└── Services/
+    └── OrderService.cs                 ← 新增
+```
+
+
+
+### 13. Git 提交
+
+```bash
+git add .
+git commit -m "feat: POST /orders - create order with car status update"
+git push origin feature/orders
+```
+
+
+
+### Step 26 完成状态
+
+```
+✅ 切出 feature/orders 分支
+✅ 理解创建订单的五条业务规则
+✅ 理解数据库事务的必要性（订单创建 + 车辆状态更新必须原子性）
+✅ 理解 EF Core 同一 DbContext 的 SaveChangesAsync 自动事务
+✅ OrderNotFoundException / CarNotAvailableException / CannotOrderOwnCarException
+✅ OrderCreateRequest（只传 CarId，价格由服务端锁定）/ OrderResponse
+✅ IOrderRepository（一次定义完整接口）+ EfOrderRepository
+✅ 理解买家/卖家查询为什么 Include 不同字段
+✅ OrderService.CreateAsync（完整业务规则 + 事务性保存 + 重新查询加载关联数据）
+✅ 理解创建后为什么要重新查一次订单
+✅ OrdersController POST /orders（Controller 级别 [Authorize]）
+✅ Scalar 测试通过（201 下单成功、409 车辆不可用、400 自己买自己、404 车辆不存在）
+✅ Git commit + push 完成
+```
+
