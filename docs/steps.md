@@ -9470,3 +9470,187 @@ git push origin feature/favorites
 ✅ Scalar 测试通过（201 收藏成功、409 重复收藏、404 非 Published、401 未登录）
 ✅ Git commit + push 完成
 ```
+
+
+
+## Step 24 · 取消收藏
+
+### 这一步做什么
+
+实现 `DELETE /favorites/{carId}`，让买家能从收藏列表里移除一辆车。
+
+
+
+### 1. 取消收藏的业务规则
+
+取消收藏比添加收藏简单——只需要验证两件事：
+
+```
+1. 当前用户已经收藏了这辆车（没收藏过就无法取消）
+2. 操作的是自己的收藏（不能取消别人的收藏）
+```
+
+第二条不需要单独检查——`GetAsync(userId, carId)` 按 `(UserId, CarId)` 联合主键查询，本身就限定了是"当前用户对这辆车的收藏"，查不到就是没有，不存在查到别人收藏的情况。
+
+
+
+### 2. 创建业务异常
+
+```bash
+touch UUcars.API/Exceptions/FavoriteNotFoundException.cs
+```
+
+```c#
+namespace UUcars.API.Exceptions;
+
+// 用户尝试取消一个不存在的收藏时抛出
+public class FavoriteNotFoundException : AppException
+{
+    public FavoriteNotFoundException(int carId)
+        : base(StatusCodes.Status404NotFound,
+            $"Car '{carId}' is not in your favorites.")
+    {
+    }
+}
+```
+
+
+
+### 3. 在 FavoriteService 里添加取消收藏方法
+
+打开 `UUcars.API/Services/FavoriteService.cs`，添加 `RemoveFavoriteAsync`：
+
+```csharp
+public async Task RemoveFavoriteAsync(
+    int userId,
+    int carId,
+    CancellationToken cancellationToken = default)
+{
+    // 查询当前用户对这辆车的收藏记录
+    // GetAsync 按 (UserId, CarId) 联合主键查询，天然限定了是当前用户自己的收藏
+    var favorite = await _favoriteRepository.GetAsync(userId, carId, cancellationToken);
+
+    if (favorite == null)
+        throw new FavoriteNotFoundException(carId);
+
+    await _favoriteRepository.DeleteAsync(favorite, cancellationToken);
+
+    _logger.LogInformation("User {UserId} removed car {CarId} from favorites", userId, carId);
+}
+```
+
+
+
+### 4. 在 FavoritesController 里添加 DELETE /favorites/{carId}
+
+打开 `UUcars.API/Controllers/FavoritesController.cs`，在 `AddFavorite` 方法下方添加：
+
+```csharp
+// DELETE /favorites/{carId}
+[HttpDelete("{carId:int}")]
+public async Task<IActionResult> RemoveFavorite(int carId, CancellationToken cancellationToken)
+{
+    var userId = _currentUserService.GetCurrentUserId();
+    if (userId == null)
+        return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+    await _favoriteService.RemoveFavoriteAsync(userId.Value, carId, cancellationToken);
+
+    // 删除成功返回 204 No Content，和 DELETE /cars/{id} 保持一致
+    return NoContent();
+}
+```
+
+
+
+### 5. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 6. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**正常取消收藏：**
+
+先收藏一辆车（`POST /favorites/1`），然后取消：
+
+```
+DELETE /favorites/1
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......
+```
+
+预期（204）：无响应体。
+
+**取消一个没有收藏过的车（应返回 404）：**
+
+直接取消一辆从未收藏过的车：
+
+```json
+{
+  "success": false,
+  "message": "Car '2' is not in your favorites."
+}
+```
+
+**取消后重新收藏（应返回 201）：**
+
+取消收藏后再次 `POST /favorites/1`，预期能重新收藏成功，说明删除操作真正清除了记录，不是逻辑删除。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 7. 此时的目录变化
+
+```
+UUcars.API/
+└── Exceptions/
+    └── FavoriteNotFoundException.cs    ← 新增
+```
+
+`FavoriteService` 和 `FavoritesController` 新增了方法，不是新文件。
+
+
+
+### 8. Git 提交
+
+```bash
+git add .
+git commit -m "feat: DELETE /favorites/{carId} - remove car from favorites"
+git push origin feature/favorites
+```
+
+
+
+### Step 24 完成状态
+
+```
+✅ 理解取消收藏的业务规则（联合主键天然限定了操作范围）
+✅ FavoriteNotFoundException（404）
+✅ FavoriteService.RemoveFavoriteAsync
+✅ FavoritesController DELETE /favorites/{carId}（返回 204）
+✅ Scalar 测试通过（204 取消成功、404 未收藏过、取消后可重新收藏）
+✅ Git commit + push 完成
+```
+

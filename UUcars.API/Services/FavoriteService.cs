@@ -65,4 +65,14 @@ public class FavoriteService
             Car = CarService.MapToResponse(car)
         };
     }
+
+    public async Task RemoveFavoriteAsync(int userId, int carId, CancellationToken cancellationToken = default)
+    {
+        var favorite = await _favoriteRepository.GetAsync(userId, carId, cancellationToken);
+
+        if (favorite == null) throw new FavoriteNotFoundException(carId);
+        
+        await _favoriteRepository.DeleteAsync(favorite, cancellationToken);
+        _logger.LogInformation("User {UserId} removed car {CarId} from favorites", userId, carId);
+    }
 }
