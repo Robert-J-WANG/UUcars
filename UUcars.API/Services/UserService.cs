@@ -1,0 +1,164 @@
+using System.Runtime.InteropServices;
+using Microsoft.AspNetCore.Identity;
+using UUcars.API.Auth;
+using UUcars.API.DTOs.Requests;
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Entities;
+using UUcars.API.Entities.Enums;
+using UUcars.API.Exceptions;
+using UUcars.API.Repositories;
+
+namespace UUcars.API.Services;
+
+public class UserService
+{
+    private readonly IUserRepository _userRepository;
+    private readonly IPasswordHasher<User> _passwordHasher; // 改为接口
+    private readonly JwtTokenGenerator _jwtTokenGenerator;
+    private readonly ILogger<UserService> _logger;
+
+
+    // 通过构造函数注入，由 DI 容器提供
+    public UserService(
+        IUserRepository userRepository,
+        IPasswordHasher<User> passwordHasher, // 改为接口注入
+        JwtTokenGenerator jwtTokenGenerator,
+        ILogger<UserService> logger)
+    {
+        _userRepository = userRepository;
+        _passwordHasher = passwordHasher;
+        _jwtTokenGenerator = jwtTokenGenerator;
+        _logger = logger;
+    }
+
+    public async Task<UserResponse> RegisterAsync(RegisterRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        // 1. 检查邮箱是否已被注册
+        var existing = await _userRepository.GetByEmailAsync(request.Email, cancellationToken);
+        if (existing != null)
+        {
+            throw new UserAlreadyExistsException(request.Email);
+        }
+
+        // 2. 构建用户实体（先不填 PasswordHash）
+        var user = new User
+        {
+            Username = request.Username,
+            Email = request.Email.ToLower(), // 统一存小写，保持一致性
+            Role = UserRole.User, // 注册的用户默认是普通用户
+            EmailConfirmed = false, // V1 不做邮箱验证，默认 false
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        // 3. Hash 密码（细节在 Step 09 讲解）
+        user.PasswordHash = _passwordHasher.HashPassword(user, request.Password);
+
+        // 4. 存入数据库
+        var created = await _userRepository.AddAsync(user, cancellationToken);
+
+        _logger.LogInformation("New user registered: {Email}", created.Email);
+
+        // 5. 返回 DTO（不包含 PasswordHash）
+        return MapToResponse(created);
+    }
+
+    public async Task<LoginResponse> LoginAsync(LoginRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        // 1. 按邮箱查找用户
+        var user = await _userRepository.GetByEmailAsync(request.Email, cancellationToken);
+
+        // 2. 用户不存在：抛出和密码错误一样的异常，不透露"邮箱不存在"
+        if (user == null)
+        {
+            throw new InvalidCredentialsException();
+        }
+
+        // 3. 验证密码
+        // VerifyHashedPassword 做的事：
+        //   从 user.PasswordHash 字符串里提取出当初 HashPassword 时用的 Salt
+        //   用这个 Salt 对 request.Password（用户输入的明文）重新计算 Hash
+        //   把计算结果和 user.PasswordHash 比对
+        // 返回值是 PasswordVerificationResult 枚举：
+        //   Success             → 匹配，验证通过
+        //   Failed              → 不匹配，密码错误
+        //   SuccessRehashNeeded → 匹配，但 Hash 算法版本较旧，建议更新
+        var result = _passwordHasher.VerifyHashedPassword(user, user.PasswordHash, request.Password);
+        if (result == PasswordVerificationResult.Failed)
+        {
+            throw new InvalidCredentialsException();
+        }
+
+        // 4. 验证通过，生成 JWT Token
+        var token = _jwtTokenGenerator.GenerateToken(user);
+
+        _logger.LogInformation("User logged in: {Email}", user.Email);
+
+        return new LoginResponse
+        {
+            Token = token,
+            // ExpiresAt 和 JwtTokenGenerator 里的 expires 保持一致
+            ExpiresAt = DateTime.UtcNow.AddMinutes(60),
+            User = MapToResponse(user)
+        };
+    }
+
+    public async Task<UserResponse> GetCurrentUserAsync(
+        int userId,
+        CancellationToken cancellationToken = default)
+    {
+        var user = await _userRepository.GetByIdAsync(userId, cancellationToken);
+        if (user == null)
+            throw new UserNotFoundException(userId);
+
+        return MapToResponse(user);
+    }
+
+    public async Task<UserResponse> UpdateCurrentUserAsync(
+        int userId,
+        UpdateUserRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        var user = await _userRepository.GetByIdAsync(userId, cancellationToken);
+        if (user == null)
+            throw new UserNotFoundException(userId);
+
+        // 如果邮箱发生了变化，检查新邮箱是否已被其他人使用
+        // 这里用 OrdinalIgnoreCase 做大小写不敏感的比较
+        // 原因：用户输入的邮箱大小写可能和数据库里存的不一致（数据库存的是小写）
+        // 不能直接用 == 比较，否则 "Test@example.com" 和 "test@example.com" 会被判断为不同
+        if (!string.Equals(user.Email, request.Email, StringComparison.OrdinalIgnoreCase))
+        {
+            var existing = await _userRepository.GetByEmailAsync(request.Email, cancellationToken);
+
+            // existing.Id != userId：排除自己
+            // 场景：用户只改了用户名，邮箱没变，或者邮箱大小写变了但本质一样
+            // 如果不排除自己，用原邮箱提交也会触发"邮箱已被注册"的错误
+            if (existing != null && existing.Id != userId)
+                throw new UserAlreadyExistsException(request.Email);
+        }
+
+        user.Username = request.Username;
+        user.Email = request.Email.ToLower();
+        user.UpdatedAt = DateTime.UtcNow;
+
+        var updated = await _userRepository.UpdateAsync(user, cancellationToken);
+
+        _logger.LogInformation("User updated: {Email}", updated.Email);
+
+        return MapToResponse(updated);
+    }
+
+    // 实体 → DTO 的映射方法
+    // 写成 private static：不依赖实例状态，也不需要从外部调用
+    private static UserResponse MapToResponse(User user) => new()
+    {
+        Id = user.Id,
+        Username = user.Username,
+        Email = user.Email,
+        Role = user.Role.ToString(),
+        CreatedAt = user.CreatedAt
+    };
+}

@@ -1,10 +1,18 @@
+using System.Text;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
+using Microsoft.IdentityModel.Tokens;
 using Scalar.AspNetCore;
 using Serilog;
 using UUcars.API.Auth;
 using UUcars.API.Data;
+using UUcars.API.Entities;
+using UUcars.API.Extensions;
 using UUcars.API.Middleware;
+using UUcars.API.Repositories;
+using UUcars.API.Services;
 
 // =============================================
 // Bootstrap Logger
@@ -41,21 +49,51 @@ try
     // 服务注册
     // =============================================
     builder.Services.AddControllers();
-    
+
     // OpenAPI + Scalar（API 文档）
     builder.Services.AddOpenApi();
 
     // 将 appsettings.json 中的 JwtSettings 节绑定到 JwtSettings 类
-    // 后续需要 JWT 配置的地方通过 IOptions<JwtSettings> 注入
+    // 后续 运行阶段 需要 JWT 配置的地方通过 IOptions<JwtSettings> 注入
     builder.Services.Configure<JwtSettings>(
         builder.Configuration.GetSection("JwtSettings")
     );
-    
+
     // 注册 AppDbContext
     // 从配置文件读取连接字符串（开发环境从 User Secrets 读取）
     builder.Services.AddDbContext<AppDbContext>(options =>
         options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection"))
     );
+
+    // 配置 JWT 认证
+    // JWT 认证（细节在 Extensions/AuthExtensions.cs）
+    builder.Services.AddJwtAuthentication(builder.Configuration);
+    
+    // 用户模块
+    // AddScoped：每次 HTTP 请求创建一个新实例，请求结束后销毁
+    // Repository 和 Service 都用 Scoped，因为它们依赖 DbContext（也是 Scoped）
+    builder.Services.AddScoped<IPasswordHasher<User>, PasswordHasher<User>>();
+    builder.Services.AddScoped<IUserRepository, EfUserRepository>();
+    builder.Services.AddScoped<JwtTokenGenerator>();
+    builder.Services.AddScoped<UserService>();
+    
+    // AddHttpContextAccessor：IHttpContextAccessor 默认不自动注册，需要显式加上
+    // 它内部用 AsyncLocal<T> 保证线程安全，每个请求有自己独立的 HttpContext
+    builder.Services.AddHttpContextAccessor();
+    builder.Services.AddScoped<CurrentUserService>();
+    
+    // 车辆模块
+    builder.Services.AddScoped<ICarRepository, EfCarRepository>();
+    builder.Services.AddScoped<CarService>();
+    builder.Services.AddScoped<ICarImageRepository, EfCarImageRepository>();  // 新增
+    
+    // 收藏模块
+    builder.Services.AddScoped<IFavoriteRepository, EfFavoriteRepository>();
+    builder.Services.AddScoped<FavoriteService>();
+    
+    // 订单模块
+    builder.Services.AddScoped<IOrderRepository, EfOrderRepository>();
+    builder.Services.AddScoped<OrderService>();
 
     // =============================================
     // 构建应用
@@ -81,8 +119,12 @@ try
         );
     }
 
-    app.UseHttpsRedirection();
+    // UseAuthentication 必须在 UseAuthorization 之前
+    // 原因：Authorization 需要读取 Authentication 的结果（HttpContext.User）
+    // 如果顺序反了，[Authorize] 读到的 HttpContext.User 是空的，永远判定为未认证
+    app.UseAuthentication();
     app.UseAuthorization();
+
     app.MapControllers();
 
     app.Run();
