@@ -90,6 +90,10 @@ try
     // 收藏模块
     builder.Services.AddScoped<IFavoriteRepository, EfFavoriteRepository>();
     builder.Services.AddScoped<FavoriteService>();
+    
+    // 订单模块
+    builder.Services.AddScoped<IOrderRepository, EfOrderRepository>();
+    builder.Services.AddScoped<OrderService>();
 
     // =============================================
     // 构建应用
