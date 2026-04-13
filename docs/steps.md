@@ -11466,5 +11466,282 @@ git checkout develop
 ✅ v0.5 里程碑 tag 打完
 ```
 
-准备好告诉我，继续 Step 29。
+
+
+## Step 29 · 审核车辆（通过）
+
+### 这一步做什么
+
+进入第八阶段——管理员系统。Admin 的核心职责是审核卖家提交的车辆，决定是否允许上架。这一步实现审核通过：`POST /admin/cars/{id}/approve`。
+
+------
+
+### 1. 切出 feature/admin 分支
+
+```bash
+git checkout develop
+git checkout -b feature/admin
+git push -u origin feature/admin
+```
+
+------
+
+### 2. Admin 接口的权限控制
+
+前面所有接口的权限控制都是"登录 vs 未登录"。Admin 接口多了一层——不只是要登录，还要是 `Admin` 角色。
+
+ASP.NET Core 提供了一个简洁的写法：
+
+```csharp
+[Authorize(Roles = "Admin")]
+```
+
+这一行特性做了两件事：
+
+- 确保用户已登录（Token 有效）
+- 确保用户的 Role Claim 包含 `"Admin"`
+
+如果未登录，返回 401。如果已登录但不是 Admin，返回 403。这两种情况框架会自动处理，不需要在 Controller 里手动判断。
+
+Step 10 里生成 Token 时用的是 `ClaimTypes.Role` 存角色值，`[Authorize(Roles = "Admin")]` 就是读取这个 Claim 来判断的——这就是当时为什么必须用 `ClaimTypes.Role` 而不是随便写个 `"role"` Key 的原因。
+
+------
+
+### 3. Admin 接口为什么用 `/admin/` 前缀
+
+```
+POST /admin/cars/{id}/approve
+POST /admin/cars/{id}/reject
+GET  /admin/cars/pending
+DELETE /admin/cars/{id}
+```
+
+用 `/admin/` 前缀而不是直接复用 `/cars/` 有两个好处：
+
+**第一，职责清晰。** `/cars/` 是用户侧的接口，`/admin/cars/` 是管理员侧的接口，虽然操作的是同一张表，但操作语义完全不同——用户的 `DELETE /cars/{id}` 是卖家删除自己的草稿，管理员的 `DELETE /admin/cars/{id}` 是强制下架违规车辆。分开前缀，一眼就知道这是管理员操作。
+
+**第二，权限配置方便。** 可以在 Controller 级别用 `[Authorize(Roles = "Admin")]` 覆盖整个 `/admin/` 下的所有接口，不需要每个 Action 单独配置。
+
+------
+
+### 4. 创建 AdminCarService
+
+Admin 的车辆操作和卖家的车辆操作虽然都涉及 `Car` 实体，但业务逻辑完全不同，单独建一个 `AdminCarService`，不混入 `CarService`：
+
+```bash
+touch UUcars.API/Services/AdminCarService.cs
+```
+
+```c#
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Entities.Enums;
+using UUcars.API.Exceptions;
+using UUcars.API.Repositories;
+
+namespace UUcars.API.Services;
+
+public class AdminCarService
+{
+    private readonly ICarRepository _carRepository;
+    private readonly ILogger<AdminCarService> _logger;
+
+    public AdminCarService(ICarRepository carRepository, ILogger<AdminCarService> logger)
+    {
+        _carRepository = carRepository;
+        _logger = logger;
+    }
+
+    public async Task<CarResponse> ApproveAsync(
+        int carId,
+        CancellationToken cancellationToken = default)
+    {
+        var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+        if (car == null)
+            throw new CarNotFoundException(carId);
+
+        // 只有 PendingReview 状态才能审核通过
+        // 已经 Published 的车不需要重复审核
+        // Draft 的车还没提交，不应该直接被 Admin 通过
+        if (car.Status != CarStatus.PendingReview)
+            throw new CarStatusException(car.Id, car.Status, CarStatus.PendingReview);
+
+        car.Status = CarStatus.Published;
+        car.UpdatedAt = DateTime.UtcNow;
+
+        var updated = await _carRepository.UpdateAsync(car, cancellationToken);
+
+        _logger.LogInformation("Car {CarId} approved by admin, now Published", carId);
+
+        return CarService.MapToResponse(updated);
+    }
+}
+```
+
+> **为什么复用 `CarService.MapToResponse` 而不是自己写一个？** `MapToResponse` 在 Step 14 里定义为 `internal static`，同一个程序集（Assembly）内都可以访问。`CarResponse` 的映射逻辑只有一份，不需要在 `AdminCarService` 里重复写一遍——重复代码意味着将来改 `CarResponse` 时要改两个地方，容易遗漏。
+
+------
+
+### 5. 创建 AdminController
+
+```bash
+touch UUcars.API/Controllers/AdminController.cs
+```
+
+```c#
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using UUcars.API.DTOs;
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Services;
+
+namespace UUcars.API.Controllers;
+
+[ApiController]
+[Route("admin")]
+[Authorize(Roles = "Admin")]    // Controller 级别：所有 Admin 接口都需要 Admin 角色
+public class AdminController : ControllerBase
+{
+    private readonly AdminCarService _adminCarService;
+
+    public AdminController(AdminCarService adminCarService)
+    {
+        _adminCarService = adminCarService;
+    }
+
+    // POST /admin/cars/{id}/approve
+    [HttpPost("cars/{id:int}/approve")]
+    public async Task<IActionResult> ApproveCar(int id, CancellationToken cancellationToken)
+    {
+        var car = await _adminCarService.ApproveAsync(id, cancellationToken);
+        return Ok(ApiResponse<CarResponse>.Ok(car, "Car approved and published successfully."));
+    }
+}
+```
+
+------
+
+### 6. 注册依赖到 Program.cs
+
+```csharp
+// Admin 模块
+builder.Services.AddScoped<AdminCarService>();
+```
+
+------
+
+### 7. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+------
+
+### 8. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**正常审核通过：**
+
+用 Admin 账号（`admin@uucars.com` / `Admin@123456`）登录，找一辆 `PendingReview` 状态的车（先用卖家账号创建一辆车并提交审核）：
+
+```
+POST /admin/cars/1/approve
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......（Admin Token）
+```
+
+预期（200）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": 1,
+    "status": "Published",
+    ...
+  },
+  "message": "Car approved and published successfully."
+}
+```
+
+审核通过后，这辆车应该出现在 `GET /cars` 的公开列表里。
+
+**审核 Draft 状态的车（应返回 409）：**
+
+尝试审核一辆还在 `Draft` 状态的车（还没提交），预期：
+
+```json
+{
+  "success": false,
+  "message": "Car '1' is in 'Draft' status. Required status: 'PendingReview'."
+}
+```
+
+**用普通用户 Token 调用（应返回 403）：**
+
+换普通用户的 Token，访问 `POST /admin/cars/1/approve`，预期返回 403。
+
+**不带 Token 访问（应返回 401）：**
+
+不带 Authorization 头，预期返回 401。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+------
+
+### 9. 此时的目录变化
+
+```
+UUcars.API/
+├── Controllers/
+│   └── AdminController.cs      ← 新增
+└── Services/
+    └── AdminCarService.cs      ← 新增
+```
+
+------
+
+### 10. Git 提交
+
+```bash
+git add .
+git commit -m "feat: POST /admin/cars/{id}/approve - approve car for publishing"
+git push origin feature/admin
+```
+
+------
+
+### Step 29 完成状态
+
+```
+✅ 切出 feature/admin 分支
+✅ 理解 [Authorize(Roles = "Admin")] 的工作原理（依赖 ClaimTypes.Role）
+✅ 理解 /admin/ 前缀的作用（职责清晰 + 权限配置方便）
+✅ 理解为什么单独建 AdminCarService 而不是混入 CarService
+✅ AdminCarService.ApproveAsync（PendingReview → Published）
+✅ 复用 CarService.MapToResponse（internal static，不重复映射逻辑）
+✅ AdminController（Controller 级别 [Authorize(Roles = "Admin")]）
+✅ DI 注册完成
+✅ Scalar 测试通过（200 审核成功、409 状态不对、403 非 Admin、401 未登录）
+✅ Git commit + push 完成
+```
+
+
 
