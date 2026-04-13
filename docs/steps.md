@@ -10754,5 +10754,717 @@ git push origin feature/orders
 ✅ Git commit + push 完成
 ```
 
+## Step 28 · 我的订单
 
+### 这一步做什么
+
+实现两个订单查询接口：
+
+```
+GET /orders/my-purchases  ← 买家视角：我买的订单
+GET /orders/my-sales      ← 卖家视角：我卖出的订单
+```
+
+这两个接口是 Step 26 里在 `Orders` 表冗余存储 `SellerId` 的直接体现——有了 `SellerId`，卖家查自己的订单只需要按 `SellerId` 过滤，不需要 JOIN `Cars` 表。
+
+完成后补充 `OrderService` 的单元测试，订单系统全部功能就完成了。
+
+
+
+### 1. 为什么要分两个接口而不是一个
+
+一个直觉上的问题：能不能用一个 `GET /orders` 返回"和我相关的所有订单"？
+
+可以，但有问题：同一个用户既可以是买家也可以是卖家，"和我相关的订单"混在一起会让客户端很难区分——这个订单我是买家还是卖家？客户端需要额外判断逻辑。
+
+分成两个接口，职责清晰：
+
+```
+GET /orders/my-purchases  → 我作为买家的订单，关心的是"我买了什么车、付了多少钱"
+GET /orders/my-sales      → 我作为卖家的订单，关心的是"谁买了我的车、收了多少钱"
+```
+
+两个接口虽然查的是同一张表，但视角不同，关心的信息侧重点也不同。
+
+
+
+### 2. 在 OrderService 里添加查询方法
+
+`IOrderRepository` 在 Step 26 里已经定义了 `GetByBuyerAsync` 和 `GetBySellerAsync`，`EfOrderRepository` 也已经实现了，这里直接在 Service 层调用：
+
+打开 `UUcars.API/Services/OrderService.cs`，在顶部补上 using：
+
+```csharp
+using UUcars.API.DTOs;
+using UUcars.API.DTOs.Requests;
+```
+
+然后添加两个查询方法：
+
+```csharp
+public async Task<PagedResponse<OrderResponse>> GetMyPurchasesAsync(
+    int buyerId,
+    CarQueryRequest query,
+    CancellationToken cancellationToken = default)
+{
+    var page = query.Page < 1 ? 1 : query.Page;
+    var pageSize = query.PageSize < 1 ? 20 : query.PageSize;
+    pageSize = Math.Min(pageSize, 50);
+
+    var (orders, totalCount) = await _orderRepository.GetByBuyerAsync(
+        buyerId,
+        page,
+        pageSize,
+        cancellationToken);
+
+    var items = orders.Select(MapToResponse).ToList();
+
+    return PagedResponse<OrderResponse>.Create(items, totalCount, page, pageSize);
+}
+
+public async Task<PagedResponse<OrderResponse>> GetMySalesAsync(
+    int sellerId,
+    CarQueryRequest query,
+    CancellationToken cancellationToken = default)
+{
+    var page = query.Page < 1 ? 1 : query.Page;
+    var pageSize = query.PageSize < 1 ? 20 : query.PageSize;
+    pageSize = Math.Min(pageSize, 50);
+
+    var (orders, totalCount) = await _orderRepository.GetBySellerAsync(
+        sellerId,
+        page,
+        pageSize,
+        cancellationToken);
+
+    var items = orders.Select(MapToResponse).ToList();
+
+    return PagedResponse<OrderResponse>.Create(items, totalCount, page, pageSize);
+}
+```
+
+
+
+### 3. 在 OrdersController 里添加查询端点
+
+打开 `UUcars.API/Controllers/OrdersController.cs`，在顶部补上 using：
+
+```csharp
+using UUcars.API.DTOs.Requests;
+```
+
+在 `Cancel` 方法下方添加：
+
+```csharp
+// GET /orders/my-purchases
+// 注意：必须放在 GET /orders/{id:int} 之前定义（如果以后有这个接口）
+// 原因和 Step 20 里 /cars/my-listings 的路由顺序问题一样：
+// 固定路径要优先于参数路径，:int 约束虽然能保护，但显式顺序更清晰
+[HttpGet("my-purchases")]
+public async Task<IActionResult> GetMyPurchases(
+    [FromQuery] CarQueryRequest query,
+    CancellationToken cancellationToken)
+{
+    var currentUserId = _currentUserService.GetCurrentUserId();
+    if (currentUserId == null)
+        return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+    var result = await _orderService.GetMyPurchasesAsync(
+        currentUserId.Value, query, cancellationToken);
+
+    return Ok(ApiResponse<PagedResponse<OrderResponse>>.Ok(result));
+}
+
+// GET /orders/my-sales
+[HttpGet("my-sales")]
+public async Task<IActionResult> GetMySales(
+    [FromQuery] CarQueryRequest query,
+    CancellationToken cancellationToken)
+{
+    var currentUserId = _currentUserService.GetCurrentUserId();
+    if (currentUserId == null)
+        return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+    var result = await _orderService.GetMySalesAsync(
+        currentUserId.Value, query, cancellationToken);
+
+    return Ok(ApiResponse<PagedResponse<OrderResponse>>.Ok(result));
+}
+```
+
+
+
+### 4. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 5. 补充单元测试
+
+这一步要补充 `OrderService` 的单元测试，重点测试创建订单的各种边界情况。
+
+#### 5.1 创建 FakeOrderRepository
+
+```bash
+touch UUcars.Tests/Fakes/FakeOrderRepository.cs
+```
+
+```c#
+using UUcars.API.Entities;
+using UUcars.API.Repositories;
+
+namespace UUcars.Tests.Fakes;
+
+public class FakeOrderRepository : IOrderRepository
+{
+    private readonly Dictionary<int, Order> _store = new();
+    private int _nextId = 1;
+
+    public void Seed(Order order)
+    {
+        if (order.Id == 0) order.Id = _nextId++;
+        _store[order.Id] = order;
+    }
+
+    public Task<Order> AddAsync(Order order, CancellationToken cancellationToken = default)
+    {
+        order.Id = _nextId++;
+        _store[order.Id] = order;
+        return Task.FromResult(order);
+    }
+
+    public Task<Order?> GetByIdAsync(int id, CancellationToken cancellationToken = default)
+    {
+        _store.TryGetValue(id, out var order);
+        return Task.FromResult(order);
+    }
+
+    public Task<Order> UpdateAsync(Order order, CancellationToken cancellationToken = default)
+    {
+        _store[order.Id] = order;
+        return Task.FromResult(order);
+    }
+
+    public Task<(List<Order> Orders, int TotalCount)> GetByBuyerAsync(
+        int buyerId, int page, int pageSize,
+        CancellationToken cancellationToken = default)
+    {
+        var result = _store.Values
+            .Where(o => o.BuyerId == buyerId)
+            .ToList();
+        return Task.FromResult((result, result.Count));
+    }
+
+    public Task<(List<Order> Orders, int TotalCount)> GetBySellerAsync(
+        int sellerId, int page, int pageSize,
+        CancellationToken cancellationToken = default)
+    {
+        var result = _store.Values
+            .Where(o => o.SellerId == sellerId)
+            .ToList();
+        return Task.FromResult((result, result.Count));
+    }
+}
+```
+
+#### 5.2 OrderService 的单元测试需要 AppDbContext
+
+`OrderService` 直接依赖 `AppDbContext`（用于事务性保存），单元测试里不能用真实数据库。
+
+EF Core 提供了一个**内存数据库（InMemory）**，专门用于测试——它的行为和真实数据库一样（支持 Add、Update、SaveChanges），但数据存在内存里，测试结束就消失，不需要真实的 SQL Server。
+
+先安装 InMemory 包：
+
+```bash
+dotnet add UUcars.Tests/UUcars.Tests.csproj package Microsoft.EntityFrameworkCore.InMemory
+```
+
+#### 5.3 编写 OrderService 单元测试
+
+```bash
+touch UUcars.Tests/Services/OrderServiceTests.cs
+```
+
+```c#
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging.Abstractions;
+using UUcars.API.Data;
+using UUcars.API.DTOs.Requests;
+using UUcars.API.Entities;
+using UUcars.API.Entities.Enums;
+using UUcars.API.Exceptions;
+using UUcars.API.Repositories;
+using UUcars.API.Services;
+using UUcars.Tests.Fakes;
+
+namespace UUcars.Tests.Services;
+
+public class OrderServiceTests
+{
+    // 每个测试用一个独立的 InMemory 数据库（通过唯一的数据库名区分）
+    // 为什么要独立？InMemory 数据库是共享的，如果多个测试用同一个，
+    // 一个测试插入的数据会影响另一个测试的结果
+    private static AppDbContext CreateDbContext()
+    {
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseInMemoryDatabase(Guid.NewGuid().ToString())
+            .Options;
+        return new AppDbContext(options);
+    }
+
+    private static OrderService CreateService(
+        AppDbContext context,
+        FakeCarRepository? carRepo = null)
+    {
+        // 这个测试需要验证事务性保存，用真实的 EfOrderRepository + InMemory 数据库
+        // 而不是 FakeOrderRepository——因为 OrderService 直接操作 _context 保存，
+        // FakeOrderRepository._store 感知不到这个操作，GetByIdAsync 会返回 null
+        var orderRepo = new EfOrderRepository(context);
+        return new OrderService(
+            orderRepo,
+            carRepo ?? new FakeCarRepository(),
+            context,
+            NullLogger<OrderService>.Instance
+        );
+    }
+
+    // ===== 创建订单的测试 =====
+
+    [Fact]
+    public async Task CreateAsync_WithValidData_ShouldCreateOrderAndMarkCarAsSold()
+    {
+        // Arrange
+        var context = CreateDbContext();
+        var carRepo = new FakeCarRepository();
+
+        // 把 Buyer、Seller、Car 都加进 InMemory 数据库
+        // 原因：EfOrderRepository.GetByIdAsync 用了 Include(o => o.Buyer) 和 Include(o => o.Seller)
+        // InMemory 数据库里必须有这些关联数据，Include 才能正确加载
+        var buyer = new User
+        {
+            Id = 2,
+            Username = "buyer",
+            Email = "buyer@test.com",
+            PasswordHash = "hash",
+            Role = UserRole.User,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+        var seller = new User
+        {
+            Id = 10,
+            Username = "seller",
+            Email = "seller@test.com",
+            PasswordHash = "hash",
+            Role = UserRole.User,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+        var car = new Car
+        {
+            Id = 1,
+            SellerId = 10,
+            Price = 260000,
+            Status = CarStatus.Published,
+            Title = "宝马3系",
+            Brand = "BMW",
+            Model = "3 Series",
+            Year = 2020,
+            Mileage = 15000,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        context.Users.AddRange(buyer, seller);
+        context.Cars.Add(car);
+        await context.SaveChangesAsync();
+        carRepo.Seed(car);
+
+        var service = CreateService(context, carRepo);
+
+        // Act
+        var result = await service.CreateAsync(
+            2,
+            new OrderCreateRequest { CarId = 1 });
+
+        // Assert
+        Assert.NotNull(result);
+        Assert.Equal(OrderStatus.Pending.ToString(), result.Status);
+        Assert.Equal(260000, result.Price);
+        Assert.Equal(10, result.SellerId);
+        Assert.Equal("buyer", result.BuyerUsername); // 现在能正确加载了
+        Assert.Equal("seller", result.SellerUsername); // 现在能正确加载了
+
+        var updatedCar = await context.Cars.FindAsync(1);
+        Assert.Equal(CarStatus.Sold, updatedCar!.Status);
+    }
+
+    [Fact]
+    public async Task CreateAsync_WhenCarNotPublished_ShouldThrowCarNotAvailableException()
+    {
+        // Arrange
+        var context = CreateDbContext();
+        var carRepo = new FakeCarRepository();
+
+        // 不需要User数据
+        // 在业务规则判断阶段就抛了异常，不涉及 Include 查询
+
+        // Arrange：车辆是 Draft 状态，不可下单
+        var car = new Car
+        {
+            Id = 1,
+            SellerId = 10,
+            Price = 260000,
+            Status = CarStatus.Draft,
+            Title = "宝马3系",
+            Brand = "BMW",
+            Model = "3 Series",
+            Year = 2020,
+            Mileage = 15000,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        carRepo.Seed(car);
+        var service = CreateService(context, carRepo);
+
+        // Act + Assert
+
+        // Act + Assert
+        await Assert.ThrowsAsync<CarNotAvailableException>(() => service.CreateAsync(
+            2,
+            new OrderCreateRequest { CarId = 1 }));
+    }
+
+    [Fact]
+    public async Task CreateAsync_WhenBuyerIsSeller_ShouldThrowCannotOrderOwnCarException()
+    {
+        // Arrange
+        var context = CreateDbContext();
+        var carRepo = new FakeCarRepository();
+
+        // 不需要准备user的数据
+        // 在业务规则判断阶段就抛了异常，不涉及 Include 查询
+        var car = new Car
+        {
+            Id = 1,
+            SellerId = 10,
+            Price = 260000,
+            Status = CarStatus.Published, // ← 改成 Published，让代码能走到买家/卖家检查
+            Title = "宝马3系",
+            Brand = "BMW",
+            Model = "3 Series",
+            Year = 2020,
+            Mileage = 15000,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+        carRepo.Seed(car);
+
+        var service = CreateService(context, carRepo);
+
+        // Act + Assert：buyerId = 10，和 SellerId = 10 相同
+        await Assert.ThrowsAsync<CannotOrderOwnCarException>(() =>
+            service.CreateAsync(10, new OrderCreateRequest { CarId = 1 }));
+    }
+
+    [Fact]
+    public async Task CancelAsync_WhenPendingAndBuyer_ShouldCancelOrderAndRestoreCar()
+    {
+        // Arrange
+        var context = CreateDbContext();
+        var carRepo = new FakeCarRepository();
+        
+        // 和创建订单的测试一样，CancelAsync 也调用了 _orderRepository.GetByIdAsync（含 Include），
+        // 所以订单、车辆、用户都需要放进 InMemory 数据库。
+
+        var buyer = new User
+        {
+            Id = 2, Username = "buyer", Email = "buyer@test.com",
+            PasswordHash = "hash", Role = UserRole.User,
+            CreatedAt = DateTime.UtcNow, UpdatedAt = DateTime.UtcNow
+        };
+        var seller = new User
+        {
+            Id = 10, Username = "seller", Email = "seller@test.com",
+            PasswordHash = "hash", Role = UserRole.User,
+            CreatedAt = DateTime.UtcNow, UpdatedAt = DateTime.UtcNow
+        };
+        var car = new Car
+        {
+            Id = 1, SellerId = 10, Status = CarStatus.Sold,
+            Title = "宝马", Brand = "BMW", Model = "3系", Year = 2020,
+            Mileage = 0, CreatedAt = DateTime.UtcNow, UpdatedAt = DateTime.UtcNow
+        };
+        var order = new Order
+        {
+            Id = 1, CarId = 1, BuyerId = 2, SellerId = 10,
+            Price = 260000, Status = OrderStatus.Pending,
+            CreatedAt = DateTime.UtcNow, UpdatedAt = DateTime.UtcNow
+        };
+
+        context.Users.AddRange(buyer, seller);
+        context.Cars.Add(car);
+        context.Orders.Add(order);
+        await context.SaveChangesAsync();
+        carRepo.Seed(car);
+
+        var service = CreateService(context, carRepo);
+
+        // Act
+        var result = await service.CancelAsync(1, 2);
+
+        // Assert：订单已取消
+        Assert.Equal(OrderStatus.Cancelled.ToString(), result.Status);
+
+        // 验证车辆状态已恢复为 Published
+        var updatedCar = await context.Cars.FindAsync(1);
+        Assert.Equal(CarStatus.Published, updatedCar!.Status);
+    }
+
+    [Fact]
+    public async Task CancelAsync_WhenNotBuyer_ShouldThrowForbiddenException()
+    {
+        // Arrange
+        var context = CreateDbContext();
+        var carRepo = new FakeCarRepository();
+
+        var buyer = new User
+        {
+            Id = 2, Username = "buyer", Email = "buyer@test.com",
+            PasswordHash = "hash", Role = UserRole.User,
+            CreatedAt = DateTime.UtcNow, UpdatedAt = DateTime.UtcNow
+        };
+        var seller = new User
+        {
+            Id = 10, Username = "seller", Email = "seller@test.com",
+            PasswordHash = "hash", Role = UserRole.User,
+            CreatedAt = DateTime.UtcNow, UpdatedAt = DateTime.UtcNow
+        };
+        var car = new Car
+        {
+            Id = 1, SellerId = 10, Status = CarStatus.Sold,
+            Title = "宝马", Brand = "BMW", Model = "3系", Year = 2020,
+            Mileage = 0, CreatedAt = DateTime.UtcNow, UpdatedAt = DateTime.UtcNow
+        };
+        var order = new Order
+        {
+            Id = 1, CarId = 1, BuyerId = 2, SellerId = 10,
+            Price = 260000, Status = OrderStatus.Pending,
+            CreatedAt = DateTime.UtcNow, UpdatedAt = DateTime.UtcNow
+        };
+
+        context.Users.AddRange(buyer, seller);
+        context.Cars.Add(car);
+        context.Orders.Add(order);
+        await context.SaveChangesAsync();
+
+        carRepo.Seed(car);
+        var service = CreateService(context, carRepo);
+
+        // Act + Assert：currentUserId = 10（卖家），不是买家，不能取消
+        await Assert.ThrowsAsync<ForbiddenException>(() =>
+            service.CancelAsync(1, 10));
+    }
+
+    [Fact]
+    public async Task CancelAsync_WhenAlreadyCancelled_ShouldThrowOrderStatusException()
+    {
+        // Arrange
+        var context = CreateDbContext();
+        var carRepo = new FakeCarRepository();
+
+        var buyer = new User
+        {
+            Id = 2, Username = "buyer", Email = "buyer@test.com",
+            PasswordHash = "hash", Role = UserRole.User,
+            CreatedAt = DateTime.UtcNow, UpdatedAt = DateTime.UtcNow
+        };
+        var seller = new User
+        {
+            Id = 10, Username = "seller", Email = "seller@test.com",
+            PasswordHash = "hash", Role = UserRole.User,
+            CreatedAt = DateTime.UtcNow, UpdatedAt = DateTime.UtcNow
+        };
+        var car = new Car
+        {
+            Id = 1, SellerId = 10, Status = CarStatus.Sold,
+            Title = "宝马", Brand = "BMW", Model = "3系", Year = 2020,
+            Mileage = 0, CreatedAt = DateTime.UtcNow, UpdatedAt = DateTime.UtcNow
+        };
+
+        var order = new Order
+        {
+            Id = 1, CarId = 1, BuyerId = 2, SellerId = 10,
+            Price = 260000, Status = OrderStatus.Cancelled,
+            CreatedAt = DateTime.UtcNow, UpdatedAt = DateTime.UtcNow
+        };
+
+        context.Users.AddRange(buyer, seller);
+        context.Cars.Add(car);
+        context.Orders.Add(order);
+        await context.SaveChangesAsync();
+        carRepo.Seed(car);
+
+        var service = CreateService(context, carRepo);
+
+        // Act + Assert：不能重复取消
+        await Assert.ThrowsAsync<OrderStatusException>(() => service.CancelAsync(1, 2));
+    }
+}
+```
+
+#### 5.4 运行测试
+
+```bash
+dotnet test
+```
+
+预期：
+
+```
+Test summary: total: 17, failed: 0, succeeded: 17, skipped: 0
+```
+
+原来的 11 个测试 + 新增的 6 个订单测试，全部通过。
+
+
+
+### 6. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**GET /orders/my-purchases（买家视角）：**
+
+用买家账号登录，创建几个订单后：
+
+```
+GET /orders/my-purchases
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......
+```
+
+预期（200）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "items": [
+      {
+        "id": 1,
+        "carTitle": "2020款宝马3系",
+        "sellerUsername": "seller",
+        "price": 260000,
+        "status": "Pending",
+        ...
+      }
+    ],
+    "totalCount": 1,
+    "page": 1,
+    "pageSize": 20,
+    "totalPages": 1
+  }
+}
+```
+
+**GET /orders/my-sales（卖家视角）：**
+
+换卖家账号的 Token：
+
+```
+GET /orders/my-sales
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......
+```
+
+预期：返回该卖家车辆被购买的订单，包含买家用户名。
+
+**验证两个接口的数据隔离：**
+
+买家调用 `GET /orders/my-sales`，因为买家没有卖出过任何车，应该返回空列表——而不是看到别人的订单。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 7. 此时的目录变化
+
+```
+UUcars.Tests/
+├── Fakes/
+│   └── FakeOrderRepository.cs      ← 新增
+└── Services/
+    └── OrderServiceTests.cs        ← 新增
+```
+
+`OrderService` 和 `OrdersController` 新增了方法，不是新文件。
+
+
+
+### 8. Git 提交 + 合并分支
+
+```bash
+git add .
+git commit -m "feat: GET /orders/my-purchases + GET /orders/my-sales + test: OrderService unit tests (create/cancel/edge cases)"
+git push origin feature/orders
+```
+
+合并回 `develop`，同时这是 v0.5 里程碑节点：
+
+```bash
+git checkout develop
+git merge --no-ff feature/orders -m "merge: feature/orders into develop"
+git push origin develop
+git branch -D feature/orders
+git push origin --delete feature/orders
+```
+
+用户 + 车辆 + 收藏 + 订单核心业务全部完成，合并到 `main` 打 v0.5 tag：
+
+```bash
+git checkout main
+git merge --no-ff develop -m "release: v0.5 - core business modules complete"
+git tag -a v0.5 -m "Auth + Cars + Favorites + Orders all working"
+git push origin main
+git push origin v0.5
+git checkout develop
+```
+
+
+
+### Step 28 完成状态
+
+```
+✅ 理解为什么要分两个接口（买家/卖家视角不同，关心的信息侧重点不同）
+✅ OrderService 新增 GetMyPurchasesAsync / GetMySalesAsync
+✅ OrdersController 新增 GET /orders/my-purchases + GET /orders/my-sales
+✅ FakeOrderRepository 建立
+✅ 理解 InMemory 数据库的用途（测试时替代真实数据库）
+✅ 理解每个测试用独立 InMemory 数据库的原因（测试隔离）
+✅ 6 个 OrderService 单元测试（创建订单边界 + 取消订单边界）
+✅ 全部 17 个测试通过
+✅ Scalar 测试通过（买家/卖家视角、数据隔离验证）
+✅ feature/orders 合并回 develop
+✅ v0.5 里程碑 tag 打完
+```
+
+准备好告诉我，继续 Step 29。
 

@@ -1,4 +1,5 @@
 using UUcars.API.Data;
+using UUcars.API.DTOs;
 using UUcars.API.DTOs.Requests;
 using UUcars.API.DTOs.Responses;
 using UUcars.API.Entities;
@@ -10,10 +11,10 @@ namespace UUcars.API.Services;
 
 public class OrderService
 {
-    private readonly IOrderRepository _orderRepository;
     private readonly ICarRepository _carRepository;
     private readonly AppDbContext _context;
     private readonly ILogger<OrderService> _logger;
+    private readonly IOrderRepository _orderRepository;
 
     public OrderService(
         IOrderRepository orderRepository,
@@ -140,18 +141,49 @@ public class OrderService
         return MapToResponse(order);
     }
 
-    internal static OrderResponse MapToResponse(Order order) => new()
+    public async Task<PagedResponse<OrderResponse>> GetMyPurchasesAsync(int buyerId, CarQueryRequest request,
+        CancellationToken cancellationToken = default)
     {
-        Id = order.Id,
-        CarId = order.CarId,
-        CarTitle = order.Car?.Title ?? string.Empty,
-        BuyerId = order.BuyerId,
-        BuyerUsername = order.Buyer?.Username ?? string.Empty,
-        SellerId = order.SellerId,
-        SellerUsername = order.Seller?.Username ?? string.Empty,
-        Price = order.Price,
-        Status = order.Status.ToString(),
-        CreatedAt = order.CreatedAt,
-        UpdatedAt = order.UpdatedAt
-    };
+        var page = request.Page < 1 ? 1 : request.Page;
+        var pageSize = Math.Min(50, request.PageSize);
+
+        var (orders, totalCount) = await _orderRepository.GetByBuyerAsync(buyerId, page, pageSize, cancellationToken);
+
+
+        var items = orders.Select(MapToResponse).ToList();
+
+        return PagedResponse<OrderResponse>.Create(items, totalCount, page, pageSize);
+    }
+
+    public async Task<PagedResponse<OrderResponse>> GetMySalesAsync(int sellerId, CarQueryRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        var page = request.Page < 1 ? 1 : request.Page;
+        var pageSize = Math.Min(50, request.PageSize);
+
+        var (orders, totalCount) = await _orderRepository.GetBySellerAsync(sellerId, page, pageSize, cancellationToken);
+
+        var items = orders.Select(MapToResponse).ToList();
+
+        return PagedResponse<OrderResponse>.Create(items, totalCount, page, pageSize);
+    }
+
+
+    internal static OrderResponse MapToResponse(Order order)
+    {
+        return new OrderResponse
+        {
+            Id = order.Id,
+            CarId = order.CarId,
+            CarTitle = order.Car?.Title ?? string.Empty,
+            BuyerId = order.BuyerId,
+            BuyerUsername = order.Buyer?.Username ?? string.Empty,
+            SellerId = order.SellerId,
+            SellerUsername = order.Seller?.Username ?? string.Empty,
+            Price = order.Price,
+            Status = order.Status.ToString(),
+            CreatedAt = order.CreatedAt,
+            UpdatedAt = order.UpdatedAt
+        };
+    }
 }
