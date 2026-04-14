@@ -94,6 +94,9 @@ try
     // 订单模块
     builder.Services.AddScoped<IOrderRepository, EfOrderRepository>();
     builder.Services.AddScoped<OrderService>();
+    
+    // Admin 模块
+    builder.Services.AddScoped<AdminCarService>();
 
     // =============================================
     // 构建应用

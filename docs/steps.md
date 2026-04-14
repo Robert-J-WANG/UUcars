@@ -11466,5 +11466,803 @@ git checkout develop
 ✅ v0.5 里程碑 tag 打完
 ```
 
-准备好告诉我，继续 Step 29。
 
+
+## Step 29 · 审核车辆（通过）
+
+### 这一步做什么
+
+进入第八阶段——管理员系统。Admin 的核心职责是审核卖家提交的车辆，决定是否允许上架。这一步实现审核通过：`POST /admin/cars/{id}/approve`。
+
+------
+
+### 1. 切出 feature/admin 分支
+
+```bash
+git checkout develop
+git checkout -b feature/admin
+git push -u origin feature/admin
+```
+
+------
+
+### 2. Admin 接口的权限控制
+
+前面所有接口的权限控制都是"登录 vs 未登录"。Admin 接口多了一层——不只是要登录，还要是 `Admin` 角色。
+
+ASP.NET Core 提供了一个简洁的写法：
+
+```csharp
+[Authorize(Roles = "Admin")]
+```
+
+这一行特性做了两件事：
+
+- 确保用户已登录（Token 有效）
+- 确保用户的 Role Claim 包含 `"Admin"`
+
+如果未登录，返回 401。如果已登录但不是 Admin，返回 403。这两种情况框架会自动处理，不需要在 Controller 里手动判断。
+
+Step 10 里生成 Token 时用的是 `ClaimTypes.Role` 存角色值，`[Authorize(Roles = "Admin")]` 就是读取这个 Claim 来判断的——这就是当时为什么必须用 `ClaimTypes.Role` 而不是随便写个 `"role"` Key 的原因。
+
+------
+
+### 3. Admin 接口为什么用 `/admin/` 前缀
+
+```
+POST /admin/cars/{id}/approve
+POST /admin/cars/{id}/reject
+GET  /admin/cars/pending
+DELETE /admin/cars/{id}
+```
+
+用 `/admin/` 前缀而不是直接复用 `/cars/` 有两个好处：
+
+**第一，职责清晰。** `/cars/` 是用户侧的接口，`/admin/cars/` 是管理员侧的接口，虽然操作的是同一张表，但操作语义完全不同——用户的 `DELETE /cars/{id}` 是卖家删除自己的草稿，管理员的 `DELETE /admin/cars/{id}` 是强制下架违规车辆。分开前缀，一眼就知道这是管理员操作。
+
+**第二，权限配置方便。** 可以在 Controller 级别用 `[Authorize(Roles = "Admin")]` 覆盖整个 `/admin/` 下的所有接口，不需要每个 Action 单独配置。
+
+------
+
+### 4. 创建 AdminCarService
+
+Admin 的车辆操作和卖家的车辆操作虽然都涉及 `Car` 实体，但业务逻辑完全不同，单独建一个 `AdminCarService`，不混入 `CarService`：
+
+```bash
+touch UUcars.API/Services/AdminCarService.cs
+```
+
+```c#
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Entities.Enums;
+using UUcars.API.Exceptions;
+using UUcars.API.Repositories;
+
+namespace UUcars.API.Services;
+
+public class AdminCarService
+{
+    private readonly ICarRepository _carRepository;
+    private readonly ILogger<AdminCarService> _logger;
+
+    public AdminCarService(ICarRepository carRepository, ILogger<AdminCarService> logger)
+    {
+        _carRepository = carRepository;
+        _logger = logger;
+    }
+
+    public async Task<CarResponse> ApproveAsync(
+        int carId,
+        CancellationToken cancellationToken = default)
+    {
+        var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+        if (car == null)
+            throw new CarNotFoundException(carId);
+
+        // 只有 PendingReview 状态才能审核通过
+        // 已经 Published 的车不需要重复审核
+        // Draft 的车还没提交，不应该直接被 Admin 通过
+        if (car.Status != CarStatus.PendingReview)
+            throw new CarStatusException(car.Id, car.Status, CarStatus.PendingReview);
+
+        car.Status = CarStatus.Published;
+        car.UpdatedAt = DateTime.UtcNow;
+
+        var updated = await _carRepository.UpdateAsync(car, cancellationToken);
+
+        _logger.LogInformation("Car {CarId} approved by admin, now Published", carId);
+
+        return CarService.MapToResponse(updated);
+    }
+}
+```
+
+> **为什么复用 `CarService.MapToResponse` 而不是自己写一个？** `MapToResponse` 在 Step 14 里定义为 `internal static`，同一个程序集（Assembly）内都可以访问。`CarResponse` 的映射逻辑只有一份，不需要在 `AdminCarService` 里重复写一遍——重复代码意味着将来改 `CarResponse` 时要改两个地方，容易遗漏。
+
+------
+
+### 5. 创建 AdminController
+
+```bash
+touch UUcars.API/Controllers/AdminController.cs
+```
+
+```c#
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using UUcars.API.DTOs;
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Services;
+
+namespace UUcars.API.Controllers;
+
+[ApiController]
+[Route("admin")]
+[Authorize(Roles = "Admin")]    // Controller 级别：所有 Admin 接口都需要 Admin 角色
+public class AdminController : ControllerBase
+{
+    private readonly AdminCarService _adminCarService;
+
+    public AdminController(AdminCarService adminCarService)
+    {
+        _adminCarService = adminCarService;
+    }
+
+    // POST /admin/cars/{id}/approve
+    [HttpPost("cars/{id:int}/approve")]
+    public async Task<IActionResult> ApproveCar(int id, CancellationToken cancellationToken)
+    {
+        var car = await _adminCarService.ApproveAsync(id, cancellationToken);
+        return Ok(ApiResponse<CarResponse>.Ok(car, "Car approved and published successfully."));
+    }
+}
+```
+
+------
+
+### 6. 注册依赖到 Program.cs
+
+```csharp
+// Admin 模块
+builder.Services.AddScoped<AdminCarService>();
+```
+
+------
+
+### 7. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+------
+
+### 8. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**正常审核通过：**
+
+用 Admin 账号（`admin@uucars.com` / `Admin@123456`）登录，找一辆 `PendingReview` 状态的车（先用卖家账号创建一辆车并提交审核）：
+
+```
+POST /admin/cars/1/approve
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......（Admin Token）
+```
+
+预期（200）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": 1,
+    "status": "Published",
+    ...
+  },
+  "message": "Car approved and published successfully."
+}
+```
+
+审核通过后，这辆车应该出现在 `GET /cars` 的公开列表里。
+
+**审核 Draft 状态的车（应返回 409）：**
+
+尝试审核一辆还在 `Draft` 状态的车（还没提交），预期：
+
+```json
+{
+  "success": false,
+  "message": "Car '1' is in 'Draft' status. Required status: 'PendingReview'."
+}
+```
+
+**用普通用户 Token 调用（应返回 403）：**
+
+换普通用户的 Token，访问 `POST /admin/cars/1/approve`，预期返回 403。
+
+**不带 Token 访问（应返回 401）：**
+
+不带 Authorization 头，预期返回 401。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+------
+
+### 9. 此时的目录变化
+
+```
+UUcars.API/
+├── Controllers/
+│   └── AdminController.cs      ← 新增
+└── Services/
+    └── AdminCarService.cs      ← 新增
+```
+
+------
+
+### 10. Git 提交
+
+```bash
+git add .
+git commit -m "feat: POST /admin/cars/{id}/approve - approve car for publishing"
+git push origin feature/admin
+```
+
+------
+
+### Step 29 完成状态
+
+```
+✅ 切出 feature/admin 分支
+✅ 理解 [Authorize(Roles = "Admin")] 的工作原理（依赖 ClaimTypes.Role）
+✅ 理解 /admin/ 前缀的作用（职责清晰 + 权限配置方便）
+✅ 理解为什么单独建 AdminCarService 而不是混入 CarService
+✅ AdminCarService.ApproveAsync（PendingReview → Published）
+✅ 复用 CarService.MapToResponse（internal static，不重复映射逻辑）
+✅ AdminController（Controller 级别 [Authorize(Roles = "Admin")]）
+✅ DI 注册完成
+✅ Scalar 测试通过（200 审核成功、409 状态不对、403 非 Admin、401 未登录）
+✅ Git commit + push 完成
+```
+
+## Step 30 · 审核车辆（拒绝）
+
+### 这一步做什么
+
+实现 `POST /admin/cars/{id}/reject`——Admin 审核不通过，把车辆退回给卖家修改。
+
+------
+
+### 1. 拒绝审核的业务逻辑
+
+拒绝审核和通过审核的流程基本对称，但方向相反：
+
+```
+通过：PendingReview → Published（上架）
+拒绝：PendingReview → Draft   （退回卖家修改）
+```
+
+退回 `Draft` 而不是 `Deleted` 的原因：拒绝不是永久封禁，只是"这次提交有问题，请修改后重新提交"。卖家收到退回后，可以修改车辆信息再次提交审核，走完整的流程。
+
+------
+
+### 2. 在 AdminCarService 里添加拒绝方法
+
+打开 `UUcars.API/Services/AdminCarService.cs`，在 `ApproveAsync` 下方添加：
+
+```csharp
+public async Task<CarResponse> RejectAsync(
+    int carId,
+    CancellationToken cancellationToken = default)
+{
+    var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+    if (car == null)
+        throw new CarNotFoundException(carId);
+
+    // 同样只有 PendingReview 状态才能被拒绝
+    if (car.Status != CarStatus.PendingReview)
+        throw new CarStatusException(car.Id, car.Status, CarStatus.PendingReview);
+
+    // 拒绝后退回 Draft，让卖家修改后重新提交
+    car.Status = CarStatus.Draft;
+    car.UpdatedAt = DateTime.UtcNow;
+
+    var updated = await _carRepository.UpdateAsync(car, cancellationToken);
+
+    _logger.LogInformation("Car {CarId} rejected by admin, returned to Draft", carId);
+
+    return CarService.MapToResponse(updated);
+}
+```
+
+------
+
+### 3. 在 AdminController 里添加拒绝端点
+
+打开 `UUcars.API/Controllers/AdminController.cs`，在 `ApproveCar` 方法下方添加：
+
+```csharp
+// POST /admin/cars/{id}/reject
+[HttpPost("cars/{id:int}/reject")]
+public async Task<IActionResult> RejectCar(int id, CancellationToken cancellationToken)
+{
+    var car = await _adminCarService.RejectAsync(id, cancellationToken);
+    return Ok(ApiResponse<CarResponse>.Ok(car, "Car rejected and returned to seller for revision."));
+}
+```
+
+------
+
+### 4. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+------
+
+### 5. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**正常拒绝审核：**
+
+用 Admin Token，找一辆 `PendingReview` 状态的车：
+
+```
+POST /admin/cars/1/reject
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......（Admin Token）
+```
+
+预期（200）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": 1,
+    "status": "Draft",
+    ...
+  },
+  "message": "Car rejected and returned to seller for revision."
+}
+```
+
+**验证卖家可以重新提交：**
+
+拒绝后车辆回到 `Draft`，卖家应该能修改后再次 `POST /cars/1/submit`，验证整个流程闭环。
+
+**拒绝已经 Published 的车（应返回 409）：**
+
+预期：
+
+```json
+{
+  "success": false,
+  "message": "Car '1' is in 'Published' status. Required status: 'PendingReview'."
+}
+```
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+------
+
+### 6. Git 提交
+
+```bash
+git add .
+git commit -m "feat: POST /admin/cars/{id}/reject - reject car back to draft"
+git push origin feature/admin
+```
+
+------
+
+### Step 30 完成状态
+
+```
+✅ 理解拒绝审核退回 Draft 而不是 Deleted 的原因（允许修改重新提交）
+✅ AdminCarService.RejectAsync（PendingReview → Draft）
+✅ AdminController POST /admin/cars/{id}/reject
+✅ Scalar 测试通过（200 拒绝成功、409 状态不对、卖家可重新提交验证）
+✅ Git commit + push 完成
+```
+
+## Step 31 · 待审核车辆列表
+
+### 这一步做什么
+
+实现 `GET /admin/cars/pending`，返回所有 `PendingReview` 状态的车辆列表，供 Admin 查看和处理待审核的车辆。
+
+------
+
+### 1. 这个接口和公开列表有什么不同
+
+`GET /cars` 是买家视角，只返回 `Published` 的车辆，不需要登录。`GET /admin/cars/pending` 是 Admin 视角，只返回 `PendingReview` 的车辆，需要 Admin 权限。
+
+两者底层都是查 `Cars` 表，只是过滤条件不同。`ICarRepository` 里已经有 `GetPagedAsync(CarStatus status, ...)` 方法，直接复用，传入 `CarStatus.PendingReview` 即可，不需要新增 Repository 方法。
+
+------
+
+### 2. 在 AdminCarService 里添加待审核列表方法
+
+打开 `UUcars.API/Services/AdminCarService.cs`，在顶部补上 using：
+
+```csharp
+using UUcars.API.DTOs;
+using UUcars.API.DTOs.Requests;
+```
+
+在 `RejectAsync` 下方添加：
+
+```csharp
+public async Task<PagedResponse<CarResponse>> GetPendingCarsAsync(
+    CarQueryRequest query,
+    CancellationToken cancellationToken = default)
+{
+    var page = query.Page < 1 ? 1 : query.Page;
+    var pageSize = query.PageSize < 1 ? 20 : query.PageSize;
+    pageSize = Math.Min(pageSize, 50);
+
+    // 直接复用 ICarRepository 的 GetPagedAsync，传入 PendingReview 状态
+    // 不需要新增 Repository 方法，这正是把 status 作为参数设计的价值
+    var (cars, totalCount) = await _carRepository.GetPagedAsync(
+        CarStatus.PendingReview,
+        query,
+        cancellationToken);
+
+    var items = cars.Select(CarService.MapToResponse).ToList();
+
+    return PagedResponse<CarResponse>.Create(items, totalCount, page, pageSize);
+}
+```
+
+------
+
+### 3. 在 AdminController 里添加待审核列表端点
+
+打开 `UUcars.API/Controllers/AdminController.cs`，在顶部补上 using：
+
+```csharp
+using UUcars.API.DTOs.Requests;
+```
+
+在 `RejectCar` 方法下方添加：
+
+```csharp
+// GET /admin/cars/pending
+// 注意路由顺序：/admin/cars/pending 是固定路径，
+// 必须在 /admin/cars/{id:int}/approve 等参数路由之前定义，
+// 避免 "pending" 被误匹配为 {id}（虽然 :int 约束已经能保护，但显式顺序更清晰）
+[HttpGet("cars/pending")]
+public async Task<IActionResult> GetPendingCars(
+    [FromQuery] CarQueryRequest query,
+    CancellationToken cancellationToken)
+{
+    var result = await _adminCarService.GetPendingCarsAsync(query, cancellationToken);
+    return Ok(ApiResponse<PagedResponse<CarResponse>>.Ok(result));
+}
+```
+
+------
+
+### 4. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+------
+
+### 5. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**获取待审核列表：**
+
+用 Admin Token，先确保数据库里有几辆 `PendingReview` 状态的车（用卖家账号创建车辆并提交审核）：
+
+```
+GET /admin/cars/pending
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......（Admin Token）
+```
+
+预期（200）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "items": [
+      {
+        "id": 2,
+        "title": "2019款丰田凯美瑞",
+        "status": "PendingReview",
+        "sellerUsername": "seller",
+        ...
+      }
+    ],
+    "totalCount": 1,
+    "page": 1,
+    "pageSize": 20,
+    "totalPages": 1
+  }
+}
+```
+
+**验证过滤：**
+
+已经 `Published` 或 `Draft` 的车辆不出现在这个列表里——这是这个接口最核心的逻辑，需要验证。
+
+**分页测试：**
+
+```
+GET /admin/cars/pending?page=1&pageSize=5
+```
+
+验证分页参数生效。
+
+**用普通用户 Token 访问（应返回 403）：**
+
+换普通用户的 Token，预期返回 403。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+------
+
+### 6. 此时的目录变化
+
+这一步没有新增文件，只在 `AdminCarService` 和 `AdminController` 里新增了方法。
+
+------
+
+### 7. Git 提交
+
+```bash
+git add .
+git commit -m "feat: GET /admin/cars/pending - pending review car list"
+git push origin feature/admin
+```
+
+------
+
+### Step 31 完成状态
+
+```
+✅ 理解复用 GetPagedAsync 而不新增 Repository 方法的原因
+✅ AdminCarService.GetPendingCarsAsync（复用 ICarRepository.GetPagedAsync）
+✅ AdminController GET /admin/cars/pending（[FromQuery] 分页参数）
+✅ Scalar 测试通过（待审核列表、过滤验证、分页、403 非 Admin）
+✅ Git commit + push 完成
+```
+
+
+
+## Step 32 · 删除违规车辆
+
+### 这一步做什么
+
+实现 `DELETE /admin/cars/{id}`，Admin 强制逻辑删除违规车辆——无论车辆当前是什么状态，Admin 都可以将其标记为 `Deleted`。
+
+------
+
+### 1. Admin 删除和卖家删除的区别
+
+Step 17 里卖家已经有了 `DELETE /cars/{id}`，为什么 Admin 还需要一个单独的删除接口？
+
+```
+卖家删除（Step 17）：
+  只能删除自己的车
+  只能删除 Draft 状态的车
+  用于卖家主动撤回草稿
+
+Admin 删除（本步骤）：
+  可以删除任何人的车
+  可以删除任何状态的车（Draft / PendingReview / Published / Sold）
+  用于平台强制下架违规内容
+```
+
+两者操作的是同一个"逻辑删除"动作（`Status = Deleted`），但权限和适用范围完全不同，所以分开实现。
+
+------
+
+### 2. 为什么 Sold 状态的车也可以被 Admin 删除
+
+卖家不能删除 `Sold` 的车是因为有成交订单，不能随意消除。但 Admin 是平台管理方，如果一辆已售出的车被发现是违规车辆（比如欺诈），平台有责任强制下架并保留记录（逻辑删除，数据还在）。
+
+------
+
+### 3. 在 AdminCarService 里添加删除方法
+
+打开 `UUcars.API/Services/AdminCarService.cs`，在 `GetPendingCarsAsync` 下方添加：
+
+```csharp
+public async Task AdminDeleteAsync(
+    int carId,
+    CancellationToken cancellationToken = default)
+{
+    var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+    if (car == null)
+        throw new CarNotFoundException(carId);
+
+    // Admin 可以删除任何状态的车辆，不受状态约束
+    // 但已经是 Deleted 状态的车不需要重复操作
+    if (car.Status == CarStatus.Deleted)
+        throw new CarStatusException(car.Id, car.Status, CarStatus.Published);
+
+    car.Status = CarStatus.Deleted;
+    car.UpdatedAt = DateTime.UtcNow;
+
+    await _carRepository.UpdateAsync(car, cancellationToken);
+
+    _logger.LogInformation("Car {CarId} forcefully deleted by admin", carId);
+}
+```
+
+> **为什么已经是 `Deleted` 时抛 `CarStatusException` 而不是直接返回成功？** 重复删除一辆已经删除的车，通常意味着调用方出现了问题（比如 Bug 或误操作）。明确返回错误比静默成功更安全，让调用方知道"这辆车已经是删除状态了"。
+
+------
+
+### 4. 在 AdminController 里添加删除端点
+
+打开 `UUcars.API/Controllers/AdminController.cs`，在 `GetPendingCars` 下方添加：
+
+```csharp
+// DELETE /admin/cars/{id}
+[HttpDelete("cars/{id:int}")]
+public async Task<IActionResult> DeleteCar(int id, CancellationToken cancellationToken)
+{
+    await _adminCarService.AdminDeleteAsync(id, cancellationToken);
+    return NoContent();
+}
+```
+
+------
+
+### 5. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+------
+
+### 6. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**正常删除违规车辆（Published 状态）：**
+
+用 Admin Token，找一辆 `Published` 状态的车：
+
+```
+DELETE /admin/cars/1
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......（Admin Token）
+```
+
+预期（204）：无响应体。
+
+去数据库确认：`Cars` 表里这辆车的 `Status` 应该变成了 `Deleted`，数据行还在。
+
+**验证被删除的车辆从公开列表消失：**
+
+执行 `GET /cars`，确认刚才删除的车不再出现在列表里。
+
+**重复删除同一辆车（应返回 409）：**
+
+再次删除同一辆 `Deleted` 状态的车，预期：
+
+```json
+{
+  "success": false,
+  "message": "Car '1' is in 'Deleted' status. Required status: 'Published'."
+}
+```
+
+**用普通用户 Token 访问（应返回 403）：**
+
+换普通用户的 Token，预期返回 403。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+------
+
+### 7. Git 提交 + 合并分支
+
+Admin 系统四个接口全部完成：
+
+```bash
+git add .
+git commit -m "feat: DELETE /admin/cars/{id} - force delete violation car"
+git push origin feature/admin
+```
+
+合并回 `develop`：
+
+```bash
+git checkout develop
+git merge --no-ff feature/admin -m "merge: feature/admin into develop"
+git push origin develop
+git branch -D feature/admin
+git push origin --delete feature/admin
+```
+
+------
+
+### Step 32 完成状态
+
+```
+✅ 理解 Admin 删除和卖家删除的区别（权限范围和适用状态不同）
+✅ 理解为什么 Sold 状态的车也可以被 Admin 删除
+✅ AdminCarService.AdminDeleteAsync（无状态限制，已删除时报错）
+✅ AdminController DELETE /admin/cars/{id}（返回 204）
+✅ Scalar 测试通过（204 删除成功、从公开列表消失、409 重复删除、403 非 Admin）
+✅ feature/admin 合并回 develop
+```
