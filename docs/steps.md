@@ -11474,7 +11474,7 @@ git checkout develop
 
 进入第八阶段——管理员系统。Admin 的核心职责是审核卖家提交的车辆，决定是否允许上架。这一步实现审核通过：`POST /admin/cars/{id}/approve`。
 
-------
+
 
 ### 1. 切出 feature/admin 分支
 
@@ -11484,7 +11484,7 @@ git checkout -b feature/admin
 git push -u origin feature/admin
 ```
 
-------
+
 
 ### 2. Admin 接口的权限控制
 
@@ -11505,7 +11505,7 @@ ASP.NET Core 提供了一个简洁的写法：
 
 Step 10 里生成 Token 时用的是 `ClaimTypes.Role` 存角色值，`[Authorize(Roles = "Admin")]` 就是读取这个 Claim 来判断的——这就是当时为什么必须用 `ClaimTypes.Role` 而不是随便写个 `"role"` Key 的原因。
 
-------
+
 
 ### 3. Admin 接口为什么用 `/admin/` 前缀
 
@@ -11522,7 +11522,7 @@ DELETE /admin/cars/{id}
 
 **第二，权限配置方便。** 可以在 Controller 级别用 `[Authorize(Roles = "Admin")]` 覆盖整个 `/admin/` 下的所有接口，不需要每个 Action 单独配置。
 
-------
+
 
 ### 4. 创建 AdminCarService
 
@@ -11580,7 +11580,7 @@ public class AdminCarService
 
 > **为什么复用 `CarService.MapToResponse` 而不是自己写一个？** `MapToResponse` 在 Step 14 里定义为 `internal static`，同一个程序集（Assembly）内都可以访问。`CarResponse` 的映射逻辑只有一份，不需要在 `AdminCarService` 里重复写一遍——重复代码意味着将来改 `CarResponse` 时要改两个地方，容易遗漏。
 
-------
+
 
 ### 5. 创建 AdminController
 
@@ -11619,7 +11619,7 @@ public class AdminController : ControllerBase
 }
 ```
 
-------
+
 
 ### 6. 注册依赖到 Program.cs
 
@@ -11628,7 +11628,7 @@ public class AdminController : ControllerBase
 builder.Services.AddScoped<AdminCarService>();
 ```
 
-------
+
 
 ### 7. 验证编译
 
@@ -11644,7 +11644,7 @@ Build succeeded.
     0 Error(s)
 ```
 
-------
+
 
 ### 8. 用 Scalar 测试
 
@@ -11704,7 +11704,7 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......（Admin Token）
 cd ..
 ```
 
-------
+
 
 ### 9. 此时的目录变化
 
@@ -11716,7 +11716,7 @@ UUcars.API/
     └── AdminCarService.cs      ← 新增
 ```
 
-------
+
 
 ### 10. Git 提交
 
@@ -11726,7 +11726,7 @@ git commit -m "feat: POST /admin/cars/{id}/approve - approve car for publishing"
 git push origin feature/admin
 ```
 
-------
+
 
 ### Step 29 完成状态
 
@@ -11749,7 +11749,7 @@ git push origin feature/admin
 
 实现 `POST /admin/cars/{id}/reject`——Admin 审核不通过，把车辆退回给卖家修改。
 
-------
+
 
 ### 1. 拒绝审核的业务逻辑
 
@@ -11762,7 +11762,7 @@ git push origin feature/admin
 
 退回 `Draft` 而不是 `Deleted` 的原因：拒绝不是永久封禁，只是"这次提交有问题，请修改后重新提交"。卖家收到退回后，可以修改车辆信息再次提交审核，走完整的流程。
 
-------
+
 
 ### 2. 在 AdminCarService 里添加拒绝方法
 
@@ -11794,7 +11794,7 @@ public async Task<CarResponse> RejectAsync(
 }
 ```
 
-------
+
 
 ### 3. 在 AdminController 里添加拒绝端点
 
@@ -11810,7 +11810,7 @@ public async Task<IActionResult> RejectCar(int id, CancellationToken cancellatio
 }
 ```
 
-------
+
 
 ### 4. 验证编译
 
@@ -11826,7 +11826,7 @@ Build succeeded.
     0 Error(s)
 ```
 
-------
+
 
 ### 5. 用 Scalar 测试
 
@@ -11880,7 +11880,7 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......（Admin Token）
 cd ..
 ```
 
-------
+
 
 ### 6. Git 提交
 
@@ -11890,7 +11890,7 @@ git commit -m "feat: POST /admin/cars/{id}/reject - reject car back to draft"
 git push origin feature/admin
 ```
 
-------
+
 
 ### Step 30 完成状态
 
@@ -11908,7 +11908,7 @@ git push origin feature/admin
 
 实现 `GET /admin/cars/pending`，返回所有 `PendingReview` 状态的车辆列表，供 Admin 查看和处理待审核的车辆。
 
-------
+
 
 ### 1. 这个接口和公开列表有什么不同
 
@@ -11916,7 +11916,7 @@ git push origin feature/admin
 
 两者底层都是查 `Cars` 表，只是过滤条件不同。`ICarRepository` 里已经有 `GetPagedAsync(CarStatus status, ...)` 方法，直接复用，传入 `CarStatus.PendingReview` 即可，不需要新增 Repository 方法。
 
-------
+
 
 ### 2. 在 AdminCarService 里添加待审核列表方法
 
@@ -11951,7 +11951,7 @@ public async Task<PagedResponse<CarResponse>> GetPendingCarsAsync(
 }
 ```
 
-------
+
 
 ### 3. 在 AdminController 里添加待审核列表端点
 
@@ -11978,7 +11978,7 @@ public async Task<IActionResult> GetPendingCars(
 }
 ```
 
-------
+
 
 ### 4. 验证编译
 
@@ -11994,7 +11994,7 @@ Build succeeded.
     0 Error(s)
 ```
 
-------
+
 
 ### 5. 用 Scalar 测试
 
@@ -12058,13 +12058,13 @@ GET /admin/cars/pending?page=1&pageSize=5
 cd ..
 ```
 
-------
+
 
 ### 6. 此时的目录变化
 
 这一步没有新增文件，只在 `AdminCarService` 和 `AdminController` 里新增了方法。
 
-------
+
 
 ### 7. Git 提交
 
@@ -12074,7 +12074,7 @@ git commit -m "feat: GET /admin/cars/pending - pending review car list"
 git push origin feature/admin
 ```
 
-------
+
 
 ### Step 31 完成状态
 
@@ -12094,7 +12094,7 @@ git push origin feature/admin
 
 实现 `DELETE /admin/cars/{id}`，Admin 强制逻辑删除违规车辆——无论车辆当前是什么状态，Admin 都可以将其标记为 `Deleted`。
 
-------
+
 
 ### 1. Admin 删除和卖家删除的区别
 
@@ -12114,13 +12114,13 @@ Admin 删除（本步骤）：
 
 两者操作的是同一个"逻辑删除"动作（`Status = Deleted`），但权限和适用范围完全不同，所以分开实现。
 
-------
+
 
 ### 2. 为什么 Sold 状态的车也可以被 Admin 删除
 
 卖家不能删除 `Sold` 的车是因为有成交订单，不能随意消除。但 Admin 是平台管理方，如果一辆已售出的车被发现是违规车辆（比如欺诈），平台有责任强制下架并保留记录（逻辑删除，数据还在）。
 
-------
+
 
 ### 3. 在 AdminCarService 里添加删除方法
 
@@ -12152,7 +12152,7 @@ public async Task AdminDeleteAsync(
 
 > **为什么已经是 `Deleted` 时抛 `CarStatusException` 而不是直接返回成功？** 重复删除一辆已经删除的车，通常意味着调用方出现了问题（比如 Bug 或误操作）。明确返回错误比静默成功更安全，让调用方知道"这辆车已经是删除状态了"。
 
-------
+
 
 ### 4. 在 AdminController 里添加删除端点
 
@@ -12168,7 +12168,7 @@ public async Task<IActionResult> DeleteCar(int id, CancellationToken cancellatio
 }
 ```
 
-------
+
 
 ### 5. 验证编译
 
@@ -12184,7 +12184,7 @@ Build succeeded.
     0 Error(s)
 ```
 
-------
+
 
 ### 6. 用 Scalar 测试
 
@@ -12232,7 +12232,7 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......（Admin Token）
 cd ..
 ```
 
-------
+
 
 ### 7. Git 提交 + 合并分支
 
@@ -12254,7 +12254,7 @@ git branch -D feature/admin
 git push origin --delete feature/admin
 ```
 
-------
+
 
 ### Step 32 完成状态
 
@@ -12266,3 +12266,373 @@ git push origin --delete feature/admin
 ✅ Scalar 测试通过（204 删除成功、从公开列表消失、409 重复删除、403 非 Admin）
 ✅ feature/admin 合并回 develop
 ```
+
+
+
+你说得对，我回看了之前的对话，在 Step 13 完成后你特意问过这件事，我当时承诺在测试完善阶段做一个完整的总结性说明，覆盖：测什么层、测什么内容、怎么隔离、测试粒度。现在重新完整生成 Step 33。
+
+
+
+## Step 33 · 完善单元测试
+
+### 这一步做什么
+
+这一步是系统性地补全和回顾单元测试。
+
+在补充遗漏的测试用例之前，先把整个单元测试的思路和框架梳理清楚。
+
+从 Step 09 开始我们一直在写测试，现在是时候回头看看这些测试为什么这样写、为什么选这些地方测、为什么不测别的地方。
+
+
+
+### 1. 单元测试测什么层
+
+整个项目有三层：Controller、Service、Repository。我们的单元测试全部集中在 **Service 层**，一个 Controller 测试和 Repository 测试都没有写。这是有意为之的。
+
+**为什么不测 Controller？**
+
+Controller 的职责非常薄：从请求里提取参数，调用 Service，把结果包装成 HTTP 响应。这三件事都不包含任何业务判断逻辑。如果要测 Controller，就必须启动整个 HTTP 管道，配置路由、中间件、序列化……成本很高，而且测的大部分是框架本身的行为，不是我们自己写的逻辑。
+
+**为什么不测 Repository？**
+
+Repository 的职责同样单一：执行数据库操作。里面没有任何业务规则，只有 EF Core 的查询语句。测 Repository 就是在测 EF Core 是否正确工作——这是框架自己的事，不需要我们验证。真正需要测的是"Repository 被正确调用了"，这一点在 Service 测试里通过 Fake Repository 间接验证。
+
+**为什么只测 Service？**
+
+Service 是整个系统的业务规则中心，所有重要的判断都在这里：
+
+```
+邮箱是否已被注册（UserService）
+密码是否正确（UserService）
+车辆状态是否允许提交审核（CarService）
+买家是否是卖家本人（OrderService）
+订单是否可以被取消（OrderService）
+```
+
+这些规则一旦出错，会直接影响系统的正确性和安全性。而且 Service 依赖的是接口（`IUserRepository`、`ICarRepository`），可以用 Fake 实现替换真实的数据库，让测试在内存里跑，不依赖任何外部环境。
+
+
+
+### 2. 选择测试用例的标准
+
+不是所有方法都需要测，判断标准只有一个：**这个方法里有没有值得保护的业务规则？**
+
+具体来说，以下情况值得写测试：
+
+```
+状态约束    → 只有 Draft 状态才能提交审核
+权限边界    → 只有车主才能修改自己的车
+安全规则    → 密码不能以明文存储，邮箱不能重复注册
+业务联动    → 创建订单后车辆状态必须变为 Sold
+边界条件    → 车辆不存在、订单已取消、重复收藏
+```
+
+以下情况不需要写测试：
+
+```
+简单数据查询  → GetByIdAsync 只是查数据库，没有判断逻辑
+字段映射      → MapToResponse 只是赋值，出错一眼就看到
+框架行为      → AddControllers、JWT 验证这些是框架自己的事
+```
+
+
+
+### 3. Fake Repository 的设计思路
+
+单元测试的核心要求是**快速、稳定、不依赖外部资源**。但 Service 依赖 Repository，Repository 要操作数据库。解决方案是用 **Fake Repository** 替换真实的 Repository。
+
+Fake Repository 实现同一个接口（`IUserRepository`、`ICarRepository`），但用内存字典模拟数据库：
+
+```csharp
+public class FakeCarRepository : ICarRepository
+{
+    private readonly Dictionary<int, Car> _store = new();
+
+    // Seed：测试前预设"数据库里已有的数据"
+    public void Seed(Car car) => _store[car.Id] = car;
+
+    // GetByIdAsync：从字典里找，模拟数据库查询
+    public Task<Car?> GetByIdAsync(int id, ...)
+        => Task.FromResult(_store.TryGetValue(id, out var car) ? car : null);
+}
+```
+
+Fake 的三个关键能力：
+
+```
+可控输入  → Seed 方法：预设"数据库里有什么"，测试每次都是干净的起点
+可观察    → 可以在测试里直接读取 _store 验证数据是否被正确写入
+可替换    → DI 注入时换成 Fake，Service 代码不需要任何修改
+```
+
+
+
+### 4. 测试的结构：Arrange / Act / Assert
+
+每个测试方法都遵循固定的三段结构：
+
+```
+Arrange（准备）：设置测试数据和依赖，准备"舞台"
+Act（执行）    ：调用被测试的方法
+Assert（断言） ：验证结果是否符合预期
+```
+
+每个测试只验证一件事。一个测试方法里不应该有多个独立的 Assert 目标——如果一个测试失败了，你应该能一眼知道是什么出了问题，而不是需要排查"到底是哪个 Assert 失败了"。
+
+
+
+### 5. 特殊情况：OrderService 用 InMemory 数据库
+
+大部分测试用 Fake Repository 就够了，但 `OrderService.CreateAsync` 和 `CancelAsync` 有一个特殊性：它们直接操作 `AppDbContext`（为了在同一个事务里保存订单和车辆状态变更）。
+
+Fake Repository 只管自己的 `_store`，感知不到 `AppDbContext` 的变更，所以这两个测试改用 **EF Core InMemory 数据库**——行为和真实数据库一样（支持 Add、Update、SaveChanges），但数据存在内存里，测试结束就消失：
+
+```csharp
+var options = new DbContextOptionsBuilder<AppDbContext>()
+    .UseInMemoryDatabase(Guid.NewGuid().ToString())  // 每个测试独立的数据库名
+    .Options;
+var context = new AppDbContext(options);
+```
+
+每个测试用唯一的数据库名（`Guid.NewGuid()`），确保测试之间互不影响。
+
+
+
+### 6. 回顾所有测试节点的选择逻辑
+
+```
+Step 09 · UserService 注册测试
+  为什么测：邮箱重复、密码明文存储——安全规则，出错后果严重
+  为什么这时候测：注册功能刚完成，趁热打铁
+
+Step 13 · UserService 登录测试
+  为什么测：密码验证逻辑、邮箱不存在和密码错误返回相同错误——安全设计
+  为什么这时候测：登录功能刚完成
+
+Step 22 · CarService 测试
+  为什么测：状态流转约束（Draft → PendingReview）、权限边界（车主才能操作）
+  为什么这时候测：车辆模块最后一个接口完成，覆盖整个模块
+
+Step 28 · OrderService 测试
+  为什么测：创建订单的多个边界（车辆状态、买家不是卖家）、取消订单的事务性
+  为什么这时候测：订单模块最后一个接口完成
+```
+
+
+
+### 7. 切出 feature/tests 分支
+
+```bash
+git checkout develop
+git checkout -b feature/tests
+git push -u origin feature/tests
+```
+
+
+
+### 8. 检查并补充 CarService 测试
+
+目前 `CarServiceTests` 已有 5 个测试，覆盖了提交审核的状态流转和车辆详情的权限判断。补充创建车辆和修改车辆的边界：
+
+打开 `UUcars.Tests/Services/CarServiceTests.cs`，顶部补上 using：
+
+```csharp
+using UUcars.API.DTOs.Requests;
+```
+
+在已有测试下方添加：
+
+```csharp
+// ===== 创建车辆草稿的测试 =====
+
+[Fact]
+public async Task CreateAsync_ShouldSetStatusToDraftAndAssignSeller()
+{
+    // Arrange
+    var repo = new FakeCarRepository();
+    var service = CreateService(repo);
+
+    var request = new CarCreateRequest
+        {
+            Title = "2020 BMW 3 Series",
+            Brand = "BMW",
+            Model = "3 Series",
+            Year = 2020,
+            Price = 260000,
+            Mileage = 15000
+        };
+
+    // Act
+    var result = await service.CreateAsync(sellerId: 10, request);
+
+    // Assert
+    Assert.NotNull(result);
+    // 无论客户端传什么，Status 必须强制为 Draft
+    // 这是核心安全规则：客户端不能绕过审核直接创建 Published 的车辆
+    Assert.Equal("Draft", result.Status);
+    // SellerId 必须是当前登录用户，不能是客户端传入的值
+    Assert.Equal(10, result.SellerId);
+}
+
+// ===== 修改车辆的测试 =====
+
+[Fact]
+public async Task UpdateAsync_WhenDraftAndOwner_ShouldUpdateFields()
+{
+    // Arrange
+    var repo = new FakeCarRepository();
+    repo.Seed(new Car
+    {
+        Id = 1, 
+        SellerId = 10, 
+        Status = CarStatus.Draft,
+        Title = "2020 BMW 3 Series",
+        Brand = "BMW",
+        Model = "3 Series",
+        Year = 2020,
+        Price = 260000,
+        Mileage = 15000,
+        CreatedAt = DateTime.UtcNow,
+        UpdatedAt = DateTime.UtcNow
+    });
+    var service = CreateService(repo);
+
+    var request = new CarUpdateRequest
+    {
+        Title = "New 2020 BMW 3 Series", 
+        Brand = "BMW", 
+        Model = "3 Series",
+        Year = 2020, 
+        Price = 260000, 
+        Mileage = 15000
+    };
+
+    // Act
+    var result = await service.UpdateAsync(1, currentUserId: 10, request);
+
+    // Assert
+    Assert.Equal("New 2020 BMW 3 Series", result.Title);
+    Assert.Equal(260000, result.Price);
+    // 修改后状态仍是 Draft，修改操作不会改变状态
+    Assert.Equal("Draft", result.Status);
+}
+
+[Fact]
+public async Task UpdateAsync_WhenPendingReview_ShouldThrowCarStatusException()
+{
+    // Arrange：已提交审核的车不能修改
+    // 原因：审核中改信息会导致 Admin 看到的和最终上架的内容不一致
+    var repo = new FakeCarRepository();
+    repo.Seed(new Car
+    {
+        Id = 1, 
+        SellerId = 10, 
+        Status = CarStatus.PendingReview,
+        Title = "2020 BMW 3 Series",
+        Brand = "BMW",
+        Model = "3 Series",
+        Year = 2020,
+        Price = 260000,
+        Mileage = 15000,
+        CreatedAt = DateTime.UtcNow,
+        UpdatedAt = DateTime.UtcNow
+    });
+    var service = CreateService(repo);
+
+    var request = new CarUpdateRequest
+    {
+        Title = "New 2020 BMW 3 Series", 
+        Brand = "BMW", 
+        Model = "3 Series",
+        Year = 2020, 
+        Price = 260000, 
+        Mileage = 15000
+    };
+
+
+    // Act + Assert
+    await Assert.ThrowsAsync<CarStatusException>(
+        () => service.UpdateAsync(1, currentUserId: 10, request));
+}
+```
+
+
+
+### 9. 检查并补充 OrderService 测试
+
+目前已有 6 个测试，补充"车辆不存在"这个边界场景：
+
+打开 `UUcars.Tests/Services/OrderServiceTests.cs`，补充：
+
+```csharp
+[Fact]
+public async Task CreateAsync_WhenCarNotFound_ShouldThrowCarNotFoundException()
+{
+    // Arrange：空 carRepo，没有任何车辆
+    // 模拟客户端传了一个不存在的 CarId
+    var context = CreateDbContext();
+    var carRepo = new FakeCarRepository();
+    var service = CreateService(context, carRepo);
+
+    // Act + Assert
+    await Assert.ThrowsAsync<CarNotFoundException>(
+        () => service.CreateAsync(
+            buyerId: 2,
+            new OrderCreateRequest { CarId = 999 }));
+}
+```
+
+
+
+### 10. 运行全部测试
+
+```bash
+dotnet test
+```
+
+预期：
+
+```
+Test summary: total: 20, failed: 0, succeeded: 20, skipped: 0
+```
+
+原来的 17 个 + 新增的 4 个（CarService 3 个 + OrderService 1 个），全部通过。
+
+
+
+### 11. 此时的目录变化
+
+```
+UUcars.Tests/
+└── Services/
+    ├── CarServiceTests.cs      ← 已更新（新增 3 个测试）
+    └── OrderServiceTests.cs    ← 已更新（新增 1 个测试）
+```
+
+
+
+### 12. Git 提交
+
+```bash
+git add .
+git commit -m "test: complete unit test coverage for all Services"
+git push origin feature/tests
+```
+
+
+
+### Step 33 完成状态
+
+```
+✅ 理解为什么只测 Service 层（Controller 太薄，Repository 无业务规则）
+✅ 理解选择测试用例的标准（有业务规则才测，简单查询不测）
+✅ 理解 Fake Repository 的设计思路（可控输入、可观察、可替换）
+✅ 理解 Arrange / Act / Assert 结构（每个测试只验证一件事）
+✅ 理解 OrderService 测试为什么用 InMemory 而不是 Fake（事务性操作）
+✅ 回顾了所有测试节点的选择逻辑
+✅ CarService 补充 3 个测试（创建草稿状态验证、修改成功、修改状态约束）
+✅ OrderService 补充 1 个测试（车辆不存在边界）
+✅ 全部 20 个测试通过
+✅ Git commit + push 完成
+```
+

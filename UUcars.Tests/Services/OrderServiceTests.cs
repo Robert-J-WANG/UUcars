@@ -323,4 +323,20 @@ public class OrderServiceTests
         // Act + Assert：不能重复取消
         await Assert.ThrowsAsync<OrderStatusException>(() => service.CancelAsync(1, 2));
     }
+    
+    [Fact]
+    public async Task CreateAsync_WhenCarNotFound_ShouldThrowCarNotFoundException()
+    {
+        // Arrange：空 carRepo，没有任何车辆
+        // 模拟客户端传了一个不存在的 CarId
+        var context = CreateDbContext();
+        var carRepo = new FakeCarRepository();
+        var service = CreateService(context, carRepo);
+
+        // Act + Assert
+        await Assert.ThrowsAsync<CarNotFoundException>(
+            () => service.CreateAsync(
+                buyerId: 2,
+                new OrderCreateRequest { CarId = 999 }));
+    }
 }
