@@ -11902,3 +11902,187 @@ git push origin feature/admin
 ✅ Git commit + push 完成
 ```
 
+## Step 31 · 待审核车辆列表
+
+### 这一步做什么
+
+实现 `GET /admin/cars/pending`，返回所有 `PendingReview` 状态的车辆列表，供 Admin 查看和处理待审核的车辆。
+
+------
+
+### 1. 这个接口和公开列表有什么不同
+
+`GET /cars` 是买家视角，只返回 `Published` 的车辆，不需要登录。`GET /admin/cars/pending` 是 Admin 视角，只返回 `PendingReview` 的车辆，需要 Admin 权限。
+
+两者底层都是查 `Cars` 表，只是过滤条件不同。`ICarRepository` 里已经有 `GetPagedAsync(CarStatus status, ...)` 方法，直接复用，传入 `CarStatus.PendingReview` 即可，不需要新增 Repository 方法。
+
+------
+
+### 2. 在 AdminCarService 里添加待审核列表方法
+
+打开 `UUcars.API/Services/AdminCarService.cs`，在顶部补上 using：
+
+```csharp
+using UUcars.API.DTOs;
+using UUcars.API.DTOs.Requests;
+```
+
+在 `RejectAsync` 下方添加：
+
+```csharp
+public async Task<PagedResponse<CarResponse>> GetPendingCarsAsync(
+    CarQueryRequest query,
+    CancellationToken cancellationToken = default)
+{
+    var page = query.Page < 1 ? 1 : query.Page;
+    var pageSize = query.PageSize < 1 ? 20 : query.PageSize;
+    pageSize = Math.Min(pageSize, 50);
+
+    // 直接复用 ICarRepository 的 GetPagedAsync，传入 PendingReview 状态
+    // 不需要新增 Repository 方法，这正是把 status 作为参数设计的价值
+    var (cars, totalCount) = await _carRepository.GetPagedAsync(
+        CarStatus.PendingReview,
+        query,
+        cancellationToken);
+
+    var items = cars.Select(CarService.MapToResponse).ToList();
+
+    return PagedResponse<CarResponse>.Create(items, totalCount, page, pageSize);
+}
+```
+
+------
+
+### 3. 在 AdminController 里添加待审核列表端点
+
+打开 `UUcars.API/Controllers/AdminController.cs`，在顶部补上 using：
+
+```csharp
+using UUcars.API.DTOs.Requests;
+```
+
+在 `RejectCar` 方法下方添加：
+
+```csharp
+// GET /admin/cars/pending
+// 注意路由顺序：/admin/cars/pending 是固定路径，
+// 必须在 /admin/cars/{id:int}/approve 等参数路由之前定义，
+// 避免 "pending" 被误匹配为 {id}（虽然 :int 约束已经能保护，但显式顺序更清晰）
+[HttpGet("cars/pending")]
+public async Task<IActionResult> GetPendingCars(
+    [FromQuery] CarQueryRequest query,
+    CancellationToken cancellationToken)
+{
+    var result = await _adminCarService.GetPendingCarsAsync(query, cancellationToken);
+    return Ok(ApiResponse<PagedResponse<CarResponse>>.Ok(result));
+}
+```
+
+------
+
+### 4. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+------
+
+### 5. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**获取待审核列表：**
+
+用 Admin Token，先确保数据库里有几辆 `PendingReview` 状态的车（用卖家账号创建车辆并提交审核）：
+
+```
+GET /admin/cars/pending
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......（Admin Token）
+```
+
+预期（200）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "items": [
+      {
+        "id": 2,
+        "title": "2019款丰田凯美瑞",
+        "status": "PendingReview",
+        "sellerUsername": "seller",
+        ...
+      }
+    ],
+    "totalCount": 1,
+    "page": 1,
+    "pageSize": 20,
+    "totalPages": 1
+  }
+}
+```
+
+**验证过滤：**
+
+已经 `Published` 或 `Draft` 的车辆不出现在这个列表里——这是这个接口最核心的逻辑，需要验证。
+
+**分页测试：**
+
+```
+GET /admin/cars/pending?page=1&pageSize=5
+```
+
+验证分页参数生效。
+
+**用普通用户 Token 访问（应返回 403）：**
+
+换普通用户的 Token，预期返回 403。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+------
+
+### 6. 此时的目录变化
+
+这一步没有新增文件，只在 `AdminCarService` 和 `AdminController` 里新增了方法。
+
+------
+
+### 7. Git 提交
+
+```bash
+git add .
+git commit -m "feat: GET /admin/cars/pending - pending review car list"
+git push origin feature/admin
+```
+
+------
+
+### Step 31 完成状态
+
+```
+✅ 理解复用 GetPagedAsync 而不新增 Repository 方法的原因
+✅ AdminCarService.GetPendingCarsAsync（复用 ICarRepository.GetPagedAsync）
+✅ AdminController GET /admin/cars/pending（[FromQuery] 分页参数）
+✅ Scalar 测试通过（待审核列表、过滤验证、分页、403 非 Admin）
+✅ Git commit + push 完成
+```
+

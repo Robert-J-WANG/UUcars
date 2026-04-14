@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using UUcars.API.DTOs;
+using UUcars.API.DTOs.Requests;
 using UUcars.API.DTOs.Responses;
 using UUcars.API.Services;
 
@@ -32,5 +33,18 @@ public class AdminController : ControllerBase
     {
         var car = await _adminCarService.RejectAsync(id, cancellationToken);
         return Ok(ApiResponse<CarResponse>.Ok(car, "Car rejected and returned to seller for revision."));
+    }
+
+    // GET /admin/cars/pending
+// 注意路由顺序：/admin/cars/pending 是固定路径，
+// 必须在 /admin/cars/{id:int}/approve 等参数路由之前定义，
+// 避免 "pending" 被误匹配为 {id}（虽然 :int 约束已经能保护，但显式顺序更清晰）
+    [HttpGet("cars/pending")]
+    public async Task<IActionResult> GetPendingCars(
+        [FromQuery] CarQueryRequest query,
+        CancellationToken cancellationToken)
+    {
+        var result = await _adminCarService.GetPendingCarsAsync(query, cancellationToken);
+        return Ok(ApiResponse<PagedResponse<CarResponse>>.Ok(result));
     }
 }

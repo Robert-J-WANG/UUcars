@@ -1,3 +1,5 @@
+using UUcars.API.DTOs;
+using UUcars.API.DTOs.Requests;
 using UUcars.API.DTOs.Responses;
 using UUcars.API.Entities.Enums;
 using UUcars.API.Exceptions;
@@ -63,5 +65,25 @@ public class AdminCarService
         _logger.LogInformation("Car {CarId} rejected by admin, returned to Draft", carId);
 
         return CarService.MapToResponse(updated);
+    }
+
+    public async Task<PagedResponse<CarResponse>> GetPendingCarsAsync(
+        CarQueryRequest query,
+        CancellationToken cancellationToken = default)
+    {
+        var page = query.Page < 1 ? 1 : query.Page;
+        var pageSize = query.PageSize < 1 ? 20 : query.PageSize;
+        pageSize = Math.Min(pageSize, 50);
+
+        // 直接复用 ICarRepository 的 GetPagedAsync，传入 PendingReview 状态
+        // 不需要新增 Repository 方法，这正是把 status 作为参数设计的价值
+        var (cars, totalCount) = await _carRepository.GetPagedAsync(
+            CarStatus.PendingReview,
+            query,
+            cancellationToken);
+
+        var items = cars.Select(CarService.MapToResponse).ToList();
+
+        return PagedResponse<CarResponse>.Create(items, totalCount, page, pageSize);
     }
 }
