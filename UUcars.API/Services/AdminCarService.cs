@@ -1,4 +1,3 @@
-using UUcars.API.DTOs.Requests;
 using UUcars.API.DTOs.Responses;
 using UUcars.API.Entities.Enums;
 using UUcars.API.Exceptions;
@@ -38,6 +37,30 @@ public class AdminCarService
         var updated = await _carRepository.UpdateAsync(car, cancellationToken);
 
         _logger.LogInformation("Car {CarId} approved by admin, now Published", carId);
+
+        return CarService.MapToResponse(updated);
+    }
+
+    public async Task<CarResponse> RejectAsync(
+        int carId,
+        CancellationToken cancellationToken = default)
+    {
+        var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+        if (car == null)
+            throw new CarNotFoundException(carId);
+
+        // 同样只有 PendingReview 状态才能被拒绝
+        if (car.Status != CarStatus.PendingReview)
+            throw new CarStatusException(car.Id, car.Status, CarStatus.PendingReview);
+
+        // 拒绝后退回 Draft，让卖家修改后重新提交
+        car.Status = CarStatus.Draft;
+        car.UpdatedAt = DateTime.UtcNow;
+
+        var updated = await _carRepository.UpdateAsync(car, cancellationToken);
+
+        _logger.LogInformation("Car {CarId} rejected by admin, returned to Draft", carId);
 
         return CarService.MapToResponse(updated);
     }

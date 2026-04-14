@@ -11743,5 +11743,162 @@ git push origin feature/admin
 ✅ Git commit + push 完成
 ```
 
+## Step 30 · 审核车辆（拒绝）
 
+### 这一步做什么
+
+实现 `POST /admin/cars/{id}/reject`——Admin 审核不通过，把车辆退回给卖家修改。
+
+------
+
+### 1. 拒绝审核的业务逻辑
+
+拒绝审核和通过审核的流程基本对称，但方向相反：
+
+```
+通过：PendingReview → Published（上架）
+拒绝：PendingReview → Draft   （退回卖家修改）
+```
+
+退回 `Draft` 而不是 `Deleted` 的原因：拒绝不是永久封禁，只是"这次提交有问题，请修改后重新提交"。卖家收到退回后，可以修改车辆信息再次提交审核，走完整的流程。
+
+------
+
+### 2. 在 AdminCarService 里添加拒绝方法
+
+打开 `UUcars.API/Services/AdminCarService.cs`，在 `ApproveAsync` 下方添加：
+
+```csharp
+public async Task<CarResponse> RejectAsync(
+    int carId,
+    CancellationToken cancellationToken = default)
+{
+    var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+    if (car == null)
+        throw new CarNotFoundException(carId);
+
+    // 同样只有 PendingReview 状态才能被拒绝
+    if (car.Status != CarStatus.PendingReview)
+        throw new CarStatusException(car.Id, car.Status, CarStatus.PendingReview);
+
+    // 拒绝后退回 Draft，让卖家修改后重新提交
+    car.Status = CarStatus.Draft;
+    car.UpdatedAt = DateTime.UtcNow;
+
+    var updated = await _carRepository.UpdateAsync(car, cancellationToken);
+
+    _logger.LogInformation("Car {CarId} rejected by admin, returned to Draft", carId);
+
+    return CarService.MapToResponse(updated);
+}
+```
+
+------
+
+### 3. 在 AdminController 里添加拒绝端点
+
+打开 `UUcars.API/Controllers/AdminController.cs`，在 `ApproveCar` 方法下方添加：
+
+```csharp
+// POST /admin/cars/{id}/reject
+[HttpPost("cars/{id:int}/reject")]
+public async Task<IActionResult> RejectCar(int id, CancellationToken cancellationToken)
+{
+    var car = await _adminCarService.RejectAsync(id, cancellationToken);
+    return Ok(ApiResponse<CarResponse>.Ok(car, "Car rejected and returned to seller for revision."));
+}
+```
+
+------
+
+### 4. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+------
+
+### 5. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**正常拒绝审核：**
+
+用 Admin Token，找一辆 `PendingReview` 状态的车：
+
+```
+POST /admin/cars/1/reject
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......（Admin Token）
+```
+
+预期（200）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": 1,
+    "status": "Draft",
+    ...
+  },
+  "message": "Car rejected and returned to seller for revision."
+}
+```
+
+**验证卖家可以重新提交：**
+
+拒绝后车辆回到 `Draft`，卖家应该能修改后再次 `POST /cars/1/submit`，验证整个流程闭环。
+
+**拒绝已经 Published 的车（应返回 409）：**
+
+预期：
+
+```json
+{
+  "success": false,
+  "message": "Car '1' is in 'Published' status. Required status: 'PendingReview'."
+}
+```
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+------
+
+### 6. Git 提交
+
+```bash
+git add .
+git commit -m "feat: POST /admin/cars/{id}/reject - reject car back to draft"
+git push origin feature/admin
+```
+
+------
+
+### Step 30 完成状态
+
+```
+✅ 理解拒绝审核退回 Draft 而不是 Deleted 的原因（允许修改重新提交）
+✅ AdminCarService.RejectAsync（PendingReview → Draft）
+✅ AdminController POST /admin/cars/{id}/reject
+✅ Scalar 测试通过（200 拒绝成功、409 状态不对、卖家可重新提交验证）
+✅ Git commit + push 完成
+```
 
