@@ -86,4 +86,26 @@ public class AdminCarService
 
         return PagedResponse<CarResponse>.Create(items, totalCount, page, pageSize);
     }
+
+    public async Task AdminDeleteAsync(
+        int carId,
+        CancellationToken cancellationToken = default)
+    {
+        var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+        if (car == null)
+            throw new CarNotFoundException(carId);
+
+        // Admin 可以删除任何状态的车辆，不受状态约束
+        // 但已经是 Deleted 状态的车不需要重复操作
+        if (car.Status == CarStatus.Deleted)
+            throw new CarStatusException(car.Id, car.Status, CarStatus.Published);
+
+        car.Status = CarStatus.Deleted;
+        car.UpdatedAt = DateTime.UtcNow;
+
+        await _carRepository.UpdateAsync(car, cancellationToken);
+
+        _logger.LogInformation("Car {CarId} forcefully deleted by admin", carId);
+    }
 }

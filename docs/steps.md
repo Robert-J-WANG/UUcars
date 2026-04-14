@@ -12086,3 +12086,183 @@ git push origin feature/admin
 ✅ Git commit + push 完成
 ```
 
+
+
+## Step 32 · 删除违规车辆
+
+### 这一步做什么
+
+实现 `DELETE /admin/cars/{id}`，Admin 强制逻辑删除违规车辆——无论车辆当前是什么状态，Admin 都可以将其标记为 `Deleted`。
+
+------
+
+### 1. Admin 删除和卖家删除的区别
+
+Step 17 里卖家已经有了 `DELETE /cars/{id}`，为什么 Admin 还需要一个单独的删除接口？
+
+```
+卖家删除（Step 17）：
+  只能删除自己的车
+  只能删除 Draft 状态的车
+  用于卖家主动撤回草稿
+
+Admin 删除（本步骤）：
+  可以删除任何人的车
+  可以删除任何状态的车（Draft / PendingReview / Published / Sold）
+  用于平台强制下架违规内容
+```
+
+两者操作的是同一个"逻辑删除"动作（`Status = Deleted`），但权限和适用范围完全不同，所以分开实现。
+
+------
+
+### 2. 为什么 Sold 状态的车也可以被 Admin 删除
+
+卖家不能删除 `Sold` 的车是因为有成交订单，不能随意消除。但 Admin 是平台管理方，如果一辆已售出的车被发现是违规车辆（比如欺诈），平台有责任强制下架并保留记录（逻辑删除，数据还在）。
+
+------
+
+### 3. 在 AdminCarService 里添加删除方法
+
+打开 `UUcars.API/Services/AdminCarService.cs`，在 `GetPendingCarsAsync` 下方添加：
+
+```csharp
+public async Task AdminDeleteAsync(
+    int carId,
+    CancellationToken cancellationToken = default)
+{
+    var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+    if (car == null)
+        throw new CarNotFoundException(carId);
+
+    // Admin 可以删除任何状态的车辆，不受状态约束
+    // 但已经是 Deleted 状态的车不需要重复操作
+    if (car.Status == CarStatus.Deleted)
+        throw new CarStatusException(car.Id, car.Status, CarStatus.Published);
+
+    car.Status = CarStatus.Deleted;
+    car.UpdatedAt = DateTime.UtcNow;
+
+    await _carRepository.UpdateAsync(car, cancellationToken);
+
+    _logger.LogInformation("Car {CarId} forcefully deleted by admin", carId);
+}
+```
+
+> **为什么已经是 `Deleted` 时抛 `CarStatusException` 而不是直接返回成功？** 重复删除一辆已经删除的车，通常意味着调用方出现了问题（比如 Bug 或误操作）。明确返回错误比静默成功更安全，让调用方知道"这辆车已经是删除状态了"。
+
+------
+
+### 4. 在 AdminController 里添加删除端点
+
+打开 `UUcars.API/Controllers/AdminController.cs`，在 `GetPendingCars` 下方添加：
+
+```csharp
+// DELETE /admin/cars/{id}
+[HttpDelete("cars/{id:int}")]
+public async Task<IActionResult> DeleteCar(int id, CancellationToken cancellationToken)
+{
+    await _adminCarService.AdminDeleteAsync(id, cancellationToken);
+    return NoContent();
+}
+```
+
+------
+
+### 5. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+------
+
+### 6. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**正常删除违规车辆（Published 状态）：**
+
+用 Admin Token，找一辆 `Published` 状态的车：
+
+```
+DELETE /admin/cars/1
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......（Admin Token）
+```
+
+预期（204）：无响应体。
+
+去数据库确认：`Cars` 表里这辆车的 `Status` 应该变成了 `Deleted`，数据行还在。
+
+**验证被删除的车辆从公开列表消失：**
+
+执行 `GET /cars`，确认刚才删除的车不再出现在列表里。
+
+**重复删除同一辆车（应返回 409）：**
+
+再次删除同一辆 `Deleted` 状态的车，预期：
+
+```json
+{
+  "success": false,
+  "message": "Car '1' is in 'Deleted' status. Required status: 'Published'."
+}
+```
+
+**用普通用户 Token 访问（应返回 403）：**
+
+换普通用户的 Token，预期返回 403。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+------
+
+### 7. Git 提交 + 合并分支
+
+Admin 系统四个接口全部完成：
+
+```bash
+git add .
+git commit -m "feat: DELETE /admin/cars/{id} - force delete violation car"
+git push origin feature/admin
+```
+
+合并回 `develop`：
+
+```bash
+git checkout develop
+git merge --no-ff feature/admin -m "merge: feature/admin into develop"
+git push origin develop
+git branch -D feature/admin
+git push origin --delete feature/admin
+```
+
+------
+
+### Step 32 完成状态
+
+```
+✅ 理解 Admin 删除和卖家删除的区别（权限范围和适用状态不同）
+✅ 理解为什么 Sold 状态的车也可以被 Admin 删除
+✅ AdminCarService.AdminDeleteAsync（无状态限制，已删除时报错）
+✅ AdminController DELETE /admin/cars/{id}（返回 204）
+✅ Scalar 测试通过（204 删除成功、从公开列表消失、409 重复删除、403 非 Admin）
+✅ feature/admin 合并回 develop
+```

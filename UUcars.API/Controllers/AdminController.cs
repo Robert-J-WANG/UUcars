@@ -47,4 +47,12 @@ public class AdminController : ControllerBase
         var result = await _adminCarService.GetPendingCarsAsync(query, cancellationToken);
         return Ok(ApiResponse<PagedResponse<CarResponse>>.Ok(result));
     }
+
+    // DELETE /admin/cars/{id}
+    [HttpDelete("cars/{id:int}")]
+    public async Task<IActionResult> DeleteCar(int id, CancellationToken cancellationToken)
+    {
+        await _adminCarService.AdminDeleteAsync(id, cancellationToken);
+        return NoContent();
+    }
 }
