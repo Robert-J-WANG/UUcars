@@ -12636,3 +12636,880 @@ git push origin feature/tests
 ✅ Git commit + push 完成
 ```
 
+
+
+好，先把这两个问题讨论清楚，再生成最终版本。
+
+
+
+### 选择哪种方式
+
+**SQLite 的问题：**
+
+虽然比 InMemory 好，但 SQLite 和 SQL Server 之间仍然存在方言差异。项目里用了 `decimal(18,2)`、`nvarchar`、SQL Server 特有的字符串比较行为——SQLite 处理这些的方式不一样，仍然可能出现"测试通过但生产报错"的情况。
+
+**Docker + Testcontainers 的优势：**
+
+你的项目本来就已经在用 Docker 跑 SQL Server，对 Docker 不陌生。`Testcontainers` 库会在测试时自动拉起一个真实的 SQL Server 容器，测试结束自动销毁——完全真实的数据库环境，和生产环境一模一样，没有任何行为差异。
+
+**结论：用 Testcontainers + SQL Server。**
+
+理由：已经有 Docker 基础、下一步就是 Docker 部署、这是企业级项目的标准做法，学了直接能用到真实工作里。
+
+
+
+### 关于 CI/CD
+
+Step 35 是 Docker 部署，V1 的部署目标是把 API 打包成 Docker 镜像跑起来。CI/CD 用 **GitHub Actions** 是最自然的选择——代码已经在 GitHub 上了，Actions 配置简单，免费额度够用。
+
+V1 的 CI/CD 目标定为：
+
+```
+push 到 develop → 自动跑所有测试（单元 + 集成）
+push 到 main / 打 tag → 自动构建 Docker 镜像
+```
+
+这个内容放在 Step 35 里一起实现，Step 34 专注把集成测试做好。
+
+
+
+## Step 34 · 集成测试
+
+### 这一步做什么
+
+Step 33 完善了单元测试。这一步做集成测试，一种和单元测试完全不同的测试方式。
+
+在写代码之前，先把集成测试的概念、原理、和单元测试的关系理解清楚。
+
+
+
+### 1. 单元测试的局限性
+
+回顾一下单元测试做的事：
+
+```
+UserService.RegisterAsync()       → 邮箱不能重复、密码不能明文存储
+CarService.SubmitForReviewAsync() → 只有车主能提交、只有 Draft 才能提交
+OrderService.CreateAsync()        → 买家不能是卖家、车辆必须是 Published
+```
+
+单元测试很好地验证了**每个 Service 方法内部的业务逻辑**。但它有一个根本局限。
+
+它是孤立的，用 Fake Repository 替换了真实数据库，整个测试在"人造"环境里运行。
+
+这意味着有些问题单元测试发现不了：
+
+**DI 配置错误：**
+
+```csharp
+// 假设写错了
+builder.Services.AddScoped<ICarRepository, EfUserRepository>();
+```
+
+单元测试不走 DI 容器，发现不了这个错误。
+
+**中间件行为：**
+
+`GlobalExceptionMiddleware` 是否真的能捕获异常并返回正确格式的 JSON？`[Authorize]` 在不带 Token 时是否真的返回 401？这些只有在真实 HTTP 管道里才能验证。
+
+**路由是否正确：**
+
+`POST /cars/{id}/submit` 是否真的路由到 `CarsController.Submit()`？只有发真实 HTTP 请求才能验证。
+
+**完整链路：**
+
+"注册 → 登录 → 发布车辆 → 下单"这条链路跨越了多个层，单元测试只能分段验证，无法验证整条链路。
+
+
+
+### 2. 集成测试是什么
+
+集成测试的目标是验证**多个组件一起工作时**是否正确。
+
+```
+单元测试：
+  只测一个 Service 方法
+  用 Fake 替换所有外部依赖
+  不启动 HTTP 服务器，不连接数据库
+  非常快（毫秒级）
+
+集成测试：
+  测整个 HTTP 请求链路（Controller → Service → Repository → 数据库）
+  启动完整的应用（包括所有中间件、DI 容器、路由）
+  连接真实数据库（测试用的独立容器）
+  验证 HTTP 响应（状态码、响应体格式）
+  较慢（启动数据库容器需要几秒）
+```
+
+两者互补，不是替代关系：
+
+```
+单元测试：验证业务规则的正确性（快、精准）
+集成测试：验证整个系统的连通性（全面、真实）
+```
+
+
+
+### 3. WebApplicationFactory 是什么
+
+`WebApplicationFactory<T>` 是 ASP.NET Core 官方提供的集成测试框架。
+
+它解决的问题是：**如何在测试里启动一个真实的 ASP.NET Core 应用，同时不需要真正监听端口？**
+
+```
+正常运行：
+  Program.cs → 启动 Kestrel → 监听 5085 端口 → 等待 HTTP 请求
+
+WebApplicationFactory：
+  读取 Program.cs 配置 → 在内存里启动应用 → 创建测试用 HTTP 客户端
+  发请求 → 走完整的中间件管道 → 返回真实 HTTP 响应
+  整个过程不需要真实的网络端口
+```
+
+简单来说：就是在内存中启动API（加载Program.cs、中间件、controller等），并产生一个可以发送请求的HttpClient用于测试。
+
+
+
+### 4. Testcontainers是什么
+
+集成测试需要连接数据库，但不能用生产数据库（会污染数据）。
+
+`Testcontainers` 是一个开源库，**在测试运行时自动启动一个 Docker 容器**（这里是 SQL Server），测试结束后自动销毁。
+
+```
+测试开始
+  ↓
+Testcontainers 自动启动一个新的 SQL Server Docker 容器
+  ↓
+获取这个容器的连接字符串
+  ↓
+WebApplicationFactory 用这个连接字符串启动测试应用
+  ↓
+执行 Migration（建表）
+  ↓
+插入测试需要的初始数据（如 Admin 账号）
+  ↓
+跑集成测试
+  ↓
+测试结束，容器自动销毁
+```
+
+为什么比 InMemory / SQLite 好：
+
+```
+InMemory：不是真实数据库，不支持外键、事务、SQL 函数
+SQLite：  是真实数据库，但和 SQL Server 方言不同，某些行为不一致
+Testcontainers：完全真实的 SQL Server，和生产环境零差异
+```
+
+
+
+### 5. 安装所需包
+
+```bash
+# WebApplicationFactory 工具包
+dotnet add UUcars.Tests/UUcars.Tests.csproj package Microsoft.AspNetCore.Mvc.Testing
+
+# Testcontainers SQL Server 支持
+dotnet add UUcars.Tests/UUcars.Tests.csproj package Testcontainers.MsSql
+
+# EF Core Design 工具（用于在测试里跑 Migration）
+dotnet add UUcars.Tests/UUcars.Tests.csproj package Microsoft.EntityFrameworkCore.Design
+```
+
+
+
+### 6. 让 Program.cs 对测试可见
+
+`WebApplicationFactory<T>` 需要通过类型参数 `T` 找到应用的入口点。.NET 6 之后 `Program.cs` 使用顶层语句，没有显式的 `Program` 类。需要在末尾加一行：
+
+打开 `UUcars.API/Program.cs`，在 `app.Run()` 下方添加：
+
+```csharp
+app.Run();
+
+// 让 Program 类对测试项目可见
+// WebApplicationFactory<Program> 需要通过这个类型找到应用入口
+public partial class Program { }
+```
+
+
+
+### 7. 创建 SQL Server 测试容器工厂
+
+这是集成测试的核心基础设施。把启动容器、配置应用、执行 Migration、插入初始数据的逻辑集中在这里：
+
+由于通过docker连接的测试数据库，连接过程需要时间，因此容器的启动是异步的，需要确保在测试开始前容器已就绪。
+
+对此，测试工厂需要实现 IAsyncLifetime 接口：
+
+- 异步初始化：在测试运行前启动容器
+- 异步清理：测试结束后停止并销毁容器
+
+```c#
+public class SqlServerTestFactory : WebApplicationFactory<Program>, IAsyncLifetime
+{
+    private readonly MsSqlContainer _sqlContainer = ...
+
+    // 异步初始化：在测试运行前启动容器
+    public async Task InitializeAsync()
+    {
+        await _sqlContainer.StartAsync();
+    }
+
+    // 异步清理：测试结束后停止并销毁容器
+    public async Task DisposeAsync()
+    {
+        await _sqlContainer.StopAsync();
+    }
+}
+```
+
+完整的代码如下：
+
+```bash
+mkdir -p UUcars.Tests/Integration
+touch UUcars.Tests/Integration/SqlServerTestFactory.cs
+```
+
+```c#
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
+using Testcontainers.MsSql;
+using UUcars.API.Data;
+using UUcars.API.Entities;
+using UUcars.API.Entities.Enums;
+
+namespace UUcars.Tests.Integration;
+
+// 自定义的 WebApplicationFactory
+// 在测试启动时自动拉起 SQL Server 容器，测试结束后自动销毁
+public class SqlServerTestFactory : WebApplicationFactory<Program>, IAsyncLifetime
+{
+    // MsSqlContainer：Testcontainers 提供的 SQL Server 容器对象
+    // 它封装了 Docker 操作：启动容器、获取连接字符串、停止容器
+    private readonly MsSqlContainer _sqlContainer = new MsSqlBuilder("mcr.microsoft.com/mssql/server:2022-latest")
+        .WithPassword("TestStrong!Passw0rd")
+        .Build();
+
+    // IAsyncLifetime.InitializeAsync：测试类实例化时自动调用
+    // xUnit 发现这个接口后，会在运行第一个测试前先执行这个方法
+    public async Task InitializeAsync()
+    {
+        // 启动 SQL Server 容器（需要几秒钟）
+        await _sqlContainer.StartAsync();
+    }
+
+    // IAsyncLifetime.DisposeAsync：所有测试结束后自动调用
+    // 停止并销毁容器
+    public new async Task DisposeAsync()
+    {
+        await _sqlContainer.StopAsync();
+    }
+
+    // ConfigureWebHost：在 WebApplicationFactory 构建应用时调用
+    // 在这里替换 DI 服务，把生产用的 SQL Server 换成测试容器
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    {
+        builder.ConfigureServices(services =>
+        {
+            // 找到并移除原来注册的 DbContext（连接生产数据库的）
+            var descriptor = services.SingleOrDefault(
+                d => d.ServiceType == typeof(DbContextOptions<AppDbContext>));
+            if (descriptor != null)
+                services.Remove(descriptor);
+
+            // 用测试容器的连接字符串注册新的 DbContext
+            // _sqlContainer.GetConnectionString() 返回容器的动态连接字符串
+            services.AddDbContext<AppDbContext>(options =>
+                options.UseSqlServer(_sqlContainer.GetConnectionString()));
+        });
+
+        // 使用测试环境，避免加载生产配置
+        builder.UseEnvironment("Testing");
+    }
+
+    // 初始化数据库：执行 Migration + 插入初始数据
+    // 在每个测试类开始前调用，确保数据库结构是最新的
+    public async Task InitializeDatabaseAsync()
+    {
+        // 通过 DI 容器获取 DbContext
+        using var scope = Services.CreateScope();
+        var context = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        // 执行所有 Migration，建好数据库表结构
+        await context.Database.MigrateAsync();
+
+        // 插入测试需要的 Admin 用户
+        // 为什么要手动插入？
+        // Step 07 里的 Seed Data（HasData）会在 Migration 文件里生成 INSERT 语句，
+        // MigrateAsync 执行时会自动插入。但如果 Seed Data 已经在 Migration 里了，
+        // 这里就不需要手动插了。如果没有，就在这里手动创建
+        if (!context.Users.Any(u => u.Role == UserRole.Admin))
+        {
+            var hasher = new PasswordHasher<User>();
+            var admin = new User
+            {
+                Username = "admin",
+                Email = "admin@uucars.com",
+                Role = UserRole.Admin,
+                EmailConfirmed = true,
+                CreatedAt = DateTime.UtcNow,
+                UpdatedAt = DateTime.UtcNow
+            };
+            admin.PasswordHash = hasher.HashPassword(admin, "Admin@123456");
+            context.Users.Add(admin);
+            await context.SaveChangesAsync();
+        }
+    }
+
+    // 清理数据库：每个测试方法结束后调用
+    // 删除所有业务数据，但保留表结构和 Admin 账号
+    // 这样下一个测试面对的是干净的数据库
+    public async Task CleanDatabaseAsync()
+    {
+        using var scope = Services.CreateScope();
+        var context = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        // 按外键依赖顺序删除，避免约束冲突
+        context.Favorites.RemoveRange(context.Favorites);
+        context.Orders.RemoveRange(context.Orders);
+        context.CarImages.RemoveRange(context.CarImages);
+        context.Cars.RemoveRange(context.Cars);
+        // 只删除普通用户，保留 Admin
+        context.Users.RemoveRange(context.Users.Where(u => u.Role != UserRole.Admin));
+        await context.SaveChangesAsync();
+    }
+}
+```
+
+> **`IAsyncLifetime` 是什么？** 这是 xUnit 提供的接口。实现它的类在测试生命周期里会被自动调用：
+>
+> - `InitializeAsync`：在第一个测试运行前执行（这里用来启动容器）
+> - `DisposeAsync`：在所有测试结束后执行（这里用来销毁容器）
+>
+> 一个容器在整个测试类的所有测试方法里共享，不是每个测试方法都启动一个新容器——启动容器需要几秒钟，共享容器可以显著提升测试速度。数据隔离靠 `CleanDatabaseAsync` 在每个测试方法之间清理数据来保证。
+
+
+
+### 8. 创建集成测试基类
+
+把通用的辅助方法抽成基类，所有集成测试都继承它：
+
+```bash
+touch UUcars.Tests/Integration/IntegrationTestBase.cs
+```
+
+```c#
+using System.Net.Http.Headers;
+using System.Text;
+using System.Text.Json;
+
+namespace UUcars.Tests.Integration;
+
+// 集成测试基类
+// 提供统一的 HTTP 客户端和辅助方法
+public abstract class IntegrationTestBase : IAsyncLifetime
+{
+    // 共享同一个 SqlServerTestFactory（共享同一个数据库容器）
+    protected readonly SqlServerTestFactory Factory;
+    protected readonly HttpClient Client;
+
+    // JSON 选项：反序列化时忽略大小写
+    protected static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true
+    };
+
+    protected IntegrationTestBase(SqlServerTestFactory factory)
+    {
+        Factory = factory;
+        Client = factory.CreateClient();
+    }
+
+    // 每个测试方法开始前：初始化数据库（只在第一次时执行 Migration）
+    public async Task InitializeAsync()
+    {
+        await Factory.InitializeDatabaseAsync();
+    }
+
+    // 每个测试方法结束后：清理数据，为下一个测试准备干净环境
+    public async Task DisposeAsync()
+    {
+        await Factory.CleanDatabaseAsync();
+    }
+
+    // ===== 辅助方法 =====
+
+    // 构建 JSON 请求体
+    protected static StringContent JsonContent(object data)
+    {
+        var json = JsonSerializer.Serialize(data, new JsonSerializerOptions
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+        });
+        return new StringContent(json, Encoding.UTF8, "application/json");
+    }
+
+    // 反序列化 HTTP 响应体
+    protected static async Task<T?> DeserializeAsync<T>(HttpResponseMessage response)
+    {
+        var content = await response.Content.ReadAsStringAsync();
+        return JsonSerializer.Deserialize<T>(content, JsonOptions);
+    }
+
+    // 注册用户并登录，返回 JWT Token
+    protected async Task<string> RegisterAndLoginAsync(
+        string email = "test@example.com",
+        string username = "testuser",
+        string password = "Test@123456")
+    {
+        await Client.PostAsync("/auth/register", JsonContent(new
+        {
+            username, email, password
+        }));
+
+        var loginResponse = await Client.PostAsync("/auth/login", JsonContent(new
+        {
+            email, password
+        }));
+
+        var result = await DeserializeAsync<ApiResponseWrapper<LoginData>>(loginResponse);
+        return result?.Data?.Token ?? string.Empty;
+    }
+
+    // 设置请求头的 Bearer Token
+    protected void SetBearerToken(string token)
+    {
+        Client.DefaultRequestHeaders.Authorization =
+            new AuthenticationHeaderValue("Bearer", token);
+    }
+
+    // 清除 Token（测试未登录场景时使用）
+    protected void ClearBearerToken()
+    {
+        Client.DefaultRequestHeaders.Authorization = null;
+    }
+
+    // ===== 内部响应结构 =====
+
+    protected class ApiResponseWrapper<T>
+    {
+        public bool Success { get; set; }
+        public T? Data { get; set; }
+        public string? Message { get; set; }
+    }
+
+    protected class LoginData
+    {
+        public string Token { get; set; } = string.Empty;
+    }
+
+    protected class UserData
+    {
+        public int Id { get; set; }
+        public string Email { get; set; } = string.Empty;
+        public string Username { get; set; } = string.Empty;
+        public string Role { get; set; } = string.Empty;
+    }
+
+    protected class CarData
+    {
+        public int Id { get; set; }
+        public string Title { get; set; } = string.Empty;
+        public string Status { get; set; } = string.Empty;
+        public decimal Price { get; set; }
+    }
+
+    protected class PagedData<T>
+    {
+        public List<T> Items { get; set; } = [];
+        public int TotalCount { get; set; }
+        public int Page { get; set; }
+        public int PageSize { get; set; }
+    }
+
+    protected class OrderData
+    {
+        public int Id { get; set; }
+        public string Status { get; set; } = string.Empty;
+        public decimal Price { get; set; }
+        public int SellerId { get; set; }
+    }
+}
+```
+
+
+
+### 9. 编写集成测试
+
+```bash
+touch UUcars.Tests/Integration/CoreFlowIntegrationTests.cs
+```
+
+```c#
+using System.Net;
+
+namespace UUcars.Tests.Integration;
+
+// [Collection] 让这个测试类使用共享的 SqlServerTestFactory
+// 同一个 Collection 里的所有测试类共享同一个数据库容器
+// 避免每个测试类都启动一个新容器（启动容器需要几秒钟，非常耗时）
+[Collection("Integration")]
+public class CoreFlowIntegrationTests : IntegrationTestBase
+{
+    public CoreFlowIntegrationTests(SqlServerTestFactory factory)
+        : base(factory) { }
+
+    // ===== 用户注册和登录 =====
+
+    [Fact]
+    public async Task Register_WithValidData_ShouldReturn201()
+    {
+        var response = await Client.PostAsync("/auth/register", JsonContent(new
+        {
+            username = "testuser",
+            email = "test@example.com",
+            password = "Test@123456"
+        }));
+
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+
+        var result = await DeserializeAsync<ApiResponseWrapper<UserData>>(response);
+        Assert.NotNull(result);
+        Assert.True(result.Success);
+        Assert.Equal("test@example.com", result.Data?.Email);
+        Assert.Equal("User", result.Data?.Role);
+    }
+
+    [Fact]
+    public async Task Register_WithDuplicateEmail_ShouldReturn409()
+    {
+        // 先注册一次
+        await Client.PostAsync("/auth/register", JsonContent(new
+        {
+            username = "user1",
+            email = "duplicate@example.com",
+            password = "Test@123456"
+        }));
+
+        // 用同一个邮箱再注册
+        var response = await Client.PostAsync("/auth/register", JsonContent(new
+        {
+            username = "user2",
+            email = "duplicate@example.com",
+            password = "Test@123456"
+        }));
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Login_WithValidCredentials_ShouldReturnToken()
+    {
+        await Client.PostAsync("/auth/register", JsonContent(new
+        {
+            username = "testuser",
+            email = "test@example.com",
+            password = "Test@123456"
+        }));
+
+        var response = await Client.PostAsync("/auth/login", JsonContent(new
+        {
+            email = "test@example.com",
+            password = "Test@123456"
+        }));
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var result = await DeserializeAsync<ApiResponseWrapper<LoginData>>(response);
+        Assert.NotNull(result?.Data?.Token);
+        Assert.NotEmpty(result!.Data!.Token);
+    }
+
+    // ===== 认证保护 =====
+
+    [Fact]
+    public async Task GetMe_WithoutToken_ShouldReturn401()
+    {
+        // 验证 JWT 中间件确实在保护这个接口
+        var response = await Client.GetAsync("/users/me");
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task GetMe_WithValidToken_ShouldReturnUserInfo()
+    {
+        var token = await RegisterAndLoginAsync();
+        SetBearerToken(token);
+
+        var response = await Client.GetAsync("/users/me");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var result = await DeserializeAsync<ApiResponseWrapper<UserData>>(response);
+        Assert.True(result?.Success);
+        Assert.Equal("test@example.com", result?.Data?.Email);
+    }
+
+    // ===== 核心业务链路 =====
+
+    [Fact]
+    public async Task FullFlow_RegisterLoginCreateCarSubmit_ShouldWork()
+    {
+        // 这个测试验证完整的卖家操作链路：
+        // 注册 → 登录 → 创建草稿 → 查看我的车辆 → 提交审核 → 验证公开列表
+
+        // Step 1：注册并登录
+        var token = await RegisterAndLoginAsync(
+            email: "seller@example.com",
+            username: "seller");
+        SetBearerToken(token);
+
+        // Step 2：创建车辆草稿
+        var createResponse = await Client.PostAsync("/cars", JsonContent(new
+        {
+            title = "2020款宝马3系",
+            brand = "BMW",
+            model = "3 Series",
+            year = 2020,
+            price = 260000,
+            mileage = 15000
+        }));
+
+        Assert.Equal(HttpStatusCode.Created, createResponse.StatusCode);
+        var car = (await DeserializeAsync<ApiResponseWrapper<CarData>>(createResponse))?.Data;
+        Assert.Equal("Draft", car?.Status);
+
+        // Step 3：卖家能在"我的车辆"列表看到草稿
+        var myListResponse = await Client.GetAsync("/cars/my-listings");
+        Assert.Equal(HttpStatusCode.OK, myListResponse.StatusCode);
+        var myList = (await DeserializeAsync<ApiResponseWrapper<PagedData<CarData>>>(myListResponse))?.Data;
+        Assert.Equal(1, myList?.TotalCount);
+
+        // Step 4：提交审核
+        var submitResponse = await Client.PostAsync($"/cars/{car!.Id}/submit", null);
+        Assert.Equal(HttpStatusCode.OK, submitResponse.StatusCode);
+        var submitted = (await DeserializeAsync<ApiResponseWrapper<CarData>>(submitResponse))?.Data;
+        Assert.Equal("PendingReview", submitted?.Status);
+
+        // Step 5：公开列表里不应该出现这辆车（还未 Published）
+        ClearBearerToken();
+        var publicListResponse = await Client.GetAsync("/cars");
+        var publicList = (await DeserializeAsync<ApiResponseWrapper<PagedData<CarData>>>(publicListResponse))?.Data;
+        Assert.Equal(0, publicList?.TotalCount);
+    }
+
+    [Fact]
+    public async Task AdminFlow_ApproveCarAndBuyerOrder_ShouldWork()
+    {
+        // 验证完整的平台业务闭环：
+        // 卖家发车 → Admin 审核通过 → 买家下单 → 车辆变 Sold → 买家取消 → 车辆恢复
+
+        // Step 1：卖家创建并提交车辆
+        var sellerToken = await RegisterAndLoginAsync(
+            email: "seller@example.com",
+            username: "seller");
+        SetBearerToken(sellerToken);
+
+        var createResponse = await Client.PostAsync("/cars", JsonContent(new
+        {
+            title = "2020款宝马3系", brand = "BMW", model = "3 Series",
+            year = 2020, price = 260000, mileage = 15000
+        }));
+        var car = (await DeserializeAsync<ApiResponseWrapper<CarData>>(createResponse))?.Data;
+        await Client.PostAsync($"/cars/{car!.Id}/submit", null);
+
+        // Step 2：Admin 登录并审核通过
+        // Admin 账号在 InitializeDatabaseAsync 里已经插入了
+        var adminLoginResponse = await Client.PostAsync("/auth/login", JsonContent(new
+        {
+            email = "admin@uucars.com",
+            password = "Admin@123456"
+        }));
+        var adminToken = (await DeserializeAsync<ApiResponseWrapper<LoginData>>(adminLoginResponse))?.Data?.Token;
+        SetBearerToken(adminToken!);
+
+        var approveResponse = await Client.PostAsync($"/admin/cars/{car.Id}/approve", null);
+        Assert.Equal(HttpStatusCode.OK, approveResponse.StatusCode);
+
+        // Step 3：验证车辆出现在公开列表
+        ClearBearerToken();
+        var publicListResponse = await Client.GetAsync("/cars");
+        var publicList = (await DeserializeAsync<ApiResponseWrapper<PagedData<CarData>>>(publicListResponse))?.Data;
+        Assert.Equal(1, publicList?.TotalCount);
+        Assert.Equal("Published", publicList?.Items?.First().Status);
+
+        // Step 4：买家注册登录并下单
+        var buyerToken = await RegisterAndLoginAsync(
+            email: "buyer@example.com",
+            username: "buyer");
+        SetBearerToken(buyerToken);
+
+        var orderResponse = await Client.PostAsync("/orders", JsonContent(new
+        {
+            carId = car.Id
+        }));
+        Assert.Equal(HttpStatusCode.Created, orderResponse.StatusCode);
+        var order = (await DeserializeAsync<ApiResponseWrapper<OrderData>>(orderResponse))?.Data;
+        Assert.Equal("Pending", order?.Status);
+        Assert.Equal(260000, order?.Price);     // 价格已锁定
+
+        // Step 5：下单后车辆从公开列表消失（Sold 状态）
+        ClearBearerToken();
+        var publicListAfterOrder = await Client.GetAsync("/cars");
+        var publicListData = (await DeserializeAsync<ApiResponseWrapper<PagedData<CarData>>>(publicListAfterOrder))?.Data;
+        Assert.Equal(0, publicListData?.TotalCount);
+
+        // Step 6：买家取消订单，车辆恢复 Published
+        SetBearerToken(buyerToken);
+        var cancelResponse = await Client.PostAsync($"/orders/{order!.Id}/cancel", null);
+        Assert.Equal(HttpStatusCode.OK, cancelResponse.StatusCode);
+
+        // Step 7：车辆重新出现在公开列表
+        ClearBearerToken();
+        var publicListRestored = await Client.GetAsync("/cars");
+        var restoredData = (await DeserializeAsync<ApiResponseWrapper<PagedData<CarData>>>(publicListRestored))?.Data;
+        Assert.Equal(1, restoredData?.TotalCount);
+    }
+
+    [Fact]
+    public async Task AdminEndpoint_WithNonAdminToken_ShouldReturn403()
+    {
+        // 验证 Admin 接口的权限保护
+        var userToken = await RegisterAndLoginAsync();
+        SetBearerToken(userToken);
+
+        var response = await Client.GetAsync("/admin/cars/pending");
+
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+    }
+}
+```
+
+
+
+### 10. 注册 Collection 定义
+
+xUnit 的 `[Collection]` 需要一个对应的 Collection 定义类，把 `SqlServerTestFactory` 作为共享 Fixture：
+
+```bash
+touch UUcars.Tests/Integration/IntegrationCollection.cs
+```
+
+```c#
+namespace UUcars.Tests.Integration;
+
+// 定义 "Integration" 这个 Collection
+// 所有标注了 [Collection("Integration")] 的测试类共享同一个 SqlServerTestFactory 实例
+// 这意味着：整个集成测试只启动一次 SQL Server 容器，显著减少测试时间
+[CollectionDefinition("Integration")]
+public class IntegrationCollection : ICollectionFixture<SqlServerTestFactory>
+{
+    // 这个类本身不包含任何代码
+    // 它只是一个标记，告诉 xUnit：
+    // "Integration" 这个 Collection 使用 SqlServerTestFactory 作为共享 Fixture
+}
+```
+
+> **为什么要共享 Fixture？** 每次启动 SQL Server 容器需要 3-5 秒。如果每个测试类都创建自己的容器，10 个测试类就要等 30-50 秒。共享一个容器，所有测试类一起用，整个集成测试只需要等一次容器启动。数据隔离靠 `CleanDatabaseAsync` 在每个测试方法之间清理来保证。
+
+
+
+### 11. 确保 Docker 正在运行
+
+集成测试运行时，Testcontainers 会自动拉起一个 SQL Server 容器。前提是 **Docker Desktop 必须正在运行**。
+
+```bash
+# 确认 Docker 正常运行
+docker ps
+```
+
+
+
+### 12. 验证编译和测试
+
+```bash
+dotnet build
+dotnet test
+```
+
+第一次运行时，Testcontainers 会拉取 SQL Server 镜像（如果本地没有），需要等一会儿。之后运行就快了。
+
+预期：
+
+```
+Test summary: total: 27, failed: 0, succeeded: 27, skipped: 0
+```
+
+原来的 20 个单元测试 + 新增的 7 个集成测试，全部通过。
+
+
+
+### 13. 单元测试 vs 集成测试：完整对比
+
+```
+维度            单元测试                    集成测试
+─────────────────────────────────────────────────────────────
+测试对象        一个 Service 方法           整个 HTTP 请求链路
+数据库          Fake Repository/InMemory  真实 SQL Server（容器）
+启动应用        不需要                      完整启动（含中间件、DI）
+速度            毫秒级                      秒级（含容器启动）
+覆盖范围        精准（业务逻辑）            全面（路由到数据库）
+发现的问题      业务规则 Bug                路由错误、DI 配置错误
+                权限边界问题                中间件行为、完整链路
+```
+
+
+
+### 14. 此时的目录变化
+
+```
+UUcars.Tests/
+└── Integration/
+    ├── IntegrationCollection.cs        ← 新增（Collection 定义）
+    ├── SqlServerTestFactory.cs         ← 新增（容器 + 应用配置）
+    ├── IntegrationTestBase.cs          ← 新增（基类 + 辅助方法）
+    └── CoreFlowIntegrationTests.cs     ← 新增（测试用例）
+```
+
+
+
+### 15. Git 提交
+
+```bash
+git add .
+git commit -m "test: integration tests with Testcontainers SQL Server"
+git push origin feature/tests
+```
+
+合并回 `develop`：
+
+```bash
+git checkout develop
+git merge --no-ff feature/tests -m "merge: feature/tests into develop"
+git push origin develop
+git branch -D feature/tests
+git push origin --delete feature/tests
+```
+
+
+
+### Step 34 完成状态
+
+```
+✅ 理解单元测试的局限性（孤立，发现不了组件间连接问题）
+✅ 理解集成测试的目标（验证多个组件一起工作时的正确性）
+✅ 理解 WebApplicationFactory 的工作原理（内存启动完整应用）
+✅ 理解为什么用 Testcontainers 而不是 InMemory / SQLite（真实行为无差异）
+✅ 理解 IAsyncLifetime（容器生命周期管理）
+✅ 理解 Collection Fixture（共享容器减少测试时间）
+✅ SqlServerTestFactory（容器启动、Migration、Seed 数据）
+✅ IntegrationTestBase（辅助方法、Token 管理、测试隔离）
+✅ 7 个集成测试（注册登录、认证保护、完整业务链路、Admin 权限）
+✅ 全部 27 个测试通过
+✅ feature/tests 合并回 develop
+```
+

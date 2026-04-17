@@ -8,12 +8,12 @@ using UUcars.API.Services;
 namespace UUcars.API.Controllers;
 
 [ApiController]
-[Route("user")]
+[Route("users")]
 [Authorize]
 public class UsersController : ControllerBase
 {
-    private readonly UserService _userService;
     private readonly CurrentUserService _currentUserService;
+    private readonly UserService _userService;
 
     public UsersController(UserService userService, CurrentUserService currentUserService)
     {
@@ -40,12 +40,9 @@ public class UsersController : ControllerBase
     [HttpPut("me")]
     public async Task<IActionResult> UpdateMe([FromBody] UpdateUserRequest request, CancellationToken cancellationToken)
     {
-        var userId= _currentUserService.GetCurrentUserId();
-        if (userId == null)
-        {
-            return Unauthorized(ApiResponse<UserResponse>.Fail("Invalid token."));
-        }
+        var userId = _currentUserService.GetCurrentUserId();
+        if (userId == null) return Unauthorized(ApiResponse<UserResponse>.Fail("Invalid token."));
         var user = await _userService.UpdateCurrentUserAsync(userId.Value, request, cancellationToken);
-        return Ok(ApiResponse<UserResponse>.Ok(user,"Profile updated successfully!"));
+        return Ok(ApiResponse<UserResponse>.Ok(user, "Profile updated successfully!"));
     }
 }
