@@ -21,7 +21,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup .NET 9
         uses: actions/setup-dotnet@v4
@@ -50,16 +50,28 @@ jobs:
     needs: test           # 必须 test job 通过才执行
     if: github.ref == 'refs/heads/main'   # 只在 main 分支触发
 
+    # 声明权限：使用内置 GITHUB_TOKEN 推送镜像到 ghcr.io
+    # 不需要手动创建任何 Secret 或 PAT
+    permissions:
+      contents: read
+      packages: write
+
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          password: ${{ secrets.REGISTRY_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}   # 内置 Token，自动注入，无需手动配置
+
+      # setup-buildx 必须在 build-push 之前
+      # 原因：type=gha 缓存依赖 BuildKit 的 buildx driver
+      # 默认的 docker driver 不支持缓存导出，会报错
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Extract metadata for Docker
         id: meta
@@ -75,11 +87,12 @@ jobs:
             type=sha,prefix=sha-
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           # 构建缓存：利用 GitHub Actions 缓存加速构建
+          # 依赖 setup-buildx 提供的 BuildKit driver 才能工作
           cache-from: type=gha
           cache-to: type=gha,mode=max
