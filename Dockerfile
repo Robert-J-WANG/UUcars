@@ -12,7 +12,6 @@ WORKDIR /src
 COPY UUcars.API/UUcars.API.csproj UUcars.API/
 
 # 恢复 NuGet 依赖
-# restore 只针对 API 项目
 RUN dotnet restore UUcars.API/UUcars.API.csproj
 
 # 复制所有源代码（在 restore 之后，避免源码变化使 restore 缓存失效）
@@ -43,8 +42,8 @@ COPY --from=build /app/publish .
 # 声明应用监听 8080 端口（容器内部端口）
 EXPOSE 8080
 
-# 设置环境变量，告诉 ASP.NET Core 监听 8080 而不是默认的 5000/5001
-ENV ASPNETCORE_URLS=http://+:8080
+# 告诉 ASP.NET Core 监听 8080 端口
+ENV ASPNETCORE_HTTP_PORTS=8080
 
 # 容器启动时执行的命令
 ENTRYPOINT ["dotnet", "UUcars.API.dll"]
