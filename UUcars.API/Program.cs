@@ -1,9 +1,5 @@
-using System.Text;
-using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Options;
-using Microsoft.IdentityModel.Tokens;
 using Scalar.AspNetCore;
 using Serilog;
 using UUcars.API.Auth;
@@ -39,7 +35,7 @@ try
             .ReadFrom.Services(services)
             .WriteTo.Console()
             .WriteTo.File(
-                path: "logs/uucars-.log",
+                "logs/uucars-.log",
                 rollingInterval: RollingInterval.Day, // 每天滚动一个新文件
                 retainedFileCountLimit: 30 // 最多保留 30 天
             )
@@ -68,7 +64,7 @@ try
     // 配置 JWT 认证
     // JWT 认证（细节在 Extensions/AuthExtensions.cs）
     builder.Services.AddJwtAuthentication(builder.Configuration);
-    
+
     // 用户模块
     // AddScoped：每次 HTTP 请求创建一个新实例，请求结束后销毁
     // Repository 和 Service 都用 Scoped，因为它们依赖 DbContext（也是 Scoped）
@@ -76,24 +72,27 @@ try
     builder.Services.AddScoped<IUserRepository, EfUserRepository>();
     builder.Services.AddScoped<JwtTokenGenerator>();
     builder.Services.AddScoped<UserService>();
-    
+
     // AddHttpContextAccessor：IHttpContextAccessor 默认不自动注册，需要显式加上
     // 它内部用 AsyncLocal<T> 保证线程安全，每个请求有自己独立的 HttpContext
     builder.Services.AddHttpContextAccessor();
     builder.Services.AddScoped<CurrentUserService>();
-    
+
     // 车辆模块
     builder.Services.AddScoped<ICarRepository, EfCarRepository>();
     builder.Services.AddScoped<CarService>();
-    builder.Services.AddScoped<ICarImageRepository, EfCarImageRepository>();  // 新增
-    
+    builder.Services.AddScoped<ICarImageRepository, EfCarImageRepository>(); // 新增
+
     // 收藏模块
     builder.Services.AddScoped<IFavoriteRepository, EfFavoriteRepository>();
     builder.Services.AddScoped<FavoriteService>();
-    
+
     // 订单模块
     builder.Services.AddScoped<IOrderRepository, EfOrderRepository>();
     builder.Services.AddScoped<OrderService>();
+
+    // Admin 模块
+    builder.Services.AddScoped<AdminCarService>();
 
     // =============================================
     // 构建应用
@@ -127,6 +126,14 @@ try
 
     app.MapControllers();
 
+    // 自动执行 Migration（V1 学习项目用法）
+// 生产环境建议改为独立的部署脚本，不在应用启动时执行
+    using (var scope = app.Services.CreateScope())
+    {
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        await db.Database.MigrateAsync();
+    }
+
     app.Run();
 }
 catch (Exception ex)
@@ -139,3 +146,9 @@ finally
     // 确保程序退出前把缓冲区里的日志全部写出去
     Log.CloseAndFlush();
 }
+
+// 让 Program 类对测试项目可见
+// WebApplicationFactory<Program> 需要通过这个类找到应用入口
+public partial class Program
+{
+};

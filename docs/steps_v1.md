@@ -11466,5 +11466,2648 @@ git checkout develop
 ✅ v0.5 里程碑 tag 打完
 ```
 
-准备好告诉我，继续 Step 29。
 
+
+## Step 29 · 审核车辆（通过）
+
+### 这一步做什么
+
+进入第八阶段——管理员系统。Admin 的核心职责是审核卖家提交的车辆，决定是否允许上架。这一步实现审核通过：`POST /admin/cars/{id}/approve`。
+
+
+
+### 1. 切出 feature/admin 分支
+
+```bash
+git checkout develop
+git checkout -b feature/admin
+git push -u origin feature/admin
+```
+
+
+
+### 2. Admin 接口的权限控制
+
+前面所有接口的权限控制都是"登录 vs 未登录"。Admin 接口多了一层——不只是要登录，还要是 `Admin` 角色。
+
+ASP.NET Core 提供了一个简洁的写法：
+
+```csharp
+[Authorize(Roles = "Admin")]
+```
+
+这一行特性做了两件事：
+
+- 确保用户已登录（Token 有效）
+- 确保用户的 Role Claim 包含 `"Admin"`
+
+如果未登录，返回 401。如果已登录但不是 Admin，返回 403。这两种情况框架会自动处理，不需要在 Controller 里手动判断。
+
+Step 10 里生成 Token 时用的是 `ClaimTypes.Role` 存角色值，`[Authorize(Roles = "Admin")]` 就是读取这个 Claim 来判断的——这就是当时为什么必须用 `ClaimTypes.Role` 而不是随便写个 `"role"` Key 的原因。
+
+
+
+### 3. Admin 接口为什么用 `/admin/` 前缀
+
+```
+POST /admin/cars/{id}/approve
+POST /admin/cars/{id}/reject
+GET  /admin/cars/pending
+DELETE /admin/cars/{id}
+```
+
+用 `/admin/` 前缀而不是直接复用 `/cars/` 有两个好处：
+
+**第一，职责清晰。** `/cars/` 是用户侧的接口，`/admin/cars/` 是管理员侧的接口，虽然操作的是同一张表，但操作语义完全不同——用户的 `DELETE /cars/{id}` 是卖家删除自己的草稿，管理员的 `DELETE /admin/cars/{id}` 是强制下架违规车辆。分开前缀，一眼就知道这是管理员操作。
+
+**第二，权限配置方便。** 可以在 Controller 级别用 `[Authorize(Roles = "Admin")]` 覆盖整个 `/admin/` 下的所有接口，不需要每个 Action 单独配置。
+
+
+
+### 4. 创建 AdminCarService
+
+Admin 的车辆操作和卖家的车辆操作虽然都涉及 `Car` 实体，但业务逻辑完全不同，单独建一个 `AdminCarService`，不混入 `CarService`：
+
+```bash
+touch UUcars.API/Services/AdminCarService.cs
+```
+
+```c#
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Entities.Enums;
+using UUcars.API.Exceptions;
+using UUcars.API.Repositories;
+
+namespace UUcars.API.Services;
+
+public class AdminCarService
+{
+    private readonly ICarRepository _carRepository;
+    private readonly ILogger<AdminCarService> _logger;
+
+    public AdminCarService(ICarRepository carRepository, ILogger<AdminCarService> logger)
+    {
+        _carRepository = carRepository;
+        _logger = logger;
+    }
+
+    public async Task<CarResponse> ApproveAsync(
+        int carId,
+        CancellationToken cancellationToken = default)
+    {
+        var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+        if (car == null)
+            throw new CarNotFoundException(carId);
+
+        // 只有 PendingReview 状态才能审核通过
+        // 已经 Published 的车不需要重复审核
+        // Draft 的车还没提交，不应该直接被 Admin 通过
+        if (car.Status != CarStatus.PendingReview)
+            throw new CarStatusException(car.Id, car.Status, CarStatus.PendingReview);
+
+        car.Status = CarStatus.Published;
+        car.UpdatedAt = DateTime.UtcNow;
+
+        var updated = await _carRepository.UpdateAsync(car, cancellationToken);
+
+        _logger.LogInformation("Car {CarId} approved by admin, now Published", carId);
+
+        return CarService.MapToResponse(updated);
+    }
+}
+```
+
+> **为什么复用 `CarService.MapToResponse` 而不是自己写一个？** `MapToResponse` 在 Step 14 里定义为 `internal static`，同一个程序集（Assembly）内都可以访问。`CarResponse` 的映射逻辑只有一份，不需要在 `AdminCarService` 里重复写一遍——重复代码意味着将来改 `CarResponse` 时要改两个地方，容易遗漏。
+
+
+
+### 5. 创建 AdminController
+
+```bash
+touch UUcars.API/Controllers/AdminController.cs
+```
+
+```c#
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using UUcars.API.DTOs;
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Services;
+
+namespace UUcars.API.Controllers;
+
+[ApiController]
+[Route("admin")]
+[Authorize(Roles = "Admin")]    // Controller 级别：所有 Admin 接口都需要 Admin 角色
+public class AdminController : ControllerBase
+{
+    private readonly AdminCarService _adminCarService;
+
+    public AdminController(AdminCarService adminCarService)
+    {
+        _adminCarService = adminCarService;
+    }
+
+    // POST /admin/cars/{id}/approve
+    [HttpPost("cars/{id:int}/approve")]
+    public async Task<IActionResult> ApproveCar(int id, CancellationToken cancellationToken)
+    {
+        var car = await _adminCarService.ApproveAsync(id, cancellationToken);
+        return Ok(ApiResponse<CarResponse>.Ok(car, "Car approved and published successfully."));
+    }
+}
+```
+
+
+
+### 6. 注册依赖到 Program.cs
+
+```csharp
+// Admin 模块
+builder.Services.AddScoped<AdminCarService>();
+```
+
+
+
+### 7. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 8. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**正常审核通过：**
+
+用 Admin 账号（`admin@uucars.com` / `Admin@123456`）登录，找一辆 `PendingReview` 状态的车（先用卖家账号创建一辆车并提交审核）：
+
+```
+POST /admin/cars/1/approve
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......（Admin Token）
+```
+
+预期（200）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": 1,
+    "status": "Published",
+    ...
+  },
+  "message": "Car approved and published successfully."
+}
+```
+
+审核通过后，这辆车应该出现在 `GET /cars` 的公开列表里。
+
+**审核 Draft 状态的车（应返回 409）：**
+
+尝试审核一辆还在 `Draft` 状态的车（还没提交），预期：
+
+```json
+{
+  "success": false,
+  "message": "Car '1' is in 'Draft' status. Required status: 'PendingReview'."
+}
+```
+
+**用普通用户 Token 调用（应返回 403）：**
+
+换普通用户的 Token，访问 `POST /admin/cars/1/approve`，预期返回 403。
+
+**不带 Token 访问（应返回 401）：**
+
+不带 Authorization 头，预期返回 401。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 9. 此时的目录变化
+
+```
+UUcars.API/
+├── Controllers/
+│   └── AdminController.cs      ← 新增
+└── Services/
+    └── AdminCarService.cs      ← 新增
+```
+
+
+
+### 10. Git 提交
+
+```bash
+git add .
+git commit -m "feat: POST /admin/cars/{id}/approve - approve car for publishing"
+git push origin feature/admin
+```
+
+
+
+### Step 29 完成状态
+
+```
+✅ 切出 feature/admin 分支
+✅ 理解 [Authorize(Roles = "Admin")] 的工作原理（依赖 ClaimTypes.Role）
+✅ 理解 /admin/ 前缀的作用（职责清晰 + 权限配置方便）
+✅ 理解为什么单独建 AdminCarService 而不是混入 CarService
+✅ AdminCarService.ApproveAsync（PendingReview → Published）
+✅ 复用 CarService.MapToResponse（internal static，不重复映射逻辑）
+✅ AdminController（Controller 级别 [Authorize(Roles = "Admin")]）
+✅ DI 注册完成
+✅ Scalar 测试通过（200 审核成功、409 状态不对、403 非 Admin、401 未登录）
+✅ Git commit + push 完成
+```
+
+## Step 30 · 审核车辆（拒绝）
+
+### 这一步做什么
+
+实现 `POST /admin/cars/{id}/reject`——Admin 审核不通过，把车辆退回给卖家修改。
+
+
+
+### 1. 拒绝审核的业务逻辑
+
+拒绝审核和通过审核的流程基本对称，但方向相反：
+
+```
+通过：PendingReview → Published（上架）
+拒绝：PendingReview → Draft   （退回卖家修改）
+```
+
+退回 `Draft` 而不是 `Deleted` 的原因：拒绝不是永久封禁，只是"这次提交有问题，请修改后重新提交"。卖家收到退回后，可以修改车辆信息再次提交审核，走完整的流程。
+
+
+
+### 2. 在 AdminCarService 里添加拒绝方法
+
+打开 `UUcars.API/Services/AdminCarService.cs`，在 `ApproveAsync` 下方添加：
+
+```csharp
+public async Task<CarResponse> RejectAsync(
+    int carId,
+    CancellationToken cancellationToken = default)
+{
+    var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+    if (car == null)
+        throw new CarNotFoundException(carId);
+
+    // 同样只有 PendingReview 状态才能被拒绝
+    if (car.Status != CarStatus.PendingReview)
+        throw new CarStatusException(car.Id, car.Status, CarStatus.PendingReview);
+
+    // 拒绝后退回 Draft，让卖家修改后重新提交
+    car.Status = CarStatus.Draft;
+    car.UpdatedAt = DateTime.UtcNow;
+
+    var updated = await _carRepository.UpdateAsync(car, cancellationToken);
+
+    _logger.LogInformation("Car {CarId} rejected by admin, returned to Draft", carId);
+
+    return CarService.MapToResponse(updated);
+}
+```
+
+
+
+### 3. 在 AdminController 里添加拒绝端点
+
+打开 `UUcars.API/Controllers/AdminController.cs`，在 `ApproveCar` 方法下方添加：
+
+```csharp
+// POST /admin/cars/{id}/reject
+[HttpPost("cars/{id:int}/reject")]
+public async Task<IActionResult> RejectCar(int id, CancellationToken cancellationToken)
+{
+    var car = await _adminCarService.RejectAsync(id, cancellationToken);
+    return Ok(ApiResponse<CarResponse>.Ok(car, "Car rejected and returned to seller for revision."));
+}
+```
+
+
+
+### 4. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 5. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**正常拒绝审核：**
+
+用 Admin Token，找一辆 `PendingReview` 状态的车：
+
+```
+POST /admin/cars/1/reject
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......（Admin Token）
+```
+
+预期（200）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": 1,
+    "status": "Draft",
+    ...
+  },
+  "message": "Car rejected and returned to seller for revision."
+}
+```
+
+**验证卖家可以重新提交：**
+
+拒绝后车辆回到 `Draft`，卖家应该能修改后再次 `POST /cars/1/submit`，验证整个流程闭环。
+
+**拒绝已经 Published 的车（应返回 409）：**
+
+预期：
+
+```json
+{
+  "success": false,
+  "message": "Car '1' is in 'Published' status. Required status: 'PendingReview'."
+}
+```
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 6. Git 提交
+
+```bash
+git add .
+git commit -m "feat: POST /admin/cars/{id}/reject - reject car back to draft"
+git push origin feature/admin
+```
+
+
+
+### Step 30 完成状态
+
+```
+✅ 理解拒绝审核退回 Draft 而不是 Deleted 的原因（允许修改重新提交）
+✅ AdminCarService.RejectAsync（PendingReview → Draft）
+✅ AdminController POST /admin/cars/{id}/reject
+✅ Scalar 测试通过（200 拒绝成功、409 状态不对、卖家可重新提交验证）
+✅ Git commit + push 完成
+```
+
+## Step 31 · 待审核车辆列表
+
+### 这一步做什么
+
+实现 `GET /admin/cars/pending`，返回所有 `PendingReview` 状态的车辆列表，供 Admin 查看和处理待审核的车辆。
+
+
+
+### 1. 这个接口和公开列表有什么不同
+
+`GET /cars` 是买家视角，只返回 `Published` 的车辆，不需要登录。`GET /admin/cars/pending` 是 Admin 视角，只返回 `PendingReview` 的车辆，需要 Admin 权限。
+
+两者底层都是查 `Cars` 表，只是过滤条件不同。`ICarRepository` 里已经有 `GetPagedAsync(CarStatus status, ...)` 方法，直接复用，传入 `CarStatus.PendingReview` 即可，不需要新增 Repository 方法。
+
+
+
+### 2. 在 AdminCarService 里添加待审核列表方法
+
+打开 `UUcars.API/Services/AdminCarService.cs`，在顶部补上 using：
+
+```csharp
+using UUcars.API.DTOs;
+using UUcars.API.DTOs.Requests;
+```
+
+在 `RejectAsync` 下方添加：
+
+```csharp
+public async Task<PagedResponse<CarResponse>> GetPendingCarsAsync(
+    CarQueryRequest query,
+    CancellationToken cancellationToken = default)
+{
+    var page = query.Page < 1 ? 1 : query.Page;
+    var pageSize = query.PageSize < 1 ? 20 : query.PageSize;
+    pageSize = Math.Min(pageSize, 50);
+
+    // 直接复用 ICarRepository 的 GetPagedAsync，传入 PendingReview 状态
+    // 不需要新增 Repository 方法，这正是把 status 作为参数设计的价值
+    var (cars, totalCount) = await _carRepository.GetPagedAsync(
+        CarStatus.PendingReview,
+        query,
+        cancellationToken);
+
+    var items = cars.Select(CarService.MapToResponse).ToList();
+
+    return PagedResponse<CarResponse>.Create(items, totalCount, page, pageSize);
+}
+```
+
+
+
+### 3. 在 AdminController 里添加待审核列表端点
+
+打开 `UUcars.API/Controllers/AdminController.cs`，在顶部补上 using：
+
+```csharp
+using UUcars.API.DTOs.Requests;
+```
+
+在 `RejectCar` 方法下方添加：
+
+```csharp
+// GET /admin/cars/pending
+// 注意路由顺序：/admin/cars/pending 是固定路径，
+// 必须在 /admin/cars/{id:int}/approve 等参数路由之前定义，
+// 避免 "pending" 被误匹配为 {id}（虽然 :int 约束已经能保护，但显式顺序更清晰）
+[HttpGet("cars/pending")]
+public async Task<IActionResult> GetPendingCars(
+    [FromQuery] CarQueryRequest query,
+    CancellationToken cancellationToken)
+{
+    var result = await _adminCarService.GetPendingCarsAsync(query, cancellationToken);
+    return Ok(ApiResponse<PagedResponse<CarResponse>>.Ok(result));
+}
+```
+
+
+
+### 4. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 5. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**获取待审核列表：**
+
+用 Admin Token，先确保数据库里有几辆 `PendingReview` 状态的车（用卖家账号创建车辆并提交审核）：
+
+```
+GET /admin/cars/pending
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......（Admin Token）
+```
+
+预期（200）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "items": [
+      {
+        "id": 2,
+        "title": "2019款丰田凯美瑞",
+        "status": "PendingReview",
+        "sellerUsername": "seller",
+        ...
+      }
+    ],
+    "totalCount": 1,
+    "page": 1,
+    "pageSize": 20,
+    "totalPages": 1
+  }
+}
+```
+
+**验证过滤：**
+
+已经 `Published` 或 `Draft` 的车辆不出现在这个列表里——这是这个接口最核心的逻辑，需要验证。
+
+**分页测试：**
+
+```
+GET /admin/cars/pending?page=1&pageSize=5
+```
+
+验证分页参数生效。
+
+**用普通用户 Token 访问（应返回 403）：**
+
+换普通用户的 Token，预期返回 403。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 6. 此时的目录变化
+
+这一步没有新增文件，只在 `AdminCarService` 和 `AdminController` 里新增了方法。
+
+
+
+### 7. Git 提交
+
+```bash
+git add .
+git commit -m "feat: GET /admin/cars/pending - pending review car list"
+git push origin feature/admin
+```
+
+
+
+### Step 31 完成状态
+
+```
+✅ 理解复用 GetPagedAsync 而不新增 Repository 方法的原因
+✅ AdminCarService.GetPendingCarsAsync（复用 ICarRepository.GetPagedAsync）
+✅ AdminController GET /admin/cars/pending（[FromQuery] 分页参数）
+✅ Scalar 测试通过（待审核列表、过滤验证、分页、403 非 Admin）
+✅ Git commit + push 完成
+```
+
+
+
+## Step 32 · 删除违规车辆
+
+### 这一步做什么
+
+实现 `DELETE /admin/cars/{id}`，Admin 强制逻辑删除违规车辆——无论车辆当前是什么状态，Admin 都可以将其标记为 `Deleted`。
+
+
+
+### 1. Admin 删除和卖家删除的区别
+
+Step 17 里卖家已经有了 `DELETE /cars/{id}`，为什么 Admin 还需要一个单独的删除接口？
+
+```
+卖家删除（Step 17）：
+  只能删除自己的车
+  只能删除 Draft 状态的车
+  用于卖家主动撤回草稿
+
+Admin 删除（本步骤）：
+  可以删除任何人的车
+  可以删除任何状态的车（Draft / PendingReview / Published / Sold）
+  用于平台强制下架违规内容
+```
+
+两者操作的是同一个"逻辑删除"动作（`Status = Deleted`），但权限和适用范围完全不同，所以分开实现。
+
+
+
+### 2. 为什么 Sold 状态的车也可以被 Admin 删除
+
+卖家不能删除 `Sold` 的车是因为有成交订单，不能随意消除。但 Admin 是平台管理方，如果一辆已售出的车被发现是违规车辆（比如欺诈），平台有责任强制下架并保留记录（逻辑删除，数据还在）。
+
+
+
+### 3. 在 AdminCarService 里添加删除方法
+
+打开 `UUcars.API/Services/AdminCarService.cs`，在 `GetPendingCarsAsync` 下方添加：
+
+```csharp
+public async Task AdminDeleteAsync(
+    int carId,
+    CancellationToken cancellationToken = default)
+{
+    var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+    if (car == null)
+        throw new CarNotFoundException(carId);
+
+    // Admin 可以删除任何状态的车辆，不受状态约束
+    // 但已经是 Deleted 状态的车不需要重复操作
+    if (car.Status == CarStatus.Deleted)
+        throw new CarStatusException(car.Id, car.Status, CarStatus.Published);
+
+    car.Status = CarStatus.Deleted;
+    car.UpdatedAt = DateTime.UtcNow;
+
+    await _carRepository.UpdateAsync(car, cancellationToken);
+
+    _logger.LogInformation("Car {CarId} forcefully deleted by admin", carId);
+}
+```
+
+> **为什么已经是 `Deleted` 时抛 `CarStatusException` 而不是直接返回成功？** 重复删除一辆已经删除的车，通常意味着调用方出现了问题（比如 Bug 或误操作）。明确返回错误比静默成功更安全，让调用方知道"这辆车已经是删除状态了"。
+
+
+
+### 4. 在 AdminController 里添加删除端点
+
+打开 `UUcars.API/Controllers/AdminController.cs`，在 `GetPendingCars` 下方添加：
+
+```csharp
+// DELETE /admin/cars/{id}
+[HttpDelete("cars/{id:int}")]
+public async Task<IActionResult> DeleteCar(int id, CancellationToken cancellationToken)
+{
+    await _adminCarService.AdminDeleteAsync(id, cancellationToken);
+    return NoContent();
+}
+```
+
+
+
+### 5. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 6. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**正常删除违规车辆（Published 状态）：**
+
+用 Admin Token，找一辆 `Published` 状态的车：
+
+```
+DELETE /admin/cars/1
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9......（Admin Token）
+```
+
+预期（204）：无响应体。
+
+去数据库确认：`Cars` 表里这辆车的 `Status` 应该变成了 `Deleted`，数据行还在。
+
+**验证被删除的车辆从公开列表消失：**
+
+执行 `GET /cars`，确认刚才删除的车不再出现在列表里。
+
+**重复删除同一辆车（应返回 409）：**
+
+再次删除同一辆 `Deleted` 状态的车，预期：
+
+```json
+{
+  "success": false,
+  "message": "Car '1' is in 'Deleted' status. Required status: 'Published'."
+}
+```
+
+**用普通用户 Token 访问（应返回 403）：**
+
+换普通用户的 Token，预期返回 403。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 7. Git 提交 + 合并分支
+
+Admin 系统四个接口全部完成：
+
+```bash
+git add .
+git commit -m "feat: DELETE /admin/cars/{id} - force delete violation car"
+git push origin feature/admin
+```
+
+合并回 `develop`：
+
+```bash
+git checkout develop
+git merge --no-ff feature/admin -m "merge: feature/admin into develop"
+git push origin develop
+git branch -D feature/admin
+git push origin --delete feature/admin
+```
+
+
+
+### Step 32 完成状态
+
+```
+✅ 理解 Admin 删除和卖家删除的区别（权限范围和适用状态不同）
+✅ 理解为什么 Sold 状态的车也可以被 Admin 删除
+✅ AdminCarService.AdminDeleteAsync（无状态限制，已删除时报错）
+✅ AdminController DELETE /admin/cars/{id}（返回 204）
+✅ Scalar 测试通过（204 删除成功、从公开列表消失、409 重复删除、403 非 Admin）
+✅ feature/admin 合并回 develop
+```
+
+
+
+你说得对，我回看了之前的对话，在 Step 13 完成后你特意问过这件事，我当时承诺在测试完善阶段做一个完整的总结性说明，覆盖：测什么层、测什么内容、怎么隔离、测试粒度。现在重新完整生成 Step 33。
+
+
+
+## Step 33 · 完善单元测试
+
+### 这一步做什么
+
+这一步是系统性地补全和回顾单元测试。
+
+在补充遗漏的测试用例之前，先把整个单元测试的思路和框架梳理清楚。
+
+从 Step 09 开始我们一直在写测试，现在是时候回头看看这些测试为什么这样写、为什么选这些地方测、为什么不测别的地方。
+
+
+
+### 1. 单元测试测什么层
+
+整个项目有三层：Controller、Service、Repository。我们的单元测试全部集中在 **Service 层**，一个 Controller 测试和 Repository 测试都没有写。这是有意为之的。
+
+**为什么不测 Controller？**
+
+Controller 的职责非常薄：从请求里提取参数，调用 Service，把结果包装成 HTTP 响应。这三件事都不包含任何业务判断逻辑。如果要测 Controller，就必须启动整个 HTTP 管道，配置路由、中间件、序列化……成本很高，而且测的大部分是框架本身的行为，不是我们自己写的逻辑。
+
+**为什么不测 Repository？**
+
+Repository 的职责同样单一：执行数据库操作。里面没有任何业务规则，只有 EF Core 的查询语句。测 Repository 就是在测 EF Core 是否正确工作——这是框架自己的事，不需要我们验证。真正需要测的是"Repository 被正确调用了"，这一点在 Service 测试里通过 Fake Repository 间接验证。
+
+**为什么只测 Service？**
+
+Service 是整个系统的业务规则中心，所有重要的判断都在这里：
+
+```
+邮箱是否已被注册（UserService）
+密码是否正确（UserService）
+车辆状态是否允许提交审核（CarService）
+买家是否是卖家本人（OrderService）
+订单是否可以被取消（OrderService）
+```
+
+这些规则一旦出错，会直接影响系统的正确性和安全性。而且 Service 依赖的是接口（`IUserRepository`、`ICarRepository`），可以用 Fake 实现替换真实的数据库，让测试在内存里跑，不依赖任何外部环境。
+
+
+
+### 2. 选择测试用例的标准
+
+不是所有方法都需要测，判断标准只有一个：**这个方法里有没有值得保护的业务规则？**
+
+具体来说，以下情况值得写测试：
+
+```
+状态约束    → 只有 Draft 状态才能提交审核
+权限边界    → 只有车主才能修改自己的车
+安全规则    → 密码不能以明文存储，邮箱不能重复注册
+业务联动    → 创建订单后车辆状态必须变为 Sold
+边界条件    → 车辆不存在、订单已取消、重复收藏
+```
+
+以下情况不需要写测试：
+
+```
+简单数据查询  → GetByIdAsync 只是查数据库，没有判断逻辑
+字段映射      → MapToResponse 只是赋值，出错一眼就看到
+框架行为      → AddControllers、JWT 验证这些是框架自己的事
+```
+
+
+
+### 3. Fake Repository 的设计思路
+
+单元测试的核心要求是**快速、稳定、不依赖外部资源**。但 Service 依赖 Repository，Repository 要操作数据库。解决方案是用 **Fake Repository** 替换真实的 Repository。
+
+Fake Repository 实现同一个接口（`IUserRepository`、`ICarRepository`），但用内存字典模拟数据库：
+
+```csharp
+public class FakeCarRepository : ICarRepository
+{
+    private readonly Dictionary<int, Car> _store = new();
+
+    // Seed：测试前预设"数据库里已有的数据"
+    public void Seed(Car car) => _store[car.Id] = car;
+
+    // GetByIdAsync：从字典里找，模拟数据库查询
+    public Task<Car?> GetByIdAsync(int id, ...)
+        => Task.FromResult(_store.TryGetValue(id, out var car) ? car : null);
+}
+```
+
+Fake 的三个关键能力：
+
+```
+可控输入  → Seed 方法：预设"数据库里有什么"，测试每次都是干净的起点
+可观察    → 可以在测试里直接读取 _store 验证数据是否被正确写入
+可替换    → DI 注入时换成 Fake，Service 代码不需要任何修改
+```
+
+
+
+### 4. 测试的结构：Arrange / Act / Assert
+
+每个测试方法都遵循固定的三段结构：
+
+```
+Arrange（准备）：设置测试数据和依赖，准备"舞台"
+Act（执行）    ：调用被测试的方法
+Assert（断言） ：验证结果是否符合预期
+```
+
+每个测试只验证一件事。一个测试方法里不应该有多个独立的 Assert 目标——如果一个测试失败了，你应该能一眼知道是什么出了问题，而不是需要排查"到底是哪个 Assert 失败了"。
+
+
+
+### 5. 特殊情况：OrderService 用 InMemory 数据库
+
+大部分测试用 Fake Repository 就够了，但 `OrderService.CreateAsync` 和 `CancelAsync` 有一个特殊性：它们直接操作 `AppDbContext`（为了在同一个事务里保存订单和车辆状态变更）。
+
+Fake Repository 只管自己的 `_store`，感知不到 `AppDbContext` 的变更，所以这两个测试改用 **EF Core InMemory 数据库**——行为和真实数据库一样（支持 Add、Update、SaveChanges），但数据存在内存里，测试结束就消失：
+
+```csharp
+var options = new DbContextOptionsBuilder<AppDbContext>()
+    .UseInMemoryDatabase(Guid.NewGuid().ToString())  // 每个测试独立的数据库名
+    .Options;
+var context = new AppDbContext(options);
+```
+
+每个测试用唯一的数据库名（`Guid.NewGuid()`），确保测试之间互不影响。
+
+
+
+### 6. 回顾所有测试节点的选择逻辑
+
+```
+Step 09 · UserService 注册测试
+  为什么测：邮箱重复、密码明文存储——安全规则，出错后果严重
+  为什么这时候测：注册功能刚完成，趁热打铁
+
+Step 13 · UserService 登录测试
+  为什么测：密码验证逻辑、邮箱不存在和密码错误返回相同错误——安全设计
+  为什么这时候测：登录功能刚完成
+
+Step 22 · CarService 测试
+  为什么测：状态流转约束（Draft → PendingReview）、权限边界（车主才能操作）
+  为什么这时候测：车辆模块最后一个接口完成，覆盖整个模块
+
+Step 28 · OrderService 测试
+  为什么测：创建订单的多个边界（车辆状态、买家不是卖家）、取消订单的事务性
+  为什么这时候测：订单模块最后一个接口完成
+```
+
+
+
+### 7. 切出 feature/tests 分支
+
+```bash
+git checkout develop
+git checkout -b feature/tests
+git push -u origin feature/tests
+```
+
+
+
+### 8. 检查并补充 CarService 测试
+
+目前 `CarServiceTests` 已有 5 个测试，覆盖了提交审核的状态流转和车辆详情的权限判断。补充创建车辆和修改车辆的边界：
+
+打开 `UUcars.Tests/Services/CarServiceTests.cs`，顶部补上 using：
+
+```csharp
+using UUcars.API.DTOs.Requests;
+```
+
+在已有测试下方添加：
+
+```csharp
+// ===== 创建车辆草稿的测试 =====
+
+[Fact]
+public async Task CreateAsync_ShouldSetStatusToDraftAndAssignSeller()
+{
+    // Arrange
+    var repo = new FakeCarRepository();
+    var service = CreateService(repo);
+
+    var request = new CarCreateRequest
+        {
+            Title = "2020 BMW 3 Series",
+            Brand = "BMW",
+            Model = "3 Series",
+            Year = 2020,
+            Price = 260000,
+            Mileage = 15000
+        };
+
+    // Act
+    var result = await service.CreateAsync(sellerId: 10, request);
+
+    // Assert
+    Assert.NotNull(result);
+    // 无论客户端传什么，Status 必须强制为 Draft
+    // 这是核心安全规则：客户端不能绕过审核直接创建 Published 的车辆
+    Assert.Equal("Draft", result.Status);
+    // SellerId 必须是当前登录用户，不能是客户端传入的值
+    Assert.Equal(10, result.SellerId);
+}
+
+// ===== 修改车辆的测试 =====
+
+[Fact]
+public async Task UpdateAsync_WhenDraftAndOwner_ShouldUpdateFields()
+{
+    // Arrange
+    var repo = new FakeCarRepository();
+    repo.Seed(new Car
+    {
+        Id = 1, 
+        SellerId = 10, 
+        Status = CarStatus.Draft,
+        Title = "2020 BMW 3 Series",
+        Brand = "BMW",
+        Model = "3 Series",
+        Year = 2020,
+        Price = 260000,
+        Mileage = 15000,
+        CreatedAt = DateTime.UtcNow,
+        UpdatedAt = DateTime.UtcNow
+    });
+    var service = CreateService(repo);
+
+    var request = new CarUpdateRequest
+    {
+        Title = "New 2020 BMW 3 Series", 
+        Brand = "BMW", 
+        Model = "3 Series",
+        Year = 2020, 
+        Price = 260000, 
+        Mileage = 15000
+    };
+
+    // Act
+    var result = await service.UpdateAsync(1, currentUserId: 10, request);
+
+    // Assert
+    Assert.Equal("New 2020 BMW 3 Series", result.Title);
+    Assert.Equal(260000, result.Price);
+    // 修改后状态仍是 Draft，修改操作不会改变状态
+    Assert.Equal("Draft", result.Status);
+}
+
+[Fact]
+public async Task UpdateAsync_WhenPendingReview_ShouldThrowCarStatusException()
+{
+    // Arrange：已提交审核的车不能修改
+    // 原因：审核中改信息会导致 Admin 看到的和最终上架的内容不一致
+    var repo = new FakeCarRepository();
+    repo.Seed(new Car
+    {
+        Id = 1, 
+        SellerId = 10, 
+        Status = CarStatus.PendingReview,
+        Title = "2020 BMW 3 Series",
+        Brand = "BMW",
+        Model = "3 Series",
+        Year = 2020,
+        Price = 260000,
+        Mileage = 15000,
+        CreatedAt = DateTime.UtcNow,
+        UpdatedAt = DateTime.UtcNow
+    });
+    var service = CreateService(repo);
+
+    var request = new CarUpdateRequest
+    {
+        Title = "New 2020 BMW 3 Series", 
+        Brand = "BMW", 
+        Model = "3 Series",
+        Year = 2020, 
+        Price = 260000, 
+        Mileage = 15000
+    };
+
+
+    // Act + Assert
+    await Assert.ThrowsAsync<CarStatusException>(
+        () => service.UpdateAsync(1, currentUserId: 10, request));
+}
+```
+
+
+
+### 9. 检查并补充 OrderService 测试
+
+目前已有 6 个测试，补充"车辆不存在"这个边界场景：
+
+打开 `UUcars.Tests/Services/OrderServiceTests.cs`，补充：
+
+```csharp
+[Fact]
+public async Task CreateAsync_WhenCarNotFound_ShouldThrowCarNotFoundException()
+{
+    // Arrange：空 carRepo，没有任何车辆
+    // 模拟客户端传了一个不存在的 CarId
+    var context = CreateDbContext();
+    var carRepo = new FakeCarRepository();
+    var service = CreateService(context, carRepo);
+
+    // Act + Assert
+    await Assert.ThrowsAsync<CarNotFoundException>(
+        () => service.CreateAsync(
+            buyerId: 2,
+            new OrderCreateRequest { CarId = 999 }));
+}
+```
+
+
+
+### 10. 运行全部测试
+
+```bash
+dotnet test
+```
+
+预期：
+
+```
+Test summary: total: 20, failed: 0, succeeded: 20, skipped: 0
+```
+
+原来的 17 个 + 新增的 4 个（CarService 3 个 + OrderService 1 个），全部通过。
+
+
+
+### 11. 此时的目录变化
+
+```
+UUcars.Tests/
+└── Services/
+    ├── CarServiceTests.cs      ← 已更新（新增 3 个测试）
+    └── OrderServiceTests.cs    ← 已更新（新增 1 个测试）
+```
+
+
+
+### 12. Git 提交
+
+```bash
+git add .
+git commit -m "test: complete unit test coverage for all Services"
+git push origin feature/tests
+```
+
+
+
+### Step 33 完成状态
+
+```
+✅ 理解为什么只测 Service 层（Controller 太薄，Repository 无业务规则）
+✅ 理解选择测试用例的标准（有业务规则才测，简单查询不测）
+✅ 理解 Fake Repository 的设计思路（可控输入、可观察、可替换）
+✅ 理解 Arrange / Act / Assert 结构（每个测试只验证一件事）
+✅ 理解 OrderService 测试为什么用 InMemory 而不是 Fake（事务性操作）
+✅ 回顾了所有测试节点的选择逻辑
+✅ CarService 补充 3 个测试（创建草稿状态验证、修改成功、修改状态约束）
+✅ OrderService 补充 1 个测试（车辆不存在边界）
+✅ 全部 20 个测试通过
+✅ Git commit + push 完成
+```
+
+
+
+好，先把这两个问题讨论清楚，再生成最终版本。
+
+
+
+### 选择哪种方式
+
+**SQLite 的问题：**
+
+虽然比 InMemory 好，但 SQLite 和 SQL Server 之间仍然存在方言差异。项目里用了 `decimal(18,2)`、`nvarchar`、SQL Server 特有的字符串比较行为——SQLite 处理这些的方式不一样，仍然可能出现"测试通过但生产报错"的情况。
+
+**Docker + Testcontainers 的优势：**
+
+你的项目本来就已经在用 Docker 跑 SQL Server，对 Docker 不陌生。`Testcontainers` 库会在测试时自动拉起一个真实的 SQL Server 容器，测试结束自动销毁——完全真实的数据库环境，和生产环境一模一样，没有任何行为差异。
+
+**结论：用 Testcontainers + SQL Server。**
+
+理由：已经有 Docker 基础、下一步就是 Docker 部署、这是企业级项目的标准做法，学了直接能用到真实工作里。
+
+
+
+### 关于 CI/CD
+
+Step 35 是 Docker 部署，V1 的部署目标是把 API 打包成 Docker 镜像跑起来。CI/CD 用 **GitHub Actions** 是最自然的选择——代码已经在 GitHub 上了，Actions 配置简单，免费额度够用。
+
+V1 的 CI/CD 目标定为：
+
+```
+push 到 develop → 自动跑所有测试（单元 + 集成）
+push 到 main / 打 tag → 自动构建 Docker 镜像
+```
+
+这个内容放在 Step 35 里一起实现，Step 34 专注把集成测试做好。
+
+
+
+## Step 34 · 集成测试
+
+### 这一步做什么
+
+Step 33 完善了单元测试。这一步做集成测试，一种和单元测试完全不同的测试方式。
+
+在写代码之前，先把集成测试的概念、原理、和单元测试的关系理解清楚。
+
+
+
+### 1. 单元测试的局限性
+
+回顾一下单元测试做的事：
+
+```
+UserService.RegisterAsync()       → 邮箱不能重复、密码不能明文存储
+CarService.SubmitForReviewAsync() → 只有车主能提交、只有 Draft 才能提交
+OrderService.CreateAsync()        → 买家不能是卖家、车辆必须是 Published
+```
+
+单元测试很好地验证了**每个 Service 方法内部的业务逻辑**。但它有一个根本局限。
+
+它是孤立的，用 Fake Repository 替换了真实数据库，整个测试在"人造"环境里运行。
+
+这意味着有些问题单元测试发现不了：
+
+**DI 配置错误：**
+
+```csharp
+// 假设写错了
+builder.Services.AddScoped<ICarRepository, EfUserRepository>();
+```
+
+单元测试不走 DI 容器，发现不了这个错误。
+
+**中间件行为：**
+
+`GlobalExceptionMiddleware` 是否真的能捕获异常并返回正确格式的 JSON？`[Authorize]` 在不带 Token 时是否真的返回 401？这些只有在真实 HTTP 管道里才能验证。
+
+**路由是否正确：**
+
+`POST /cars/{id}/submit` 是否真的路由到 `CarsController.Submit()`？只有发真实 HTTP 请求才能验证。
+
+**完整链路：**
+
+"注册 → 登录 → 发布车辆 → 下单"这条链路跨越了多个层，单元测试只能分段验证，无法验证整条链路。
+
+
+
+### 2. 集成测试是什么
+
+集成测试的目标是验证**多个组件一起工作时**是否正确。
+
+```
+单元测试：
+  只测一个 Service 方法
+  用 Fake 替换所有外部依赖
+  不启动 HTTP 服务器，不连接数据库
+  非常快（毫秒级）
+
+集成测试：
+  测整个 HTTP 请求链路（Controller → Service → Repository → 数据库）
+  启动完整的应用（包括所有中间件、DI 容器、路由）
+  连接真实数据库（测试用的独立容器）
+  验证 HTTP 响应（状态码、响应体格式）
+  较慢（启动数据库容器需要几秒）
+```
+
+两者互补，不是替代关系：
+
+```
+单元测试：验证业务规则的正确性（快、精准）
+集成测试：验证整个系统的连通性（全面、真实）
+```
+
+
+
+### 3. WebApplicationFactory 是什么
+
+`WebApplicationFactory<T>` 是 ASP.NET Core 官方提供的集成测试框架。
+
+它解决的问题是：**如何在测试里启动一个真实的 ASP.NET Core 应用，同时不需要真正监听端口？**
+
+```
+正常运行：
+  Program.cs → 启动 Kestrel → 监听 5085 端口 → 等待 HTTP 请求
+
+WebApplicationFactory：
+  读取 Program.cs 配置 → 在内存里启动应用 → 创建测试用 HTTP 客户端
+  发请求 → 走完整的中间件管道 → 返回真实 HTTP 响应
+  整个过程不需要真实的网络端口
+```
+
+简单来说：就是在内存中启动API（加载Program.cs、中间件、controller等），并产生一个可以发送请求的HttpClient用于测试。
+
+
+
+### 4. Testcontainers是什么
+
+集成测试需要连接数据库，但不能用生产数据库（会污染数据）。
+
+`Testcontainers` 是一个开源库，**在测试运行时自动启动一个 Docker 容器**（这里是 SQL Server），测试结束后自动销毁。
+
+```
+测试开始
+  ↓
+Testcontainers 自动启动一个新的 SQL Server Docker 容器
+  ↓
+获取这个容器的连接字符串
+  ↓
+WebApplicationFactory 用这个连接字符串启动测试应用
+  ↓
+执行 Migration（建表）
+  ↓
+插入测试需要的初始数据（如 Admin 账号）
+  ↓
+跑集成测试
+  ↓
+测试结束，容器自动销毁
+```
+
+为什么比 InMemory / SQLite 好：
+
+```
+InMemory：不是真实数据库，不支持外键、事务、SQL 函数
+SQLite：  是真实数据库，但和 SQL Server 方言不同，某些行为不一致
+Testcontainers：完全真实的 SQL Server，和生产环境零差异
+```
+
+
+
+### 5. 安装所需包
+
+```bash
+# WebApplicationFactory 工具包
+dotnet add UUcars.Tests/UUcars.Tests.csproj package Microsoft.AspNetCore.Mvc.Testing
+
+# Testcontainers SQL Server 支持
+dotnet add UUcars.Tests/UUcars.Tests.csproj package Testcontainers.MsSql
+
+# EF Core Design 工具（用于在测试里跑 Migration）
+dotnet add UUcars.Tests/UUcars.Tests.csproj package Microsoft.EntityFrameworkCore.Design
+```
+
+
+
+### 6. 让 Program.cs 对测试可见
+
+`WebApplicationFactory<T>` 需要通过类型参数 `T` 找到应用的入口点。.NET 6 之后 `Program.cs` 使用顶层语句，没有显式的 `Program` 类。需要在末尾加一行：
+
+打开 `UUcars.API/Program.cs`，在 `app.Run()` 下方添加：
+
+```csharp
+app.Run();
+
+// 让 Program 类对测试项目可见
+// WebApplicationFactory<Program> 需要通过这个类型找到应用入口
+public partial class Program { }
+```
+
+
+
+### 7. 创建 SQL Server 测试容器工厂
+
+这是集成测试的核心基础设施。把启动容器、配置应用、执行 Migration、插入初始数据的逻辑集中在这里：
+
+由于通过docker连接的测试数据库，连接过程需要时间，因此容器的启动是异步的，需要确保在测试开始前容器已就绪。
+
+对此，测试工厂需要实现 IAsyncLifetime 接口：
+
+- 异步初始化：在测试运行前启动容器
+- 异步清理：测试结束后停止并销毁容器
+
+```c#
+public class SqlServerTestFactory : WebApplicationFactory<Program>, IAsyncLifetime
+{
+    private readonly MsSqlContainer _sqlContainer = ...
+
+    // 异步初始化：在测试运行前启动容器
+    public async Task InitializeAsync()
+    {
+        await _sqlContainer.StartAsync();
+    }
+
+    // 异步清理：测试结束后停止并销毁容器
+    public async Task DisposeAsync()
+    {
+        await _sqlContainer.StopAsync();
+    }
+}
+```
+
+完整的代码如下：
+
+```bash
+mkdir -p UUcars.Tests/Integration
+touch UUcars.Tests/Integration/SqlServerTestFactory.cs
+```
+
+```c#
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
+using Testcontainers.MsSql;
+using UUcars.API.Data;
+using UUcars.API.Entities;
+using UUcars.API.Entities.Enums;
+
+namespace UUcars.Tests.Integration;
+
+// 自定义的 WebApplicationFactory
+// 在测试启动时自动拉起 SQL Server 容器，测试结束后自动销毁
+public class SqlServerTestFactory : WebApplicationFactory<Program>, IAsyncLifetime
+{
+    // MsSqlContainer：Testcontainers 提供的 SQL Server 容器对象
+    // 它封装了 Docker 操作：启动容器、获取连接字符串、停止容器
+    private readonly MsSqlContainer _sqlContainer = new MsSqlBuilder("mcr.microsoft.com/mssql/server:2022-latest")
+        .WithPassword("TestStrong!Passw0rd")
+        .Build();
+
+    // IAsyncLifetime.InitializeAsync：测试类实例化时自动调用
+    // xUnit 发现这个接口后，会在运行第一个测试前先执行这个方法
+    public async Task InitializeAsync()
+    {
+        // 启动 SQL Server 容器（需要几秒钟）
+        await _sqlContainer.StartAsync();
+    }
+
+    // IAsyncLifetime.DisposeAsync：所有测试结束后自动调用
+    // 停止并销毁容器
+    public new async Task DisposeAsync()
+    {
+        await _sqlContainer.StopAsync();
+    }
+
+    // ConfigureWebHost：在 WebApplicationFactory 构建应用时调用
+    // 在这里替换 DI 服务，把生产用的 SQL Server 换成测试容器
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    {
+        builder.ConfigureServices(services =>
+        {
+            // 找到并移除原来注册的 DbContext（连接生产数据库的）
+            var descriptor = services.SingleOrDefault(
+                d => d.ServiceType == typeof(DbContextOptions<AppDbContext>));
+            if (descriptor != null)
+                services.Remove(descriptor);
+
+            // 用测试容器的连接字符串注册新的 DbContext
+            // _sqlContainer.GetConnectionString() 返回容器的动态连接字符串
+            services.AddDbContext<AppDbContext>(options =>
+                options.UseSqlServer(_sqlContainer.GetConnectionString()));
+        });
+
+        // 使用测试环境，避免加载生产配置
+        builder.UseEnvironment("Testing");
+    }
+
+    // 初始化数据库：执行 Migration + 插入初始数据
+    // 在每个测试类开始前调用，确保数据库结构是最新的
+    public async Task InitializeDatabaseAsync()
+    {
+        // 通过 DI 容器获取 DbContext
+        using var scope = Services.CreateScope();
+        var context = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        // 执行所有 Migration，建好数据库表结构
+        await context.Database.MigrateAsync();
+
+        // 插入测试需要的 Admin 用户
+        // 为什么要手动插入？
+        // Step 07 里的 Seed Data（HasData）会在 Migration 文件里生成 INSERT 语句，
+        // MigrateAsync 执行时会自动插入。但如果 Seed Data 已经在 Migration 里了，
+        // 这里就不需要手动插了。如果没有，就在这里手动创建
+        if (!context.Users.Any(u => u.Role == UserRole.Admin))
+        {
+            var hasher = new PasswordHasher<User>();
+            var admin = new User
+            {
+                Username = "admin",
+                Email = "admin@uucars.com",
+                Role = UserRole.Admin,
+                EmailConfirmed = true,
+                CreatedAt = DateTime.UtcNow,
+                UpdatedAt = DateTime.UtcNow
+            };
+            admin.PasswordHash = hasher.HashPassword(admin, "Admin@123456");
+            context.Users.Add(admin);
+            await context.SaveChangesAsync();
+        }
+    }
+
+    // 清理数据库：每个测试方法结束后调用
+    // 删除所有业务数据，但保留表结构和 Admin 账号
+    // 这样下一个测试面对的是干净的数据库
+    public async Task CleanDatabaseAsync()
+    {
+        using var scope = Services.CreateScope();
+        var context = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        // 按外键依赖顺序删除，避免约束冲突
+        context.Favorites.RemoveRange(context.Favorites);
+        context.Orders.RemoveRange(context.Orders);
+        context.CarImages.RemoveRange(context.CarImages);
+        context.Cars.RemoveRange(context.Cars);
+        // 只删除普通用户，保留 Admin
+        context.Users.RemoveRange(context.Users.Where(u => u.Role != UserRole.Admin));
+        await context.SaveChangesAsync();
+    }
+}
+```
+
+> **`IAsyncLifetime` 是什么？** 这是 xUnit 提供的接口。实现它的类在测试生命周期里会被自动调用：
+>
+> - `InitializeAsync`：在第一个测试运行前执行（这里用来启动容器）
+> - `DisposeAsync`：在所有测试结束后执行（这里用来销毁容器）
+>
+> 一个容器在整个测试类的所有测试方法里共享，不是每个测试方法都启动一个新容器——启动容器需要几秒钟，共享容器可以显著提升测试速度。数据隔离靠 `CleanDatabaseAsync` 在每个测试方法之间清理数据来保证。
+
+
+
+### 8. 创建集成测试基类
+
+把通用的辅助方法抽成基类，所有集成测试都继承它：
+
+```bash
+touch UUcars.Tests/Integration/IntegrationTestBase.cs
+```
+
+```c#
+using System.Net.Http.Headers;
+using System.Text;
+using System.Text.Json;
+
+namespace UUcars.Tests.Integration;
+
+// 集成测试基类
+// 提供统一的 HTTP 客户端和辅助方法
+public abstract class IntegrationTestBase : IAsyncLifetime
+{
+    // 共享同一个 SqlServerTestFactory（共享同一个数据库容器）
+    protected readonly SqlServerTestFactory Factory;
+    protected readonly HttpClient Client;
+
+    // JSON 选项：反序列化时忽略大小写
+    protected static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true
+    };
+
+    protected IntegrationTestBase(SqlServerTestFactory factory)
+    {
+        Factory = factory;
+        Client = factory.CreateClient();
+    }
+
+    // 每个测试方法开始前：初始化数据库（只在第一次时执行 Migration）
+    public async Task InitializeAsync()
+    {
+        await Factory.InitializeDatabaseAsync();
+    }
+
+    // 每个测试方法结束后：清理数据，为下一个测试准备干净环境
+    public async Task DisposeAsync()
+    {
+        await Factory.CleanDatabaseAsync();
+    }
+
+    // ===== 辅助方法 =====
+
+    // 构建 JSON 请求体
+    protected static StringContent JsonContent(object data)
+    {
+        var json = JsonSerializer.Serialize(data, new JsonSerializerOptions
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+        });
+        return new StringContent(json, Encoding.UTF8, "application/json");
+    }
+
+    // 反序列化 HTTP 响应体
+    protected static async Task<T?> DeserializeAsync<T>(HttpResponseMessage response)
+    {
+        var content = await response.Content.ReadAsStringAsync();
+        return JsonSerializer.Deserialize<T>(content, JsonOptions);
+    }
+
+    // 注册用户并登录，返回 JWT Token
+    protected async Task<string> RegisterAndLoginAsync(
+        string email = "test@example.com",
+        string username = "testuser",
+        string password = "Test@123456")
+    {
+        await Client.PostAsync("/auth/register", JsonContent(new
+        {
+            username, email, password
+        }));
+
+        var loginResponse = await Client.PostAsync("/auth/login", JsonContent(new
+        {
+            email, password
+        }));
+
+        var result = await DeserializeAsync<ApiResponseWrapper<LoginData>>(loginResponse);
+        return result?.Data?.Token ?? string.Empty;
+    }
+
+    // 设置请求头的 Bearer Token
+    protected void SetBearerToken(string token)
+    {
+        Client.DefaultRequestHeaders.Authorization =
+            new AuthenticationHeaderValue("Bearer", token);
+    }
+
+    // 清除 Token（测试未登录场景时使用）
+    protected void ClearBearerToken()
+    {
+        Client.DefaultRequestHeaders.Authorization = null;
+    }
+
+    // ===== 内部响应结构 =====
+
+    protected class ApiResponseWrapper<T>
+    {
+        public bool Success { get; set; }
+        public T? Data { get; set; }
+        public string? Message { get; set; }
+    }
+
+    protected class LoginData
+    {
+        public string Token { get; set; } = string.Empty;
+    }
+
+    protected class UserData
+    {
+        public int Id { get; set; }
+        public string Email { get; set; } = string.Empty;
+        public string Username { get; set; } = string.Empty;
+        public string Role { get; set; } = string.Empty;
+    }
+
+    protected class CarData
+    {
+        public int Id { get; set; }
+        public string Title { get; set; } = string.Empty;
+        public string Status { get; set; } = string.Empty;
+        public decimal Price { get; set; }
+    }
+
+    protected class PagedData<T>
+    {
+        public List<T> Items { get; set; } = [];
+        public int TotalCount { get; set; }
+        public int Page { get; set; }
+        public int PageSize { get; set; }
+    }
+
+    protected class OrderData
+    {
+        public int Id { get; set; }
+        public string Status { get; set; } = string.Empty;
+        public decimal Price { get; set; }
+        public int SellerId { get; set; }
+    }
+}
+```
+
+
+
+### 9. 编写集成测试
+
+```bash
+touch UUcars.Tests/Integration/CoreFlowIntegrationTests.cs
+```
+
+```c#
+using System.Net;
+
+namespace UUcars.Tests.Integration;
+
+// [Collection] 让这个测试类使用共享的 SqlServerTestFactory
+// 同一个 Collection 里的所有测试类共享同一个数据库容器
+// 避免每个测试类都启动一个新容器（启动容器需要几秒钟，非常耗时）
+[Collection("Integration")]
+public class CoreFlowIntegrationTests : IntegrationTestBase
+{
+    public CoreFlowIntegrationTests(SqlServerTestFactory factory)
+        : base(factory) { }
+
+    // ===== 用户注册和登录 =====
+
+    [Fact]
+    public async Task Register_WithValidData_ShouldReturn201()
+    {
+        var response = await Client.PostAsync("/auth/register", JsonContent(new
+        {
+            username = "testuser",
+            email = "test@example.com",
+            password = "Test@123456"
+        }));
+
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+
+        var result = await DeserializeAsync<ApiResponseWrapper<UserData>>(response);
+        Assert.NotNull(result);
+        Assert.True(result.Success);
+        Assert.Equal("test@example.com", result.Data?.Email);
+        Assert.Equal("User", result.Data?.Role);
+    }
+
+    [Fact]
+    public async Task Register_WithDuplicateEmail_ShouldReturn409()
+    {
+        // 先注册一次
+        await Client.PostAsync("/auth/register", JsonContent(new
+        {
+            username = "user1",
+            email = "duplicate@example.com",
+            password = "Test@123456"
+        }));
+
+        // 用同一个邮箱再注册
+        var response = await Client.PostAsync("/auth/register", JsonContent(new
+        {
+            username = "user2",
+            email = "duplicate@example.com",
+            password = "Test@123456"
+        }));
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Login_WithValidCredentials_ShouldReturnToken()
+    {
+        await Client.PostAsync("/auth/register", JsonContent(new
+        {
+            username = "testuser",
+            email = "test@example.com",
+            password = "Test@123456"
+        }));
+
+        var response = await Client.PostAsync("/auth/login", JsonContent(new
+        {
+            email = "test@example.com",
+            password = "Test@123456"
+        }));
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var result = await DeserializeAsync<ApiResponseWrapper<LoginData>>(response);
+        Assert.NotNull(result?.Data?.Token);
+        Assert.NotEmpty(result!.Data!.Token);
+    }
+
+    // ===== 认证保护 =====
+
+    [Fact]
+    public async Task GetMe_WithoutToken_ShouldReturn401()
+    {
+        // 验证 JWT 中间件确实在保护这个接口
+        var response = await Client.GetAsync("/users/me");
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task GetMe_WithValidToken_ShouldReturnUserInfo()
+    {
+        var token = await RegisterAndLoginAsync();
+        SetBearerToken(token);
+
+        var response = await Client.GetAsync("/users/me");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var result = await DeserializeAsync<ApiResponseWrapper<UserData>>(response);
+        Assert.True(result?.Success);
+        Assert.Equal("test@example.com", result?.Data?.Email);
+    }
+
+    // ===== 核心业务链路 =====
+
+    [Fact]
+    public async Task FullFlow_RegisterLoginCreateCarSubmit_ShouldWork()
+    {
+        // 这个测试验证完整的卖家操作链路：
+        // 注册 → 登录 → 创建草稿 → 查看我的车辆 → 提交审核 → 验证公开列表
+
+        // Step 1：注册并登录
+        var token = await RegisterAndLoginAsync(
+            email: "seller@example.com",
+            username: "seller");
+        SetBearerToken(token);
+
+        // Step 2：创建车辆草稿
+        var createResponse = await Client.PostAsync("/cars", JsonContent(new
+        {
+            title = "2020款宝马3系",
+            brand = "BMW",
+            model = "3 Series",
+            year = 2020,
+            price = 260000,
+            mileage = 15000
+        }));
+
+        Assert.Equal(HttpStatusCode.Created, createResponse.StatusCode);
+        var car = (await DeserializeAsync<ApiResponseWrapper<CarData>>(createResponse))?.Data;
+        Assert.Equal("Draft", car?.Status);
+
+        // Step 3：卖家能在"我的车辆"列表看到草稿
+        var myListResponse = await Client.GetAsync("/cars/my-listings");
+        Assert.Equal(HttpStatusCode.OK, myListResponse.StatusCode);
+        var myList = (await DeserializeAsync<ApiResponseWrapper<PagedData<CarData>>>(myListResponse))?.Data;
+        Assert.Equal(1, myList?.TotalCount);
+
+        // Step 4：提交审核
+        var submitResponse = await Client.PostAsync($"/cars/{car!.Id}/submit", null);
+        Assert.Equal(HttpStatusCode.OK, submitResponse.StatusCode);
+        var submitted = (await DeserializeAsync<ApiResponseWrapper<CarData>>(submitResponse))?.Data;
+        Assert.Equal("PendingReview", submitted?.Status);
+
+        // Step 5：公开列表里不应该出现这辆车（还未 Published）
+        ClearBearerToken();
+        var publicListResponse = await Client.GetAsync("/cars");
+        var publicList = (await DeserializeAsync<ApiResponseWrapper<PagedData<CarData>>>(publicListResponse))?.Data;
+        Assert.Equal(0, publicList?.TotalCount);
+    }
+
+    [Fact]
+    public async Task AdminFlow_ApproveCarAndBuyerOrder_ShouldWork()
+    {
+        // 验证完整的平台业务闭环：
+        // 卖家发车 → Admin 审核通过 → 买家下单 → 车辆变 Sold → 买家取消 → 车辆恢复
+
+        // Step 1：卖家创建并提交车辆
+        var sellerToken = await RegisterAndLoginAsync(
+            email: "seller@example.com",
+            username: "seller");
+        SetBearerToken(sellerToken);
+
+        var createResponse = await Client.PostAsync("/cars", JsonContent(new
+        {
+            title = "2020款宝马3系", brand = "BMW", model = "3 Series",
+            year = 2020, price = 260000, mileage = 15000
+        }));
+        var car = (await DeserializeAsync<ApiResponseWrapper<CarData>>(createResponse))?.Data;
+        await Client.PostAsync($"/cars/{car!.Id}/submit", null);
+
+        // Step 2：Admin 登录并审核通过
+        // Admin 账号在 InitializeDatabaseAsync 里已经插入了
+        var adminLoginResponse = await Client.PostAsync("/auth/login", JsonContent(new
+        {
+            email = "admin@uucars.com",
+            password = "Admin@123456"
+        }));
+        var adminToken = (await DeserializeAsync<ApiResponseWrapper<LoginData>>(adminLoginResponse))?.Data?.Token;
+        SetBearerToken(adminToken!);
+
+        var approveResponse = await Client.PostAsync($"/admin/cars/{car.Id}/approve", null);
+        Assert.Equal(HttpStatusCode.OK, approveResponse.StatusCode);
+
+        // Step 3：验证车辆出现在公开列表
+        ClearBearerToken();
+        var publicListResponse = await Client.GetAsync("/cars");
+        var publicList = (await DeserializeAsync<ApiResponseWrapper<PagedData<CarData>>>(publicListResponse))?.Data;
+        Assert.Equal(1, publicList?.TotalCount);
+        Assert.Equal("Published", publicList?.Items?.First().Status);
+
+        // Step 4：买家注册登录并下单
+        var buyerToken = await RegisterAndLoginAsync(
+            email: "buyer@example.com",
+            username: "buyer");
+        SetBearerToken(buyerToken);
+
+        var orderResponse = await Client.PostAsync("/orders", JsonContent(new
+        {
+            carId = car.Id
+        }));
+        Assert.Equal(HttpStatusCode.Created, orderResponse.StatusCode);
+        var order = (await DeserializeAsync<ApiResponseWrapper<OrderData>>(orderResponse))?.Data;
+        Assert.Equal("Pending", order?.Status);
+        Assert.Equal(260000, order?.Price);     // 价格已锁定
+
+        // Step 5：下单后车辆从公开列表消失（Sold 状态）
+        ClearBearerToken();
+        var publicListAfterOrder = await Client.GetAsync("/cars");
+        var publicListData = (await DeserializeAsync<ApiResponseWrapper<PagedData<CarData>>>(publicListAfterOrder))?.Data;
+        Assert.Equal(0, publicListData?.TotalCount);
+
+        // Step 6：买家取消订单，车辆恢复 Published
+        SetBearerToken(buyerToken);
+        var cancelResponse = await Client.PostAsync($"/orders/{order!.Id}/cancel", null);
+        Assert.Equal(HttpStatusCode.OK, cancelResponse.StatusCode);
+
+        // Step 7：车辆重新出现在公开列表
+        ClearBearerToken();
+        var publicListRestored = await Client.GetAsync("/cars");
+        var restoredData = (await DeserializeAsync<ApiResponseWrapper<PagedData<CarData>>>(publicListRestored))?.Data;
+        Assert.Equal(1, restoredData?.TotalCount);
+    }
+
+    [Fact]
+    public async Task AdminEndpoint_WithNonAdminToken_ShouldReturn403()
+    {
+        // 验证 Admin 接口的权限保护
+        var userToken = await RegisterAndLoginAsync();
+        SetBearerToken(userToken);
+
+        var response = await Client.GetAsync("/admin/cars/pending");
+
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+    }
+}
+```
+
+
+
+### 10. 注册 Collection 定义
+
+xUnit 的 `[Collection]` 需要一个对应的 Collection 定义类，把 `SqlServerTestFactory` 作为共享 Fixture：
+
+```bash
+touch UUcars.Tests/Integration/IntegrationCollection.cs
+```
+
+```c#
+namespace UUcars.Tests.Integration;
+
+// 定义 "Integration" 这个 Collection
+// 所有标注了 [Collection("Integration")] 的测试类共享同一个 SqlServerTestFactory 实例
+// 这意味着：整个集成测试只启动一次 SQL Server 容器，显著减少测试时间
+[CollectionDefinition("Integration")]
+public class IntegrationCollection : ICollectionFixture<SqlServerTestFactory>
+{
+    // 这个类本身不包含任何代码
+    // 它只是一个标记，告诉 xUnit：
+    // "Integration" 这个 Collection 使用 SqlServerTestFactory 作为共享 Fixture
+}
+```
+
+> **为什么要共享 Fixture？** 每次启动 SQL Server 容器需要 3-5 秒。如果每个测试类都创建自己的容器，10 个测试类就要等 30-50 秒。共享一个容器，所有测试类一起用，整个集成测试只需要等一次容器启动。数据隔离靠 `CleanDatabaseAsync` 在每个测试方法之间清理来保证。
+
+
+
+### 11. 确保 Docker 正在运行
+
+集成测试运行时，Testcontainers 会自动拉起一个 SQL Server 容器。前提是 **Docker Desktop 必须正在运行**。
+
+```bash
+# 确认 Docker 正常运行
+docker ps
+```
+
+
+
+### 12. 验证编译和测试
+
+```bash
+dotnet build
+dotnet test
+```
+
+第一次运行时，Testcontainers 会拉取 SQL Server 镜像（如果本地没有），需要等一会儿。之后运行就快了。
+
+预期：
+
+```
+Test summary: total: 27, failed: 0, succeeded: 27, skipped: 0
+```
+
+原来的 20 个单元测试 + 新增的 7 个集成测试，全部通过。
+
+
+
+### 13. 单元测试 vs 集成测试：完整对比
+
+```
+维度            单元测试                    集成测试
+─────────────────────────────────────────────────────────────
+测试对象        一个 Service 方法           整个 HTTP 请求链路
+数据库          Fake Repository/InMemory  真实 SQL Server（容器）
+启动应用        不需要                      完整启动（含中间件、DI）
+速度            毫秒级                      秒级（含容器启动）
+覆盖范围        精准（业务逻辑）            全面（路由到数据库）
+发现的问题      业务规则 Bug                路由错误、DI 配置错误
+                权限边界问题                中间件行为、完整链路
+```
+
+
+
+### 14. 此时的目录变化
+
+```
+UUcars.Tests/
+└── Integration/
+    ├── IntegrationCollection.cs        ← 新增（Collection 定义）
+    ├── SqlServerTestFactory.cs         ← 新增（容器 + 应用配置）
+    ├── IntegrationTestBase.cs          ← 新增（基类 + 辅助方法）
+    └── CoreFlowIntegrationTests.cs     ← 新增（测试用例）
+```
+
+
+
+### 15. Git 提交
+
+```bash
+git add .
+git commit -m "test: integration tests with Testcontainers SQL Server"
+git push origin feature/tests
+```
+
+合并回 `develop`：
+
+```bash
+git checkout develop
+git merge --no-ff feature/tests -m "merge: feature/tests into develop"
+git push origin develop
+git branch -D feature/tests
+git push origin --delete feature/tests
+```
+
+
+
+### Step 34 完成状态
+
+```
+✅ 理解单元测试的局限性（孤立，发现不了组件间连接问题）
+✅ 理解集成测试的目标（验证多个组件一起工作时的正确性）
+✅ 理解 WebApplicationFactory 的工作原理（内存启动完整应用）
+✅ 理解为什么用 Testcontainers 而不是 InMemory / SQLite（真实行为无差异）
+✅ 理解 IAsyncLifetime（容器生命周期管理）
+✅ 理解 Collection Fixture（共享容器减少测试时间）
+✅ SqlServerTestFactory（容器启动、Migration、Seed 数据）
+✅ IntegrationTestBase（辅助方法、Token 管理、测试隔离）
+✅ 7 个集成测试（注册登录、认证保护、完整业务链路、Admin 权限）
+✅ 全部 27 个测试通过
+✅ feature/tests 合并回 develop
+```
+
+
+
+## Step 35 · Docker 部署 
+
+### 这一步做什么
+
+V1 最后一步：把 API 打包成 Docker 镜像，配置 `docker-compose` 让 API 和 SQL Server 一起跑，同时配置 GitHub Actions 实现自动化——push 代码时自动跑测试，打 tag 时自动构建镜像。
+
+
+
+### 1. 为什么要容器化部署
+
+现在项目在本地能跑，但"在我电脑上能跑"不等于"在服务器上能跑"。不同机器上 .NET 版本不同、系统环境不同、依赖不同，容易出现环境不一致的问题。
+
+Docker 解决的核心问题是：**把应用和它所需的所有运行环境打包在一起**。
+
+```
+没有 Docker：
+  开发机：.NET 9 + SQL Server 2022 + 特定配置
+  服务器：.NET 8 + SQL Server 2019 + 不同配置
+  结果：行为不一致，难以排查
+
+有 Docker：
+  开发机：运行 uucars-api 镜像
+  服务器：运行同一个 uucars-api 镜像
+  结果：完全一致，无环境差异
+```
+
+
+
+### 2. Dockerfile 是什么
+
+`Dockerfile` 是一个文本文件，描述"如何构建这个应用的 Docker 镜像"。
+
+.NET 应用的标准做法是**多阶段构建（Multi-stage Build）**：
+
+```
+第一阶段（build）：用 SDK 镜像编译代码，生成发布产物
+第二阶段（final）：用更小的 runtime 镜像，只复制发布产物
+
+好处：
+  SDK 镜像（包含编译工具）很大，约 800MB
+  runtime 镜像（只包含运行时）很小，约 200MB
+  最终镜像只有 runtime + 应用代码，体积小、安全性高
+```
+
+切出 feature/docker分支 :
+
+```bash
+git checkout develop
+git checkout -b feature/docker
+git push -u origin feature/docker
+```
+
+在项目根目录创建 `Dockerfile`：
+
+```bash
+touch Dockerfile
+```
+
+```dockerfile
+# =============================================
+# 第一阶段：构建
+# 使用包含 .NET SDK 的镜像来编译项目
+# AS build：给这个阶段命名为 "build"，后面可以引用
+# =============================================
+FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
+WORKDIR /src
+
+# 先只复制 .csproj 文件，利用 Docker 的层缓存机制
+# 原理：如果 .csproj 没变，这一层会从缓存读取，不重新执行 restore
+# 好处：依赖没变时，构建速度快很多
+COPY UUcars.API/UUcars.API.csproj UUcars.API/
+
+# 恢复 NuGet 依赖
+# restore 只针对 API 项目
+RUN dotnet restore UUcars.API/UUcars.API.csproj
+
+# 复制所有源代码（在 restore 之后，避免源码变化使 restore 缓存失效）
+COPY . .
+
+# 发布 API 项目
+# -c Release：使用 Release 配置（优化过的生产版本）
+# -o /app/publish：发布产物输出到 /app/publish 目录
+# --no-restore：跳过重复的 restore（前面已经做过了）
+RUN dotnet publish UUcars.API/UUcars.API.csproj \
+    -c Release \
+    -o /app/publish \
+    --no-restore
+
+# =============================================
+# 第二阶段：运行
+# 使用更小的 runtime 镜像，只包含运行所需的东西
+# =============================================
+FROM mcr.microsoft.com/dotnet/aspnet:9.0 AS final
+WORKDIR /app
+
+# 创建日志目录（Serilog 写文件时需要）
+RUN mkdir -p /app/logs
+
+# 只从第一阶段复制发布产物，不包含源代码和 SDK
+COPY --from=build /app/publish .
+
+# 声明应用监听 8080 端口（容器内部端口）
+EXPOSE 8080
+
+# 设置环境变量，告诉 ASP.NET Core 监听 8080 而不是默认的 5000/5001
+ENV ASPNETCORE_URLS=http://+:8080
+
+# 容器启动时执行的命令
+ENTRYPOINT ["dotnet", "UUcars.API.dll"]
+```
+
+
+
+### 3. .dockerignore 文件
+
+和 `.gitignore` 类似，`.dockerignore` 告诉 Docker 构建时哪些文件不需要复制进镜像：
+
+```bash
+touch .dockerignore
+```
+
+```dockerfile
+# 构建产物（镜像里会重新编译）
+**/bin
+**/obj
+
+# IDE 文件
+.idea/
+.vs/
+
+# Git
+.git/
+.gitignore
+
+# 测试项目（生产镜像不需要测试代码）
+UUcars.Tests/
+
+# 敏感配置
+appsettings.Production.json
+**/secrets.json
+
+# 日志
+logs/
+*.log
+
+# Docker 文件本身
+Dockerfile
+docker-compose*.yml
+```
+
+
+
+### 4. docker-compose.yml
+
+`docker-compose` 用来同时管理多个容器。UUcars 需要两个容器一起跑：API 容器 + SQL Server 容器。
+
+在项目根目录创建：
+
+```bash
+touch docker-compose.yml
+```
+
+```yaml
+services:
+  # SQL Server 数据库容器
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "${DB_PASSWORD}"   # 从 .env 文件读取，不硬编码
+      MSSQL_PID: Developer
+    ports:
+      - "1433:1433"
+    volumes:
+      # 数据持久化：容器重启后数据不丢失
+      - sqlserver_data:/var/opt/mssql
+    healthcheck:
+      # 等待 SQL Server 真正就绪再启动 API
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P ${DB_PASSWORD} -Q 'SELECT 1' -C"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # API 容器
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      # 连接字符串：指向 sqlserver 容器（docker-compose 网络里用服务名访问）
+      ConnectionStrings__DefaultConnection: "Server=sqlserver,1433;Database=UUcarsDB;User Id=sa;Password=${DB_PASSWORD};TrustServerCertificate=True"
+      # JWT 配置
+      JwtSettings__Secret: "${JWT_SECRET}"
+      JwtSettings__Issuer: "UUcars"
+      JwtSettings__Audience: "UUcarsUsers"
+      JwtSettings__ExpiresInMinutes: "60"
+      # 使用 Production 环境
+      ASPNETCORE_ENVIRONMENT: Production
+    depends_on:
+      sqlserver:
+        condition: service_healthy    # 等 SQL Server 健康检查通过再启动
+    restart: unless-stopped          # 除非手动停止，否则崩溃后自动重启
+
+# 数据卷：持久化数据库文件
+volumes:
+  sqlserver_data:
+```
+
+> **`Server=sqlserver,1433` 而不是 `localhost`：** 在 docker-compose 网络里，每个服务可以通过**服务名**互相访问。API 容器访问数据库时用 `sqlserver`（服务名），不用 `localhost`——`localhost` 在容器里指的是容器自己，不是 SQL Server 容器。
+
+> **`ConnectionStrings__DefaultConnection` 双下划线：** ASP.NET Core 的配置系统支持用双下划线 `__` 来表示嵌套的配置键。`ConnectionStrings__DefaultConnection` 等价于 `appsettings.json` 里的 `ConnectionStrings.DefaultConnection`，是容器环境变量注入配置的标准方式。
+
+
+
+### 5. 环境变量文件
+
+docker-compose 从 `.env` 文件读取敏感配置：
+
+```bash
+touch .env.example   # 模板文件（进 Git）
+```
+
+```bash
+# .env.example
+# 复制这个文件为 .env，填入真实的值
+# .env 文件不进 Git（已在 .gitignore 里排除）
+
+DB_PASSWORD=YourStrongPassw0rd
+JWT_SECRET=your-jwt-secret-key-at-least-32-characters
+```
+
+在 `.gitignore` 里确认 `.env` 已经被排除（之前配置过 `secrets.json` 类似的规则，这里补上）：
+
+```bash
+# 在 .gitignore 里添加
+echo ".env" >> .gitignore
+```
+
+本地创建真实的 `.env` 文件：
+
+```bash
+cp .env.example .env
+# 然后编辑 .env，填入真实的密码和 Secret
+```
+
+
+
+### 6. 处理生产环境的 Migration
+
+生产环境里，数据库 Migration 不应该在应用启动时自动执行（`MigrateAsync` 在 `Program.cs`），而是作为一个独立的部署步骤。但对于 V1 学习项目，最简单的方式是在 API 启动时自动执行。
+
+打开 `UUcars.API/Program.cs`，在 `app.Run()` 之前添加：
+
+```csharp
+// 自动执行 Migration（V1 学习项目用法）
+// 生产环境建议改为独立的部署脚本，不在应用启动时执行
+using (var scope = app.Services.CreateScope())
+{
+    var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+    await db.Database.MigrateAsync();
+}
+```
+
+
+
+### 7. 验证 Docker 构建
+
+```bash
+# 构建镜像（第一次需要拉取基础镜像，会慢一点）
+docker build -t uucars-api .
+
+# 确认镜像构建成功
+docker images | grep uucars-api
+```
+
+
+
+### 8. 本地用 docker-compose 运行
+
+```bash
+# 启动所有服务（API + SQL Server）
+docker compose up -d
+
+# 查看日志，确认 API 启动成功
+docker compose logs -f api
+```
+
+看到类似这样的输出说明成功：
+
+```
+api  | info: Microsoft.Hosting.Lifetime[14]
+api  |       Now listening on: http://[::]:8080
+```
+
+注意：打开浏览器访问：
+
+```
+http://localhost:8080/scalar/v1
+```
+
+**不能看到 Scalar 文档页面：**
+
+回看 `Program.cs` 里的配置：
+
+csharp
+
+```csharp
+if (app.Environment.IsDevelopment())
+{
+    app.MapOpenApi();
+    app.MapScalarApiReference(...);
+}
+```
+
+Scalar 文档只在 **Development** 环境下挂载。而 `docker-compose.yml` 里设置的是：
+
+yaml
+
+```yaml
+ASPNETCORE_ENVIRONMENT: Production
+```
+
+生产环境不暴露 API 文档，这是有意为之的安全设计——不让外部知道你有哪些接口。
+
+测试一下注册接口，确认 API 能正常操作数据库：
+
+```bash
+curl -X POST http://localhost:8080/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"username":"testuser","email":"test@example.com","password":"Test@123456"}'
+```
+
+停止服务：
+
+```bash
+docker compose down
+```
+
+
+
+### 9. GitHub Actions CI/CD
+
+现在配置自动化流水线。目标：
+
+```
+push 到任意分支 → 自动跑单元测试
+push 到 main   → 自动构建 Docker 镜像并推送到 GitHub Container Registry
+```
+
+配置GitHub Personal Access Token： 需要 write:packages 权限
+
+生成 GitHub Personal Access Token
+
+- 登录 GitHub，点击右上角头像 → **Settings**
+
+- 左侧菜单拉到最底部 → **Developer settings**
+
+- **Personal access tokens** → **Tokens (classic)**
+
+- 点击 **Generate new token** → **Generate new token (classic)**
+
+- 填写：
+
+    - Note：`UUcars Registry Token`
+    - Expiration：选 90 days 或 No expiration
+    - 勾选权限：`write:packages`（会自动带上 `read:packages`）
+    - 
+- 点 **Generate token**
+- **立刻复制这个 Token**（页面关闭后就看不到了）
+
+把 Token 存入仓库的 Secrets
+
+- 打开 UUcars GitHub 仓库页面
+- 点击 **Settings**（仓库级别的，不是账号级别的）
+- 左侧菜单 → **Secrets and variables** → **Actions**
+- 点击 **New repository secret**
+- 填写：
+    - Name：`REGISTRY_TOKEN`
+    - Secret：粘贴刚才复制的 Token
+- 点击 **Add secret**
+
+完成后 Secrets 列表里会看到 `REGISTRY_TOKEN`，但值是隐藏的，无法再查看，只能删除重建。
+
+>创建好之后，`ci.yml` 里的：
+>
+>```yaml
+>password: ${{ secrets.REGISTRY_TOKEN }}
+>```
+>
+>就能正确读取到这个 Token 了。GitHub Actions 运行时会自动注入，不会在日志里暴露。
+
+创建 GitHub Actions 配置文件：
+
+```bash
+mkdir -p .github/workflows
+touch .github/workflows/ci.yml
+```
+
+```yaml
+name: CI/CD
+
+on:
+  push:
+    branches: ["**"]      # 所有分支 push 都触发
+  pull_request:
+    branches: [main, develop]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/uucars-api
+
+jobs:
+  # =============================================
+  # Job 1：运行单元测试
+  # 所有分支 push 都执行
+  # =============================================
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 9
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "9.0.x"
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --no-restore
+
+      - name: Run unit tests
+        # 只跑单元测试（排除集成测试）
+        # 集成测试需要 Docker，CI 环境可以支持但配置较复杂
+        # V1 阶段只在 CI 里跑单元测试，集成测试在本地跑
+        run: dotnet test --no-build --filter "FullyQualifiedName!~Integration"
+
+  # =============================================
+  # Job 2：构建并推送 Docker 镜像
+  # 只在 push 到 main 时执行
+  # =============================================
+  build-and-push:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: test           # 必须 test job 通过才执行
+    if: github.ref == 'refs/heads/main'   # 只在 main 分支触发
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.REGISTRY_TOKEN }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # push 到 main 时打 latest 标签
+            type=raw,value=latest,enable={{is_default_branch}}
+            # 如果是 tag push（v1.0 这种），同时打版本标签
+            type=semver,pattern={{version}}
+            # 永远带上 commit SHA，方便回溯
+            type=sha,prefix=sha-
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          # 构建缓存：利用 GitHub Actions 缓存加速构建
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+```
+
+> **GitHub Container Registry（ghcr.io）是什么？** GitHub 提供的容器镜像仓库，免费，和 GitHub 仓库无缝集成。构建好的镜像推送到这里，任何有权限的机器都可以拉取并运行，不需要额外配置 Docker Hub 账号。
+
+> **为什么 CI 里只跑单元测试，不跑集成测试？** 集成测试需要 Docker（Testcontainers 会自动启动容器），GitHub Actions 的 `ubuntu-latest` runner 已经安装了 Docker，技术上可以跑集成测试。但 Testcontainers 拉取 SQL Server 镜像需要时间，会让 CI 变慢。V1 阶段的权衡是：单元测试在 CI 里跑（快），集成测试在本地跑（慢但完整）。如果要在 CI 里跑集成测试，可以在 `ci.yml` 里加一个独立的 job，用 `services` 启动 SQL Server，这是 V2 可以扩展的内容。
+
+
+
+### 10. 推送并验证 CI
+
+```bash
+git add .
+git commit -m "feat: Dockerfile + docker-compose + GitHub Actions CI/CD"
+git push origin feature/docker
+```
+
+推送后，打开 GitHub 仓库的 Actions 页面，应该能看到 CI 流水线在运行：
+
+```
+✅ Unit Tests     → 所有单元测试通过
+⏭ Build & Push   → 因为不是 main 分支，跳过
+```
+
+
+
+### 11. 发布 v1.0
+
+所有功能完成，合并分支，打最终里程碑标签：
+
+```bash
+# 合并 feature/docker 回 develop
+git checkout develop
+git merge --no-ff feature/docker -m "merge: feature/docker into develop"
+git push origin develop
+git branch -D feature/docker
+git push origin --delete feature/docker
+
+# 合并 develop 到 main，发布 v1.0
+git checkout main
+git merge --no-ff develop -m "release: v1.0 MVP complete"
+git tag -a v1.0 -m "UUcars V1 MVP - full API + auth + tests + Docker + CI/CD"
+git push origin main
+git push origin v1.0
+
+git checkout develop
+```
+
+push 到 main 后，GitHub Actions 会自动触发 `build-and-push` job：
+
+```
+✅ Unit Tests     → 通过
+✅ Build & Push   → 构建 Docker 镜像，推送到 ghcr.io
+                    标签：latest、v1.0、sha-xxxxxxx
+```
+
+打开 GitHub 仓库的 Packages 页面，可以看到推送成功的镜像。
+
+
+
+### 12. 此时的目录变化
+
+```
+UUcars/
+├── .dockerignore               ← 新增
+├── .env.example                ← 新增（模板，进 Git）
+├── .env                        ← 新增（真实值，不进 Git）
+├── Dockerfile                  ← 新增
+├── docker-compose.yml          ← 新增
+└── .github/
+    └── workflows/
+        └── ci.yml              ← 新增
+```
+
+
+
+### Step 35 完成状态
+
+```
+✅ 理解 Docker 容器化的价值（环境一致性）
+✅ 理解多阶段构建（build 阶段用 SDK，final 阶段用 runtime，体积小）
+✅ Dockerfile 创建（多阶段构建，利用层缓存）
+✅ .dockerignore 配置（排除不需要的文件）
+✅ docker-compose.yml（API + SQL Server，健康检查，数据持久化）
+✅ 理解服务名访问和双下划线环境变量注入
+✅ .env.example 模板（敏感配置不进 Git）
+✅ Program.cs 添加自动 Migration
+✅ 本地 docker compose up 验证成功
+✅ GitHub Actions CI/CD 配置（测试 + 构建推送镜像）
+✅ 理解 ghcr.io 和 CI 里只跑单元测试的权衡
+✅ v1.0 tag 打完，镜像推送到 GitHub Container Registry
+```
+
+
+
+### V1 完成
+
+至此，UUcars Marketplace V1 MVP 全部完成。
+
+回顾一下整个项目覆盖的技术栈和能力：
+
+```
+API 设计        REST 规范、分层架构（Controller/Service/Repository）
+认证授权        JWT、Claims、[Authorize]、角色权限
+数据库          EF Core、Code-First、Migration、Fluent API、事务
+业务模块        用户、车辆、收藏、订单、Admin
+测试            单元测试（xUnit + Fake）、集成测试（Testcontainers）
+工程实践        统一响应格式、全局异常处理、Serilog 日志
+部署            Docker 多阶段构建、docker-compose、GitHub Actions CI/CD
+版本控制        Git 多分支策略（main/develop/feature）
+```
