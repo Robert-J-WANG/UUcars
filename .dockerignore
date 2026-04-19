@@ -1,0 +1,26 @@
+# 构建产物（镜像里会重新编译）
+**/bin
+**/obj
+
+# IDE 文件
+.idea/
+.vs/
+
+# Git
+.git/
+.gitignore
+
+# 测试项目（生产镜像不需要测试代码）
+UUcars.Tests/
+
+# 敏感配置
+appsettings.Production.json
+**/secrets.json
+
+# 日志
+logs/
+*.log
+
+# Docker 文件本身
+Dockerfile
+docker-compose*.yml

@@ -1,0 +1,45 @@
+services:
+  # SQL Server 数据库容器
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "${DB_PASSWORD}"   # 从 .env 文件读取，不硬编码
+      MSSQL_PID: Developer
+    ports:
+      - "1433:1433"
+    volumes:
+      # 数据持久化：容器重启后数据不丢失
+      - sqlserver_data:/var/opt/mssql
+    healthcheck:
+      # 等待 SQL Server 真正就绪再启动 API
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P ${DB_PASSWORD} -Q 'SELECT 1' -C"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # API 容器
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      # 连接字符串：指向 sqlserver 容器（docker-compose 网络里用服务名访问）
+      ConnectionStrings__DefaultConnection: "Server=sqlserver,1433;Database=UUcarsDB;User Id=sa;Password=${DB_PASSWORD};TrustServerCertificate=True"
+      # JWT 配置
+      JwtSettings__Secret: "${JWT_SECRET}"
+      JwtSettings__Issuer: "UUcars"
+      JwtSettings__Audience: "UUcarsUsers"
+      JwtSettings__ExpiresInMinutes: "60"
+      # 使用 Production 环境
+      ASPNETCORE_ENVIRONMENT: Production
+    depends_on:
+      sqlserver:
+        condition: service_healthy    # 等 SQL Server 健康检查通过再启动
+    restart: unless-stopped          # 除非手动停止，否则崩溃后自动重启
+
+# 数据卷：持久化数据库文件
+volumes:
+  sqlserver_data:
