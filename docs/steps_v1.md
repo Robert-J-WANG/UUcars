@@ -13513,3 +13513,601 @@ git push origin --delete feature/tests
 ✅ feature/tests 合并回 develop
 ```
 
+
+
+## Step 35 · Docker 部署 
+
+### 这一步做什么
+
+V1 最后一步：把 API 打包成 Docker 镜像，配置 `docker-compose` 让 API 和 SQL Server 一起跑，同时配置 GitHub Actions 实现自动化——push 代码时自动跑测试，打 tag 时自动构建镜像。
+
+
+
+### 1. 为什么要容器化部署
+
+现在项目在本地能跑，但"在我电脑上能跑"不等于"在服务器上能跑"。不同机器上 .NET 版本不同、系统环境不同、依赖不同，容易出现环境不一致的问题。
+
+Docker 解决的核心问题是：**把应用和它所需的所有运行环境打包在一起**。
+
+```
+没有 Docker：
+  开发机：.NET 9 + SQL Server 2022 + 特定配置
+  服务器：.NET 8 + SQL Server 2019 + 不同配置
+  结果：行为不一致，难以排查
+
+有 Docker：
+  开发机：运行 uucars-api 镜像
+  服务器：运行同一个 uucars-api 镜像
+  结果：完全一致，无环境差异
+```
+
+
+
+### 2. Dockerfile 是什么
+
+`Dockerfile` 是一个文本文件，描述"如何构建这个应用的 Docker 镜像"。
+
+.NET 应用的标准做法是**多阶段构建（Multi-stage Build）**：
+
+```
+第一阶段（build）：用 SDK 镜像编译代码，生成发布产物
+第二阶段（final）：用更小的 runtime 镜像，只复制发布产物
+
+好处：
+  SDK 镜像（包含编译工具）很大，约 800MB
+  runtime 镜像（只包含运行时）很小，约 200MB
+  最终镜像只有 runtime + 应用代码，体积小、安全性高
+```
+
+切出 feature/docker分支 :
+
+```bash
+git checkout develop
+git checkout -b feature/docker
+git push -u origin feature/docker
+```
+
+在项目根目录创建 `Dockerfile`：
+
+```bash
+touch Dockerfile
+```
+
+```dockerfile
+# =============================================
+# 第一阶段：构建
+# 使用包含 .NET SDK 的镜像来编译项目
+# AS build：给这个阶段命名为 "build"，后面可以引用
+# =============================================
+FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
+WORKDIR /src
+
+# 先只复制 .csproj 文件，利用 Docker 的层缓存机制
+# 原理：如果 .csproj 没变，这一层会从缓存读取，不重新执行 restore
+# 好处：依赖没变时，构建速度快很多
+COPY UUcars.API/UUcars.API.csproj UUcars.API/
+
+# 恢复 NuGet 依赖
+# restore 只针对 API 项目
+RUN dotnet restore UUcars.API/UUcars.API.csproj
+
+# 复制所有源代码（在 restore 之后，避免源码变化使 restore 缓存失效）
+COPY . .
+
+# 发布 API 项目
+# -c Release：使用 Release 配置（优化过的生产版本）
+# -o /app/publish：发布产物输出到 /app/publish 目录
+# --no-restore：跳过重复的 restore（前面已经做过了）
+RUN dotnet publish UUcars.API/UUcars.API.csproj \
+    -c Release \
+    -o /app/publish \
+    --no-restore
+
+# =============================================
+# 第二阶段：运行
+# 使用更小的 runtime 镜像，只包含运行所需的东西
+# =============================================
+FROM mcr.microsoft.com/dotnet/aspnet:9.0 AS final
+WORKDIR /app
+
+# 创建日志目录（Serilog 写文件时需要）
+RUN mkdir -p /app/logs
+
+# 只从第一阶段复制发布产物，不包含源代码和 SDK
+COPY --from=build /app/publish .
+
+# 声明应用监听 8080 端口（容器内部端口）
+EXPOSE 8080
+
+# 设置环境变量，告诉 ASP.NET Core 监听 8080 而不是默认的 5000/5001
+ENV ASPNETCORE_URLS=http://+:8080
+
+# 容器启动时执行的命令
+ENTRYPOINT ["dotnet", "UUcars.API.dll"]
+```
+
+
+
+### 3. .dockerignore 文件
+
+和 `.gitignore` 类似，`.dockerignore` 告诉 Docker 构建时哪些文件不需要复制进镜像：
+
+```bash
+touch .dockerignore
+```
+
+```dockerfile
+# 构建产物（镜像里会重新编译）
+**/bin
+**/obj
+
+# IDE 文件
+.idea/
+.vs/
+
+# Git
+.git/
+.gitignore
+
+# 测试项目（生产镜像不需要测试代码）
+UUcars.Tests/
+
+# 敏感配置
+appsettings.Production.json
+**/secrets.json
+
+# 日志
+logs/
+*.log
+
+# Docker 文件本身
+Dockerfile
+docker-compose*.yml
+```
+
+
+
+### 4. docker-compose.yml
+
+`docker-compose` 用来同时管理多个容器。UUcars 需要两个容器一起跑：API 容器 + SQL Server 容器。
+
+在项目根目录创建：
+
+```bash
+touch docker-compose.yml
+```
+
+```yaml
+services:
+  # SQL Server 数据库容器
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "${DB_PASSWORD}"   # 从 .env 文件读取，不硬编码
+      MSSQL_PID: Developer
+    ports:
+      - "1433:1433"
+    volumes:
+      # 数据持久化：容器重启后数据不丢失
+      - sqlserver_data:/var/opt/mssql
+    healthcheck:
+      # 等待 SQL Server 真正就绪再启动 API
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P ${DB_PASSWORD} -Q 'SELECT 1' -C"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # API 容器
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      # 连接字符串：指向 sqlserver 容器（docker-compose 网络里用服务名访问）
+      ConnectionStrings__DefaultConnection: "Server=sqlserver,1433;Database=UUcarsDB;User Id=sa;Password=${DB_PASSWORD};TrustServerCertificate=True"
+      # JWT 配置
+      JwtSettings__Secret: "${JWT_SECRET}"
+      JwtSettings__Issuer: "UUcars"
+      JwtSettings__Audience: "UUcarsUsers"
+      JwtSettings__ExpiresInMinutes: "60"
+      # 使用 Production 环境
+      ASPNETCORE_ENVIRONMENT: Production
+    depends_on:
+      sqlserver:
+        condition: service_healthy    # 等 SQL Server 健康检查通过再启动
+    restart: unless-stopped          # 除非手动停止，否则崩溃后自动重启
+
+# 数据卷：持久化数据库文件
+volumes:
+  sqlserver_data:
+```
+
+> **`Server=sqlserver,1433` 而不是 `localhost`：** 在 docker-compose 网络里，每个服务可以通过**服务名**互相访问。API 容器访问数据库时用 `sqlserver`（服务名），不用 `localhost`——`localhost` 在容器里指的是容器自己，不是 SQL Server 容器。
+
+> **`ConnectionStrings__DefaultConnection` 双下划线：** ASP.NET Core 的配置系统支持用双下划线 `__` 来表示嵌套的配置键。`ConnectionStrings__DefaultConnection` 等价于 `appsettings.json` 里的 `ConnectionStrings.DefaultConnection`，是容器环境变量注入配置的标准方式。
+
+
+
+### 5. 环境变量文件
+
+docker-compose 从 `.env` 文件读取敏感配置：
+
+```bash
+touch .env.example   # 模板文件（进 Git）
+```
+
+```bash
+# .env.example
+# 复制这个文件为 .env，填入真实的值
+# .env 文件不进 Git（已在 .gitignore 里排除）
+
+DB_PASSWORD=YourStrongPassw0rd
+JWT_SECRET=your-jwt-secret-key-at-least-32-characters
+```
+
+在 `.gitignore` 里确认 `.env` 已经被排除（之前配置过 `secrets.json` 类似的规则，这里补上）：
+
+```bash
+# 在 .gitignore 里添加
+echo ".env" >> .gitignore
+```
+
+本地创建真实的 `.env` 文件：
+
+```bash
+cp .env.example .env
+# 然后编辑 .env，填入真实的密码和 Secret
+```
+
+
+
+### 6. 处理生产环境的 Migration
+
+生产环境里，数据库 Migration 不应该在应用启动时自动执行（`MigrateAsync` 在 `Program.cs`），而是作为一个独立的部署步骤。但对于 V1 学习项目，最简单的方式是在 API 启动时自动执行。
+
+打开 `UUcars.API/Program.cs`，在 `app.Run()` 之前添加：
+
+```csharp
+// 自动执行 Migration（V1 学习项目用法）
+// 生产环境建议改为独立的部署脚本，不在应用启动时执行
+using (var scope = app.Services.CreateScope())
+{
+    var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+    await db.Database.MigrateAsync();
+}
+```
+
+
+
+### 7. 验证 Docker 构建
+
+```bash
+# 构建镜像（第一次需要拉取基础镜像，会慢一点）
+docker build -t uucars-api .
+
+# 确认镜像构建成功
+docker images | grep uucars-api
+```
+
+
+
+### 8. 本地用 docker-compose 运行
+
+```bash
+# 启动所有服务（API + SQL Server）
+docker compose up -d
+
+# 查看日志，确认 API 启动成功
+docker compose logs -f api
+```
+
+看到类似这样的输出说明成功：
+
+```
+api  | info: Microsoft.Hosting.Lifetime[14]
+api  |       Now listening on: http://[::]:8080
+```
+
+注意：打开浏览器访问：
+
+```
+http://localhost:8080/scalar/v1
+```
+
+**不能看到 Scalar 文档页面：**
+
+回看 `Program.cs` 里的配置：
+
+csharp
+
+```csharp
+if (app.Environment.IsDevelopment())
+{
+    app.MapOpenApi();
+    app.MapScalarApiReference(...);
+}
+```
+
+Scalar 文档只在 **Development** 环境下挂载。而 `docker-compose.yml` 里设置的是：
+
+yaml
+
+```yaml
+ASPNETCORE_ENVIRONMENT: Production
+```
+
+生产环境不暴露 API 文档，这是有意为之的安全设计——不让外部知道你有哪些接口。
+
+测试一下注册接口，确认 API 能正常操作数据库：
+
+```bash
+curl -X POST http://localhost:8080/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"username":"testuser","email":"test@example.com","password":"Test@123456"}'
+```
+
+停止服务：
+
+```bash
+docker compose down
+```
+
+
+
+### 9. GitHub Actions CI/CD
+
+现在配置自动化流水线。目标：
+
+```
+push 到任意分支 → 自动跑单元测试
+push 到 main   → 自动构建 Docker 镜像并推送到 GitHub Container Registry
+```
+
+配置GitHub Personal Access Token： 需要 write:packages 权限
+
+生成 GitHub Personal Access Token
+
+- 登录 GitHub，点击右上角头像 → **Settings**
+
+- 左侧菜单拉到最底部 → **Developer settings**
+
+- **Personal access tokens** → **Tokens (classic)**
+
+- 点击 **Generate new token** → **Generate new token (classic)**
+
+- 填写：
+
+    - Note：`UUcars Registry Token`
+    - Expiration：选 90 days 或 No expiration
+    - 勾选权限：`write:packages`（会自动带上 `read:packages`）
+    - 
+- 点 **Generate token**
+- **立刻复制这个 Token**（页面关闭后就看不到了）
+
+把 Token 存入仓库的 Secrets
+
+- 打开 UUcars GitHub 仓库页面
+- 点击 **Settings**（仓库级别的，不是账号级别的）
+- 左侧菜单 → **Secrets and variables** → **Actions**
+- 点击 **New repository secret**
+- 填写：
+    - Name：`REGISTRY_TOKEN`
+    - Secret：粘贴刚才复制的 Token
+- 点击 **Add secret**
+
+完成后 Secrets 列表里会看到 `REGISTRY_TOKEN`，但值是隐藏的，无法再查看，只能删除重建。
+
+>创建好之后，`ci.yml` 里的：
+>
+>```yaml
+>password: ${{ secrets.REGISTRY_TOKEN }}
+>```
+>
+>就能正确读取到这个 Token 了。GitHub Actions 运行时会自动注入，不会在日志里暴露。
+
+创建 GitHub Actions 配置文件：
+
+```bash
+mkdir -p .github/workflows
+touch .github/workflows/ci.yml
+```
+
+```yaml
+name: CI/CD
+
+on:
+  push:
+    branches: ["**"]      # 所有分支 push 都触发
+  pull_request:
+    branches: [main, develop]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/uucars-api
+
+jobs:
+  # =============================================
+  # Job 1：运行单元测试
+  # 所有分支 push 都执行
+  # =============================================
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 9
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "9.0.x"
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --no-restore
+
+      - name: Run unit tests
+        # 只跑单元测试（排除集成测试）
+        # 集成测试需要 Docker，CI 环境可以支持但配置较复杂
+        # V1 阶段只在 CI 里跑单元测试，集成测试在本地跑
+        run: dotnet test --no-build --filter "FullyQualifiedName!~Integration"
+
+  # =============================================
+  # Job 2：构建并推送 Docker 镜像
+  # 只在 push 到 main 时执行
+  # =============================================
+  build-and-push:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: test           # 必须 test job 通过才执行
+    if: github.ref == 'refs/heads/main'   # 只在 main 分支触发
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.REGISTRY_TOKEN }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # push 到 main 时打 latest 标签
+            type=raw,value=latest,enable={{is_default_branch}}
+            # 如果是 tag push（v1.0 这种），同时打版本标签
+            type=semver,pattern={{version}}
+            # 永远带上 commit SHA，方便回溯
+            type=sha,prefix=sha-
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          # 构建缓存：利用 GitHub Actions 缓存加速构建
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+```
+
+> **GitHub Container Registry（ghcr.io）是什么？** GitHub 提供的容器镜像仓库，免费，和 GitHub 仓库无缝集成。构建好的镜像推送到这里，任何有权限的机器都可以拉取并运行，不需要额外配置 Docker Hub 账号。
+
+> **为什么 CI 里只跑单元测试，不跑集成测试？** 集成测试需要 Docker（Testcontainers 会自动启动容器），GitHub Actions 的 `ubuntu-latest` runner 已经安装了 Docker，技术上可以跑集成测试。但 Testcontainers 拉取 SQL Server 镜像需要时间，会让 CI 变慢。V1 阶段的权衡是：单元测试在 CI 里跑（快），集成测试在本地跑（慢但完整）。如果要在 CI 里跑集成测试，可以在 `ci.yml` 里加一个独立的 job，用 `services` 启动 SQL Server，这是 V2 可以扩展的内容。
+
+
+
+### 10. 推送并验证 CI
+
+```bash
+git add .
+git commit -m "feat: Dockerfile + docker-compose + GitHub Actions CI/CD"
+git push origin feature/docker
+```
+
+推送后，打开 GitHub 仓库的 Actions 页面，应该能看到 CI 流水线在运行：
+
+```
+✅ Unit Tests     → 所有单元测试通过
+⏭ Build & Push   → 因为不是 main 分支，跳过
+```
+
+
+
+### 11. 发布 v1.0
+
+所有功能完成，合并分支，打最终里程碑标签：
+
+```bash
+# 合并 feature/docker 回 develop
+git checkout develop
+git merge --no-ff feature/docker -m "merge: feature/docker into develop"
+git push origin develop
+git branch -D feature/docker
+git push origin --delete feature/docker
+
+# 合并 develop 到 main，发布 v1.0
+git checkout main
+git merge --no-ff develop -m "release: v1.0 MVP complete"
+git tag -a v1.0 -m "UUcars V1 MVP - full API + auth + tests + Docker + CI/CD"
+git push origin main
+git push origin v1.0
+
+git checkout develop
+```
+
+push 到 main 后，GitHub Actions 会自动触发 `build-and-push` job：
+
+```
+✅ Unit Tests     → 通过
+✅ Build & Push   → 构建 Docker 镜像，推送到 ghcr.io
+                    标签：latest、v1.0、sha-xxxxxxx
+```
+
+打开 GitHub 仓库的 Packages 页面，可以看到推送成功的镜像。
+
+
+
+### 12. 此时的目录变化
+
+```
+UUcars/
+├── .dockerignore               ← 新增
+├── .env.example                ← 新增（模板，进 Git）
+├── .env                        ← 新增（真实值，不进 Git）
+├── Dockerfile                  ← 新增
+├── docker-compose.yml          ← 新增
+└── .github/
+    └── workflows/
+        └── ci.yml              ← 新增
+```
+
+
+
+### Step 35 完成状态
+
+```
+✅ 理解 Docker 容器化的价值（环境一致性）
+✅ 理解多阶段构建（build 阶段用 SDK，final 阶段用 runtime，体积小）
+✅ Dockerfile 创建（多阶段构建，利用层缓存）
+✅ .dockerignore 配置（排除不需要的文件）
+✅ docker-compose.yml（API + SQL Server，健康检查，数据持久化）
+✅ 理解服务名访问和双下划线环境变量注入
+✅ .env.example 模板（敏感配置不进 Git）
+✅ Program.cs 添加自动 Migration
+✅ 本地 docker compose up 验证成功
+✅ GitHub Actions CI/CD 配置（测试 + 构建推送镜像）
+✅ 理解 ghcr.io 和 CI 里只跑单元测试的权衡
+✅ v1.0 tag 打完，镜像推送到 GitHub Container Registry
+```
+
+
+
+### V1 完成
+
+至此，UUcars Marketplace V1 MVP 全部完成。
+
+回顾一下整个项目覆盖的技术栈和能力：
+
+```
+API 设计        REST 规范、分层架构（Controller/Service/Repository）
+认证授权        JWT、Claims、[Authorize]、角色权限
+数据库          EF Core、Code-First、Migration、Fluent API、事务
+业务模块        用户、车辆、收藏、订单、Admin
+测试            单元测试（xUnit + Fake）、集成测试（Testcontainers）
+工程实践        统一响应格式、全局异常处理、Serilog 日志
+部署            Docker 多阶段构建、docker-compose、GitHub Actions CI/CD
+版本控制        Git 多分支策略（main/develop/feature）
+```

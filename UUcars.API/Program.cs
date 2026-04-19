@@ -126,6 +126,14 @@ try
 
     app.MapControllers();
 
+    // 自动执行 Migration（V1 学习项目用法）
+// 生产环境建议改为独立的部署脚本，不在应用启动时执行
+    using (var scope = app.Services.CreateScope())
+    {
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        await db.Database.MigrateAsync();
+    }
+
     app.Run();
 }
 catch (Exception ex)
