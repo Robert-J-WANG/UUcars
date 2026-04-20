@@ -65,6 +65,9 @@ try
     // JWT 认证（细节在 Extensions/AuthExtensions.cs）
     builder.Services.AddJwtAuthentication(builder.Configuration);
 
+    // CORS 配置
+    builder.Services.AddUUcarsCors(builder.Configuration);
+
     // 用户模块
     // AddScoped：每次 HTTP 请求创建一个新实例，请求结束后销毁
     // Repository 和 Service 都用 Scoped，因为它们依赖 DbContext（也是 Scoped）
@@ -117,6 +120,12 @@ try
                 .WithTheme(ScalarTheme.Moon)
         );
     }
+
+    // CORS 必须在 Authentication 和 Authorization 之前
+    // 原因：Preflight 请求（OPTIONS）不携带 Token，
+    // 如果 CORS 在 Auth 之后，Preflight 会因为没有 Token 被拦截，
+    // 导致浏览器认为服务器不支持跨域
+    app.UseCors(CorsExtensions.PolicyName);
 
     // UseAuthentication 必须在 UseAuthorization 之前
     // 原因：Authorization 需要读取 Authentication 的结果（HttpContext.User）
