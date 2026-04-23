@@ -9,6 +9,7 @@ using UUcars.API.Extensions;
 using UUcars.API.Middleware;
 using UUcars.API.Repositories;
 using UUcars.API.Services;
+using UUcars.API.Services.Email;
 
 // =============================================
 // Bootstrap Logger
@@ -68,6 +69,10 @@ try
     // CORS 配置
     builder.Services.AddUUcarsCors(builder.Configuration);
 
+    // 配置邮件服务
+    builder.Services.AddEmailService(builder.Configuration);
+
+
     // 用户模块
     // AddScoped：每次 HTTP 请求创建一个新实例，请求结束后销毁
     // Repository 和 Service 都用 Scoped，因为它们依赖 DbContext（也是 Scoped）
@@ -75,6 +80,8 @@ try
     builder.Services.AddScoped<IUserRepository, EfUserRepository>();
     builder.Services.AddScoped<JwtTokenGenerator>();
     builder.Services.AddScoped<UserService>();
+    // 邮件服务
+    builder.Services.AddScoped<IEmailService, ResendEmailService>();
 
     // AddHttpContextAccessor：IHttpContextAccessor 默认不自动注册，需要显式加上
     // 它内部用 AsyncLocal<T> 保证线程安全，每个请求有自己独立的 HttpContext

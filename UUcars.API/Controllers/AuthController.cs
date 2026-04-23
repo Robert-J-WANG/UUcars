@@ -1,9 +1,11 @@
+using System.Security.Claims;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using UUcars.API.DTOs;
 using UUcars.API.DTOs.Requests;
 using UUcars.API.DTOs.Responses;
 using UUcars.API.Services;
+using UUcars.API.Services.Email;
 
 namespace UUcars.API.Controllers;
 
@@ -41,7 +43,7 @@ public class AuthController : ControllerBase
         // 登录成功返回 200 OK（不是 201，登录不是"创建资源"）
         return Ok(ApiResponse<LoginResponse>.Ok(result, "Login successful."));
     }
-    
+
     // 临时测试接口：验证 JWT 认证配置是否生效
     // 测试完成后会删掉，Step 12 会建正式的 GET /users/me
     [HttpGet("test-auth")]
@@ -49,7 +51,7 @@ public class AuthController : ControllerBase
     // [Authorize(Roles = "User")]
     public IActionResult TestAuth()
     {
-        var userId = User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value
+        var userId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value
                      ?? User.FindFirst("sub")?.Value;
         // User 是 ControllerBase 提供的属性，类型是 ClaimsPrincipal
         // 认证中间件在验证 Token 后，会把 Token Payload 里的所有 Claims
@@ -64,9 +66,23 @@ public class AuthController : ControllerBase
         //   有些版本直接保留 "sub" 这个简短名字
         // 两个都找，确保能取到值
 
-        var email = User.FindFirst(System.Security.Claims.ClaimTypes.Email)?.Value;
-        var role = User.FindFirst(System.Security.Claims.ClaimTypes.Role)?.Value;
+        var email = User.FindFirst(ClaimTypes.Email)?.Value;
+        var role = User.FindFirst(ClaimTypes.Role)?.Value;
 
         return Ok(ApiResponse<object>.Ok(new { userId, email, role }, "Token is valid."));
+    }
+
+    // 临时测试接口，验证邮件服务配置是否正常
+// 测试完成后立刻删除
+    [HttpPost("test-email")]
+    public async Task<IActionResult> TestEmail(
+        [FromQuery] string to,
+        [FromServices] IEmailService emailService,
+        CancellationToken cancellationToken)
+    {
+        var fakeData = new { name = "John", email = "jion@gmail.com" };
+        await emailService.SendPasswordResetAsync(
+            to, "test-token-12345", cancellationToken);
+        return Ok(ApiResponse<object>.Ok(fakeData, $"Test email sent to {to}"));
     }
 }
