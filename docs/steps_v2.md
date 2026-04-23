@@ -861,3 +861,1120 @@ git push origin feature/v2-backend
 ✅ dotnet build 通过
 ✅ Git commit 完成
 ```
+
+
+
+你说得对，我没有做到。重新生成完整的 Step 38。
+
+
+
+## Step 38 · 邮箱验证注册
+
+### 这一步做什么
+
+V1 的注册接口创建用户时 `EmailConfirmed = false`，但从来不检查这个字段——未验证的用户照样能登录、发车、下单，`EmailConfirmed` 只是一个摆设。
+
+这一步让它真正工作。
+
+
+
+### 1. 完整的注册流程
+
+
+
+完整的注册流程分两个阶段：
+
+- 创建账号
+- 激活账号（邮箱验证）
+
+```
+阶段一：创建账号（立刻完成）
+
+  用户提交邮箱+密码
+        ↓
+  服务端创建账号，EmailConfirmed = false
+        ↓
+  服务端发一封验证邮件到用户邮箱
+        ↓
+  注册接口返回成功
+
+阶段二：验证邮箱（用户主动完成激活）
+
+  用户去邮箱点击验证链接
+        ↓
+  EmailConfirmed = true
+        ↓
+  账号激活，可以登录
+```
+
+v1版的注册接口只做了阶段一——创建账号、发邮件。
+
+**它不知道这个邮箱是否真实存在**，也不知道用户有没有收到邮件。任何人都可以用 `abc@假域名.com` 这种不存在的邮箱注册，账号创建会成功，但邮件永远送不出去。
+
+所以**登录时必须检查 `EmailConfirmed`**，这一步是在问：
+
+```
+这个用户注册之后，有没有真正点击过验证链接，去激活账号？
+证明他确实拥有这个邮箱？
+```
+
+没有验证过的账号，邮箱可能是假的或者是别人的，不应该允许登录。
+
+> **登录时没有任何邮件发送，也没有链接跳转。** 登录流程只是多了一个检查：密码正确之后，再看 `EmailConfirmed` 是否为 `true`。是则颁发 JWT Token，否则返回 403 提示"请先验证邮箱"。
+
+
+
+### 2. 验证邮件里的 Token 是什么
+
+引入一个新概念：**一次性随机验证 Token**。
+
+目前我们涉及到的三种不同的 Token ，虽然它们名字相似但用途完全不同：
+
+```jade
+邮箱验证 Token（这一步新增）
+
+  是什么：一个随机字符串，比如 aB3kR9mXpQ2...
+  存在哪：数据库 Users 表的 EmailConfirmationToken 字段（临时）
+  用途：  证明"点击链接的人，确实能收到这个邮箱的邮件"
+  生命周期：用完立刻清除，只能用一次，24小时过期
+
+JWT Token（V1 已有）
+
+  是什么：登录成功后颁发的身份凭证，格式是三段 Base64， 用 . 连接
+  存在哪：不存数据库，保存在客户端（浏览器）
+  用途：  证明"发这个请求的人是已登录的某某用户"
+  生命周期：60分钟，过期自动失效
+
+Resend API Key（Step 37 配置的）
+
+  是什么：Resend 平台分配给你账号的凭证，比如 re_abc123...
+  存在哪：User Secrets / 环境变量
+  用途：  你的应用调用 Resend 发邮件时证明身份用
+  生命周期：长期有效，在 Resend 控制台手动撤销
+```
+
+三者没有任何关联，只是都叫"Token"或"Key"。
+
+**为什么验证 Token 必须是随机的？**
+
+这个 Token 会被放进邮件链接里对外暴露：
+
+```
+http://localhost:5173/verify-email?token=aB3kR9mXpQ2...
+```
+
+如果 Token 是可预测的（比如用用户 ID、注册时间拼接），攻击者可以猜出其他人的验证链接，替别人完成验证，绕过邮箱所有权的确认。
+
+常见的做法是: 用 `RandomNumberGenerator.GetBytes(32)` 生成 32 字节（256位）的随机数，转成 Base64 字符串。
+
+
+
+### 3. 数据库 Migration
+
+我们新增一些字段，用了保存邮件验证的行为操作：
+
+- EmailConfirmationToken
+- EmailConfirmationTokenExpiry
+
+因此，要执行数据库的迁移操作，来更新数据结构。
+
+#### 切分支确认
+
+```bash
+git checkout feature/v2-backend
+```
+
+#### 更新 User 实体
+
+打开 `UUcars.API/Entities/User.cs`，添加两个字段：
+
+```csharp
+using UUcars.API.Entities.Enums;
+
+namespace UUcars.API.Entities;
+
+public class User : BaseEntity
+{
+    public string Username { get; set; } = string.Empty;
+    public string Email { get; set; } = string.Empty;
+    public string PasswordHash { get; set; } = string.Empty;
+    public UserRole Role { get; set; } = UserRole.User;
+    public bool EmailConfirmed { get; set; } = false;
+
+    // V2 新增：邮箱验证
+    // 用户未发起验证时这两个字段为 NULL
+    // 发送验证邮件时写入，验证成功后立刻清除
+    public string? EmailConfirmationToken { get; set; }
+    public DateTime? EmailConfirmationTokenExpiry { get; set; }
+
+    // 导航属性
+    public ICollection<Car> Cars { get; set; } = [];
+    public ICollection<Order> BuyerOrders { get; set; } = [];
+    public ICollection<Order> SellerOrders { get; set; } = [];
+    public ICollection<Favorite> Favorites { get; set; } = [];
+}
+```
+
+#### 更新 UserConfiguration
+
+打开 `UUcars.API/Configurations/UserConfiguration.cs`，在 `EmailConfirmed` 配置下方补上新字段：
+
+```csharp
+builder.Property(u => u.EmailConfirmed)
+    .IsRequired()
+    .HasDefaultValue(false);
+
+// V2 新增：允许为 NULL（用户未发起验证时没有 Token）
+builder.Property(u => u.EmailConfirmationToken)
+    .HasMaxLength(200);
+
+builder.Property(u => u.EmailConfirmationTokenExpiry);
+```
+
+#### 生成并执行 Migration
+
+```bash
+dotnet ef migrations add AddEmailVerificationFields \
+    --project UUcars.API/UUcars.API.csproj
+
+dotnet ef database update \
+    --project UUcars.API/UUcars.API.csproj
+```
+
+> **增量 Migration 和初始 Migration 的区别：** V1 的 `InitialCreate` 是从零建所有表。这次的 `AddEmailVerificationFields` 只生成针对变化的 SQL——`ALTER TABLE Users ADD EmailConfirmationToken nvarchar(200) NULL` 这样的增量语句。EF Core 通过对比当前实体定义和 `AppDbContextModelSnapshot.cs` 里记录的上一次状态，自动计算出差异。已有数据不受影响。
+
+
+
+### 4. Token 生成工具
+
+定义一个工具类，用于生成加密安全的随机 Token，因为在注册邮件验证时需要token, 密码重置邮件验证时也需要。
+
+```bash
+touch UUcars.API/Auth/TokenGenerator.cs
+```
+
+```c#
+using System.Security.Cryptography;
+
+namespace UUcars.API.Auth;
+
+public static class TokenGenerator
+{
+    // 生成加密安全的随机 Token
+    
+    public static string Generate()
+    {
+        var bytes = RandomNumberGenerator.GetBytes(32);
+        return Convert.ToBase64String(bytes);
+    }
+}
+```
+
+>说明：
+>
+>- RandomNumberGenerator 是 .NET 内置的加密安全随机数生成器
+>- 32 字节 = 256 位随机性，碰撞概率可以忽略不计
+>- ToBase64String 把字节数组转成可打印字符串，适合放进 URL
+
+**注意：Base64 可能含有 +、/、= 字符，放进 URL 时需要 Uri.EscapeDataString 转义**
+
+
+
+### 5. 扩展 IUserRepository
+
+验证邮箱需要按 Token 查找用户，Repository 需要新增这个方法。
+
+打开 `UUcars.API/Repositories/IUserRepository.cs`：
+
+```csharp
+using UUcars.API.Entities;
+
+namespace UUcars.API.Repositories;
+
+public interface IUserRepository
+{
+    Task<User?> GetByEmailAsync(string email,
+        CancellationToken cancellationToken = default);
+    Task<User?> GetByIdAsync(int id,
+        CancellationToken cancellationToken = default);
+    Task<User> AddAsync(User user,
+        CancellationToken cancellationToken = default);
+    Task<User> UpdateAsync(User user,
+        CancellationToken cancellationToken = default);
+
+    // V2 新增：按邮箱验证 Token 查找用户
+    // 用户点击验证链接时，前端把 Token 传回来，服务端用它找到对应的用户
+    Task<User?> GetByEmailConfirmationTokenAsync(string token,
+        CancellationToken cancellationToken = default);
+}
+```
+
+打开 `UUcars.API/Repositories/EfUserRepository.cs`，补充实现：
+
+```csharp
+public async Task<User?> GetByEmailConfirmationTokenAsync(string token,
+    CancellationToken cancellationToken = default)
+{
+    return await _context.Users
+        .FirstOrDefaultAsync(
+            u => u.EmailConfirmationToken == token, cancellationToken);
+}
+```
+
+
+
+### 6. 创建业务异常
+
+- 用户点了两次验证链接
+- Token 无效或已过期
+- 邮箱未验证时尝试登录
+
+```bash
+touch UUcars.API/Exceptions/EmailAlreadyConfirmedException.cs
+touch UUcars.API/Exceptions/InvalidTokenException.cs
+touch UUcars.API/Exceptions/EmailNotConfirmedException.cs
+```
+
+```c#
+namespace UUcars.API.Exceptions;
+
+// 多次点击验证链接
+public class EmailAlreadyConfirmedException : AppException
+{
+    public EmailAlreadyConfirmedException()
+        : base(StatusCodes.Status409Conflict,
+            "Email is already confirmed.")
+    {
+    }
+}
+namespace UUcars.API.Exceptions;
+
+// Token 无效或已过期（邮箱验证和密码重置共用）
+// 不区分"Token不存在"和"Token过期"两种情况
+// 原因：区分会让攻击者知道Token是否存在，带来信息泄露风险
+public class InvalidTokenException : AppException
+{
+    public InvalidTokenException()
+        : base(StatusCodes.Status400BadRequest,
+            "The token is invalid or has expired.")
+    {
+    }
+}
+namespace UUcars.API.Exceptions;
+
+// 邮箱未验证时尝试登录
+// 为什么用 403 而不是 401？
+// 401（Unauthorized）：没有提供任何身份凭证，服务器不知道你是谁
+// 403（Forbidden）：  身份已确认（密码正确），但这个账号当前不允许访问
+// 未验证邮箱属于后者：密码是对的，只是账号还没完成激活
+// 前端收到 403 就知道要显示"请验证邮箱"的提示，而不是"密码错误"
+public class EmailNotConfirmedException : AppException
+{
+    public EmailNotConfirmedException()
+        : base(StatusCodes.Status403Forbidden,
+            "Please verify your email address before logging in.")
+    {
+    }
+}
+```
+
+
+
+### 7. 更新 UserService
+
+打开 `UUcars.API/Services/UserService.cs`，构造函数新增 `IEmailService` 依赖，更新四个方法：
+
+```csharp
+...
+
+namespace UUcars.API.Services;
+
+public class UserService
+{
+    private readonly IUserRepository _userRepository;
+    private readonly IPasswordHasher<User> _passwordHasher;
+    private readonly JwtTokenGenerator _jwtTokenGenerator;
+    private readonly IEmailService _emailService;
+    private readonly ILogger<UserService> _logger;
+
+    public UserService(
+        IUserRepository userRepository,
+        IPasswordHasher<User> passwordHasher,
+        JwtTokenGenerator jwtTokenGenerator,
+        IEmailService emailService,
+        ILogger<UserService> logger)
+    {
+        _userRepository = userRepository;
+        _passwordHasher = passwordHasher;
+        _jwtTokenGenerator = jwtTokenGenerator;
+        _emailService = emailService;
+        _logger = logger;
+    }
+
+    // =============================================
+    // 注册（V2 更新：注册后发验证邮件）
+    // =============================================
+    public async Task<UserResponse> RegisterAsync(
+        RegisterRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        var existing = await _userRepository.GetByEmailAsync(
+            request.Email, cancellationToken);
+        if (existing != null)
+            throw new UserAlreadyExistsException(request.Email);
+
+        var confirmationToken = TokenGenerator.Generate();
+
+        var user = new User
+        {
+            Username = request.Username,
+            Email = request.Email.ToLower(),
+            Role = UserRole.User,
+            EmailConfirmed = false,
+            EmailConfirmationToken = confirmationToken,
+            EmailConfirmationTokenExpiry = DateTime.UtcNow.AddHours(24),
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        user.PasswordHash = _passwordHasher.HashPassword(user, request.Password);
+
+        var created = await _userRepository.AddAsync(user, cancellationToken);
+
+        // 先保存用户，再发邮件
+        // 顺序很重要：确保用户已写入数据库，邮件里的验证链接才有意义
+        // 如果反过来——邮件发出去了但数据库写入失败，
+        // 用户点链接时服务端找不到这个 Token，验证永远失败
+        // 如果邮件发送失败，用户可以通过"重新发送"功能补救
+        await _emailService.SendEmailVerificationAsync(
+            created.Email, confirmationToken, cancellationToken);
+
+        _logger.LogInformation(
+            "New user registered: {Email}, verification email sent", created.Email);
+
+        return MapToResponse(created);
+    }
+
+    // =============================================
+    // 登录（V2 更新：检查邮箱是否已验证）
+    // =============================================
+    public async Task<LoginResponse> LoginAsync(
+        LoginRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        var user = await _userRepository.GetByEmailAsync(
+            request.Email, cancellationToken);
+
+        if (user == null)
+            throw new InvalidCredentialsException();
+
+        var result = _passwordHasher.VerifyHashedPassword(
+            user, user.PasswordHash, request.Password);
+
+        if (result == PasswordVerificationResult.Failed)
+            throw new InvalidCredentialsException();
+
+        // V2 新增：邮箱未验证不允许登录
+        // 密码正确但邮箱未验证 → 403，提示用户去验证邮箱
+        // 前端收到 403 后可以显示"请先验证邮箱，或重新发送验证邮件"的提示
+        if (!user.EmailConfirmed)
+            throw new EmailNotConfirmedException();
+
+        var token = _jwtTokenGenerator.GenerateToken(user);
+
+        _logger.LogInformation("User logged in: {Email}", user.Email);
+
+        return new LoginResponse
+        {
+            Token = token,
+            ExpiresAt = DateTime.UtcNow.AddMinutes(60),
+            User = MapToResponse(user)
+        };
+    }
+
+    // =============================================
+    // 验证邮箱（V2 新增）
+    // =============================================
+    public async Task VerifyEmailAsync(
+        string token,
+        CancellationToken cancellationToken = default)
+    {
+        // 用 Token 找到对应的用户
+        // 找不到说明 Token 不存在（从未发过或已被清除）
+        var user = await _userRepository
+            .GetByEmailConfirmationTokenAsync(token, cancellationToken);
+
+        if (user == null)
+            throw new InvalidTokenException();
+
+        if (user.EmailConfirmationTokenExpiry < DateTime.UtcNow)
+            throw new InvalidTokenException();
+
+        // 已经验证过（用户点了两次验证链接）
+        if (user.EmailConfirmed)
+            throw new EmailAlreadyConfirmedException();
+
+        // 验证通过：标记已验证，清除 Token（一次性使用，用完即删）
+        user.EmailConfirmed = true;
+        user.EmailConfirmationToken = null;
+        user.EmailConfirmationTokenExpiry = null;
+        user.UpdatedAt = DateTime.UtcNow;
+
+        await _userRepository.UpdateAsync(user, cancellationToken);
+
+        _logger.LogInformation("Email verified for user: {Email}", user.Email);
+    }
+
+    // =============================================
+    // 重新发送验证邮件（V2 新增）
+    // =============================================
+    public async Task ResendVerificationAsync(
+        string email,
+        CancellationToken cancellationToken = default)
+    {
+        var user = await _userRepository.GetByEmailAsync(
+            email, cancellationToken);
+
+        // 安全设计：用户不存在时静默返回，不透露邮箱是否注册
+        // 和 Step 39 忘记密码接口保持一致的安全原则：
+        // 不能让攻击者通过这个接口枚举系统里注册过哪些邮箱
+        if (user == null)
+        {
+            _logger.LogWarning(
+                "Resend verification requested for non-existent email: {Email}",
+                email);
+            return;
+        }
+
+        if (user.EmailConfirmed)
+            throw new EmailAlreadyConfirmedException();
+
+        // 生成新 Token，旧 Token 同时作废
+        // 每次重发都刷新 Token 和有效期，避免旧链接仍然有效
+        var newToken = TokenGenerator.Generate();
+        user.EmailConfirmationToken = newToken;
+        user.EmailConfirmationTokenExpiry = DateTime.UtcNow.AddHours(24);
+        user.UpdatedAt = DateTime.UtcNow;
+
+        await _userRepository.UpdateAsync(user, cancellationToken);
+
+        await _emailService.SendEmailVerificationAsync(
+            user.Email, newToken, cancellationToken);
+
+        _logger.LogInformation("Verification email resent to: {Email}", email);
+    }
+
+    // =============================================
+    // 其他方法不变，保留 V1 实现
+    // =============================================
+   
+    ...
+
+    private static UserResponse MapToResponse(User user) => new()
+    {
+        Id = user.Id,
+        Username = user.Username,
+        Email = user.Email,
+        Role = user.Role.ToString(),
+        CreatedAt = user.CreatedAt
+    };
+}
+```
+
+
+
+### 8. 创建请求 DTO
+
+```bash
+touch UUcars.API/DTOs/Requests/VerifyEmailRequest.cs
+touch UUcars.API/DTOs/Requests/ResendVerificationRequest.cs
+```
+
+
+
+```c#
+using System.ComponentModel.DataAnnotations;
+
+namespace UUcars.API.DTOs.Requests;
+
+public class VerifyEmailRequest
+{
+    [Required(ErrorMessage = "Token is required.")]
+    public string Token { get; set; } = string.Empty;
+}
+using System.ComponentModel.DataAnnotations;
+
+namespace UUcars.API.DTOs.Requests;
+
+public class ResendVerificationRequest
+{
+    [Required(ErrorMessage = "Email is required.")]
+    [EmailAddress(ErrorMessage = "Invalid email format.")]
+    public string Email { get; set; } = string.Empty;
+}
+```
+
+
+
+### 9. 更新 AuthController
+
+打开 `UUcars.API/Controllers/AuthController.cs`，更新注册提示文字，添加两个新端点：
+
+```csharp
+[HttpPost("register")]
+public async Task<IActionResult> Register(
+    [FromBody] RegisterRequest request,
+    CancellationToken cancellationToken)
+{
+    var user = await _userService.RegisterAsync(request, cancellationToken);
+    return StatusCode(StatusCodes.Status201Created,
+        ApiResponse<UserResponse>.Ok(user,
+            "Registration successful. Please check your email to verify your account."));
+}
+
+[HttpPost("login")]
+public async Task<IActionResult> Login(
+    [FromBody] LoginRequest request,
+    CancellationToken cancellationToken)
+{
+    var result = await _userService.LoginAsync(request, cancellationToken);
+    return Ok(ApiResponse<LoginResponse>.Ok(result, "Login successful."));
+}
+
+// GET /auth/verify-email?token=xxx
+// 为什么用 GET 而不是 POST？
+// 验证链接直接放在邮件里，用户点击就是一个 GET 请求
+// 浏览器打开链接 → 前端页面从 URL 读取 token → 调用这个接口
+// 如果用 POST，用户点邮件链接后需要前端页面额外触发一次 POST 请求，
+// 但 GET 更简单：前端页面加载时直接把 URL 里的 token 传给这个接口即可
+[HttpGet("verify-email")]
+public async Task<IActionResult> VerifyEmail(
+    [FromQuery] VerifyEmailRequest request,
+    CancellationToken cancellationToken)
+{
+    await _userService.VerifyEmailAsync(request.Token, cancellationToken);
+    return Ok(ApiResponse<object>.Ok(null,
+        "Email verified successfully. You can now log in."));
+}
+
+[HttpPost("resend-verification")]
+public async Task<IActionResult> ResendVerification(
+    [FromBody] ResendVerificationRequest request,
+    CancellationToken cancellationToken)
+{
+    await _userService.ResendVerificationAsync(request.Email, cancellationToken);
+
+    // 无论用户是否存在，始终返回相同的成功响应
+    // 不让外部通过响应差异判断邮箱是否注册
+    return Ok(ApiResponse<object>.Ok(null,
+        "If this email is registered and unverified, " +
+        "a new verification email has been sent."));
+}
+```
+
+
+
+### 10. 更新单元测试
+
+`UserService` 构造函数新增了 `IEmailService` 依赖，现有测试的 `CreateService` 方法需要更新，否则编译报错。同时补充新业务逻辑的测试。
+
+#### 10.1 创建 FakeEmailService
+
+```
+touch UUcars.Tests/Fakes/FakeEmailService.cs
+```
+
+```c#
+using UUcars.API.Services.Email;
+
+namespace UUcars.Tests.Fakes;
+
+// 测试用的假邮件服务，不发真实邮件
+// 记录发送记录，供测试里断言"邮件是否发送、发给了谁、Token是什么"
+public class FakeEmailService : IEmailService
+{
+    public List<(string Email, string Token)> SentVerificationEmails { get; } = [];
+    public List<(string Email, string Token)> SentPasswordResetEmails { get; } = [];
+
+    public Task SendEmailVerificationAsync(string email, string token,
+        CancellationToken cancellationToken = default)
+    {
+        SentVerificationEmails.Add((email, token));
+        return Task.CompletedTask;
+    }
+
+    public Task SendPasswordResetAsync(string email, string token,
+        CancellationToken cancellationToken = default)
+    {
+        SentPasswordResetEmails.Add((email, token));
+        return Task.CompletedTask;
+    }
+}
+```
+
+#### 10.2 更新 FakeUserRepository
+
+补上 `GetByEmailConfirmationTokenAsync` 方法：
+
+```csharp
+public Task<User?> GetByEmailConfirmationTokenAsync(string token,
+    CancellationToken cancellationToken = default)
+{
+    var user = _store.Values.FirstOrDefault(
+        u => u.EmailConfirmationToken == token);
+    return Task.FromResult(user);
+}
+```
+
+#### 10.3 更新 UserServiceTests
+
+打开 `UUcars.Tests/Services/UserServiceTests.cs`，完整更新如下：
+
+```csharp
+...
+
+namespace UUcars.Tests.Services;
+
+public class UserServiceTests
+{
+    // 返回 (service, fakeEmailService) 元组
+    // fakeEmailService 供测试里断言邮件是否发送、发给谁、Token 是什么
+    private static (UserService Service, FakeEmailService EmailService)
+        CreateService(FakeUserRepository repo)
+    {
+        var jwtSettings = Options.Create(new JwtSettings
+        {
+            Secret = "test-secret-key-at-least-32-characters!",
+            ExpiresInMinutes = 60,
+            Issuer = "TestIssuer",
+            Audience = "TestAudience"
+        });
+
+        var fakeEmailService = new FakeEmailService();
+
+        var service = new UserService(
+            repo,
+            new PasswordHasher<User>(),
+            new JwtTokenGenerator(jwtSettings),
+            fakeEmailService,
+            NullLogger<UserService>.Instance
+        );
+
+        return (service, fakeEmailService);
+    }
+
+    // ===== 注册测试（更新）=====
+
+    [Fact]
+    public async Task RegisterAsync_WithNewEmail_ShouldReturnUserResponseAndSendEmail()
+    {
+        var repo = new FakeUserRepository();
+        var (service, emailService) = CreateService(repo);
+
+        var result = await service.RegisterAsync(new RegisterRequest
+        {
+            Username = "testuser",
+            Email = "test@example.com",
+            Password = "Test@123456"
+        });
+
+        Assert.NotNull(result);
+        Assert.Equal("test@example.com", result.Email);
+        Assert.Equal("User", result.Role);
+
+        // V2 新增：验证邮件已发送
+        Assert.Single(emailService.SentVerificationEmails);
+        Assert.Equal("test@example.com",
+            emailService.SentVerificationEmails[0].Email);
+    }
+
+    [Fact]
+    public async Task RegisterAsync_WithExistingEmail_ShouldThrowUserAlreadyExistsException()
+    {
+        var repo = new FakeUserRepository();
+        repo.Seed(new User
+        {
+            Id = 1,
+            Email = "existing@example.com",
+            Username = "existing",
+            PasswordHash = "somehash",
+            Role = UserRole.User
+        });
+
+        var (service, _) = CreateService(repo);
+
+        await Assert.ThrowsAsync<UserAlreadyExistsException>(
+            () => service.RegisterAsync(new RegisterRequest
+            {
+                Username = "newuser",
+                Email = "existing@example.com",
+                Password = "Test@123456"
+            }));
+    }
+
+    [Fact]
+    public async Task RegisterAsync_ShouldNotStorePasswordAsPlainText()
+    {
+        var repo = new FakeUserRepository();
+        var (service, _) = CreateService(repo);
+
+        await service.RegisterAsync(new RegisterRequest
+        {
+            Username = "testuser",
+            Email = "test@example.com",
+            Password = "Test@123456"
+        });
+
+        var stored = await repo.GetByEmailAsync("test@example.com");
+        Assert.NotNull(stored);
+        Assert.NotEqual("Test@123456", stored.PasswordHash);
+        Assert.True(stored.PasswordHash.Length > 20);
+    }
+
+    // ===== 登录测试（更新）=====
+
+    [Fact]
+    public async Task LoginAsync_WithUnverifiedEmail_ShouldThrowEmailNotConfirmedException()
+    {
+        var repo = new FakeUserRepository();
+        var (service, _) = CreateService(repo);
+
+        // 注册但不验证邮箱
+        await service.RegisterAsync(new RegisterRequest
+        {
+            Username = "testuser",
+            Email = "test@example.com",
+            Password = "Test@123456"
+        });
+
+        // 直接尝试登录，应该被拒绝（密码正确但邮箱未验证）
+        await Assert.ThrowsAsync<EmailNotConfirmedException>(
+            () => service.LoginAsync(new LoginRequest
+            {
+                Email = "test@example.com",
+                Password = "Test@123456"
+            }));
+    }
+
+    [Fact]
+    public async Task LoginAsync_WithVerifiedEmail_ShouldReturnLoginResponse()
+    {
+        var repo = new FakeUserRepository();
+        var (service, emailService) = CreateService(repo);
+
+        await service.RegisterAsync(new RegisterRequest
+        {
+            Username = "testuser",
+            Email = "test@example.com",
+            Password = "Test@123456"
+        });
+
+        // 用注册时发出的 Token 完成邮箱验证
+        var token = emailService.SentVerificationEmails[0].Token;
+        await service.VerifyEmailAsync(token);
+
+        // 验证后登录应该成功
+        var result = await service.LoginAsync(new LoginRequest
+        {
+            Email = "test@example.com",
+            Password = "Test@123456"
+        });
+
+        Assert.NotNull(result);
+        Assert.NotEmpty(result.Token);
+    }
+
+    [Fact]
+    public async Task LoginAsync_WithWrongPassword_ShouldThrowInvalidCredentialsException()
+    {
+        var repo = new FakeUserRepository();
+        var (service, _) = CreateService(repo);
+
+        await service.RegisterAsync(new RegisterRequest
+        {
+            Username = "testuser",
+            Email = "test@example.com",
+            Password = "Test@123456"
+        });
+
+        await Assert.ThrowsAsync<InvalidCredentialsException>(
+            () => service.LoginAsync(new LoginRequest
+            {
+                Email = "test@example.com",
+                Password = "WrongPassword"
+            }));
+    }
+
+    [Fact]
+    public async Task LoginAsync_WithNonExistentEmail_ShouldThrowInvalidCredentialsException()
+    {
+        var repo = new FakeUserRepository();
+        var (service, _) = CreateService(repo);
+
+        await Assert.ThrowsAsync<InvalidCredentialsException>(
+            () => service.LoginAsync(new LoginRequest
+            {
+                Email = "notexist@example.com",
+                Password = "Test@123456"
+            }));
+    }
+
+    // ===== 邮箱验证测试（V2 新增）=====
+
+    [Fact]
+    public async Task VerifyEmailAsync_WithValidToken_ShouldConfirmEmail()
+    {
+        var repo = new FakeUserRepository();
+        var (service, emailService) = CreateService(repo);
+
+        await service.RegisterAsync(new RegisterRequest
+        {
+            Username = "testuser",
+            Email = "test@example.com",
+            Password = "Test@123456"
+        });
+
+        // 从 FakeEmailService 里取出注册时发出的 Token
+        var token = emailService.SentVerificationEmails[0].Token;
+
+        await service.VerifyEmailAsync(token);
+
+        var user = await repo.GetByEmailAsync("test@example.com");
+        Assert.True(user!.EmailConfirmed);
+        Assert.Null(user.EmailConfirmationToken);       // Token 已清除
+        Assert.Null(user.EmailConfirmationTokenExpiry);
+    }
+
+    [Fact]
+    public async Task VerifyEmailAsync_WithInvalidToken_ShouldThrowInvalidTokenException()
+    {
+        var repo = new FakeUserRepository();
+        var (service, _) = CreateService(repo);
+
+        await Assert.ThrowsAsync<InvalidTokenException>(
+            () => service.VerifyEmailAsync("completely-wrong-token"));
+    }
+
+    [Fact]
+    public async Task VerifyEmailAsync_WithExpiredToken_ShouldThrowInvalidTokenException()
+    {
+        var repo = new FakeUserRepository();
+
+        repo.Seed(new User
+        {
+            Id = 1,
+            Email = "test@example.com",
+            Username = "testuser",
+            PasswordHash = "hash",
+            Role = UserRole.User,
+            EmailConfirmed = false,
+            EmailConfirmationToken = "expired-token",
+            EmailConfirmationTokenExpiry = DateTime.UtcNow.AddHours(-1)
+        });
+
+        var (service, _) = CreateService(repo);
+
+        await Assert.ThrowsAsync<InvalidTokenException>(
+            () => service.VerifyEmailAsync("expired-token"));
+    }
+
+    [Fact]
+    public async Task ResendVerificationAsync_WithUnverifiedEmail_ShouldSendNewEmail()
+    {
+        var repo = new FakeUserRepository();
+        var (service, emailService) = CreateService(repo);
+
+        await service.RegisterAsync(new RegisterRequest
+        {
+            Username = "testuser",
+            Email = "test@example.com",
+            Password = "Test@123456"
+        });
+
+        Assert.Single(emailService.SentVerificationEmails);
+
+        await service.ResendVerificationAsync("test@example.com");
+
+        // 重发后共有两封验证邮件
+        Assert.Equal(2, emailService.SentVerificationEmails.Count);
+    }
+
+    [Fact]
+    public async Task ResendVerificationAsync_WithNonExistentEmail_ShouldNotThrowOrSendEmail()
+    {
+        var repo = new FakeUserRepository();
+        var (service, emailService) = CreateService(repo);
+
+        // 不存在的邮箱：静默返回，不发邮件，不抛异常
+        await service.ResendVerificationAsync("nobody@example.com");
+
+        Assert.Empty(emailService.SentVerificationEmails);
+    }
+}
+```
+
+#### 10.4 运行测试
+
+```bash
+dotnet test
+```
+
+预期：
+
+```
+Test summary: total: 27, failed: 0, succeeded: 27, skipped: 0
+```
+
+
+
+### 11. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 12. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**完整注册验证流程：**
+
+第一步，注册：
+
+```json
+POST /auth/register
+{
+  "username": "testuser",
+  "email": "你的真实邮箱",
+  "password": "Test@123456"
+}
+```
+
+预期（201）：收到成功响应，同时邮箱里收到验证邮件。
+
+第二步，未验证前尝试登录（应返回 403）：
+
+```json
+POST /auth/login
+{
+  "email": "你的真实邮箱",
+  "password": "Test@123456"
+}
+```
+
+预期（403）：
+
+```json
+{
+  "success": false,
+  "message": "Please verify your email address before logging in."
+}
+```
+
+第三步，点击邮件里的验证链接，或手动调用验证接口：
+
+```
+GET /auth/verify-email?token=邮件链接里的token参数
+```
+
+预期（200）：验证成功。
+
+第四步，验证后再次登录（应返回 200）：登录成功，拿到 JWT Token。
+
+**重发验证邮件（验证安全设计）：**
+
+用不存在的邮箱请求重发，应返回 200 且不发邮件（不透露邮箱是否注册）：
+
+```json
+POST /auth/resend-verification
+{
+  "email": "nobody@example.com"
+}
+```
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 13. 此时的目录变化
+
+```
+UUcars.API/
+├── Auth/
+│   └── TokenGenerator.cs                       ← 新增
+├── DTOs/Requests/
+│   ├── ResendVerificationRequest.cs            ← 新增
+│   └── VerifyEmailRequest.cs                   ← 新增
+├── Entities/
+│   └── User.cs                                 ← 已更新（新增两个字段）
+├── Exceptions/
+│   ├── EmailAlreadyConfirmedException.cs       ← 新增
+│   ├── EmailNotConfirmedException.cs           ← 新增
+│   └── InvalidTokenException.cs               ← 新增
+├── Migrations/
+│   └── [timestamp]_AddEmailVerificationFields  ← 新增
+├── Repositories/
+│   ├── IUserRepository.cs                      ← 已更新
+│   └── EfUserRepository.cs                     ← 已更新
+└── Services/
+    └── UserService.cs                          ← 已更新
+
+UUcars.Tests/
+├── Fakes/
+│   ├── FakeEmailService.cs                     ← 新增
+│   └── FakeUserRepository.cs                   ← 已更新
+└── Services/
+    └── UserServiceTests.cs                     ← 已更新
+```
+
+
+
+### 14. Git 提交
+
+```bash
+git add .
+git commit -m "feat: email verification flow (register + verify + resend)"
+git push origin feature/v2-backend
+```
+
+
+
+### Step 38 完成状态
+
+```
+✅ 理解注册成功 ≠ 邮箱验证成功（两个独立阶段）
+✅ 理解三种 Token 的区别（验证Token / JWT Token / API Key）
+✅ 理解为什么验证 Token 必须随机（防止猜测攻击）
+✅ 理解登录时检查 EmailConfirmed 的原因（确认邮箱真实存在）
+✅ 理解 403 vs 401 的语义区别
+✅ 数据库 Migration（AddEmailVerificationFields）
+✅ TokenGenerator 工具类（加密安全随机 Token）
+✅ 三个业务异常（含注释说明设计原因）
+✅ IUserRepository 新增 GetByEmailConfirmationTokenAsync
+✅ UserService 更新：注册发邮件、登录检查验证状态
+✅ UserService 新增：VerifyEmailAsync / ResendVerificationAsync
+✅ AuthController 新增两个端点（含 GET vs POST 的解释）
+✅ FakeEmailService（记录发送记录供断言）
+✅ FakeUserRepository 补充新方法
+✅ 27 个单元测试全部通过
+✅ Scalar 端到端流程验证通过
+✅ Git commit 完成
+```

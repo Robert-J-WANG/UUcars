@@ -20,6 +20,16 @@ public class UserConfiguration : IEntityTypeConfiguration<User>
         builder.HasIndex(u => u.Email)
             .IsUnique();
 
+        builder.Property(u => u.EmailConfirmed)
+            .IsRequired()
+            .HasDefaultValue(false);
+
+        // V2 新增：允许为 NULL（用户未发起验证时没有 Token）
+        builder.Property(u => u.EmailConfirmationToken)
+            .HasMaxLength(200);
+
+        builder.Property(u => u.EmailConfirmationTokenExpiry);
+
         builder.Property(u => u.PasswordHash)
             .IsRequired()
             .HasMaxLength(256);
@@ -41,6 +51,4 @@ public class UserConfiguration : IEntityTypeConfiguration<User>
         builder.Property(u => u.UpdatedAt)
             .IsRequired();
     }
-    
-   
 }

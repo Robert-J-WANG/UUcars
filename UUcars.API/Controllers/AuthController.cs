@@ -1,11 +1,8 @@
-using System.Security.Claims;
-using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using UUcars.API.DTOs;
 using UUcars.API.DTOs.Requests;
 using UUcars.API.DTOs.Responses;
 using UUcars.API.Services;
-using UUcars.API.Services.Email;
 
 namespace UUcars.API.Controllers;
 
@@ -29,8 +26,11 @@ public class AuthController : ControllerBase
 
         // 201 Created：表示成功创建了新资源
         // 用 ApiResponse<T>.Ok 包装成统一格式
+
+        // v2:更新注册提示文字
         return StatusCode(StatusCodes.Status201Created,
-            ApiResponse<UserResponse>.Ok(user, "Registration successful."));
+            ApiResponse<UserResponse>.Ok(user,
+                "Registration successful. Please check your email to verify your account."));
     }
 
     [HttpPost("login")]
@@ -44,45 +44,33 @@ public class AuthController : ControllerBase
         return Ok(ApiResponse<LoginResponse>.Ok(result, "Login successful."));
     }
 
-    // 临时测试接口：验证 JWT 认证配置是否生效
-    // 测试完成后会删掉，Step 12 会建正式的 GET /users/me
-    [HttpGet("test-auth")]
-    [Authorize]
-    // [Authorize(Roles = "User")]
-    public IActionResult TestAuth()
-    {
-        var userId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value
-                     ?? User.FindFirst("sub")?.Value;
-        // User 是 ControllerBase 提供的属性，类型是 ClaimsPrincipal
-        // 认证中间件在验证 Token 后，会把 Token Payload 里的所有 Claims
-        // 解析出来注入到这个对象里
-        //
-        // FindFirst(key)：在 Claims 集合里找第一个匹配 key 的 Claim，返回 Claim 对象
-        // ?.Value：取这个 Claim 的值（字符串），用 ?. 是因为找不到时返回 null
-        //
-        // 为什么要同时找 ClaimTypes.NameIdentifier 和 "sub"？
-        // 不同版本的 JWT 库对 "sub" 的处理不一样：
-        //   有些版本会把 "sub" 映射成 ClaimTypes.NameIdentifier（一个很长的 URI）
-        //   有些版本直接保留 "sub" 这个简短名字
-        // 两个都找，确保能取到值
-
-        var email = User.FindFirst(ClaimTypes.Email)?.Value;
-        var role = User.FindFirst(ClaimTypes.Role)?.Value;
-
-        return Ok(ApiResponse<object>.Ok(new { userId, email, role }, "Token is valid."));
-    }
-
-    // 临时测试接口，验证邮件服务配置是否正常
-// 测试完成后立刻删除
-    [HttpPost("test-email")]
-    public async Task<IActionResult> TestEmail(
-        [FromQuery] string to,
-        [FromServices] IEmailService emailService,
+    // GET /auth/verify-email?token=xxx
+    // 为什么用 GET 而不是 POST？
+    // 验证链接直接放在邮件里，用户点击就是一个 GET 请求
+    // 浏览器打开链接 → 前端页面从 URL 读取 token → 调用这个接口
+    // 如果用 POST，用户点邮件链接后需要前端页面额外触发一次 POST 请求，
+    // 但 GET 更简单：前端页面加载时直接把 URL 里的 token 传给这个接口即可
+    [HttpGet("verify-email")]
+    public async Task<IActionResult> VerifyEmail(
+        [FromQuery] VerifyEmailRequest request,
         CancellationToken cancellationToken)
     {
-        var fakeData = new { name = "John", email = "jion@gmail.com" };
-        await emailService.SendPasswordResetAsync(
-            to, "test-token-12345", cancellationToken);
-        return Ok(ApiResponse<object>.Ok(fakeData, $"Test email sent to {to}"));
+        await _userService.VerifyEmailAsync(request.Token, cancellationToken);
+        return Ok(ApiResponse<object>.Ok(null!,
+            "Email verified successfully. You can now log in."));
+    }
+
+    [HttpPost("resend-verification")]
+    public async Task<IActionResult> ResendVerification(
+        [FromBody] ResendVerificationRequest request,
+        CancellationToken cancellationToken)
+    {
+        await _userService.ResendVerificationAsync(request.Email, cancellationToken);
+
+        // 无论用户是否存在，始终返回相同的成功响应
+        // 不让外部通过响应差异判断邮箱是否注册
+        return Ok(ApiResponse<object>.Ok(null!,
+            "If this email is registered and unverified, " +
+            "a new verification email has been sent."));
     }
 }

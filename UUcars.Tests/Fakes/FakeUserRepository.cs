@@ -10,9 +10,6 @@ public class FakeUserRepository : IUserRepository
     // 模拟数据库表，key = Email（方便按邮箱查找）
     private readonly Dictionary<string, User> _store = new();
 
-    // 供测试用：预先插入数据，模拟"数据库里已有这条记录"
-    public void Seed(User user) => _store[user.Email.ToLower()] = user;
-
     public Task<User?> GetByEmailAsync(string email, CancellationToken cancellationToken = default)
     {
         _store.TryGetValue(email.ToLower(), out var user);
@@ -29,10 +26,10 @@ public class FakeUserRepository : IUserRepository
 
     public Task<User?> GetByIdAsync(int id, CancellationToken cancellationToken = default)
     {
-       var user= _store.Values.FirstOrDefault(u => u.Id == id);
-       return Task.FromResult(user);
+        var user = _store.Values.FirstOrDefault(u => u.Id == id);
+        return Task.FromResult(user);
     }
-    
+
     public Task<User> UpdateAsync(User user, CancellationToken cancellationToken = default)
     {
         // 用更新后的对象覆盖字典里的旧数据
@@ -40,5 +37,18 @@ public class FakeUserRepository : IUserRepository
         // 在测试场景下这不影响正确性，因为 GetByEmailAsync 按新邮箱查
         _store[user.Email.ToLower()] = user;
         return Task.FromResult(user);
+    }
+
+    public Task<User?> GetByEmailConfirmationTokenAsync(string token,
+        CancellationToken cancellationToken = default)
+    {
+        var user = _store.Values.FirstOrDefault(u => u.EmailConfirmationToken == token);
+        return Task.FromResult(user);
+    }
+
+    // 供测试用：预先插入数据，模拟"数据库里已有这条记录"
+    public void Seed(User user)
+    {
+        _store[user.Email.ToLower()] = user;
     }
 }

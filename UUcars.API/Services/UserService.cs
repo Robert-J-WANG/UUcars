@@ -1,4 +1,3 @@
-using System.Runtime.InteropServices;
 using Microsoft.AspNetCore.Identity;
 using UUcars.API.Auth;
 using UUcars.API.DTOs.Requests;
@@ -7,15 +6,18 @@ using UUcars.API.Entities;
 using UUcars.API.Entities.Enums;
 using UUcars.API.Exceptions;
 using UUcars.API.Repositories;
+using UUcars.API.Services.Email;
 
 namespace UUcars.API.Services;
 
 public class UserService
 {
-    private readonly IUserRepository _userRepository;
-    private readonly IPasswordHasher<User> _passwordHasher; // 改为接口
+    // email服务
+    private readonly IEmailService _emailService;
     private readonly JwtTokenGenerator _jwtTokenGenerator;
     private readonly ILogger<UserService> _logger;
+    private readonly IPasswordHasher<User> _passwordHasher; // 改为接口
+    private readonly IUserRepository _userRepository;
 
 
     // 通过构造函数注入，由 DI 容器提供
@@ -23,11 +25,13 @@ public class UserService
         IUserRepository userRepository,
         IPasswordHasher<User> passwordHasher, // 改为接口注入
         JwtTokenGenerator jwtTokenGenerator,
+        IEmailService emailService,
         ILogger<UserService> logger)
     {
         _userRepository = userRepository;
         _passwordHasher = passwordHasher;
         _jwtTokenGenerator = jwtTokenGenerator;
+        _emailService = emailService;
         _logger = logger;
     }
 
@@ -36,10 +40,12 @@ public class UserService
     {
         // 1. 检查邮箱是否已被注册
         var existing = await _userRepository.GetByEmailAsync(request.Email, cancellationToken);
-        if (existing != null)
-        {
-            throw new UserAlreadyExistsException(request.Email);
-        }
+        if (existing != null) throw new UserAlreadyExistsException(request.Email);
+
+        // =============================================
+        // 注册（V2 更新：注册后发验证邮件）
+        // =============================================
+
 
         // 2. 构建用户实体（先不填 PasswordHash）
         var user = new User
@@ -48,6 +54,9 @@ public class UserService
             Email = request.Email.ToLower(), // 统一存小写，保持一致性
             Role = UserRole.User, // 注册的用户默认是普通用户
             EmailConfirmed = false, // V1 不做邮箱验证，默认 false
+            // 邮件验证的token
+            EmailConfirmationToken = TokenGenerator.Generate(),
+            EmailConfirmationTokenExpiry = DateTime.UtcNow.AddHours(24),
             CreatedAt = DateTime.UtcNow,
             UpdatedAt = DateTime.UtcNow
         };
@@ -57,6 +66,18 @@ public class UserService
 
         // 4. 存入数据库
         var created = await _userRepository.AddAsync(user, cancellationToken);
+
+        // =============================================
+        // 注册（V2 更新：注册后发验证邮件）
+        // =============================================
+
+        // 先保存用户，再发邮件
+        // 顺序很重要：确保用户已写入数据库，邮件里的验证链接才有意义
+        // 如果反过来——邮件发出去了但数据库写入失败，
+        // 用户点链接时服务端找不到这个 Token，验证永远失败
+        // 如果邮件发送失败，用户可以通过"重新发送"功能补救
+        await _emailService.SendEmailVerificationAsync(created.Email, created.EmailConfirmationToken!,
+            cancellationToken);
 
         _logger.LogInformation("New user registered: {Email}", created.Email);
 
@@ -71,10 +92,7 @@ public class UserService
         var user = await _userRepository.GetByEmailAsync(request.Email, cancellationToken);
 
         // 2. 用户不存在：抛出和密码错误一样的异常，不透露"邮箱不存在"
-        if (user == null)
-        {
-            throw new InvalidCredentialsException();
-        }
+        if (user == null) throw new InvalidCredentialsException();
 
         // 3. 验证密码
         // VerifyHashedPassword 做的事：
@@ -86,10 +104,18 @@ public class UserService
         //   Failed              → 不匹配，密码错误
         //   SuccessRehashNeeded → 匹配，但 Hash 算法版本较旧，建议更新
         var result = _passwordHasher.VerifyHashedPassword(user, user.PasswordHash, request.Password);
-        if (result == PasswordVerificationResult.Failed)
-        {
-            throw new InvalidCredentialsException();
-        }
+        if (result == PasswordVerificationResult.Failed) throw new InvalidCredentialsException();
+
+        // =============================================
+        // 登录（V2 更新：检查邮箱是否已验证）
+        // =============================================
+
+        // 邮箱未验证不允许登录
+        // 密码正确但邮箱未验证 → 403，提示用户去验证邮箱
+        // 前端收到 403 后可以显示"请先验证邮箱，或重新发送验证邮件"的提示
+        if (!user.EmailConfirmed)
+            throw new EmailNotConfirmedException();
+
 
         // 4. 验证通过，生成 JWT Token
         var token = _jwtTokenGenerator.GenerateToken(user);
@@ -115,6 +141,79 @@ public class UserService
 
         return MapToResponse(user);
     }
+
+    // =============================================
+    // 验证邮箱（V2 新增）
+    // =============================================
+    public async Task VerifyEmailAsync(
+        string token,
+        CancellationToken cancellationToken = default)
+    {
+        // 用 Token 找到对应的用户
+        // 找不到说明 Token 不存在（从未发过或已被清除）
+        var user = await _userRepository
+            .GetByEmailConfirmationTokenAsync(token, cancellationToken);
+
+        if (user == null)
+            throw new InvalidTokenException();
+
+        if (user.EmailConfirmationTokenExpiry < DateTime.UtcNow)
+            throw new InvalidTokenException();
+
+        // 已经验证过（用户点了两次验证链接）
+        if (user.EmailConfirmed)
+            throw new EmailAlreadyConfirmedException();
+
+        // 验证通过：标记已验证，清除 Token（一次性使用，用完即删）
+        user.EmailConfirmed = true;
+        user.EmailConfirmationToken = null;
+        user.EmailConfirmationTokenExpiry = null;
+        user.UpdatedAt = DateTime.UtcNow;
+
+        await _userRepository.UpdateAsync(user, cancellationToken);
+
+        _logger.LogInformation("Email verified for user: {Email}", user.Email);
+    }
+
+    // =============================================
+    // 重新发送验证邮件（V2 新增）
+    // =============================================
+    public async Task ResendVerificationAsync(
+        string email,
+        CancellationToken cancellationToken = default)
+    {
+        var user = await _userRepository.GetByEmailAsync(
+            email, cancellationToken);
+
+        // 安全设计：用户不存在时静默返回，不透露邮箱是否注册
+        // 和 Step 39 忘记密码接口保持一致的安全原则：
+        // 不能让攻击者通过这个接口枚举系统里注册过哪些邮箱
+        if (user == null)
+        {
+            _logger.LogWarning(
+                "Resend verification requested for non-existent email: {Email}",
+                email);
+            return;
+        }
+
+        if (user.EmailConfirmed)
+            throw new EmailAlreadyConfirmedException();
+
+        // 生成新 Token，旧 Token 同时作废
+        // 每次重发都刷新 Token 和有效期，避免旧链接仍然有效
+        var newToken = TokenGenerator.Generate();
+        user.EmailConfirmationToken = newToken;
+        user.EmailConfirmationTokenExpiry = DateTime.UtcNow.AddHours(24);
+        user.UpdatedAt = DateTime.UtcNow;
+
+        await _userRepository.UpdateAsync(user, cancellationToken);
+
+        await _emailService.SendEmailVerificationAsync(
+            user.Email, newToken, cancellationToken);
+
+        _logger.LogInformation("Verification email resent to: {Email}", email);
+    }
+
 
     public async Task<UserResponse> UpdateCurrentUserAsync(
         int userId,
@@ -153,12 +252,15 @@ public class UserService
 
     // 实体 → DTO 的映射方法
     // 写成 private static：不依赖实例状态，也不需要从外部调用
-    private static UserResponse MapToResponse(User user) => new()
+    private static UserResponse MapToResponse(User user)
     {
-        Id = user.Id,
-        Username = user.Username,
-        Email = user.Email,
-        Role = user.Role.ToString(),
-        CreatedAt = user.CreatedAt
-    };
+        return new UserResponse
+        {
+            Id = user.Id,
+            Username = user.Username,
+            Email = user.Email,
+            Role = user.Role.ToString(),
+            CreatedAt = user.CreatedAt
+        };
+    }
 }

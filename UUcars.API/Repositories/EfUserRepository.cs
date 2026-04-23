@@ -38,7 +38,7 @@ public class EfUserRepository : IUserRepository
         return await _context.Users
             .FirstOrDefaultAsync(u => u.Id == id, cancellationToken);
     }
-    
+
     public async Task<User> UpdateAsync(User user, CancellationToken cancellationToken = default)
     {
         /*
@@ -52,5 +52,13 @@ public class EfUserRepository : IUserRepository
         _context.Users.Update(user);
         await _context.SaveChangesAsync(cancellationToken);
         return user;
+    }
+
+    public async Task<User?> GetByEmailConfirmationTokenAsync(string token,
+        CancellationToken cancellationToken = default)
+    {
+        return await _context.Users
+            .FirstOrDefaultAsync(
+                u => u.EmailConfirmationToken == token, cancellationToken);
     }
 }

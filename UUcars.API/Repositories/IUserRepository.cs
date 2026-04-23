@@ -9,11 +9,15 @@ public interface IUserRepository
 
     // 新增用户，返回创建后的用户（含数据库分配的 Id）
     Task<User> AddAsync(User user, CancellationToken cancellationToken = default);
-    
+
     // 按 Id 查询用户
     Task<User?> GetByIdAsync(int id, CancellationToken cancellationToken = default);
-    
-    // 新增：修改用户信息
+
+    // 修改用户信息
     Task<User> UpdateAsync(User user, CancellationToken cancellationToken = default);
-    
+
+    // V2 新增：按邮箱验证 Token 查找用户
+    // 用户点击验证链接时，前端把 Token 传回来，服务端用它找到对应的用户
+    Task<User?> GetByEmailConfirmationTokenAsync(string token,
+        CancellationToken cancellationToken = default);
 }
