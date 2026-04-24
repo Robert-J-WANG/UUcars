@@ -61,4 +61,12 @@ public class EfUserRepository : IUserRepository
             .FirstOrDefaultAsync(
                 u => u.EmailConfirmationToken == token, cancellationToken);
     }
+
+    public async Task<User?> GetByResetPasswordTokenAsync(string token,
+        CancellationToken cancellationToken = default)
+    {
+        return await _context.Users
+            .FirstOrDefaultAsync(
+                u => u.ResetPasswordToken == token, cancellationToken);
+    }
 }

@@ -22,7 +22,8 @@ public class AuthController : ControllerBase
         [FromBody] RegisterRequest request,
         CancellationToken cancellationToken)
     {
-        var user = await _userService.RegisterAsync(request, cancellationToken);
+        var user = await _userService.RegisterAsync(request.Username, request.Email, request.Password,
+            cancellationToken);
 
         // 201 Created：表示成功创建了新资源
         // 用 ApiResponse<T>.Ok 包装成统一格式
@@ -38,7 +39,7 @@ public class AuthController : ControllerBase
         [FromBody] LoginRequest request,
         CancellationToken cancellationToken)
     {
-        var result = await _userService.LoginAsync(request, cancellationToken);
+        var result = await _userService.LoginAsync(request.Email, request.Password, cancellationToken);
 
         // 登录成功返回 200 OK（不是 201，登录不是"创建资源"）
         return Ok(ApiResponse<LoginResponse>.Ok(result, "Login successful."));
@@ -72,5 +73,30 @@ public class AuthController : ControllerBase
         return Ok(ApiResponse<object>.Ok(null!,
             "If this email is registered and unverified, " +
             "a new verification email has been sent."));
+    }
+
+    // POST /auth/forgot-password
+    [HttpPost("forgot-password")]
+    public async Task<IActionResult> ForgotPassword(
+        [FromBody] ForgotPasswordRequest request,
+        CancellationToken cancellationToken)
+    {
+        await _userService.ForgotPasswordAsync(request.Email, cancellationToken);
+
+        // 无论用户是否存在、邮箱是否已验证，始终返回相同的成功响应
+        // 保持和 ResendVerification 一致的安全设计
+        return Ok(ApiResponse<object>.Ok(null!,
+            "If this email is registered, a password reset link has been sent."));
+    }
+
+    // POST /auth/reset-password
+    [HttpPost("reset-password")]
+    public async Task<IActionResult> ResetPassword(
+        [FromBody] ResetPasswordRequest request,
+        CancellationToken cancellationToken)
+    {
+        await _userService.ResetPasswordAsync(request.Token, request.NewPassword, cancellationToken);
+        return Ok(ApiResponse<object>.Ok(null!,
+            "Password has been reset successfully. You can now log in with your new password."));
     }
 }

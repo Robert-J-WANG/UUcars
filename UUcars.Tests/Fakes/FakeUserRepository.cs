@@ -46,6 +46,13 @@ public class FakeUserRepository : IUserRepository
         return Task.FromResult(user);
     }
 
+    public Task<User?> GetByResetPasswordTokenAsync(string token,
+        CancellationToken cancellationToken = default)
+    {
+        var user = _store.Values.FirstOrDefault(u => u.ResetPasswordToken == token);
+        return Task.FromResult(user);
+    }
+
     // 供测试用：预先插入数据，模拟"数据库里已有这条记录"
     public void Seed(User user)
     {

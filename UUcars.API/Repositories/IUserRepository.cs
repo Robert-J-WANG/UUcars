@@ -20,4 +20,8 @@ public interface IUserRepository
     // 用户点击验证链接时，前端把 Token 传回来，服务端用它找到对应的用户
     Task<User?> GetByEmailConfirmationTokenAsync(string token,
         CancellationToken cancellationToken = default);
+
+    // Step 39 新增
+    Task<User?> GetByResetPasswordTokenAsync(string token,
+        CancellationToken cancellationToken = default);
 }

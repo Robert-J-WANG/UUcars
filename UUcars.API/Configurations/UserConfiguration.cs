@@ -34,6 +34,11 @@ public class UserConfiguration : IEntityTypeConfiguration<User>
             .IsRequired()
             .HasMaxLength(256);
 
+        // Step 39 新增
+        builder.Property(u => u.ResetPasswordToken)
+            .HasMaxLength(200);
+        builder.Property(u => u.ResetPasswordTokenExpiry);
+
         // 枚举存为字符串：数据库里存 "User" / "Admin"，而不是 0 / 1
         // 这样直接看数据库也能看懂数据含义
         builder.Property(u => u.Role)

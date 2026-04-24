@@ -10,12 +10,13 @@ public class User : BaseEntity
     public UserRole Role { get; set; } = UserRole.User;
     public bool EmailConfirmed { get; set; } = false;
 
-    // V2 新增：邮箱验证
-    // 用户未发起验证时这两个字段为 NULL
-    // 发送验证邮件时写入，验证成功后立刻清除
+    // Step 38：邮箱验证
     public string? EmailConfirmationToken { get; set; }
     public DateTime? EmailConfirmationTokenExpiry { get; set; }
 
+    // Step 39：密码重置
+    public string? ResetPasswordToken { get; set; }
+    public DateTime? ResetPasswordTokenExpiry { get; set; }
 
     // 导航属性
     // 一个用户可以发布多辆车

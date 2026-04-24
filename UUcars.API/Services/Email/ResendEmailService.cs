@@ -28,10 +28,10 @@ public class ResendEmailService : IEmailService
         CancellationToken cancellationToken = default)
     {
         // 拼接前端验证页面的完整链接
-        // Uri.EscapeDataString：Token 是 Base64 编码，可能含有 +、/、= 等
-        // 在 URL 里有特殊含义的字符，必须转义，否则前端收到的 token 会损坏
+        // Token 是 Base64url 编码，排除含有 +、/、= 等
+        // 因此不需要转码
         var verificationLink =
-            $"{_emailSettings.BaseUrl}/verify-email?token={Uri.EscapeDataString(token)}";
+            $"{_emailSettings.BaseUrl}/verify-email?token={token}";
 
         var message = new EmailMessage
         {
@@ -51,7 +51,7 @@ public class ResendEmailService : IEmailService
         CancellationToken cancellationToken = default)
     {
         var resetLink =
-            $"{_emailSettings.BaseUrl}/reset-password?token={Uri.EscapeDataString(token)}";
+            $"{_emailSettings.BaseUrl}/reset-password?token={token}";
 
         var message = new EmailMessage();
         message.From = $"{_emailSettings.FromName} <{_emailSettings.FromEmail}>";
