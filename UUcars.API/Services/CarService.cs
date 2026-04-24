@@ -6,6 +6,7 @@ using UUcars.API.Entities;
 using UUcars.API.Entities.Enums;
 using UUcars.API.Exceptions;
 using UUcars.API.Repositories;
+using UUcars.API.Services.Storage;
 
 namespace UUcars.API.Services;
 
@@ -13,12 +14,15 @@ public class CarService
 {
     private readonly ICarRepository _carRepository;
     private readonly ICarImageRepository _carImageRepository;
+    // 构造函数新增 IStorageService
+    private readonly IStorageService _storageService;
     private readonly ILogger<CarService> _logger;
 
-    public CarService(ICarRepository carRepository, ICarImageRepository carImageRepository, ILogger<CarService> logger)
+    public CarService(ICarRepository carRepository, ICarImageRepository carImageRepository,IStorageService storageService ,ILogger<CarService> logger)
     {
         _carRepository = carRepository;
         _carImageRepository = carImageRepository;
+        _storageService = storageService;
         _logger = logger;
     }
 
@@ -160,11 +164,26 @@ public class CarService
         // 只有 Draft 状态才能添加图片
         if (car.Status != CarStatus.Draft)
             throw new CarStatusException(car.Id, car.Status, CarStatus.Draft);
+        
+        // 验证文件
+        var (isValid, error) = FileValidator.Validate(request.File);
+        if (!isValid)
+            throw new AppException(StatusCodes.Status400BadRequest, error!);
+
+        // 生成唯一文件名，上传到 R2
+        var fileName = FileValidator.GenerateFileName(request.File.FileName);
+
+        string imageUrl;
+        await using (var stream = request.File.OpenReadStream())
+        {
+            imageUrl = await _storageService.UploadAsync(
+                stream, fileName, request.File.ContentType, cancellationToken);
+        }
 
         var image = new CarImage
         {
             CarId = carId,
-            ImageUrl = request.ImageUrl,
+            ImageUrl = imageUrl,
             SortOrder = request.SortOrder
         };
 
@@ -199,6 +218,13 @@ public class CarService
         var image = await _carImageRepository.GetByIdAsync(imageId, cancellationToken);
         if (image == null || image.CarId != carId)
             throw new CarImageNotFoundException(imageId);
+        
+        // 从 URL 里提取文件名（格式：{PublicUrl}/cars/{guid}.jpg）
+        // 只需要 "cars/{guid}.jpg" 这部分来删除 R2 里的文件
+        var uri = new Uri(image.ImageUrl);
+        var fileName = uri.AbsolutePath.TrimStart('/');
+
+        await _storageService.DeleteAsync(fileName, cancellationToken);
 
         await _carImageRepository.DeleteAsync(image, cancellationToken);
 

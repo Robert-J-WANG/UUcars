@@ -2665,3 +2665,728 @@ git push origin feature/v2-backend
 ✅ Scalar 端到端流程验证通过（含安全边界测试）
 ✅ Git commit 完成
 ```
+
+
+
+## Step 40 · 真实图片上传
+
+### 这一步做什么
+
+V1 的图片接口接收的是 URL 字符串——卖家手动填写一个图片地址。这显然不是真实产品的做法，用户不可能自己找图片托管服务再复制链接。
+
+这一步把接口改成接收真实的图片文件，上传后存到 Cloudflare R2，返回一个可公开访问的图片 URL。
+
+
+
+### 1. 文件上传的工作原理
+
+普通的 JSON 请求体只能传文本数据。图片是二进制文件，不能直接放进 JSON 里。传文件用的是另一种请求格式：**multipart/form-data**。
+
+```
+普通 JSON 请求：
+  Content-Type: application/json
+  Body: {"title": "宝马3系", "price": 260000}
+
+文件上传请求：
+  Content-Type: multipart/form-data; boundary=----FormBoundary
+  Body: 多个"part"拼在一起，每个part可以是文本字段或文件
+        ----FormBoundary
+        Content-Disposition: form-data; name="file"; filename="car.jpg"
+        Content-Type: image/jpeg
+        [图片的二进制数据]
+        ----FormBoundary--
+```
+
+ASP.NET Core 用 `IFormFile` 接收上传的文件。`IFormFile` 是框架提供的接口，封装了文件名、文件类型、文件大小、文件内容流等信息，不需要手动解析 multipart 格式。
+
+
+
+### 2. 为什么用 Cloudflare R2
+
+图片上传后需要一个**可公开访问的 URL**，让前端能直接加载图片。本地文件系统做不到这一点——文件只在你的服务器上，换个环境就找不到了。
+
+R2 是云对象存储，文件上传后有一个固定的公开 URL，任何人任何地方都能访问。
+
+**R2 的免费额度：**
+
+```
+存储：每月 10GB 免费
+读取操作：每月 100 万次免费
+写入操作：每月 100 万次免费
+出口带宽：完全免费（这是 R2 相比 AWS S3 最大的优势）
+```
+
+开发和生产都用同一个 R2 bucket，不需要切换环境，行为完全一致。
+
+**R2 使用 S3 兼容 API：**
+
+R2 不需要专属 SDK，直接用 AWS 的 `AWSSDK.S3` 包操作，只需要把 endpoint 指向 R2 的地址。
+
+
+
+### 3. 安装 AWS SDK
+
+R2 使用 S3 兼容 API，直接用 AWS 的 S3 SDK：
+
+```bash
+dotnet add UUcars.API/UUcars.API.csproj package AWSSDK.S3
+```
+
+
+
+### 4. R2 SDK 的使用方式
+
+根据[官方文档](https://developers.cloudflare.com/r2/examples/aws/aws-sdk-net/)，R2 使用标准的 `AWSSDK.S3` 包，初始化时把 endpoint 指向 R2 的地址：
+
+```csharp
+var credentials = new BasicAWSCredentials(accessKeyId, secretAccessKey);
+var s3Client = new AmazonS3Client(credentials, new AmazonS3Config
+{
+    ServiceURL = $"https://{accountId}.r2.cloudflarestorage.com"
+});
+```
+
+上传文件：
+
+```csharp
+var request = new PutObjectRequest
+{
+    BucketName = bucketName,
+    Key = fileName,           // 文件在 bucket 里的路径/名称
+    InputStream = fileStream,
+    ContentType = contentType,
+    // 这两个标志必须设置，R2 不支持 AWS 默认的 Streaming SigV4
+    DisablePayloadSigning = true,
+    DisableDefaultChecksumValidation = true
+};
+await s3Client.PutObjectAsync(request);
+```
+
+删除文件：
+
+```csharp
+await s3Client.DeleteObjectAsync(bucketName, fileName);
+```
+
+上传成功后，图片的公开 URL 是：
+
+```
+{PublicUrl}/{fileName}
+// 比如：https://pub-xxxxxxxx.r2.dev/cars/abc123.jpg
+```
+
+由此可见，需要如下几个参数：
+
+- accessKeyId
+- secretAccessKey
+- accountId - 用于拼接ServiceURL地址
+- PublicUrl - 用于拼接图片的公开URL地址
+
+这些参数需要注册Cloudflare 账号来获得。
+
+
+
+### 5. 注册 Cloudflare 账号并创建 R2 Bucket
+
+**第一步：注册账号**
+
+前往 [cloudflare.com](https://cloudflare.com/) 注册免费账号。
+
+**第二步：创建 Bucket**
+
+登录后进入 **R2 Object Storage**，点击 **Create bucket**，填写 bucket 名称（比如 `uucars-images`），选择离你最近的地区，点击创建。
+
+**第三步：开启公开访问**
+
+Bucket 创建后默认是私有的，需要开启公开读取：进入 bucket 设置，找到 **Public access**，点击 **Allow Access**。开启后会得到一个公开域名，格式是：
+
+```
+https://pub-dfa53d7a7aba4cfbaba02e7282e5e007.r2.dev
+```
+
+这就是图片 URL 的前缀，上传一张图片后访问地址就是 `https://pub-xxxxxxxx.r2.dev/图片文件名`。
+
+**第四步：生成 API Token**
+
+在 R2 控制台找到 **Manage R2 API Tokens**，点击 **Create API Token**，权限选择 **Object Read & Write**，选择刚才创建的 bucket，创建后记录下：
+
+```
+Access Key ID
+Secret Access Key
+账号 ID（Account ID，在 R2 首页右侧可以看到）
+```
+
+
+
+### 6. 配置管理
+
+#### 6.1 创建 StorageSettings 配置绑定类
+
+对所需的参数定义配置类
+
+```bash
+touch UUcars.API/Configurations/StorageSettings.cs
+```
+
+```c#
+namespace UUcars.API.Configurations;
+
+public class StorageSettings
+{
+    public string AccessKeyId { get; set; } = string.Empty;
+    public string SecretAccessKey { get; set; } = string.Empty;
+    public string AccountId { get; set; } = string.Empty;
+    public string BucketName { get; set; } = string.Empty;
+
+    // R2 的 S3 兼容 endpoint，格式固定
+    // 这个值由 AccountId 决定，在 StorageExtensions 里动态拼接
+    // 不需要手动填写
+    public string PublicUrl { get; set; } = string.Empty;
+}
+```
+
+#### 6.2 更新 appsettings.json
+
+```json
+"StorageSettings": {
+  "AccessKeyId": "PLACEHOLDER_OVERRIDE_WITH_USER_SECRETS",
+  "SecretAccessKey": "PLACEHOLDER_OVERRIDE_WITH_USER_SECRETS",
+  "AccountId": "PLACEHOLDER_OVERRIDE_WITH_USER_SECRETS",
+  "BucketName": "uucars-images",
+  "PublicUrl": "PLACEHOLDER_OVERRIDE_WITH_USER_SECRETS"
+}
+```
+
+#### 6.3 把敏感配置存入 User Secrets
+
+```bash
+cd UUcars.API
+
+dotnet user-secrets set "StorageSettings:AccessKeyId" "17c962041449314ac345133944a6c849"
+dotnet user-secrets set "StorageSettings:SecretAccessKey" "ba0c9bad900c7aed96e29be873ceeb2c122fe3553cf9e7768d12d43b629e1446"
+dotnet user-secrets set "StorageSettings:AccountId" "a3dfee9bb1c425fda7ec5face2911597"
+dotnet user-secrets set "StorageSettings:PublicUrl" "https://pub-dfa53d7a7aba4cfbaba02e7282e5e007.r2.dev"
+
+cd ..
+```
+
+验证设置成功：
+
+```bash
+cd UUcars.API && dotnet user-secrets list && cd ..
+```
+
+应该能看到 `EmailSettings:ApiKey` 已经设置。
+
+
+
+### 7. 定义 IStorageService 接口
+
+和 `IEmailService` 一样，存储服务也抽成接口，业务代码不直接依赖具体的云服务商 SDK。业务功能包含：
+
+- 上传图片： 返回图片的URL
+- 删除图片
+
+```bash
+mkdir -p UUcars.API/Services/Storage
+touch UUcars.API/Services/Storage/IStorageService.cs
+```
+
+```c#
+namespace UUcars.API.Services.Storage;
+
+public interface IStorageService
+{
+    // 上传文件，返回可公开访问的 URL
+    // fileName：存储时使用的文件名（调用方负责生成唯一文件名）
+    // contentType：文件 MIME 类型，比如 image/jpeg
+    Task<string> UploadAsync(Stream fileStream, string fileName, string contentType,
+        CancellationToken cancellationToken = default);
+
+    // 删除文件
+    // fileName：存储时使用的文件名
+    Task DeleteAsync(string fileName,
+        CancellationToken cancellationToken = default);
+}
+```
+
+
+
+### 8. 实现 R2StorageService
+
+通过Amazon.S3 sdk提供的接口IAmazonS3：
+
+-  封装了方法PutObjectAsync实现上传文件
+- 封装了DeleteObjectAsync方法实现删除文件
+
+```bash
+touch UUcars.API/Services/Storage/R2StorageService.cs
+```
+
+```c#
+using Amazon.S3;
+using Amazon.S3.Model;
+using Amazon.Runtime;
+using Microsoft.Extensions.Options;
+using UUcars.API.Configurations;
+
+namespace UUcars.API.Services.Storage;
+
+public class R2StorageService : IStorageService
+{
+    private readonly IAmazonS3 _s3Client;
+    private readonly StorageSettings _storageSettings;
+    private readonly ILogger<R2StorageService> _logger;
+
+    public R2StorageService(
+        IAmazonS3 s3Client,
+        IOptions<StorageSettings> storageSettings,
+        ILogger<R2StorageService> logger)
+    {
+        _s3Client = s3Client;
+        _storageSettings = storageSettings.Value;
+        _logger = logger;
+    }
+
+    public async Task<string> UploadAsync(
+        Stream fileStream,
+        string fileName,
+        string contentType,
+        CancellationToken cancellationToken = default)
+    {
+        var request = new PutObjectRequest
+        {
+            BucketName = _storageSettings.BucketName,
+            Key = fileName,
+            InputStream = fileStream,
+            ContentType = contentType,
+            // R2 必须设置这两个标志
+            // 原因：R2 不支持 AWS SDK 默认的 Streaming SigV4 签名方式
+            DisablePayloadSigning = true,
+            DisableDefaultChecksumValidation = true
+        };
+
+        await _s3Client.PutObjectAsync(request, cancellationToken);
+
+        // 拼接公开访问 URL
+        var publicUrl = $"{_storageSettings.PublicUrl.TrimEnd('/')}/{fileName}";
+
+        _logger.LogInformation("File uploaded to R2: {Url}", publicUrl);
+
+        return publicUrl;
+    }
+
+    public async Task DeleteAsync(
+        string fileName,
+        CancellationToken cancellationToken = default)
+    {
+        await _s3Client.DeleteObjectAsync(
+            _storageSettings.BucketName, fileName, cancellationToken);
+
+        _logger.LogInformation("File deleted from R2: {FileName}", fileName);
+    }
+}
+```
+
+
+
+### 9. 创建 StorageExtensions 扩展方法
+
+对s3Client对象进行配置
+
+```bash
+touch UUcars.API/Extensions/StorageExtensions.cs
+```
+
+```c#
+using Amazon.Runtime;
+using Amazon.S3;
+using Microsoft.Extensions.Options;
+using UUcars.API.Configurations;
+using UUcars.API.Services.Storage;
+
+namespace UUcars.API.Extensions;
+
+public static class StorageExtensions
+{
+    public static IServiceCollection AddStorageService(
+        this IServiceCollection services,
+        IConfiguration configuration)
+    {
+        services.Configure<StorageSettings>(
+            configuration.GetSection("StorageSettings"));
+
+        // 读取配置，启动时就验证是否存在
+        var settings = configuration.GetSection("StorageSettings").Get<StorageSettings>()
+                       ?? throw new InvalidOperationException(
+                           "StorageSettings is not configured.");
+
+        // 初始化 S3 客户端，指向 R2 的 endpoint
+        var credentials = new BasicAWSCredentials(
+            settings.AccessKeyId,
+            settings.SecretAccessKey);
+
+        var s3Client = new AmazonS3Client(credentials, new AmazonS3Config
+        {
+            // R2 的 S3 兼容 endpoint 格式
+            ServiceURL = $"https://{settings.AccountId}.r2.cloudflarestorage.com"
+        });
+
+        // 注册 IAmazonS3（Singleton：S3 客户端是线程安全的，可以全局共享）
+        services.AddSingleton<IAmazonS3>(s3Client);
+
+        return services;
+    }
+}
+```
+
+打开 `Program.cs`，在 `AddEmailService` 下方添加：
+
+```csharp
+// 存储服务
+builder.Services.AddStorageService(builder.Configuration);
+
+// 注册我们自己的 IStorageService 实现
+builder.Services.AddScoped<IStorageService, R2StorageService>();
+```
+
+
+
+### 10. 更新图片上传接口
+
+V1 的 `POST /cars/{id}/images` 接收的是 URL 字符串，现在改成接收文件。
+
+#### 10.1 更新请求 DTO
+
+打开 `UUcars.API/DTOs/Requests/CarImageAddRequest.cs`，替换原来的内容：
+
+```csharp
+namespace UUcars.API.DTOs.Requests;
+
+// V2 更新：从接收 URL 改为接收文件
+// 不用 [FromBody]，文件上传用 [FromForm]
+// IFormFile 是 ASP.NET Core 提供的接口，封装了上传文件的所有信息
+public class CarImageAddRequest
+{
+    public IFormFile File { get; set; } = null!;
+    public int SortOrder { get; set; } = 0;
+}
+```
+
+#### 10.2 创建文件验证工具类
+
+文件类型验证和大小限制是独立的逻辑，抽成工具类：
+
+```baah
+touch UUcars.API/Services/Storage/FileValidator.cs
+```
+
+
+
+```c#
+namespace UUcars.API.Services.Storage;
+
+public static class FileValidator
+{
+    // 允许的图片类型
+    private static readonly HashSet<string> AllowedContentTypes = new(
+        StringComparer.OrdinalIgnoreCase)
+    {
+        "image/jpeg",
+        "image/jpg",
+        "image/png",
+        "image/webp"
+    };
+
+    // 最大文件大小：5MB
+    private const long MaxFileSizeBytes = 5 * 1024 * 1024;
+
+    public static (bool IsValid, string? Error) Validate(IFormFile file)
+    {
+        if (file.Length == 0)
+            return (false, "File is empty.");
+
+        if (file.Length > MaxFileSizeBytes)
+            return (false, "File size must not exceed 5MB.");
+
+        if (!AllowedContentTypes.Contains(file.ContentType))
+            return (false, "Only JPEG, PNG, and WebP images are allowed.");
+
+        return (true, null);
+    }
+
+    // 根据原始文件名生成唯一的存储文件名
+    // 格式：cars/{guid}.{扩展名}
+    // 用 GUID 避免文件名冲突，用 cars/ 前缀在 bucket 里组织文件
+    public static string GenerateFileName(string originalFileName)
+    {
+        var extension = Path.GetExtension(originalFileName).ToLowerInvariant();
+        return $"cars/{Guid.NewGuid()}{extension}";
+    }
+}
+```
+
+> **为什么用 GUID 做文件名而不是保留原始文件名？** 用户上传的原始文件名可能重复（两个用户都上传了 `car.jpg`），也可能包含特殊字符导致 URL 出问题。GUID 保证每个文件名全局唯一，`cars/` 前缀让所有车辆图片在 bucket 里有统一的组织结构。
+
+#### 10.3 更新 CarService
+
+打开 `UUcars.API/Services/CarService.cs`，构造函数新增 `IStorageService` 依赖，更新 `AddImageAsync` 方法：
+
+```csharp
+// 构造函数新增 IStorageService
+private readonly IStorageService _storageService;
+
+public CarService(
+    ICarRepository carRepository,
+    ICarImageRepository carImageRepository,
+    IStorageService storageService,
+    ILogger<CarService> logger)
+{
+    _carRepository = carRepository;
+    _carImageRepository = carImageRepository;
+    _storageService = storageService;
+    _logger = logger;
+}
+```
+
+更新 `AddImageAsync` 方法：
+
+```csharp
+public async Task<CarImageResponse> AddImageAsync(
+    int carId,
+    int currentUserId,
+    CarImageAddRequest request,
+    CancellationToken cancellationToken = default)
+{
+    var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+    if (car == null)
+        throw new CarNotFoundException(carId);
+
+    if (car.SellerId != currentUserId)
+        throw new ForbiddenException();
+
+    if (car.Status != CarStatus.Draft)
+        throw new CarStatusException(car.Id, car.Status, CarStatus.Draft);
+
+    // 验证文件
+    var (isValid, error) = FileValidator.Validate(request.File);
+    if (!isValid)
+        throw new AppException(StatusCodes.Status400BadRequest, error!);
+
+    // 生成唯一文件名，上传到 R2
+    var fileName = FileValidator.GenerateFileName(request.File.FileName);
+
+    string imageUrl;
+    await using (var stream = request.File.OpenReadStream())
+    {
+        imageUrl = await _storageService.UploadAsync(
+            stream, fileName, request.File.ContentType, cancellationToken);
+    }
+
+    var image = new CarImage
+    {
+        CarId = carId,
+        ImageUrl = imageUrl,
+        SortOrder = request.SortOrder
+    };
+
+    var created = await _carImageRepository.AddAsync(image, cancellationToken);
+
+    _logger.LogInformation(
+        "Image uploaded for car {CarId}: {Url}", carId, imageUrl);
+
+    return MapToImageResponse(created);
+}
+```
+
+同时更新 `DeleteImageAsync`，删除图片时同步删除 R2 里的文件：
+
+```csharp
+public async Task DeleteImageAsync(
+    int carId,
+    int imageId,
+    int currentUserId,
+    CancellationToken cancellationToken = default)
+{
+    var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+    if (car == null)
+        throw new CarNotFoundException(carId);
+
+    if (car.SellerId != currentUserId)
+        throw new ForbiddenException();
+
+    if (car.Status != CarStatus.Draft)
+        throw new CarStatusException(car.Id, car.Status, CarStatus.Draft);
+
+    var image = await _carImageRepository.GetByIdAsync(imageId, cancellationToken);
+    if (image == null || image.CarId != carId)
+        throw new CarImageNotFoundException(imageId);
+
+    // 从 URL 里提取文件名（格式：{PublicUrl}/cars/{guid}.jpg）
+    // 只需要 "cars/{guid}.jpg" 这部分来删除 R2 里的文件
+    var uri = new Uri(image.ImageUrl);
+    var fileName = uri.AbsolutePath.TrimStart('/');
+
+    await _storageService.DeleteAsync(fileName, cancellationToken);
+
+    await _carImageRepository.DeleteAsync(image, cancellationToken);
+
+    _logger.LogInformation(
+        "Image {ImageId} deleted from car {CarId}", imageId, carId);
+}
+```
+
+#### 10.4 更新 CarsController
+
+打开 `UUcars.API/Controllers/CarsController.cs`，更新 `AddImage` Action：
+
+```csharp
+// POST /cars/{id}/images
+// [FromForm] 而不是 [FromBody]：文件上传必须用 multipart/form-data 格式
+// [FromBody] 只能接收 JSON，无法接收文件
+[HttpPost("{id:int}/images")]
+[Authorize]
+public async Task<IActionResult> AddImage(
+    int id,
+    [FromForm] CarImageAddRequest request,
+    CancellationToken cancellationToken)
+{
+ 	...
+}
+```
+
+
+
+### 11. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 12. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**上传图片测试：**
+
+在 Scalar 里，`POST /cars/{id}/images` 接口现在接收 `multipart/form-data` 格式，需要在请求里选择文件而不是填写 JSON。
+
+先登录拿到 Token，创建一辆草稿车辆，然后上传图片：
+
+```
+POST /cars/1/images
+Authorization: Bearer ...
+Content-Type: multipart/form-data
+
+file: [选择一张本地图片]
+sortOrder: 0
+```
+
+预期（201）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": 1,
+    "imageUrl": "https://pub-xxxxxxxx.r2.dev/cars/abc123-def456.jpg",
+    "sortOrder": 0,
+    "carId": 1
+  },
+  "message": "Image uploaded successfully."
+}
+```
+
+复制返回的 `imageUrl`，在浏览器里直接访问，应该能看到上传的图片。
+
+**文件验证测试：**
+
+上传一个超过 5MB 的文件，应返回 400：
+
+```json
+{
+  "success": false,
+  "message": "File size must not exceed 5MB."
+}
+```
+
+上传一个非图片文件（比如 `.txt`），应返回 400：
+
+```json
+{
+  "success": false,
+  "message": "Only JPEG, PNG, and WebP images are allowed."
+}
+```
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 13. 此时的目录变化
+
+```
+UUcars.API/
+├── Configurations/
+│   └── StorageSettings.cs              ← 新增
+├── DTOs/Requests/
+│   └── CarImageAddRequest.cs           ← 已更新（IFormFile替换URL）
+├── Extensions/
+│   └── StorageExtensions.cs            ← 新增
+└── Services/
+    ├── CarService.cs                   ← 已更新（上传/删除文件）
+    └── Storage/                        ← 新增目录
+        ├── IStorageService.cs          ← 新增
+        ├── R2StorageService.cs         ← 新增
+        └── FileValidator.cs            ← 新增
+```
+
+
+
+### 14. Git 提交
+
+```bash
+git add .
+git commit -m "feat: real image upload with Cloudflare R2"
+git push origin feature/v2-backend
+```
+
+
+
+### Step 40 完成状态
+
+```
+✅ 理解 multipart/form-data 和 IFormFile 的工作原理
+✅ 理解为什么直接用 R2（开发生产一套，无需切换）
+✅ 注册 Cloudflare 账号，创建 R2 Bucket，开启公开访问
+✅ 安装 AWSSDK.S3，敏感配置存入 User Secrets
+✅ StorageSettings 配置绑定类
+✅ IStorageService 接口（Upload / Delete）
+✅ R2StorageService 实现（含必须的 DisablePayloadSigning 标志）
+✅ FileValidator 工具类（类型验证、大小限制、唯一文件名生成）
+✅ StorageExtensions 扩展方法
+✅ CarService 更新：上传文件到 R2，删除时同步删除 R2 文件
+✅ CarsController 更新：[FromForm] 替换 [FromBody]
+✅ dotnet build 通过
+✅ Scalar 测试通过（上传成功、URL可访问、验证错误返回400）
+✅ Git commit 完成
+```

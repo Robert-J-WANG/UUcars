@@ -10,6 +10,7 @@ using UUcars.API.Middleware;
 using UUcars.API.Repositories;
 using UUcars.API.Services;
 using UUcars.API.Services.Email;
+using UUcars.API.Services.Storage;
 
 // =============================================
 // Bootstrap Logger
@@ -72,6 +73,8 @@ try
     // 配置邮件服务
     builder.Services.AddEmailService(builder.Configuration);
 
+    // 存储服务
+    builder.Services.AddStorageService(builder.Configuration);
 
     // 用户模块
     // AddScoped：每次 HTTP 请求创建一个新实例，请求结束后销毁
@@ -82,6 +85,8 @@ try
     builder.Services.AddScoped<UserService>();
     // 邮件服务
     builder.Services.AddScoped<IEmailService, ResendEmailService>();
+    // 注册我们自己的 IStorageService 实现
+    builder.Services.AddScoped<IStorageService, R2StorageService>();
 
     // AddHttpContextAccessor：IHttpContextAccessor 默认不自动注册，需要显式加上
     // 它内部用 AsyncLocal<T> 保证线程安全，每个请求有自己独立的 HttpContext
