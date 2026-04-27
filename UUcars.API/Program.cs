@@ -9,6 +9,8 @@ using UUcars.API.Extensions;
 using UUcars.API.Middleware;
 using UUcars.API.Repositories;
 using UUcars.API.Services;
+using UUcars.API.Services.Email;
+using UUcars.API.Services.Storage;
 
 // =============================================
 // Bootstrap Logger
@@ -65,6 +67,15 @@ try
     // JWT 认证（细节在 Extensions/AuthExtensions.cs）
     builder.Services.AddJwtAuthentication(builder.Configuration);
 
+    // CORS 配置
+    builder.Services.AddUUcarsCors(builder.Configuration);
+
+    // 配置邮件服务
+    builder.Services.AddEmailService(builder.Configuration);
+
+    // 存储服务
+    builder.Services.AddStorageService(builder.Configuration);
+
     // 用户模块
     // AddScoped：每次 HTTP 请求创建一个新实例，请求结束后销毁
     // Repository 和 Service 都用 Scoped，因为它们依赖 DbContext（也是 Scoped）
@@ -72,6 +83,10 @@ try
     builder.Services.AddScoped<IUserRepository, EfUserRepository>();
     builder.Services.AddScoped<JwtTokenGenerator>();
     builder.Services.AddScoped<UserService>();
+    // 邮件服务
+    builder.Services.AddScoped<IEmailService, ResendEmailService>();
+    // 注册我们自己的 IStorageService 实现
+    builder.Services.AddScoped<IStorageService, R2StorageService>();
 
     // AddHttpContextAccessor：IHttpContextAccessor 默认不自动注册，需要显式加上
     // 它内部用 AsyncLocal<T> 保证线程安全，每个请求有自己独立的 HttpContext
@@ -93,6 +108,10 @@ try
 
     // Admin 模块
     builder.Services.AddScoped<AdminCarService>();
+
+    // 评价模块
+    builder.Services.AddScoped<IReviewRepository, EfReviewRepository>();
+    builder.Services.AddScoped<ReviewService>();
 
     // =============================================
     // 构建应用
@@ -117,6 +136,12 @@ try
                 .WithTheme(ScalarTheme.Moon)
         );
     }
+
+    // CORS 必须在 Authentication 和 Authorization 之前
+    // 原因：Preflight 请求（OPTIONS）不携带 Token，
+    // 如果 CORS 在 Auth 之后，Preflight 会因为没有 Token 被拦截，
+    // 导致浏览器认为服务器不支持跨域
+    app.UseCors(CorsExtensions.PolicyName);
 
     // UseAuthentication 必须在 UseAuthorization 之前
     // 原因：Authorization 需要读取 Authentication 的结果（HttpContext.User）

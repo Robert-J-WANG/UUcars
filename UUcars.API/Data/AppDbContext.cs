@@ -1,4 +1,3 @@
-using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using UUcars.API.Entities;
 using UUcars.API.Entities.Enums;
@@ -20,6 +19,7 @@ public class AppDbContext : DbContext
     public DbSet<CarImage> CarImages => Set<CarImage>();
     public DbSet<Order> Orders => Set<Order>();
     public DbSet<Favorite> Favorites => Set<Favorite>();
+    public DbSet<Review> Reviews => Set<Review>(); // 新增
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -28,7 +28,7 @@ public class AppDbContext : DbContext
         // 统一加载 Configurations/ 目录下的所有配置类
         // 每新增一个 IEntityTypeConfiguration 实现，这里自动识别，不需要手动添加
         modelBuilder.ApplyConfigurationsFromAssembly(typeof(AppDbContext).Assembly);
-        
+
         // Seed Data：在数据库初始化时插入初始 Admin 用户
         // 为什么用固定时间（new DateTime(2025, 1, 1)）而不是 DateTime.UtcNow？
         // 因为 Seed Data 会被写入 Migration 文件，Migration 文件进入 Git。
@@ -41,7 +41,8 @@ public class AppDbContext : DbContext
         // 使用预先计算好的固定 hash，而不是在这里动态生成
         // 原因：PasswordHasher 每次调用会用随机 salt，导致 EF Core 9 每次
         // 扫描模型时发现值不同，误判为"有未提交的变更"
-        const string adminPasswordHash = "AQAAAAIAAYagAAAAEHCDDS0DL8S0+v4RJ8Xbotyu+8ZvjCEg7EODicW0j/KfCC6beDga+cX+eYM2TkRiRg==";
+        const string adminPasswordHash =
+            "AQAAAAIAAYagAAAAEHCDDS0DL8S0+v4RJ8Xbotyu+8ZvjCEg7EODicW0j/KfCC6beDga+cX+eYM2TkRiRg==";
 
         var adminUser = new User
         {

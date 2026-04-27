@@ -1,17 +1,10 @@
-using System.ComponentModel.DataAnnotations;
-
 namespace UUcars.API.DTOs.Requests;
 
+// V2 更新：从接收 URL 改为接收文件
+// 不用 [FromBody]，文件上传用 [FromForm]
+// IFormFile 是 ASP.NET Core 提供的接口，封装了上传文件的所有信息
 public class CarImageAddRequest
 {
-    // V1 只支持提交 URL，不做真实文件上传
-    // URL 格式验证：[Url] 特性会检查是否是合法的 HTTP/HTTPS 地址
-    [Required(ErrorMessage = "ImageUrl is required.")]
-    [Url(ErrorMessage = "ImageUrl must be a valid URL.")]
-    [MaxLength(500, ErrorMessage = "ImageUrl must not exceed 500 characters.")]
-    public string ImageUrl { get; set; } = string.Empty;
-
-    // 显示顺序，默认 0（第一张图片作为封面）
-    // 客户端可以传入顺序值控制图片排列
+    public IFormFile File { get; set; } = null!;
     public int SortOrder { get; set; } = 0;
 }

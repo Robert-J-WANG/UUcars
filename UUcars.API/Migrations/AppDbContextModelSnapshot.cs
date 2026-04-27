@@ -167,6 +167,48 @@ namespace UUcars.API.Migrations
                     b.ToTable("Orders");
                 });
 
+            modelBuilder.Entity("UUcars.API.Entities.Review", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("int");
+
+                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<string>("Comment")
+                        .HasMaxLength(500)
+                        .HasColumnType("nvarchar(500)");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("datetime2");
+
+                    b.Property<int>("OrderId")
+                        .HasColumnType("int");
+
+                    b.Property<int>("Rating")
+                        .HasColumnType("int");
+
+                    b.Property<int>("RevieweeId")
+                        .HasColumnType("int");
+
+                    b.Property<int>("ReviewerId")
+                        .HasColumnType("int");
+
+                    b.Property<DateTime>("UpdatedAt")
+                        .HasColumnType("datetime2");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("OrderId")
+                        .IsUnique();
+
+                    b.HasIndex("RevieweeId");
+
+                    b.HasIndex("ReviewerId");
+
+                    b.ToTable("Reviews");
+                });
+
             modelBuilder.Entity("UUcars.API.Entities.User", b =>
                 {
                     b.Property<int>("Id")
@@ -183,6 +225,13 @@ namespace UUcars.API.Migrations
                         .HasMaxLength(100)
                         .HasColumnType("nvarchar(100)");
 
+                    b.Property<string>("EmailConfirmationToken")
+                        .HasMaxLength(200)
+                        .HasColumnType("nvarchar(200)");
+
+                    b.Property<DateTime?>("EmailConfirmationTokenExpiry")
+                        .HasColumnType("datetime2");
+
                     b.Property<bool>("EmailConfirmed")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("bit")
@@ -192,6 +241,13 @@ namespace UUcars.API.Migrations
                         .IsRequired()
                         .HasMaxLength(256)
                         .HasColumnType("nvarchar(256)");
+
+                    b.Property<string>("ResetPasswordToken")
+                        .HasMaxLength(200)
+                        .HasColumnType("nvarchar(200)");
+
+                    b.Property<DateTime?>("ResetPasswordTokenExpiry")
+                        .HasColumnType("datetime2");
 
                     b.Property<string>("Role")
                         .IsRequired()
@@ -293,6 +349,33 @@ namespace UUcars.API.Migrations
                     b.Navigation("Car");
 
                     b.Navigation("Seller");
+                });
+
+            modelBuilder.Entity("UUcars.API.Entities.Review", b =>
+                {
+                    b.HasOne("UUcars.API.Entities.Order", "Order")
+                        .WithMany()
+                        .HasForeignKey("OrderId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+
+                    b.HasOne("UUcars.API.Entities.User", "Reviewee")
+                        .WithMany()
+                        .HasForeignKey("RevieweeId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+
+                    b.HasOne("UUcars.API.Entities.User", "Reviewer")
+                        .WithMany()
+                        .HasForeignKey("ReviewerId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+
+                    b.Navigation("Order");
+
+                    b.Navigation("Reviewee");
+
+                    b.Navigation("Reviewer");
                 });
 
             modelBuilder.Entity("UUcars.API.Entities.Car", b =>
