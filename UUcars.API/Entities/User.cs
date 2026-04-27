@@ -10,6 +10,14 @@ public class User : BaseEntity
     public UserRole Role { get; set; } = UserRole.User;
     public bool EmailConfirmed { get; set; } = false;
 
+    // Step 38：邮箱验证
+    public string? EmailConfirmationToken { get; set; }
+    public DateTime? EmailConfirmationTokenExpiry { get; set; }
+
+    // Step 39：密码重置
+    public string? ResetPasswordToken { get; set; }
+    public DateTime? ResetPasswordTokenExpiry { get; set; }
+
     // 导航属性
     // 一个用户可以发布多辆车
     public ICollection<Car> Cars { get; set; } = [];

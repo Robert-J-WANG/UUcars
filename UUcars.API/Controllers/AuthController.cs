@@ -1,4 +1,3 @@
-using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using UUcars.API.DTOs;
 using UUcars.API.DTOs.Requests;
@@ -23,12 +22,16 @@ public class AuthController : ControllerBase
         [FromBody] RegisterRequest request,
         CancellationToken cancellationToken)
     {
-        var user = await _userService.RegisterAsync(request, cancellationToken);
+        var user = await _userService.RegisterAsync(request.Username, request.Email, request.Password,
+            cancellationToken);
 
         // 201 Created：表示成功创建了新资源
         // 用 ApiResponse<T>.Ok 包装成统一格式
+
+        // v2:更新注册提示文字
         return StatusCode(StatusCodes.Status201Created,
-            ApiResponse<UserResponse>.Ok(user, "Registration successful."));
+            ApiResponse<UserResponse>.Ok(user,
+                "Registration successful. Please check your email to verify your account."));
     }
 
     [HttpPost("login")]
@@ -36,37 +39,64 @@ public class AuthController : ControllerBase
         [FromBody] LoginRequest request,
         CancellationToken cancellationToken)
     {
-        var result = await _userService.LoginAsync(request, cancellationToken);
+        var result = await _userService.LoginAsync(request.Email, request.Password, cancellationToken);
 
         // 登录成功返回 200 OK（不是 201，登录不是"创建资源"）
         return Ok(ApiResponse<LoginResponse>.Ok(result, "Login successful."));
     }
-    
-    // 临时测试接口：验证 JWT 认证配置是否生效
-    // 测试完成后会删掉，Step 12 会建正式的 GET /users/me
-    [HttpGet("test-auth")]
-    [Authorize]
-    // [Authorize(Roles = "User")]
-    public IActionResult TestAuth()
+
+    // GET /auth/verify-email?token=xxx
+    // 为什么用 GET 而不是 POST？
+    // 验证链接直接放在邮件里，用户点击就是一个 GET 请求
+    // 浏览器打开链接 → 前端页面从 URL 读取 token → 调用这个接口
+    // 如果用 POST，用户点邮件链接后需要前端页面额外触发一次 POST 请求，
+    // 但 GET 更简单：前端页面加载时直接把 URL 里的 token 传给这个接口即可
+    [HttpGet("verify-email")]
+    public async Task<IActionResult> VerifyEmail(
+        [FromQuery] VerifyEmailRequest request,
+        CancellationToken cancellationToken)
     {
-        var userId = User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value
-                     ?? User.FindFirst("sub")?.Value;
-        // User 是 ControllerBase 提供的属性，类型是 ClaimsPrincipal
-        // 认证中间件在验证 Token 后，会把 Token Payload 里的所有 Claims
-        // 解析出来注入到这个对象里
-        //
-        // FindFirst(key)：在 Claims 集合里找第一个匹配 key 的 Claim，返回 Claim 对象
-        // ?.Value：取这个 Claim 的值（字符串），用 ?. 是因为找不到时返回 null
-        //
-        // 为什么要同时找 ClaimTypes.NameIdentifier 和 "sub"？
-        // 不同版本的 JWT 库对 "sub" 的处理不一样：
-        //   有些版本会把 "sub" 映射成 ClaimTypes.NameIdentifier（一个很长的 URI）
-        //   有些版本直接保留 "sub" 这个简短名字
-        // 两个都找，确保能取到值
+        await _userService.VerifyEmailAsync(request.Token, cancellationToken);
+        return Ok(ApiResponse<object>.Ok(null!,
+            "Email verified successfully. You can now log in."));
+    }
 
-        var email = User.FindFirst(System.Security.Claims.ClaimTypes.Email)?.Value;
-        var role = User.FindFirst(System.Security.Claims.ClaimTypes.Role)?.Value;
+    [HttpPost("resend-verification")]
+    public async Task<IActionResult> ResendVerification(
+        [FromBody] ResendVerificationRequest request,
+        CancellationToken cancellationToken)
+    {
+        await _userService.ResendVerificationAsync(request.Email, cancellationToken);
 
-        return Ok(ApiResponse<object>.Ok(new { userId, email, role }, "Token is valid."));
+        // 无论用户是否存在，始终返回相同的成功响应
+        // 不让外部通过响应差异判断邮箱是否注册
+        return Ok(ApiResponse<object>.Ok(null!,
+            "If this email is registered and unverified, " +
+            "a new verification email has been sent."));
+    }
+
+    // POST /auth/forgot-password
+    [HttpPost("forgot-password")]
+    public async Task<IActionResult> ForgotPassword(
+        [FromBody] ForgotPasswordRequest request,
+        CancellationToken cancellationToken)
+    {
+        await _userService.ForgotPasswordAsync(request.Email, cancellationToken);
+
+        // 无论用户是否存在、邮箱是否已验证，始终返回相同的成功响应
+        // 保持和 ResendVerification 一致的安全设计
+        return Ok(ApiResponse<object>.Ok(null!,
+            "If this email is registered, a password reset link has been sent."));
+    }
+
+    // POST /auth/reset-password
+    [HttpPost("reset-password")]
+    public async Task<IActionResult> ResetPassword(
+        [FromBody] ResetPasswordRequest request,
+        CancellationToken cancellationToken)
+    {
+        await _userService.ResetPasswordAsync(request.Token, request.NewPassword, cancellationToken);
+        return Ok(ApiResponse<object>.Ok(null!,
+            "Password has been reset successfully. You can now log in with your new password."));
     }
 }

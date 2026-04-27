@@ -7,6 +7,8 @@ using Testcontainers.MsSql;
 using UUcars.API.Data;
 using UUcars.API.Entities;
 using UUcars.API.Entities.Enums;
+using UUcars.API.Services.Email;
+using UUcars.Tests.Services;
 
 namespace UUcars.Tests.Integration;
 
@@ -19,6 +21,9 @@ public class SqlServerTestFactory : WebApplicationFactory<Program>, IAsyncLifeti
     private readonly MsSqlContainer _sqlContainer = new MsSqlBuilder("mcr.microsoft.com/mssql/server:2022-latest")
         .WithPassword("TestStrong!Passw0rd")
         .Build();
+
+    // 新增：暴露给 IntegrationTestBase 使用，取注册时发出的 token
+    public FakeEmailService FakeEmail { get; } = new();
 
     // IAsyncLifetime.InitializeAsync：测试类实例化时自动调用
     // xUnit 发现这个接口后，会在运行第一个测试前先执行这个方法
@@ -50,6 +55,15 @@ public class SqlServerTestFactory : WebApplicationFactory<Program>, IAsyncLifeti
             // _sqlContainer.GetConnectionString() 返回容器的动态连接字符串
             services.AddDbContext<AppDbContext>(options =>
                 options.UseSqlServer(_sqlContainer.GetConnectionString()));
+
+
+            // 新增：替换 IEmailService，避免真实调用 Resend API
+            var emailDescriptor = services.SingleOrDefault(d => d.ServiceType == typeof(IEmailService));
+            if (emailDescriptor != null)
+                services.Remove(emailDescriptor);
+
+            // Singleton：整个测试共享同一个实例，token 才能被正确读取
+            services.AddSingleton<IEmailService>(FakeEmail);
         });
 
         // 使用测试环境，避免加载生产配置

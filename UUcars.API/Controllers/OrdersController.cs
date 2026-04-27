@@ -49,6 +49,21 @@ public class OrdersController : ControllerBase
         return Ok(ApiResponse<OrderResponse>.Ok(order, "Order cancelled successfully."));
     }
 
+    // POST /orders/{id}/complete
+    [HttpPost("{id:int}/complete")]
+    public async Task<IActionResult> Complete(int id, CancellationToken cancellationToken)
+    {
+        var currentUserId = _currentUserService.GetCurrentUserId();
+        if (currentUserId == null)
+            return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+        var order = await _orderService.CompleteAsync(
+            id, currentUserId.Value, cancellationToken);
+
+        return Ok(ApiResponse<OrderResponse>.Ok(order,
+            "Order completed successfully."));
+    }
+
     // GET /orders/my-purchases
 // 注意：必须放在 GET /orders/{id:int} 之前定义（如果以后有这个接口）
 // 原因和 Step 20 里 /cars/my-listings 的路由顺序问题一样：

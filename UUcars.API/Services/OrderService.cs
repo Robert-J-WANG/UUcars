@@ -141,6 +141,43 @@ public class OrderService
         return MapToResponse(order);
     }
 
+
+    // =============================================
+    // 确认订单完成（Step 41 新增）
+    // =============================================
+    public async Task<OrderResponse> CompleteAsync(
+        int orderId,
+        int currentUserId,
+        CancellationToken cancellationToken = default)
+    {
+        var order = await _orderRepository.GetByIdAsync(orderId, cancellationToken);
+
+        if (order == null)
+            throw new OrderNotFoundException(orderId);
+
+        // 只有卖家可以确认完成
+        // 原因：卖家是"交货方"，由卖家确认表示货已交出
+        // 买家视角的确认可以在 V3 里作为进阶功能补充（双方确认机制）
+        if (order.SellerId != currentUserId)
+            throw new ForbiddenException();
+
+        // 只有 Pending 状态可以完成
+        if (order.Status != OrderStatus.Pending)
+            throw new OrderStatusException(orderId, order.Status, OrderStatus.Pending);
+
+        order.Status = OrderStatus.Completed;
+        order.UpdatedAt = DateTime.UtcNow;
+
+        // 同一个事务里更新订单
+        _context.Orders.Update(order);
+        await _context.SaveChangesAsync(cancellationToken);
+
+        _logger.LogInformation(
+            "Order {OrderId} completed by seller {SellerId}", orderId, currentUserId);
+
+        return MapToResponse(order);
+    }
+
     public async Task<PagedResponse<OrderResponse>> GetMyPurchasesAsync(int buyerId, CarQueryRequest request,
         CancellationToken cancellationToken = default)
     {

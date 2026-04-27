@@ -90,7 +90,7 @@ public class CarsController : ControllerBase
     [Authorize]
     public async Task<IActionResult> AddImage(
         int id,
-        [FromBody] CarImageAddRequest request,
+        [FromForm] CarImageAddRequest request,
         CancellationToken cancellationToken)
     {
         var currentUserId = _currentUserService.GetCurrentUserId();

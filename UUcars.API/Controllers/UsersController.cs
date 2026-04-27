@@ -42,7 +42,8 @@ public class UsersController : ControllerBase
     {
         var userId = _currentUserService.GetCurrentUserId();
         if (userId == null) return Unauthorized(ApiResponse<UserResponse>.Fail("Invalid token."));
-        var user = await _userService.UpdateCurrentUserAsync(userId.Value, request, cancellationToken);
+        var user = await _userService.UpdateCurrentUserAsync(userId.Value, request.Username, request.Email,
+            cancellationToken);
         return Ok(ApiResponse<UserResponse>.Ok(user, "Profile updated successfully!"));
     }
 }

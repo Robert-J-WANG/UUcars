@@ -62,11 +62,20 @@ public abstract class IntegrationTestBase : IAsyncLifetime
         string username = "testuser",
         string password = "Test@123456")
     {
+        // Step 1：注册（EmailConfirmed = false，token 发到 FakeEmailService）
         await Client.PostAsync("/auth/register", JsonContent(new
         {
             username, email, password
         }));
 
+
+        // Step 2：从已有的 FakeEmailService 取 token，调用验证接口
+        var verifyToken = Factory.FakeEmail.SentVerificationEmails
+            .Last(x => x.Email == email).Token;
+        await Client.GetAsync($"/auth/verify-email?token={verifyToken}");
+
+
+        // Step 3：EmailConfirmed = true，登录正常拿 JWT
         var loginResponse = await Client.PostAsync("/auth/login", JsonContent(new
         {
             email, password
