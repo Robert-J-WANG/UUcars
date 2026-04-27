@@ -109,6 +109,10 @@ try
     // Admin 模块
     builder.Services.AddScoped<AdminCarService>();
 
+    // 评价模块
+    builder.Services.AddScoped<IReviewRepository, EfReviewRepository>();
+    builder.Services.AddScoped<ReviewService>();
+
     // =============================================
     // 构建应用
     // =============================================

@@ -1827,24 +1827,290 @@ public class UserServiceTests
 }
 ```
 
+
+
+### 10. 更新集成测试
+
+先理解真实生产环境的流程
+
+```
+用户注册
+  → UserService.RegisterAsync()
+      → 生成 token（TokenGenerator.Generate()，一串随机字符串）
+      → 把 token 存进数据库（user.EmailConfirmationToken）
+      → 调用 IEmailService.SendEmailVerificationAsync(email, token)
+          → ResendEmailService 把含这个 token 的链接发到用户真实邮箱
+  → 用户打开邮件，点击链接 http://xxx/verify-email?token=abc123
+  → UserService.VerifyEmailAsync(token)
+      → 用 token 在数据库里找到对应用户
+      → 设置 EmailConfirmed = true，清空 token
+  → 用户登录
+      → UserService.LoginAsync()
+          → 检查 EmailConfirmed == true → 通过 → 返回 JWT
+```
+
+**关键点**：token 是 `RegisterAsync` 里生成的，写进了数据库，同时通过 `IEmailService` "发"出去。用户之所以能拿到 token，是因为他们收到了邮件。
+
+
+
+#### 集成测试的问题
+
+集成测试不能真的发邮件——没有真实邮箱可以收，也不能依赖 Resend 外部服务。
+
+但测试需要拿到那个 token，才能模拟用户"点击邮件里的链接"这个动作。
+
+**怎么办？** 把 `IEmailService` 换成 `FakeEmailService`。
+
+
+
+#### FakeEmailService 的本质
+
+```csharp
+public class FakeEmailService : IEmailService
+{
+    public List<(string Email, string Token)> SentVerificationEmails { get; } = [];
+
+    public Task SendEmailVerificationAsync(string email, string token,
+        CancellationToken cancellationToken = default)
+    {
+        SentVerificationEmails.Add((email, token));  // 不发邮件，只把 token 记下来
+        return Task.CompletedTask;
+    }
+}
+```
+
+它实现了 `IEmailService` 接口，所以 `UserService` 注入它的时候感知不到任何区别。`UserService` 调用 `SendEmailVerificationAsync(email, token)` 时：
+
+- 真实环境：`ResendEmailService` 把 token 发到用户邮箱
+- 测试环境：`FakeEmailService` 把 token 存进内存列表
+
+**token 本身不是 FakeEmailService 生成的**，是 `RegisterAsync` 里 `TokenGenerator.Generate()` 生成的，FakeEmailService 只是"拦截"了这个 token，存起来让测试代码能读到。
+
+
+
+#### 完整的集成测试流程
+
+```
+SqlServerTestFactory.ConfigureWebHost()
+  → 把 ResendEmailService 从 DI 容器里移除
+  → 注册 FakeEmailService（Singleton，整个测试共享同一个实例）
+```
+
+```c#
+
+public class SqlServerTestFactory : WebApplicationFactory<Program>, IAsyncLifetime
+{
+	// ← 新增：暴露给 IntegrationTestBase 使用，取注册时发出的 token
+    public FakeEmailService FakeEmail { get; } = new();
+
+   ...
+
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    {
+        builder.ConfigureServices(services =>
+        {
+            // 原有：替换 DbContext（不变）
+            ...
+
+            // ← 新增：替换 IEmailService，避免真实调用 Resend API
+            var emailDescriptor = services.SingleOrDefault(
+                d => d.ServiceType == typeof(IEmailService));
+            if (emailDescriptor != null)
+                services.Remove(emailDescriptor);
+
+            // Singleton：整个测试共享同一个实例，token 才能被正确读取
+            services.AddSingleton<IEmailService>(FakeEmail);
+        });
+
+        builder.UseEnvironment("Testing");
+    }
+
+    // InitializeDatabaseAsync 和 CleanDatabaseAsync 完全不变
+}
+```
+
+然后 `RegisterAndLoginAsync("test@example.com", ...)` 被调用：
+
+##### Step 1：POST /auth/register
+
+```
+测试代码 → HTTP POST /auth/register
+  → AuthController.Register()
+  → UserService.RegisterAsync()
+      → TokenGenerator.Generate() 生成 token，比如 "aB3kR9mX"
+      → 把用户写入测试数据库：
+            EmailConfirmed = false
+            EmailConfirmationToken = "aB3kR9mX"
+      → 调用 IEmailService.SendEmailVerificationAsync("test@example.com", "aB3kR9mX")
+            ↓
+          FakeEmailService（不发真实邮件）
+          SentVerificationEmails.Add(("test@example.com", "aB3kR9mX"))
+```
+
+此时内存里：
+
+```
+FakeEmailService.SentVerificationEmails = [("test@example.com", "aB3kR9mX")]
+数据库里的用户：EmailConfirmed = false，EmailConfirmationToken = "aB3kR9mX"
+```
+
+##### Step 2：从 FakeEmailService 取出 token
+
+```csharp
+var verifyToken = Factory.FakeEmail.SentVerificationEmails
+    .Last(x => x.Email == email).Token;
+// verifyToken = "aB3kR9mX"
+```
+
+这就是"拦截邮件"——在真实环境里用户从邮箱里拿到这个 token，在测试里直接从内存里拿。
+
+##### Step 3：GET /auth/verify-email?token=aB3kR9mX
+
+```
+测试代码 → HTTP GET /auth/verify-email?token=aB3kR9mX
+  → AuthController.VerifyEmail("aB3kR9mX")
+  → UserService.VerifyEmailAsync("aB3kR9mX")
+      → 用 "aB3kR9mX" 在数据库里查找用户
+      → 找到了，检查 token 没过期
+      → 设置 EmailConfirmed = true
+      → 清空 EmailConfirmationToken = null
+      → 保存进数据库
+```
+
+此时数据库里：
+
+```
+用户：EmailConfirmed = true，EmailConfirmationToken = null
+```
+
+##### Step 4：POST /auth/login
+
+```
+测试代码 → HTTP POST /auth/login
+  → UserService.LoginAsync()
+      → 查到用户
+      → 密码验证通过
+      → 检查 EmailConfirmed == true  ✅
+      → 生成 JWT Token 返回
+```
+
+`RegisterAndLoginAsync` 返回 JWT Token，后续所有需要认证的测试正常继续。
+
+```c#
+// IntegrationTestBase.cs
+
+protected async Task<string> RegisterAndLoginAsync(
+    string email = "test@example.com",
+    string username = "testuser",
+    string password = "Test@123456")
+{
+    // Step 1：注册（EmailConfirmed = false，token 发到 FakeEmailService）
+    await Client.PostAsync("/auth/register", JsonContent(new
+    {
+        username, email, password
+    }));
+
+    // Step 2：从已有的 FakeEmailService 取 token，调用验证接口
+    var verifyToken = Factory.FakeEmail.SentVerificationEmails
+        .Last(x => x.Email == email).Token;
+    
+    await Client.GetAsync($"/auth/verify-email?token={verifyToken}");
+
+    // Step 3：EmailConfirmed = true，登录正常拿 JWT
+    var loginResponse = await Client.PostAsync("/auth/login", JsonContent(new
+    {
+        email, password
+    }));
+
+    var result = await DeserializeAsync<ApiResponseWrapper<LoginData>>(loginResponse);
+    return result?.Data?.Token ?? string.Empty;
+}
+```
+
+
+
+#### 为什么必须是 Singleton
+
+```csharp
+services.AddSingleton<IEmailService>(FakeEmail);
+```
+
+如果注册成 `Scoped`，每次 HTTP 请求都会创建一个新的 `FakeEmailService` 实例。注册时存 token 的那个实例，和测试代码读 token 的那个实例，就不是同一个对象——读到的是空列表。
+
+`Singleton` 保证整个测试生命周期里只有一个 `FakeEmailService` 实例，`Factory.FakeEmail` 和 DI 容器里注入给 `UserService` 的是同一个对象，token 才能被正确读取。
+
+
+
+#### 一张图总结
+
+```
+RegisterAsync()
+    │
+    ├─→ TokenGenerator.Generate() ──→ token = "aB3kR9mX"
+    │
+    ├─→ 写入数据库
+    │       EmailConfirmed = false
+    │       EmailConfirmationToken = "aB3kR9mX"
+    │
+    └─→ IEmailService.SendEmailVerificationAsync("test@...", "aB3kR9mX")
+                │
+         ┌──────┴──────┐
+    生产环境            测试环境
+    ResendEmailService  FakeEmailService
+    发真实邮件           存进内存列表
+         │                    │
+    用户从邮箱取 token    测试代码从内存取 token
+                              │
+              GET /auth/verify-email?token=aB3kR9mX
+                              │
+              VerifyEmailAsync() → EmailConfirmed = true
+                              │
+              POST /auth/login → 检查通过 → 返回 JWT
+```
+
+整个过程里，业务代码（`UserService`、`AuthController`）一行都没变，走的是完全真实的代码路径。只是 `IEmailService` 的实现被替换了。
+
+只改一个测试测试用例：唯一一个手动写了注册+登录、没走 `RegisterAndLoginAsync` 的测试
+
+```c#
+// CoreFlowIntegrationTests.cs
+
+[Fact]
+public async Task Login_WithValidCredentials_ShouldReturnToken()
+{
+    await Client.PostAsync("/auth/register", JsonContent(new
+    {
+        username = "testuser",
+        email = "test@example.com",
+        password = "Test@123456"
+    }));
+
+    // 新增：验证邮箱
+    var verifyToken = Factory.FakeEmail.SentVerificationEmails
+        .Last(x => x.Email == "test@example.com").Token;
+    
+    await Client.GetAsync($"/auth/verify-email?token={verifyToken}");
+
+    var response = await Client.PostAsync("/auth/login", JsonContent(new
+    {
+        email = "test@example.com",
+        password = "Test@123456"
+    }));
+
+    Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    var result = await DeserializeAsync<ApiResponseWrapper<LoginData>>(response);
+    Assert.NotNull(result?.Data?.Token);
+    Assert.NotEmpty(result!.Data!.Token);
+}
+```
+
+
+
 #### 运行测试
 
 ```bash
-dotnet test
-```
-
-预期：
-
-```
-Test summary: total: 27, failed: 0, succeeded: 27, skipped: 0
-```
-
-
-
-### 10. 验证编译
-
-```bash
 dotnet build
+dotnet test
 ```
 
 预期：
@@ -1853,6 +2119,8 @@ dotnet build
 Build succeeded.
     0 Warning(s)
     0 Error(s)
+
+Test summary: total: 27, failed: 0, succeeded: 27, skipped: 0
 ```
 
 
@@ -1955,6 +2223,10 @@ UUcars.Tests/
 ├── Fakes/
 │   ├── FakeEmailService.cs                     ← 新增
 │   └── FakeUserRepository.cs                   ← 已更新
+├── Integration/
+│   ├── SqlServerTestFactory.cs                  ← 已更新
+│   └── IntegrationTestBase.cs                   ← 已更新
+│   └── CoreFlowIntegrationTests.cs              ← 已更新
 └── Services/
     └── UserServiceTests.cs                     ← 已更新
 ```
@@ -3389,4 +3661,760 @@ git push origin feature/v2-backend
 ✅ dotnet build 通过
 ✅ Scalar 测试通过（上传成功、URL可访问、验证错误返回400）
 ✅ Git commit 完成
+```
+
+
+
+## Step 41 · 用户评价系统
+
+### 这一步做什么
+
+一个二手车平台，买家在下单前需要知道"这个卖家靠不靠谱"。评价系统解决这个问题：
+
+- 买家完成交易后可以给卖家打分
+- 其他买家能看到卖家的历史评价和平均分
+
+这一步分两部分：先补全订单的完成流程，再实现评价功能。
+
+
+
+### 1. 订单完成流程
+
+V1 的订单状态只有：
+
+```
+Pending → Cancelled（买家取消）
+```
+
+缺少"交易完成"的路径。现实中，买家付款、卖家交车，双方确认后交易才算完成。这一步让卖家能主动确认订单完成，状态变为 `Completed`。
+
+只有 `Completed` 状态的订单才允许评价，这保证了评价的真实性——没有真实交易就没有评价权。
+
+订单状态不满足操作要求时,抛出异常 `OrderStatusException`。
+
+
+
+**OrderService 里添加完成订单方法**
+
+打开 `UUcars.API/Services/OrderService.cs`，在 `CancelAsync` 下方添加：
+
+```csharp
+// =============================================
+// 确认订单完成（Step 41 新增）
+// =============================================
+public async Task<OrderResponse> CompleteAsync(
+    int orderId,
+    int currentUserId,
+    CancellationToken cancellationToken = default)
+{
+    var order = await _orderRepository.GetByIdAsync(orderId, cancellationToken);
+
+    if (order == null)
+        throw new OrderNotFoundException(orderId);
+
+    // 只有卖家可以确认完成
+    // 原因：卖家是"交货方"，由卖家确认表示货已交出
+    // 买家视角的确认可以在 V3 里作为进阶功能补充（双方确认机制）
+    if (order.SellerId != currentUserId)
+        throw new ForbiddenException();
+
+    // 只有 Pending 状态可以完成
+    if (order.Status != OrderStatus.Pending)
+        throw new OrderStatusException(orderId, order.Status, OrderStatus.Pending);
+
+    order.Status = OrderStatus.Completed;
+    order.UpdatedAt = DateTime.UtcNow;
+
+    _context.Orders.Update(order);
+    await _context.SaveChangesAsync(cancellationToken);
+
+    _logger.LogInformation(
+        "Order {OrderId} completed by seller {SellerId}", orderId, currentUserId);
+
+    return MapToResponse(order);
+}
+```
+
+**OrdersController 里添加完成订单端点**
+
+打开 `UUcars.API/Controllers/OrdersController.cs`，在 `Cancel` 下方添加：
+
+```csharp
+// POST /orders/{id}/complete
+[HttpPost("{id:int}/complete")]
+public async Task<IActionResult> Complete(int id, CancellationToken cancellationToken)
+{
+    var currentUserId = _currentUserService.GetCurrentUserId();
+    if (currentUserId == null)
+        return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+    var order = await _orderService.CompleteAsync(
+        id, currentUserId.Value, cancellationToken);
+
+    return Ok(ApiResponse<OrderResponse>.Ok(order,
+        "Order completed successfully."));
+}
+```
+
+
+
+### 2. 评价系统
+
+#### 2.1 数据库 Migration
+
+先建 Reviews 表。
+
+打开 `UUcars.API/Entities`，创建 Review 实体：
+
+```bash
+touch UUcars.API/Entities/Review.cs
+```
+
+```c#
+namespace UUcars.API.Entities;
+
+public class Review : BaseEntity
+{
+    // 关联的订单（唯一索引保证一个订单只能评价一次）
+    public int OrderId { get; set; }
+    public Order Order { get; set; } = null!;
+
+    // 评价人（买家）
+    public int ReviewerId { get; set; }
+    public User Reviewer { get; set; } = null!;
+
+    // 被评价人（卖家）
+    public int RevieweeId { get; set; }
+    public User Reviewee { get; set; } = null!;
+
+    // 评分 1-5 星
+    public int Rating { get; set; }
+
+    // 评价内容，允许为空（用户可以只打分不写评论）
+    public string? Comment { get; set; }
+}
+```
+
+创建 Fluent API 配置：
+
+```bash
+touch UUcars.API/Configurations/ReviewConfiguration.cs
+```
+
+```c#
+
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+using UUcars.API.Entities;
+
+namespace UUcars.API.Configurations;
+
+public class ReviewConfiguration : IEntityTypeConfiguration<Review>
+{
+    public void Configure(EntityTypeBuilder<Review> builder)
+    {
+        // 唯一索引：一个订单只能产生一条评价
+        // 数据库层面保证，即使并发提交也不会出现重复评价
+        builder.HasIndex(r => r.OrderId)
+            .IsUnique();
+
+        builder.Property(r => r.Rating)
+            .IsRequired();
+
+        builder.Property(r => r.Comment)
+            .HasMaxLength(500);
+
+        builder.Property(r => r.CreatedAt)
+            .IsRequired();
+
+        builder.Property(r => r.UpdatedAt)
+            .IsRequired();
+
+        // 关联订单
+        builder.HasOne(r => r.Order)
+            .WithMany()
+            .HasForeignKey(r => r.OrderId)
+            .OnDelete(DeleteBehavior.Restrict);
+
+        // 关联评价人（买家）
+        builder.HasOne(r => r.Reviewer)
+            .WithMany()
+            .HasForeignKey(r => r.ReviewerId)
+            .OnDelete(DeleteBehavior.Restrict);
+
+        // 关联被评价人（卖家）
+        builder.HasOne(r => r.Reviewee)
+            .WithMany()
+            .HasForeignKey(r => r.RevieweeId)
+            .OnDelete(DeleteBehavior.Restrict);
+    }
+}
+```
+
+> **为什么三个外键都用 `Restrict`？** 评价是重要的业务记录。订单、买家、卖家任何一方被删除（逻辑删除），评价记录都应该保留，不能级联删除。
+
+更新 `AppDbContext`，添加 `Reviews` 的 DbSet：
+
+打开 `UUcars.API/Data/AppDbContext.cs`：
+
+```csharp
+public DbSet<User> Users => Set<User>();
+public DbSet<Car> Cars => Set<Car>();
+public DbSet<CarImage> CarImages => Set<CarImage>();
+public DbSet<Order> Orders => Set<Order>();
+public DbSet<Favorite> Favorites => Set<Favorite>();
+public DbSet<Review> Reviews => Set<Review>();  // 新增
+```
+
+生成并执行 Migration：
+
+```bash
+dotnet ef migrations add AddReviewsTable \
+    --project UUcars.API/UUcars.API.csproj
+
+dotnet ef database update \
+    --project UUcars.API/UUcars.API.csproj
+```
+
+#### 2.2 创建 DTO
+
+```bash
+touch UUcars.API/DTOs/Requests/CreateReviewRequest.cs
+touch UUcars.API/DTOs/Responses/ReviewResponse.cs
+touch UUcars.API/DTOs/Responses/SellerRatingResponse.cs
+```
+
+```c#
+using System.ComponentModel.DataAnnotations;
+
+namespace UUcars.API.DTOs.Requests;
+
+public class CreateReviewRequest
+{
+    [Required(ErrorMessage = "OrderId is required.")]
+    public int OrderId { get; set; }
+
+    [Required(ErrorMessage = "Rating is required.")]
+    [Range(1, 5, ErrorMessage = "Rating must be between 1 and 5.")]
+    public int Rating { get; set; }
+
+    [MaxLength(500, ErrorMessage = "Comment must not exceed 500 characters.")]
+    public string? Comment { get; set; }
+}
+namespace UUcars.API.DTOs.Responses;
+
+public class ReviewResponse
+{
+    public int Id { get; set; }
+    public int OrderId { get; set; }
+    public int ReviewerId { get; set; }
+    public string ReviewerUsername { get; set; } = string.Empty;
+    public int Rating { get; set; }
+    public string? Comment { get; set; }
+    public DateTime CreatedAt { get; set; }
+}
+namespace UUcars.API.DTOs.Responses;
+
+// 卖家评价汇总：平均分 + 评价列表
+public class SellerRatingResponse
+{
+    public int SellerId { get; set; }
+    public double AverageRating { get; set; }
+    public int TotalReviews { get; set; }
+    public List<ReviewResponse> Reviews { get; set; } = [];
+}
+```
+
+#### 2.3 创建业务异常
+
+```bash
+touch UUcars.API/Exceptions/ReviewAlreadyExistsException.cs
+touch UUcars.API/Exceptions/OrderNotCompletedException.cs
+```
+
+```c#
+namespace UUcars.API.Exceptions;
+
+// 同一个订单已经评价过了
+public class ReviewAlreadyExistsException : AppException
+{
+    public ReviewAlreadyExistsException()
+        : base(StatusCodes.Status409Conflict,
+            "This order has already been reviewed.")
+    {
+    }
+}
+namespace UUcars.API.Exceptions;
+
+// 订单未完成，不能评价
+public class OrderNotCompletedException : AppException
+{
+    public OrderNotCompletedException()
+        : base(StatusCodes.Status409Conflict,
+            "You can only review a completed order.")
+    {
+    }
+}
+```
+
+#### 2.4 创建 IReviewRepository 和 EfReviewRepository
+
+```bash
+touch UUcars.API/Repositories/IReviewRepository.cs
+touch UUcars.API/Repositories/EfReviewRepository.cs
+```
+
+```c#
+using UUcars.API.Entities;
+
+namespace UUcars.API.Repositories;
+
+public interface IReviewRepository
+{
+    // 检查某订单是否已经评价过
+    Task<bool> ExistsByOrderIdAsync(int orderId,
+        CancellationToken cancellationToken = default);
+
+    // 创建评价
+    Task<Review> AddAsync(Review review,
+        CancellationToken cancellationToken = default);
+
+    // 查询某卖家的所有评价
+    Task<List<Review>> GetByRevieweeIdAsync(int revieweeId,
+        CancellationToken cancellationToken = default);
+}
+
+using Microsoft.EntityFrameworkCore;
+using UUcars.API.Data;
+using UUcars.API.Entities;
+
+namespace UUcars.API.Repositories;
+
+public class EfReviewRepository : IReviewRepository
+{
+    private readonly AppDbContext _context;
+
+    public EfReviewRepository(AppDbContext context)
+    {
+        _context = context;
+    }
+
+    public async Task<bool> ExistsByOrderIdAsync(int orderId,
+        CancellationToken cancellationToken = default)
+    {
+        return await _context.Reviews
+            .AnyAsync(r => r.OrderId == orderId, cancellationToken);
+    }
+
+    public async Task<Review> AddAsync(Review review,
+        CancellationToken cancellationToken = default)
+    {
+        _context.Reviews.Add(review);
+        await _context.SaveChangesAsync(cancellationToken);
+        return review;
+    }
+
+    public async Task<List<Review>> GetByRevieweeIdAsync(int revieweeId,
+        CancellationToken cancellationToken = default)
+    {
+        return await _context.Reviews
+            .Include(r => r.Reviewer)
+            .Where(r => r.RevieweeId == revieweeId)
+            .OrderByDescending(r => r.CreatedAt)
+            .ToListAsync(cancellationToken);
+    }
+}
+```
+
+#### 2.5 创建 ReviewService
+
+```bash
+touch UUcars.API/Services/ReviewService.cs
+```
+
+```c#
+using UUcars.API.DTOs.Requests;
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Entities;
+using UUcars.API.Entities.Enums;
+using UUcars.API.Exceptions;
+using UUcars.API.Repositories;
+
+namespace UUcars.API.Services;
+
+public class ReviewService
+{
+    private readonly IReviewRepository _reviewRepository;
+    private readonly IOrderRepository _orderRepository;
+    private readonly ILogger<ReviewService> _logger;
+
+    public ReviewService(
+        IReviewRepository reviewRepository,
+        IOrderRepository orderRepository,
+        ILogger<ReviewService> logger)
+    {
+        _reviewRepository = reviewRepository;
+        _orderRepository = orderRepository;
+        _logger = logger;
+    }
+
+    public async Task<ReviewResponse> CreateAsync(
+        int reviewerId,
+        CreateReviewRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        // 1. 验证订单存在
+        var order = await _orderRepository.GetByIdAsync(
+            request.OrderId, cancellationToken);
+
+        if (order == null)
+            throw new OrderNotFoundException(request.OrderId);
+
+        // 2. 只有买家可以评价
+        // 卖家不能评价自己的订单，也不能让第三方评价
+        if (order.BuyerId != reviewerId)
+            throw new ForbiddenException();
+
+        // 3. 只有 Completed 状态的订单可以评价
+        // 确保交易真实完成后才能评价，防止虚假评价
+        if (order.Status != OrderStatus.Completed)
+            throw new OrderNotCompletedException();
+
+        // 4. 检查是否已经评价过
+        // 数据库有唯一索引兜底，这里提前检查给出更友好的错误信息
+        var alreadyReviewed = await _reviewRepository
+            .ExistsByOrderIdAsync(request.OrderId, cancellationToken);
+        if (alreadyReviewed)
+            throw new ReviewAlreadyExistsException();
+
+        // 5. 创建评价
+        // RevieweeId 从订单里取，不从客户端传入
+        // 防止客户端传入错误的被评价人
+        var review = new Review
+        {
+            OrderId = request.OrderId,
+            ReviewerId = reviewerId,
+            RevieweeId = order.SellerId,
+            Rating = request.Rating,
+            Comment = request.Comment,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        var created = await _reviewRepository.AddAsync(review, cancellationToken);
+
+        _logger.LogInformation(
+            "Review created for order {OrderId} by buyer {ReviewerId}",
+            request.OrderId, reviewerId);
+
+        return new ReviewResponse
+        {
+            Id = created.Id,
+            OrderId = created.OrderId,
+            ReviewerId = created.ReviewerId,
+            ReviewerUsername = order.Buyer?.Username ?? string.Empty,
+            Rating = created.Rating,
+            Comment = created.Comment,
+            CreatedAt = created.CreatedAt
+        };
+    }
+
+    public async Task<SellerRatingResponse> GetSellerRatingAsync(
+        int sellerId,
+        CancellationToken cancellationToken = default)
+    {
+        var reviews = await _reviewRepository
+            .GetByRevieweeIdAsync(sellerId, cancellationToken);
+
+        // 平均分：没有评价时返回 0
+        var averageRating = reviews.Count > 0
+            ? reviews.Average(r => r.Rating)
+            : 0;
+
+        return new SellerRatingResponse
+        {
+            SellerId = sellerId,
+            AverageRating = Math.Round(averageRating, 1),
+            TotalReviews = reviews.Count,
+            Reviews = reviews.Select(r => new ReviewResponse
+            {
+                Id = r.Id,
+                OrderId = r.OrderId,
+                ReviewerId = r.ReviewerId,
+                ReviewerUsername = r.Reviewer?.Username ?? string.Empty,
+                Rating = r.Rating,
+                Comment = r.Comment,
+                CreatedAt = r.CreatedAt
+            }).ToList()
+        };
+    }
+}
+```
+
+> **为什么 `RevieweeId` 从订单里取，不让客户端传？** 如果让客户端传 `RevieweeId`，恶意用户可以传任意卖家 ID，评价一个和这笔订单无关的人。从订单里取 `SellerId` 可以保证评价的对象一定是这笔交易的卖家，不可被伪造。
+
+#### 2.6 创建 ReviewsController
+
+```bash
+touch UUcars.API/Controllers/ReviewsController.cs
+```
+
+```c#
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using UUcars.API.DTOs;
+using UUcars.API.DTOs.Requests;
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Services;
+
+namespace UUcars.API.Controllers;
+
+[ApiController]
+[Route("reviews")]
+public class ReviewsController : ControllerBase
+{
+    private readonly ReviewService _reviewService;
+    private readonly CurrentUserService _currentUserService;
+
+    public ReviewsController(
+        ReviewService reviewService,
+        CurrentUserService currentUserService)
+    {
+        _reviewService = reviewService;
+        _currentUserService = currentUserService;
+    }
+
+    // POST /reviews
+    [HttpPost]
+    [Authorize]
+    public async Task<IActionResult> Create(
+        [FromBody] CreateReviewRequest request,
+        CancellationToken cancellationToken)
+    {
+        var currentUserId = _currentUserService.GetCurrentUserId();
+        if (currentUserId == null)
+            return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+        var review = await _reviewService.CreateAsync(
+            currentUserId.Value, request, cancellationToken);
+
+        return StatusCode(StatusCodes.Status201Created,
+            ApiResponse<ReviewResponse>.Ok(review, "Review submitted successfully."));
+    }
+
+    // GET /reviews/seller/{id}
+    // 公开接口，不需要登录，任何人都可以查看卖家的评价
+    [HttpGet("seller/{id:int}")]
+    public async Task<IActionResult> GetSellerRating(
+        int id,
+        CancellationToken cancellationToken)
+    {
+        var result = await _reviewService.GetSellerRatingAsync(
+            id, cancellationToken);
+
+        return Ok(ApiResponse<SellerRatingResponse>.Ok(result));
+    }
+}
+```
+
+#### 2.7 注册依赖到 Program.cs
+
+```csharp
+// 评价模块
+builder.Services.AddScoped<IReviewRepository, EfReviewRepository>();
+builder.Services.AddScoped<ReviewService>();
+```
+
+
+
+### 3. 验证编译
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+
+
+### 4. 用 Scalar 测试
+
+启动项目：
+
+```bash
+cd UUcars.API && dotnet run
+```
+
+**完整评价流程测试：**
+
+第一步，准备数据——用卖家账号创建并提交车辆审核，用 Admin 审核通过，用买家账号下单。
+
+第二步，卖家确认订单完成：
+
+```
+POST /orders/1/complete
+Authorization: Bearer [卖家Token]
+```
+
+预期（200）：
+
+```json
+{
+  "success": true,
+  "data": { "id": 1, "status": "Completed", ... },
+  "message": "Order completed successfully."
+}
+```
+
+第三步，买家提交评价：
+
+```json
+POST /reviews
+Authorization: Bearer [买家Token]
+
+{
+  "orderId": 1,
+  "rating": 5,
+  "comment": "卖家非常靠谱，车况和描述完全一致，推荐！"
+}
+```
+
+预期（201）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": 1,
+    "orderId": 1,
+    "rating": 5,
+    "comment": "卖家非常靠谱，车况和描述完全一致，推荐！",
+    ...
+  },
+  "message": "Review submitted successfully."
+}
+```
+
+第四步，查看卖家评价：
+
+```
+GET /reviews/seller/{卖家ID}
+```
+
+预期（200）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "sellerId": 3,
+    "averageRating": 5.0,
+    "totalReviews": 1,
+    "reviews": [...]
+  }
+}
+```
+
+**安全边界测试：**
+
+重复评价同一个订单（应返回 409）。
+
+用 Pending 状态的订单评价（应返回 409）。
+
+用卖家 Token 评价自己的订单（应返回 403）。
+
+`Ctrl+C` 停止，回到根目录：
+
+```bash
+cd ..
+```
+
+
+
+### 5. 此时的目录变化
+
+```
+UUcars.API/
+├── Configurations/
+│   └── ReviewConfiguration.cs          ← 新增
+├── Controllers/
+│   └── ReviewsController.cs            ← 新增
+├── DTOs/
+│   ├── Requests/
+│   │   └── CreateReviewRequest.cs      ← 新增
+│   └── Responses/
+│       ├── ReviewResponse.cs           ← 新增
+│       └── SellerRatingResponse.cs     ← 新增
+├── Entities/
+│   └── Review.cs                       ← 新增
+├── Exceptions/
+│   ├── OrderNotCompletedException.cs   ← 新增
+│   ├── OrderStatusException.cs         ← 新增
+│   └── ReviewAlreadyExistsException.cs ← 新增
+├── Migrations/
+│   └── [timestamp]_AddReviewsTable     ← 新增
+├── Repositories/
+│   ├── IReviewRepository.cs            ← 新增
+│   └── EfReviewRepository.cs           ← 新增
+├── Services/
+│   ├── OrderService.cs                 ← 已更新（新增 CompleteAsync）
+│   └── ReviewService.cs               ← 新增
+└── Data/
+    └── AppDbContext.cs                 ← 已更新（新增 DbSet<Review>）
+```
+
+
+
+### 6. Git 提交 + 合并分支
+
+V2 后端全部完成，合并回 `develop` 并打里程碑 tag：
+
+```bash
+git add .
+git commit -m "feat: order complete + review system"
+git push origin feature/v2-backend
+
+git checkout develop
+git merge --no-ff feature/v2-backend \
+    -m "merge: feature/v2-backend into develop"
+git push origin develop
+git branch -D feature/v2-backend
+git push origin --delete feature/v2-backend
+
+git checkout main
+git merge --no-ff develop -m "release: v2.0-backend complete"
+git tag -a v2.0-backend \
+    -m "V2 backend: CORS + email + image upload + reviews"
+git push origin main
+git push origin v2.0-backend
+git checkout develop
+```
+
+
+
+### Step 41 完成状态
+
+```
+✅ OrderStatusException（订单状态不满足操作要求）
+✅ OrderService 新增 CompleteAsync（Pending → Completed，卖家确认）
+✅ OrdersController 新增 POST /orders/{id}/complete
+✅ Review 实体（含唯一索引配置）
+✅ AppDbContext 新增 DbSet<Review>
+✅ 数据库 Migration（AddReviewsTable）
+✅ CreateReviewRequest / ReviewResponse / SellerRatingResponse DTO
+✅ ReviewAlreadyExistsException / OrderNotCompletedException
+✅ IReviewRepository + EfReviewRepository
+✅ ReviewService（三层权限验证：买家身份/订单完成/防重复）
+✅ RevieweeId 从订单取而非客户端传入（防伪造）
+✅ ReviewsController（POST /reviews 需登录，GET /reviews/seller/{id} 公开）
+✅ DI 注册完成
+✅ dotnet build 通过
+✅ Scalar 端到端流程验证通过（含安全边界测试）
+✅ feature/v2-backend 合并回 develop，v2.0-backend tag 打完
 ```
