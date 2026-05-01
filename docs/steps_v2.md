@@ -6172,3 +6172,662 @@ git push origin feature/auth-pages
 ✅ npm run build 无错误
 ✅ Git commit 完成
 ```
+
+
+
+## Step 46 · 登录页
+
+### 这一步做什么
+
+实现第一个真实可用的页面——登录。完成后用户可以输入邮箱密码，点击登录，Token 存入 localStorage，跳转到首页。
+
+这是前端最核心的一步。做完这步，就掌握了后续所有页面的开发模式: 
+
+- 表单验证
+- API调用
+- 状态更新
+- 页面跳转
+
+后面每个页面都是这套模式的重复和扩展。
+
+
+
+### 1. 安装 React Router
+
+登录成功后需要跳转页面，先装路由库：
+
+```bash
+npm install react-router-dom
+```
+
+先做最简单的路由配置，只有两个路由，够登录页用就行。后续 Step 47 会做完整的路由结构。
+
+打开 `src/main.tsx`：
+
+```tsx
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import { BrowserRouter } from 'react-router-dom'
+import './index.css'
+import App from './App.tsx'
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    {/* 包裹rowserRouter组件 */}
+    <BrowserRouter>
+      <App />
+    </BrowserRouter>
+  </StrictMode>
+)
+```
+
+打开 `src/App.tsx`，配置临时路由：
+
+```tsx
+import { Routes, Route } from 'react-router-dom'
+import LoginPage from '@/pages/LoginPage'
+
+function App() {
+  return (
+    <Routes>
+      <Route path="/login" element={<LoginPage />} />
+      <Route path="/" element={<div className="p-8">首页（占位）</div>} />
+    </Routes>
+  )
+}
+
+export default App
+```
+
+
+
+### 2. React 组件是什么
+
+React 组件就是**一个返回 UI 的函数**。
+
+描述"这个界面长什么样"，React 负责把它渲染到浏览器里：
+
+```tsx
+// 最简单的组件
+function LoginPage() {
+  return <div>登录页</div>
+}
+```
+
+这里的 `<div>` 不是真正的 HTML，而是 **JSX**：一种在 JavaScript 里写类似 HTML 的语法，React 会把它转换成真正的 DOM 操作。
+
+**组件里的状态（useState）**
+
+组件里的普通变量不会触发界面更新。如果想"数据变了，界面跟着变"，需要用 `useState`：
+
+```tsx
+// count 变化时，React 会重新渲染这个组件
+const [count, setCount] = useState(0)
+
+// count 是当前值
+// setCount 是修改它的函数
+// 0 是初始值
+```
+
+登录页需要两个状态：
+
+- `isLoading`：是否正在提交（控制按钮的禁用和文字）
+- `serverError`：服务端返回的错误信息（密码错误等）
+
+**TypeScript 在组件里的作用**
+
+TypeScript 给变量加类型标注，让 IDE 有提示，写错了编译器报错：
+
+```tsx
+// <boolean> 是泛型，告诉 TS 这个状态是布尔类型
+const [isLoading, setIsLoading] = useState<boolean>(false)
+
+// <string | null> 表示可以是字符串或 null
+const [serverError, setServerError] = useState<string | null>(null)
+```
+
+
+
+### 3. 表单数据怎么处理
+
+现在来想一个问题：用户在输入框里打字，怎么拿到这个值？
+
+**最直接的想法（受控组件）：**
+
+```tsx
+const [email, setEmail] = useState('')
+
+<input
+  value={email}
+  onChange={(e) => setEmail(e.target.value)}
+/>
+```
+
+每次用户打一个字，`onChange` 就触发一次，更新 `email` 状态。但表单字段多了，就要写很多个 `useState` 和 `onChange`，而且每次打字都触发重渲染，性能不好。
+
+**React Hook Form 的方式（非受控组件）：**
+
+RHF 不用 `useState` 追踪每个字段，而是直接操作 DOM 读取值，只在需要的时候（比如提交时）才收集所有字段的值。性能更好，代码更少。
+
+RHF 的用法是通过 `register` 函数把输入框"注册"进来：
+
+```tsx
+const { register } = useForm()
+
+// register('email') 返回一些 props（onChange、onBlur、ref 等）
+// 展开传给 input，RHF 就能追踪这个字段了
+<input {...register('email')} />
+```
+
+`register` 返回的是一个普通对象，里面是几个事件处理函数和属性：
+
+```ts
+register('email') 返回：
+{
+  name: 'email',
+  ref: (el) => { /* RHF 保存 DOM 引用 */ },
+  onChange: (e) => { /* 用户输入时更新 RHF 内部状态 */ },
+  onBlur: (e) => { /* 失焦时触发验证 */ },
+}
+```
+
+用展开运算符 `{...register('email')}` 把这些属性全部传给 input：
+
+```ts
+<input {...register('email')} />
+
+// 等价于：
+<input
+  name="email"
+  ref={...}
+  onChange={...}
+  onBlur={...}
+/>
+```
+
+
+
+### 4. 验证规则怎么定义
+
+光收集数据不够，还需要验证格式是否正确。这里用 Zod。
+
+Zod 的思路是：**先描述数据应该长什么样（Schema），再用这个 Schema 验证实际数据**：
+
+```tsx
+import { z } from 'zod'
+
+// 描述登录表单的 Schema
+const loginSchema = z.object({
+  // email 字段：必须是字符串，不能为空，必须是邮箱格式
+  email: z.string()
+    .min(1, 'Email is required')        // 不能为空，错误提示是第二个参数
+    .email('Please enter a valid email'), // 必须是邮箱格式
+
+  // password 字段：必须是字符串，不能为空
+  password: z.string()
+    .min(1, 'Password is required'),
+})
+```
+
+有了 Schema 之后，可以用 TypeScript 的类型推导功能，**从 Schema 自动生成类型**，不需要手动写 interface：
+
+```tsx
+// z.infer 从 Schema 推导出对应的 TypeScript 类型
+// LoginForm 的类型等价于 { email: string; password: string }
+type LoginForm = z.infer<typeof loginSchema>
+```
+
+这样做的好处是：验证规则和类型定义只写一次，永远保持一致。
+
+
+
+### 5. RHF 和 Zod 怎么连接
+
+RHF 负责管理表单，Zod 负责验证规则，两者通过 `zodResolver` 连接：
+
+```tsx
+import { useForm } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+
+const {
+  register,       // 注册字段
+  handleSubmit,   // 包装提交函数
+  formState: { errors, isSubmitting }  // 表单状态
+} = useForm<LoginForm>({
+  // 告诉 RHF：用 loginSchema 来验证表单
+  resolver: zodResolver(loginSchema),
+})
+```
+
+`formState` 里有两个重要的东西：
+
+- `errors`：验证失败时，每个字段的错误信息。`errors.email?.message` 就是邮箱字段的错误文字
+
+    ```ts
+    // 验证失败时 errors 的结构：
+    errors = {
+      email: {
+        message: '邮箱格式不正确',  // ← Zod schema 里定义的错误信息
+        type: 'invalid_string',     // ← 错误类型
+        ref: input DOM 元素          // ← 对应的 input 引用
+      },
+      password: {
+        message: '密码至少6位',
+        type: 'too_small',
+        ref: input DOM 元素
+      }
+    }
+    
+    // 验证通过时对应字段是 undefined
+    errors = {}  // 全部通过，空对象
+    errors.email     // undefined
+    errors.password  // undefined
+    ```
+
+- `isSubmitting`：表单正在提交时为 `true`，提交完成后变回 `false`。用来控制按钮禁用状态
+
+
+
+### 6. 登录页
+
+先创建文件：
+
+```bash
+touch src/pages/LoginPage.tsx
+```
+
+**第一步：最骨架的组件**
+
+先写能跑起来的最简单版本：
+
+```tsx
+export default function LoginPage() {
+  return (
+    <div>
+      <h1>Sign in</h1>
+    </div>
+  )
+}
+```
+
+**第二步：加入状态**
+
+登录页需要两个状态——加进来：
+
+```tsx
+import { useState } from 'react'
+
+export default function LoginPage() {
+  // 服务端错误信息（密码错误、邮箱未验证等）
+  const [serverError, setServerError] = useState<string | null>(null)
+
+  return (
+    <div>
+      <h1>Sign in</h1>
+      {/* serverError 有值时才显示错误提示 */}
+      {serverError && <p>{serverError}</p>}
+    </div>
+  )
+}
+```
+
+**第三步：加入表单和 RHF**
+
+引入 RHF 和 Zod，定义 Schema，注册字段：
+
+```tsx
+import { useState } from 'react'
+import { useForm } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { z } from 'zod'
+
+// 定义验证规则
+const loginSchema = z.object({
+  email: z.string().min(1, 'Email is required').email('Invalid email'),
+  password: z.string().min(1, 'Password is required'),
+})
+
+// 从 Schema 推导类型
+type LoginForm = z.infer<typeof loginSchema>
+
+export default function LoginPage() {
+  const [serverError, setServerError] = useState<string | null>(null)
+
+  // 初始化 RHF，连接 Zod
+  const {
+    register,
+    handleSubmit,
+    formState: { errors, isSubmitting },
+  } = useForm<LoginForm>({
+    resolver: zodResolver(loginSchema),
+  })
+
+  return (
+    <div>
+      <h1>Sign in</h1>
+
+      {serverError && <p>{serverError}</p>}
+
+      {/* handleSubmit 包装 onSubmit，先验证再提交 */}
+      {/* onSubmit 现在还没定义，下一步加 */}
+      <form>
+        <div>
+          <label>Email</label>
+          {/* register('email') 展开传给 input，RHF 开始追踪这个字段 */}
+          <input type="email" {...register('email')} />
+          {/* errors.email 验证失败时有值 */}
+          {errors.email && <p>{errors.email.message}</p>}
+        </div>
+
+        <div>
+          <label>Password</label>
+          <input type="password" {...register('password')} />
+          {errors.password && <p>{errors.password.message}</p>}
+        </div>
+
+        <button type="submit" disabled={isSubmitting}>
+          {isSubmitting ? 'Signing in...' : 'Sign in'}
+        </button>
+      </form>
+    </div>
+  )
+}
+```
+
+在浏览器里测试一下：
+
+- 什么都不填直接点提交，没有错误提示。
+- 填了不是邮箱格式的内容，应该看到格式错误提示。
+
+注意：现在RHF + Zod 的验证还没生效，因为 `<form>` 标签没有绑定 `handleSubmit`，RHF 根本没有拦截到提交事件，验证从来没有被触发。上面邮箱格式错误提示的功能是来自  `<input type="email">` 触发的是**浏览器原生验证**。
+
+**第四步：加入提交处理**
+
+编写onSubmit逻辑，并绑定到`handleSubmit`。
+
+验证通过后，调用 API 登录， 因此我们也引入API 和路由
+
+```tsx
+// 引入 API 和路由
+import { useNavigate } from 'react-router-dom'
+import { authApi } from '@/api'
+import { useAuthStore } from '@/stores/authStore'
+
+export default function LoginPage() {
+  const navigate = useNavigate()
+  const { setAuth } = useAuthStore()
+  const [serverError, setServerError] = useState<string | null>(null)
+
+  const { register, handleSubmit, formState: { errors, isSubmitting } }
+    = useForm<LoginForm>({ resolver: zodResolver(loginSchema) })
+
+  // onSubmit 只在 RHF 验证通过后才会被调用
+  // data 是表单所有字段的值，类型是 LoginForm
+  const onSubmit = async (data: LoginForm) => {
+    // 清除上次的服务端错误
+    setServerError(null)
+
+    try {
+      // 调用登录 API
+      const result = await authApi.login(data)
+
+      // 登录成功：把用户信息和 Token 存入 Zustand
+      // setAuth 内部会同时写入 localStorage
+      setAuth(result.user, result.token)
+
+      // 跳转首页
+      navigate('/')
+    } catch (error) {
+      // Axios 拦截器已经把错误提取成 Error 对象
+      // 直接读 message 显示给用户
+      if (error instanceof Error) {
+        setServerError(error.message)
+      }
+    }
+  }
+
+  return (
+    <div>
+      {serverError && <p>{serverError}</p>}
+
+      {/* 把 onSubmit 传给 handleSubmit */}
+      <form onSubmit={handleSubmit(onSubmit)}>
+        {/* ... 字段不变 ... */}
+      </form>
+    </div>
+  )
+}
+```
+
+**第五步：换上 shadcn 组件**
+
+现在逻辑完全正确了，把原生 HTML 标签换成 shadcn 组件，加上 Tailwind 样式：
+
+```tsx
+// src/pages/LoginPage.tsx
+import { useState } from 'react'
+import { useForm } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { z } from 'zod'
+import { useNavigate, Link } from 'react-router-dom'
+import { authApi } from '@/api'
+import { useAuthStore } from '@/stores/authStore'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card'
+
+const loginSchema = z.object({
+  email: z.string().min(1, 'Email is required').email('Invalid email format'),
+  password: z.string().min(1, 'Password is required'),
+})
+
+type LoginForm = z.infer<typeof loginSchema>
+
+export default function LoginPage() {
+  const navigate = useNavigate()
+  const { setAuth } = useAuthStore()
+  const [serverError, setServerError] = useState<string | null>(null)
+
+  const {
+    register,
+    handleSubmit,
+    formState: { errors, isSubmitting },
+  } = useForm<LoginForm>({
+    resolver: zodResolver(loginSchema),
+  })
+
+  const onSubmit = async (data: LoginForm) => {
+    setServerError(null)
+    try {
+      const result = await authApi.login(data)
+      setAuth(result.user, result.token)
+      navigate('/')
+    } catch (error) {
+      if (error instanceof Error) {
+        setServerError(error.message)
+      }
+    }
+  }
+
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-gray-50">
+      <Card className="w-full max-w-md">
+        <CardHeader className="space-y-1">
+          <CardTitle className="text-2xl font-bold">Sign in</CardTitle>
+          <CardDescription>
+            Enter your email and password to sign in
+          </CardDescription>
+        </CardHeader>
+
+        <CardContent>
+          <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+
+            {serverError && (
+              <div className="rounded-md bg-red-50 p-3 text-sm text-red-600">
+                {serverError}
+              </div>
+            )}
+
+            <div className="space-y-2">
+              <Label htmlFor="email">Email</Label>
+              <Input
+                id="email"
+                type="email"
+                placeholder="you@example.com"
+                {...register('email')}
+              />
+              {errors.email && (
+                <p className="text-sm text-red-500">{errors.email.message}</p>
+              )}
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="password">Password</Label>
+              <Input
+                id="password"
+                type="password"
+                placeholder="••••••••"
+                {...register('password')}
+              />
+              {errors.password && (
+                <p className="text-sm text-red-500">{errors.password.message}</p>
+              )}
+            </div>
+
+            <div className="flex justify-end">
+              <Link
+                to="/forgot-password"
+                className="text-sm text-blue-600 hover:underline"
+              >
+                Forgot password?
+              </Link>
+            </div>
+
+            <Button type="submit" className="w-full" disabled={isSubmitting}>
+              {isSubmitting ? 'Signing in...' : 'Sign in'}
+            </Button>
+
+            <p className="text-center text-sm text-gray-600">
+              Don't have an account?{' '}
+              <Link to="/register" className="text-blue-600 hover:underline">
+                Sign up
+              </Link>
+            </p>
+
+          </form>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+```
+
+
+
+### 7. 更新入口配置
+
+更新 `src/main.tsx` 加入路由支持：
+
+```tsx
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import { BrowserRouter } from 'react-router-dom'
+import './index.css'
+import App from './App.tsx'
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <BrowserRouter>
+      <App />
+    </BrowserRouter>
+  </StrictMode>,
+)
+```
+
+更新 `src/App.tsx` 加入临时路由：
+
+```tsx
+import { Routes, Route } from 'react-router-dom'
+import LoginPage from '@/pages/LoginPage'
+
+function App() {
+  return (
+    <Routes>
+      <Route path="/login" element={<LoginPage />} />
+      <Route path="/" element={<div className="p-8">首页（占位）</div>} />
+    </Routes>
+  )
+}
+
+export default App
+```
+
+
+
+### 8. 完整测试
+
+启动后端和前端，打开 `http://localhost:5173/login`。
+
+**测试一：表单验证**
+
+什么都不填直接点提交 → 两个字段下方出现红色错误提示，请求没有发出去。
+
+填写格式错误的邮箱（比如 `abc`）→ 看到 `Invalid email format` 提示。
+
+**测试二：服务端错误**
+
+填写正确格式的邮箱但密码错误 → 表单验证通过，请求发出去，服务端返回错误，红色错误提示出现在表单顶部。
+
+填写未验证邮箱的账号 → 看到 `Please verify your email address before logging in.`
+
+**测试三：正常登录**
+
+用注册过且已验证的账号登录 → 跳转到首页（占位文字），打开浏览器开发者工具 → Application → Local Storage，看到 `accessToken` 已存入。
+
+
+
+### 9. 此时的目录变化
+
+```
+src/
+├── pages/
+│   └── LoginPage.tsx    ← 新增
+├── App.tsx              ← 已更新
+└── main.tsx             ← 已更新
+```
+
+
+
+### 10. Git 提交
+
+```bash
+git add .
+git commit -m "feat: login page with RHF + Zod validation"
+git push origin feature/auth-pages
+```
+
+
+
+### Step 46 完成状态
+
+```
+✅ 理解 React 函数组件和 JSX
+✅ 理解 useState（状态变化驱动界面更新）
+✅ 理解 RHF 非受控表单的工作方式（register / handleSubmit / errors）
+✅ 理解 Zod Schema 定义验证规则
+✅ 理解 z.infer 从 Schema 推导 TypeScript 类型
+✅ 理解 zodResolver 连接 RHF 和 Zod
+✅ 理解提交流程（验证 → onSubmit → API → setAuth → navigate）
+✅ 五步逐步构建：骨架 → 状态 → 表单 → 提交逻辑 → 样式
+✅ 三种场景测试通过（验证错误 / 服务端错误 / 正常登录）
+✅ Git commit 完成
+```
+
+
