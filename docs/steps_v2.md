@@ -6831,3 +6831,365 @@ git push origin feature/auth-pages
 ```
 
 
+
+## Step 47 · 路由结构
+
+### 这一步做什么
+
+Step 46 用了最简单的临时路由——`BrowserRouter` 包着两个 `Route`，够登录页用就行。
+
+这一步把路由系统做完整：切换到 React Router v6 推荐的方式，搭建完整的路由结构，实现"未登录时自动跳转登录页"的受保护路由。
+
+
+
+### 1. 路由是什么？
+
+浏览器地址栏里的 URL 变化时，页面应该显示不同的内容。这就是前端路由要解决的问题。
+
+传统的多页应用是服务器决定的：访问 `/login` 服务器返回登录页的 HTML，访问 `/cars` 服务器返回车辆列表页的 HTML，每次都是完整的页面刷新。
+
+React 应用是**单页应用（SPA）**：整个应用只有一个 HTML 文件，URL 变化时不请求服务器，而是由 JavaScript 决定渲染哪个组件。React Router 就是做这件事的库。
+
+
+
+### 2. BrowserRouter vs createBrowserRouter
+
+Step 46 用的是 `BrowserRouter`：
+
+```tsx
+// Step 46 的临时方式
+<BrowserRouter>
+  <Routes>
+    <Route path="/login" element={<LoginPage />} />
+    <Route path="/" element={<div>首页</div>} />
+  </Routes>
+</BrowserRouter>
+```
+
+这种写法把路由配置**散落在组件树里**。当路由越来越多时，要找某个路由的配置，需要在组件树里到处翻。
+
+React Router v6 推荐用 `createBrowserRouter`，把所有路由配置**集中在一个地方**：
+
+```tsx
+// v6 推荐方式
+const router = createBrowserRouter([
+  { path: '/', element: <HomePage /> },
+  { path: '/login', element: <LoginPage /> },
+])
+
+// 入口文件
+<RouterProvider router={router} />
+```
+
+路由配置就是一个数组，每个元素描述一条路由：`path` 是 URL，`element` 是要渲染的组件。结构清晰，集中管理。
+
+
+
+### 3. 把路由配置迁移到独立文件
+
+现在路由配置在 `App.tsx` 里，随着路由增多会越来越乱。把它移到独立的 `router.tsx` 文件里。
+
+先创建文件：
+
+```bash
+touch src/router.tsx
+```
+
+把登录页和首页的路由配置迁移进去：
+
+```tsx
+// src/router.tsx
+import { createBrowserRouter } from 'react-router-dom'
+import LoginPage from '@/pages/LoginPage'
+
+export const router = createBrowserRouter([
+  {
+    path: '/',
+    element: <div className="p-8">首页（占位）</div>,
+  },
+  {
+    path: '/login',
+    element: <LoginPage />,
+  },
+])
+```
+
+更新 `src/main.tsx`，用 `RouterProvider` 替换 `BrowserRouter`：
+
+```tsx
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import { RouterProvider } from 'react-router-dom'
+import { router } from './router'
+import './index.css'
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <RouterProvider router={router} />
+  </StrictMode>,
+)
+```
+
+`App.tsx` 现在不再需要了，路由配置已经移到 `router.tsx`：
+
+```bash
+rm src/App.tsx
+```
+
+验证：
+
+```bash
+npm run dev
+```
+
+访问 `http://localhost:5173/login`，登录页正常显示。访问 `http://localhost:5173/`，显示占位文字。和之前行为完全一致，只是路由配置的组织方式变了。
+
+
+
+### 4. 受保护路由：问题在哪里
+
+现在 `/` 是公开的，任何人都能访问。但后面会有很多需要登录才能访问的页面——发布车辆、个人中心、订单列表等。
+
+最直接的想法是在每个需要登录的页面组件里检查：
+
+```tsx
+// 在每个需要登录的页面里都这样写
+export default function CreateCarPage() {
+  const { isAuthenticated } = useAuthStore()
+
+  if (!isAuthenticated()) {
+    return <Navigate to="/login" />
+  }
+
+  return <div>发布车辆</div>
+}
+```
+
+这能工作，但有个问题：**每个需要登录的页面都要复制这段逻辑**。如果将来要改跳转逻辑，要改很多个文件。
+
+更好的做法是把这个检查逻辑**抽成一个组件**，在路由配置里统一处理。
+
+
+
+### 5. Outlet 是什么
+
+在实现受保护路由之前，先理解 `Outlet`，因为受保护路由依赖它。
+
+`Outlet` 是 React Router 提供的一个组件，它是**子路由的渲染占位符**。
+
+先看一个具体例子理解它：
+
+```tsx
+// 假设有这样的路由配置
+{
+  path: '/dashboard',
+  element: <DashboardLayout />,  // 父路由
+  children: [
+    { path: 'profile', element: <ProfilePage /> },  // 子路由
+    { path: 'settings', element: <SettingsPage /> }, // 子路由
+  ]
+}
+// DashboardLayout 组件
+function DashboardLayout() {
+  return (
+    <div>
+      <nav>导航栏（始终显示）</nav>
+
+      {/* Outlet 是子路由内容的渲染位置 */}
+      {/* 访问 /dashboard/profile 时，这里渲染 ProfilePage */}
+      {/* 访问 /dashboard/settings 时，这里渲染 SettingsPage */}
+      <Outlet />
+    </div>
+  )
+}
+```
+
+访问 `/dashboard/profile`：
+
+```
+渲染 DashboardLayout
+  → 导航栏（始终显示）
+  → Outlet 位置渲染 ProfilePage
+```
+
+访问 `/dashboard/settings`：
+
+```
+渲染 DashboardLayout
+  → 导航栏（始终显示）
+  → Outlet 位置渲染 SettingsPage
+```
+
+导航栏只写一次，子路由切换时只有 `Outlet` 的内容变化，外层布局保持不动。
+
+
+
+### 6. 用 Outlet 实现受保护路由
+
+理解了 `Outlet` 之后，受保护路由的实现思路就很自然了：
+
+```
+创建一个 ProtectedRoute 组件
+  → 检查是否已登录
+  → 未登录：跳转到登录页（不渲染子路由）
+  → 已登录：渲染 Outlet（让子路由正常显示）
+```
+
+在路由配置里，把需要登录的路由都放在 `ProtectedRoute` 的 `children` 里：
+
+```tsx
+{
+  element: <ProtectedRoute />,   // 父路由：做权限检查
+  children: [
+    { path: '/cars/new', element: <CreateCarPage /> },   // 子路由
+    { path: '/profile', element: <ProfilePage /> },      // 子路由
+  ]
+}
+```
+
+这样权限检查逻辑只写一次，所有子路由都受到保护。
+
+现在来实现它：
+
+```bash
+touch src/components/ProtectedRoute.tsx
+// src/components/ProtectedRoute.tsx
+import { Navigate, Outlet } from 'react-router-dom'
+import { useAuthStore } from '@/stores/authStore'
+
+export default function ProtectedRoute() {
+  const { isAuthenticated } = useAuthStore()
+
+  if (!isAuthenticated()) {
+    // replace 参数：用登录页替换当前历史记录
+    // 不加 replace 的话，用户登录后点返回键会回到被拦截的页面，再被拦截，死循环
+    return <Navigate to="/login" replace />
+  }
+
+  // 已登录：渲染子路由的内容
+  return <Outlet />
+}
+```
+
+
+
+### 7. 更新路由配置，使用 ProtectedRoute
+
+现在把 `router.tsx` 更新，加入受保护路由。暂时只加一个占位页面测试效果：
+
+```bash
+touch src/pages/CreateCarPage.tsx
+// src/pages/CreateCarPage.tsx（占位）
+export default function CreateCarPage() {
+  return <div className="p-8">发布车辆（占位）</div>
+}
+```
+
+更新 `src/router.tsx`：
+
+```tsx
+// src/router.tsx
+import { createBrowserRouter } from 'react-router-dom'
+import LoginPage from '@/pages/LoginPage'
+import CreateCarPage from '@/pages/CreateCarPage'
+import ProtectedRoute from '@/components/ProtectedRoute'
+
+export const router = createBrowserRouter([
+  // 公开路由
+  {
+    path: '/',
+    element: <div className="p-8">首页（占位）</div>,
+  },
+  {
+    path: '/login',
+    element: <LoginPage />,
+  },
+
+  // 受保护路由
+  // element 是 ProtectedRoute，它负责权限检查
+  // children 里的页面只有登录后才能访问
+  {
+    element: <ProtectedRoute />,
+    children: [
+      {
+        path: '/cars/new',
+        element: <CreateCarPage />,
+      },
+    ],
+  },
+])
+```
+
+
+
+### 8. 验证受保护路由是否工作
+
+```bash
+npm run dev
+```
+
+**测试一：未登录访问受保护路由**
+
+清除 localStorage（浏览器开发者工具 → Application → Local Storage → 全部清除），然后访问：
+
+```
+http://localhost:5173/cars/new
+```
+
+应该自动跳转到 `/login`。
+
+**测试二：登录后访问受保护路由**
+
+用正确账号登录，登录成功后手动访问：
+
+```
+http://localhost:5173/cars/new
+```
+
+应该正常显示"发布车辆（占位）"，不再被跳转。
+
+两个测试都通过，说明受保护路由工作正常。
+
+
+
+### 9. 此时的目录变化
+
+```
+src/
+├── components/
+│   └── ProtectedRoute.tsx    ← 新增
+├── pages/
+│   ├── LoginPage.tsx         （已有）
+│   └── CreateCarPage.tsx     ← 新增（占位）
+├── router.tsx                ← 新增
+└── main.tsx                  ← 已更新
+```
+
+`App.tsx` 已删除。
+
+
+
+### 10. Git 提交
+
+```bash
+git add .
+git commit -m "feat: router setup with ProtectedRoute"
+git push origin feature/auth-pages
+```
+
+
+
+### Step 47 完成状态
+
+```
+✅ 理解 SPA 前端路由的工作原理
+✅ 理解 createBrowserRouter vs BrowserRouter 的区别
+✅ 路由配置迁移到独立的 router.tsx
+✅ RouterProvider 替换 BrowserRouter
+✅ 理解 Outlet（子路由渲染占位符）
+✅ 理解受保护路由的实现思路（一处检查保护所有子路由）
+✅ ProtectedRoute 组件实现（未登录跳转 + Outlet）
+✅ 受保护路由配置（children 结构）
+✅ 测试通过（未登录跳转 / 登录后正常访问）
+✅ Git commit 完成
+```

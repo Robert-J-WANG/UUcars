@@ -29,7 +29,7 @@ export default function LoginPage() {
   // 路由跳转
   const navigate = useNavigate();
   const { setAuth } = useAuthStore();
-  const [isLoading, setIsLoading] = useState<boolean>(false);
+  // const [isLoading, setIsLoading] = useState<boolean>(false);
   // 服务端错误信息（密码错误、邮箱未验证等）
   const [serverError, setServerError] = useState<string | null>(null);
 
