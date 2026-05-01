@@ -4418,3 +4418,1757 @@ git checkout develop
 ✅ Scalar 端到端流程验证通过（含安全边界测试）
 ✅ feature/v2-backend 合并回 develop，v2.0-backend tag 打完
 ```
+
+
+
+## Step 42 · 前端工程初始化
+
+### 这一步做什么
+
+搭建前端项目骨架。目标是一个能跑起来、目录结构清晰、能连接后端 API 的空白项目。后续所有页面都建立在这个基础上。
+
+切出前端专用分支
+
+```BASH
+# 确认在 develop 分支
+git checkout develop
+
+# 切出前端专用分支
+git checkout -b feature/frontend-setup
+git push -u origin feature/frontend-setup
+```
+
+
+
+### 1. 创建项目
+
+在项目根目录（和 `UUcars.API` 同级）执行：
+
+```bash
+npm create vite@latest uucars-web -- --template react-ts
+cd uucars-web
+npm install
+```
+
+此时目录结构：
+
+```
+UUcars/
+├── UUcars.API/         ← 后端
+├── UUcars.Tests/       ← 后端测试
+└── uucars-web/         ← 前端（新增）
+```
+
+验证能跑起来：
+
+```bash
+npm run dev
+```
+
+浏览器打开 `http://localhost:5173`，看到 Vite + React 的默认页面，说明项目创建成功。`Ctrl+C` 停止。
+
+
+
+### 2. 配置路径别名
+
+默认情况下导入文件要写相对路径，层级深时很难看：
+
+```typescript
+// 没有别名：很难看
+import { Button } from '../../../components/ui/Button'
+
+// 有别名：清晰
+import { Button } from '@/components/ui/Button'
+```
+
+`@/` 是前端项目的通用约定，指向 `src/` 目录。需要同时在两个地方配置：一个告诉 Vite 怎么解析，一个告诉 TypeScript 怎么识别。
+
+#### 2.1 安装 node 类型包
+
+```bash
+npm install -D @types/node
+```
+
+#### 2.2 更新 vite.config.ts
+
+```typescript
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+import path from 'path'
+
+export default defineConfig({
+  plugins: [react()],
+  resolve: {
+    alias: {
+      '@': path.resolve(__dirname, './src'),
+    },
+  },
+})
+```
+
+#### 2.3 更新 tsconfig.app.json
+
+打开 `tsconfig.app.json`，在 `compilerOptions` 里添加：
+
+```json
+{
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.app.tsbuildinfo",
+    "target": "es2023",
+    "lib": ["ES2023", "DOM"],
+    "module": "esnext",
+    "types": ["vite/client"],
+    "skipLibCheck": true,
+
+    /* Bundler mode */
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+    "jsx": "react-jsx",
+
+    /* Linting */
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "erasableSyntaxOnly": true,
+    "noFallthroughCasesInSwitch": true,
+
+    /* Path aliases */
+    // "baseUrl": ".",
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  },
+
+  "include": ["src"]
+}
+
+```
+
+
+
+### 3. 配置环境变量
+
+前端需要知道后端 API 的地址。开发时是 `http://localhost:5065`，生产时是真实域名。用 Vite 的环境变量机制管理，不硬编码在代码里。
+
+在 `uucars-web/` 目录下创建两个文件：
+
+```bash
+touch .env.local
+touch .env.production
+```
+
+`.env.local`（开发环境，不进 Git）：
+
+```
+VITE_API_BASE_URL=http://localhost:5065
+```
+
+`.env.production`（生产环境，进 Git）：
+
+```
+VITE_API_BASE_URL=https://你的生产域名
+```
+
+在 `.gitignore` 里确认 `.env.local` 已排除：
+
+```bash
+echo ".env.local" >> .gitignore
+```
+
+> **Vite 环境变量的规则：** 只有以 `VITE_` 开头的变量才会暴露给前端代码，其他变量不会。在代码里通过 `import.meta.env.VITE_API_BASE_URL` 读取。这是 Vite 的安全设计，防止把服务端的敏感环境变量意外暴露给浏览器。
+
+
+
+### 4. 规划目录结构
+
+把 `src/` 目录按职责划分清楚，后面每一步往对应位置放文件：
+
+```bash
+cd src
+mkdir -p api components features hooks lib pages stores types
+cd ..
+```
+
+各目录的职责：
+
+```
+src/
+├── api/          Axios封装和各模块API函数
+├── components/   可复用的UI组件（Button、Card等）
+├── features/     按功能模块组织的业务组件
+├── hooks/        自定义Hooks
+├── lib/          工具函数（cn等）
+├── pages/        路由页面组件
+├── stores/       Zustand全局状态
+├── types/        TypeScript类型定义
+├── App.tsx
+└── main.tsx
+```
+
+同时清理掉 Vite 模板自带的示例文件，保持干净：
+
+```bash
+# 删除模板示例文件
+
+rm src/App.css
+rm src/assets/react.svg
+rm public/vite.svg
+```
+
+把 `src/App.tsx` 清理成最简单的起点：
+
+```tsx
+function App() {
+  return (
+    <div>
+      <h1>UUcars</h1>
+    </div>
+  )
+}
+
+export default App
+```
+
+把 `src/index.css` 内容清空（后面 Tailwind 会接管样式）：
+
+```bash
+echo "" > src/index.css
+```
+
+
+
+### 5. 验证配置
+
+```bash
+npm run dev
+```
+
+浏览器打开 `http://localhost:5173`，看到 "UUcars" 文字，说明清理和配置都正确。
+
+验证路径别名是否生效——在 `App.tsx` 里临时写一行导入测试：
+
+```tsx
+// 临时测试，验证后删掉
+import {} from '@/types'
+```
+
+如果没有 TypeScript 报错，说明别名配置正确。删掉这行测试代码。
+
+
+
+### 6. 此时的目录结构
+
+```
+uucars-web/
+├── public/
+├── src/
+│   ├── api/
+│   ├── components/
+│   ├── features/
+│   ├── hooks/
+│   ├── lib/
+│   ├── pages/
+│   ├── stores/
+│   ├── types/
+│   ├── App.tsx
+│   ├── index.css
+│   └── main.tsx
+├── .env.local          ← 不进 Git
+├── .env.production     ← 进 Git
+├── .gitignore
+├── index.html
+├── package.json
+├── tsconfig.json
+└── vite.config.ts
+```
+
+
+
+### 7. Git 提交
+
+```bash
+git add .
+git commit -m "feat: frontend project setup with Vite + React + TypeScript"
+```
+
+
+
+### Step 42 完成状态
+
+```
+✅ Vite + React + TypeScript 项目创建
+✅ 路径别名 @/ 配置（vite.config.ts + tsconfig.json）
+✅ 环境变量配置（VITE_API_BASE_URL）
+✅ 目录结构规划完成
+✅ 模板示例文件清理干净
+✅ npm run dev 验证通过
+✅ Git commit 完成
+```
+
+
+
+## Step 43 · Tailwind CSS + shadcn/ui
+
+### 这一步做什么
+
+搭建 UI 基础——安装样式系统和组件库，后续所有页面直接使用，不需要从零写 CSS。
+
+
+
+### 1. 安装 Tailwind CSS
+
+```bash
+npm install -D tailwindcss @tailwindcss/vite
+```
+
+更新 `vite.config.ts`，加入 Tailwind 插件：
+
+```typescript
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+import tailwindcss from '@tailwindcss/vite'
+import path from 'path'
+
+export default defineConfig({
+  plugins: [
+    react(),
+    tailwindcss(),
+  ],
+  resolve: {
+    alias: {
+      '@': path.resolve(__dirname, './src'),
+    },
+  },
+})
+```
+
+把 `src/index.css` 内容替换为：
+
+```css
+@import "tailwindcss";
+```
+
+验证 Tailwind 是否生效——打开 `src/App.tsx`，临时加一个样式测试：
+
+```tsx
+function App() {
+  return (
+    <div className="flex min-h-screen items-center justify-center">
+      <h1 className="text-3xl font-bold text-blue-600">UUcars</h1>
+    </div>
+  )
+}
+
+export default App
+npm run dev
+```
+
+浏览器里看到蓝色加粗居中的 "UUcars"，说明 Tailwind 配置正确。
+
+
+
+### 2. 安装 shadcn/ui
+
+shadcn/ui 不是普通的组件库——它不是一个 npm 包，而是把组件源代码直接生成到你的项目里，你可以随意修改。
+
+shadcn需要识别tsconfig.json里的别名路径，因此先配置（注意tsconfig.app.json里也要配置）
+
+```json
+{
+  "files": [],
+  "references": [
+    { "path": "./tsconfig.app.json" },
+    { "path": "./tsconfig.node.json" }
+  ],
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["src/*"]
+    }
+  }
+}
+```
+
+
+
+#### 2.1 初始化 shadcn/ui
+
+```bash
+npx shadcn@latest init
+```
+
+过程中会有几个选项，按如下选择：
+
+```
+Which style would you like to use? › Default
+Which color would you like to use as base color? › Slate
+Would you like to use CSS variables for colors? › yes
+```
+
+初始化完成后，`src/` 下会自动生成 `lib/utils.ts` 和 `components/ui/` 目录。
+
+#### 2.2 cn() 工具函数
+
+打开 `src/lib/utils.ts`，shadcn 已经自动生成了这个文件：
+
+```typescript
+import { clsx, type ClassValue } from "clsx"
+import { twMerge } from "tailwind-merge"
+
+export function cn(...inputs: ClassValue[]) {
+  return twMerge(clsx(inputs))
+}
+```
+
+**`cn()` 是什么？** 它解决了 Tailwind 里一个常见问题：当你需要根据条件动态组合 class 名时，直接用字符串拼接可能产生冲突（比如同时有 `text-red-500` 和 `text-blue-500`）。`cn()` 用 `clsx` 处理条件逻辑，用 `tailwind-merge` 智能合并冲突的类名，保留最后一个有效的：
+
+```typescript
+// 使用场景：根据 props 动态切换样式
+cn(
+  "base-class",           // 始终应用
+  isError && "text-red-500",  // 条件应用
+  className               // 外部传入的类名（可覆盖默认样式）
+)
+```
+
+后续写组件时会大量用到这个函数。
+
+#### 2.3 安装现在就会用到的组件
+
+Step 47 开始做登录页，马上需要这几个组件：
+
+```bash
+npx shadcn@latest add button
+npx shadcn@latest add input
+npx shadcn@latest add form
+npx shadcn@latest add card
+npx shadcn@latest add label
+```
+
+安装完后这些组件的源代码会出现在 `src/components/ui/` 目录里，可以直接查看和修改。
+
+
+
+### 3. 验证
+
+```bash
+npm run dev
+```
+
+确认没有报错，项目正常运行。
+
+
+
+### 4. 此时的目录变化
+
+```
+uucars-web/
+└── src/
+    ├── components/
+    │   └── ui/              ← shadcn 生成
+    │       ├── button.tsx
+    │       ├── card.tsx
+    │       ├── form.tsx
+    │       ├── input.tsx
+    │       └── label.tsx
+    ├── lib/
+    │   └── utils.ts         ← cn() 工具函数
+    └── index.css            ← 已更新（Tailwind）
+```
+
+
+
+### 5. Git 提交
+
+```bash
+git add .
+git commit -m "feat: Tailwind CSS + shadcn/ui setup"
+git push origin feature/frontend-setup
+```
+
+
+
+### Step 43 完成状态
+
+```
+✅ Tailwind CSS 安装配置（@tailwindcss/vite 插件方式）
+✅ 验证 Tailwind 样式生效
+✅ shadcn/ui 初始化完成
+✅ cn() 工具函数就绪（理解其作用）
+✅ 核心组件安装（Button/Input/Form/Card/Label）
+✅ Git commit 完成
+```
+
+
+
+## Step 44 · 类型定义层 + Axios 封装
+
+### 这一步做什么
+
+前端和后端通信需要两样东西：**知道数据长什么样**（TypeScript 类型），**知道怎么发请求**（Axios 封装）。
+
+这一步把这两件事都做好，后续每个页面直接调用封装好的 API 函数，有完整的类型提示，不需要写任何重复的请求代码。
+
+
+
+### 1. 安装依赖
+
+```bash
+npm install axios
+```
+
+
+
+### 2. TypeScript 类型定义
+
+TypeScript 的核心价值在于：**在编译阶段发现错误，而不是在运行时**。把后端所有 DTO 定义成 TypeScript 类型后，调用 API 时 IDE 会自动提示有哪些字段、字段是什么类型，写错了编译器直接报错。
+
+#### 2.1 通用响应类型
+
+后端所有接口都用 `ApiResponse<T>` 和 `PagedResponse<T>` 包装，前端对应定义：
+
+```bash
+touch src/types/api.ts
+// src/types/api.ts
+
+// 对应后端 ApiResponse<T>
+export interface ApiResponse<T> {
+  success: boolean
+  data: T | null
+  message: string | null
+  errors: string[] | null
+}
+
+// 对应后端 PagedResponse<T>
+export interface PagedResponse<T> {
+  items: T[]
+  totalCount: number
+  page: number
+  pageSize: number
+  totalPages: number
+}
+```
+
+#### 2.2 用户相关类型
+
+```bash
+touch src/types/user.ts
+// src/types/user.ts
+
+// 对应后端 UserResponse
+export interface User {
+  id: number
+  username: string
+  email: string
+  role: 'User' | 'Admin'    // 联合类型：只能是这两个值之一
+  createdAt: string
+}
+
+// 对应后端 LoginResponse
+export interface LoginResponse {
+  token: string
+  expiresAt: string
+  user: User
+}
+
+// 对应后端 RegisterRequest
+export interface RegisterRequest {
+  username: string
+  email: string
+  password: string
+}
+
+// 对应后端 LoginRequest
+export interface LoginRequest {
+  email: string
+  password: string
+}
+```
+
+> **为什么 `role` 用联合类型 `'User' | 'Admin'` 而不是 `string`？** 用 `string` 的话，你写 `user.role === 'admin'`（小写）编译器不会报错，但逻辑永远不会成立，因为后端返回的是 `'Admin'`（首字母大写）。用联合类型，编译器会直接告诉你只能比较 `'User'` 或 `'Admin'`，在写代码时就发现问题，而不是在运行时排查 Bug。
+
+#### 2.3 车辆相关类型
+
+```bash
+touch src/types/car.ts
+// src/types/car.ts
+
+// 车辆状态枚举——对应后端 CarStatus
+// 用 const 对象而不是 enum，原因：
+// TypeScript 的 enum 编译后会生成额外的 JS 代码
+// const 对象 + 类型推导更轻量，是目前的主流做法
+export const CarStatus = {
+  Draft: 'Draft',
+  PendingReview: 'PendingReview',
+  Published: 'Published',
+  Sold: 'Sold',
+  Deleted: 'Deleted',
+} as const
+
+// 从 const 对象推导出联合类型：'Draft' | 'PendingReview' | 'Published' | 'Sold' | 'Deleted'
+export type CarStatus = typeof CarStatus[keyof typeof CarStatus]
+
+// 对应后端 CarResponse
+export interface Car {
+  id: number
+  title: string
+  brand: string
+  model: string
+  year: number
+  price: number
+  mileage: number
+  description: string | null
+  status: CarStatus
+  sellerId: number
+  sellerUsername: string
+  createdAt: string
+  updatedAt: string
+}
+
+// 对应后端 CarDetailResponse（含图片列表）
+export interface CarDetail extends Car {
+  images: CarImage[]
+}
+
+// 对应后端 CarImageResponse
+export interface CarImage {
+  id: number
+  imageUrl: string
+  sortOrder: number
+  carId: number
+}
+
+// 对应后端 CarCreateRequest
+export interface CarCreateRequest {
+  title: string
+  brand: string
+  model: string
+  year: number
+  price: number
+  mileage: number
+  description?: string   // ? 表示可选字段，对应后端的 nullable
+}
+
+// 对应后端 CarUpdateRequest（和 Create 字段一样，单独定义保持灵活性）
+export type CarUpdateRequest = CarCreateRequest; // 直接使用类型别名，简化代码  
+
+// 对应后端 CarQueryRequest
+export interface CarQueryRequest {
+  page?: number
+  pageSize?: number
+  brand?: string
+  minPrice?: number
+  maxPrice?: number
+  minYear?: number
+  maxYear?: number
+}
+```
+
+#### 2.4 订单相关类型
+
+```bash
+touch src/types/order.ts
+// src/types/order.ts
+
+export const OrderStatus = {
+  Pending: 'Pending',
+  Completed: 'Completed',
+  Cancelled: 'Cancelled',
+} as const
+
+export type OrderStatus = typeof OrderStatus[keyof typeof OrderStatus]
+
+// 对应后端 OrderResponse
+export interface Order {
+  id: number
+  carId: number
+  carTitle: string
+  buyerId: number
+  buyerUsername: string
+  sellerId: number
+  sellerUsername: string
+  price: number
+  status: OrderStatus
+  createdAt: string
+  updatedAt: string
+}
+
+// 对应后端 OrderCreateRequest
+export interface OrderCreateRequest {
+  carId: number
+}
+```
+
+#### 2.5 收藏相关类型
+
+```bash
+touch src/types/favorite.ts
+// src/types/favorite.ts
+import type { Car } from './car'
+
+// 对应后端 FavoriteResponse
+export interface Favorite {
+  carId: number
+  userId: number
+  createdAt: string
+  car: Car | null
+}
+```
+
+#### 2.6 评价相关类型
+
+```bash
+touch src/types/review.ts
+// src/types/review.ts
+
+// 对应后端 ReviewResponse
+export interface Review {
+  id: number
+  orderId: number
+  reviewerId: number
+  reviewerUsername: string
+  rating: number
+  comment: string | null
+  createdAt: string
+}
+
+// 对应后端 SellerRatingResponse
+export interface SellerRating {
+  sellerId: number
+  averageRating: number
+  totalReviews: number
+  reviews: Review[]
+}
+
+// 对应后端 CreateReviewRequest
+export interface CreateReviewRequest {
+  orderId: number
+  rating: number
+  comment?: string
+}
+```
+
+#### 2.7 统一导出
+
+```bash
+touch src/types/index.ts
+// src/types/index.ts
+// 统一从这里导入，不需要记每个类型在哪个文件里
+export * from './api'
+export * from './user'
+export * from './car'
+export * from './order'
+export * from './favorite'
+export * from './review'
+```
+
+导入使用时类似
+
+```ts
+import type { Car } from "@/types";
+```
+
+
+
+### 3. Axios 封装
+
+#### 3.1 为什么要封装 Axios
+
+直接用 Axios 发请求可以工作，但每次都要：
+
+```typescript
+// 没有封装时，每次请求都要重复这些
+const response = await axios.get('http://localhost:5065/cars', {
+  headers: {
+    Authorization: `Bearer ${token}`,
+    'Content-Type': 'application/json',
+  }
+})
+// 还要手动处理错误、解包数据...
+```
+
+封装之后：
+
+```typescript
+// 封装后
+const cars = await carsApi.getPaged({ page: 1 })
+// token 自动附加，错误自动处理，数据自动解包
+```
+
+
+
+#### 3.2 创建 Axios 实例
+
+```bash
+touch src/api/client.ts
+```
+
+```ts
+
+// src/api/client.ts
+import axios from 'axios'
+import type { ApiResponse } from '@/types'
+
+// 创建 Axios 实例
+// 所有请求都基于这个实例，统一配置 baseURL 和超时
+const apiClient = axios.create({
+  baseURL: import.meta.env.VITE_API_BASE_URL,
+  timeout: 10000,   // 10秒超时
+  headers: {
+    'Content-Type': 'application/json',
+  },
+})
+
+// =============================================
+// 请求拦截器：自动附加 JWT Token
+// =============================================
+// 每次请求发出前，从 localStorage 取出 Token 附加到请求头
+// 这样所有需要认证的接口不需要手动传 Token
+apiClient.interceptors.request.use((config) => {
+  const token = localStorage.getItem('accessToken')
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`
+  }
+  return config
+})
+
+// =============================================
+// 响应拦截器：统一处理响应和错误
+// =============================================
+apiClient.interceptors.response.use(
+  (response) => {
+    // 请求成功（HTTP 2xx）
+    // 后端所有接口都用 ApiResponse<T> 包装
+    // 直接解包返回 data 字段，调用方不需要每次都写 response.data.data
+    const apiResponse = response.data as ApiResponse<unknown>
+
+    if (!apiResponse.success) {
+      // HTTP 状态码是 2xx，但业务逻辑失败（success: false）
+      // 把业务错误信息包装成 Error 抛出，调用方统一用 catch 处理
+      return Promise.reject(new Error(apiResponse.message ?? 'Request failed'))
+    }
+
+    return response
+  },
+  (error) => {
+    // 请求失败（HTTP 4xx / 5xx / 网络错误）
+    if (error.response) {
+      // 服务端返回了错误响应
+      const apiResponse = error.response.data as ApiResponse<unknown>
+      const message = apiResponse?.message ?? 'An error occurred'
+      return Promise.reject(new Error(message))
+    }
+
+    if (error.code === 'ECONNABORTED') {
+      return Promise.reject(new Error('Request timeout, please try again'))
+    }
+
+    // 网络错误（断网等）
+    return Promise.reject(new Error('Network error, please check your connection'))
+  }
+)
+
+export default apiClient
+```
+
+> **为什么从 localStorage 读 Token 而不是从 Zustand？** Zustand 的状态在 `apiClient.ts` 这个模块层面还没有初始化，如果在这里直接导入 Zustand store 会有循环依赖的风险。从 localStorage 读取是更安全的做法，Step 47 配置 Zustand 时会保证 Token 同步写入 localStorage。
+
+#### 3.3 封装各模块 API 函数
+
+**认证模块：**
+
+```ts
+touch src/api/auth.ts
+// src/api/auth.ts
+import apiClient from './client'
+import type {
+  LoginRequest,
+  LoginResponse,
+  RegisterRequest,
+  User,
+  ApiResponse
+} from '@/types'
+
+export const authApi = {
+  register: async (data: RegisterRequest): Promise<User> => {
+    const response = await apiClient.post<ApiResponse<User>>(
+      '/auth/register', data)
+    return response.data.data!
+  },
+
+  login: async (data: LoginRequest): Promise<LoginResponse> => {
+    const response = await apiClient.post<ApiResponse<LoginResponse>>(
+      '/auth/login', data)
+    return response.data.data!
+  },
+
+  verifyEmail: async (token: string): Promise<void> => {
+    await apiClient.get('/auth/verify-email', { params: { token } })
+  },
+
+  resendVerification: async (email: string): Promise<void> => {
+    await apiClient.post('/auth/resend-verification', { email })
+  },
+
+  forgotPassword: async (email: string): Promise<void> => {
+    await apiClient.post('/auth/forgot-password', { email })
+  },
+
+  resetPassword: async (token: string, newPassword: string): Promise<void> => {
+    await apiClient.post('/auth/reset-password', { token, newPassword })
+  },
+}
+```
+
+**用户模块：**
+
+```ts
+touch src/api/users.ts
+// src/api/users.ts
+import apiClient from './client'
+import type { User, ApiResponse } from '@/types'
+
+export const usersApi = {
+  getMe: async (): Promise<User> => {
+    const response = await apiClient.get<ApiResponse<User>>('/users/me')
+    return response.data.data!
+  },
+
+  updateMe: async (data: { username: string; email: string }): Promise<User> => {
+    const response = await apiClient.put<ApiResponse<User>>('/users/me', data)
+    return response.data.data!
+  },
+}
+```
+
+**车辆模块：**
+
+```c#
+touch src/api/cars.ts
+// src/api/cars.ts
+import apiClient from './client'
+import type {
+  Car,
+  CarDetail,
+  CarImage,
+  CarCreateRequest,
+  CarUpdateRequest,
+  CarQueryRequest,
+  PagedResponse,
+  ApiResponse
+} from '@/types'
+
+export const carsApi = {
+  // 公开列表（含搜索过滤）
+  getPaged: async (params?: CarQueryRequest): Promise<PagedResponse<Car>> => {
+    const response = await apiClient.get<ApiResponse<PagedResponse<Car>>>(
+      '/cars', { params })
+    return response.data.data!
+  },
+
+  // 车辆详情
+  getById: async (id: number): Promise<CarDetail> => {
+    const response = await apiClient.get<ApiResponse<CarDetail>>(`/cars/${id}`)
+    return response.data.data!
+  },
+
+  // 我的车辆列表
+  getMyListings: async (params?: CarQueryRequest): Promise<PagedResponse<Car>> => {
+    const response = await apiClient.get<ApiResponse<PagedResponse<Car>>>(
+      '/cars/my-listings', { params })
+    return response.data.data!
+  },
+
+  // 创建草稿
+  create: async (data: CarCreateRequest): Promise<Car> => {
+    const response = await apiClient.post<ApiResponse<Car>>('/cars', data)
+    return response.data.data!
+  },
+
+  // 修改草稿
+  update: async (id: number, data: CarUpdateRequest): Promise<Car> => {
+    const response = await apiClient.put<ApiResponse<Car>>(`/cars/${id}`, data)
+    return response.data.data!
+  },
+
+  // 逻辑删除
+  delete: async (id: number): Promise<void> => {
+    await apiClient.delete(`/cars/${id}`)
+  },
+
+  // 提交审核
+  submit: async (id: number): Promise<Car> => {
+    const response = await apiClient.post<ApiResponse<Car>>(
+      `/cars/${id}/submit`)
+    return response.data.data!
+  },
+
+  // 上传图片（multipart/form-data）
+  uploadImage: async (carId: number, file: File, sortOrder = 0): Promise<CarImage> => {
+    const formData = new FormData()
+    formData.append('file', file)
+    formData.append('sortOrder', sortOrder.toString())
+    const response = await apiClient.post<ApiResponse<CarImage>>(
+      `/cars/${carId}/images`,
+      formData,
+      { headers: { 'Content-Type': 'multipart/form-data' } }
+    )
+    return response.data.data!
+  },
+
+  // 删除图片
+  deleteImage: async (carId: number, imageId: number): Promise<void> => {
+    await apiClient.delete(`/cars/${carId}/images/${imageId}`)
+  },
+}
+```
+
+**收藏模块：**
+
+```ts
+touch src/api/favorites.ts
+// src/api/favorites.ts
+import apiClient from './client'
+import type { Favorite, PagedResponse, ApiResponse } from '@/types'
+
+export const favoritesApi = {
+  add: async (carId: number): Promise<Favorite> => {
+    const response = await apiClient.post<ApiResponse<Favorite>>(
+      `/favorites/${carId}`)
+    return response.data.data!
+  },
+
+  remove: async (carId: number): Promise<void> => {
+    await apiClient.delete(`/favorites/${carId}`)
+  },
+
+  getMyFavorites: async (page = 1, pageSize = 20): Promise<PagedResponse<Favorite>> => {
+    const response = await apiClient.get<ApiResponse<PagedResponse<Favorite>>>(
+      '/favorites', { params: { page, pageSize } })
+    return response.data.data!
+  },
+}
+```
+
+**订单模块：**
+
+```bash
+touch src/api/orders.ts
+// src/api/orders.ts
+import apiClient from './client'
+import type { Order, OrderCreateRequest, PagedResponse, ApiResponse } from '@/types'
+
+export const ordersApi = {
+  create: async (data: OrderCreateRequest): Promise<Order> => {
+    const response = await apiClient.post<ApiResponse<Order>>('/orders', data)
+    return response.data.data!
+  },
+
+  cancel: async (id: number): Promise<Order> => {
+    const response = await apiClient.post<ApiResponse<Order>>(
+      `/orders/${id}/cancel`)
+    return response.data.data!
+  },
+
+  complete: async (id: number): Promise<Order> => {
+    const response = await apiClient.post<ApiResponse<Order>>(
+      `/orders/${id}/complete`)
+    return response.data.data!
+  },
+
+  getMyPurchases: async (page = 1, pageSize = 20): Promise<PagedResponse<Order>> => {
+    const response = await apiClient.get<ApiResponse<PagedResponse<Order>>>(
+      '/orders/my-purchases', { params: { page, pageSize } })
+    return response.data.data!
+  },
+
+  getMySales: async (page = 1, pageSize = 20): Promise<PagedResponse<Order>> => {
+    const response = await apiClient.get<ApiResponse<PagedResponse<Order>>>(
+      '/orders/my-sales', { params: { page, pageSize } })
+    return response.data.data!
+  },
+}
+```
+
+**评价模块：**
+
+```bash
+touch src/api/reviews.ts
+// src/api/reviews.ts
+import apiClient from './client'
+import type {
+  Review,
+  SellerRating,
+  CreateReviewRequest,
+  ApiResponse
+} from '@/types'
+
+export const reviewsApi = {
+  create: async (data: CreateReviewRequest): Promise<Review> => {
+    const response = await apiClient.post<ApiResponse<Review>>('/reviews', data)
+    return response.data.data!
+  },
+
+  getSellerRating: async (sellerId: number): Promise<SellerRating> => {
+    const response = await apiClient.get<ApiResponse<SellerRating>>(
+      `/reviews/seller/${sellerId}`)
+    return response.data.data!
+  },
+}
+```
+
+**Admin 模块：**
+
+```bash
+touch src/api/admin.ts
+// src/api/admin.ts
+import apiClient from './client'
+import type { Car, PagedResponse, ApiResponse } from '@/types'
+
+export const adminApi = {
+  getPendingCars: async (page = 1, pageSize = 20): Promise<PagedResponse<Car>> => {
+    const response = await apiClient.get<ApiResponse<PagedResponse<Car>>>(
+      '/admin/cars/pending', { params: { page, pageSize } })
+    return response.data.data!
+  },
+
+  approve: async (carId: number): Promise<Car> => {
+    const response = await apiClient.post<ApiResponse<Car>>(
+      `/admin/cars/${carId}/approve`)
+    return response.data.data!
+  },
+
+  reject: async (carId: number): Promise<Car> => {
+    const response = await apiClient.post<ApiResponse<Car>>(
+      `/admin/cars/${carId}/reject`)
+    return response.data.data!
+  },
+
+  deleteCar: async (carId: number): Promise<void> => {
+    await apiClient.delete(`/admin/cars/${carId}`)
+  },
+}
+```
+
+**统一导出：**
+
+```bash
+touch src/api/index.ts
+// src/api/index.ts
+export * from './auth'
+export * from './users'
+export * from './cars'
+export * from './favorites'
+export * from './orders'
+export * from './reviews'
+export * from './admin'
+```
+
+
+
+### 4. 验证编译
+
+```bash
+npm run build
+```
+
+预期没有 TypeScript 错误。如果有，根据错误信息修正类型定义。
+
+
+
+### 5. 此时的目录变化
+
+```
+src/
+├── api/
+│   ├── admin.ts      ← 新增
+│   ├── auth.ts       ← 新增
+│   ├── cars.ts       ← 新增
+│   ├── client.ts     ← 新增
+│   ├── favorites.ts  ← 新增
+│   ├── index.ts      ← 新增
+│   ├── orders.ts     ← 新增
+│   ├── reviews.ts    ← 新增
+│   └── users.ts      ← 新增
+└── types/
+    ├── api.ts        ← 新增
+    ├── car.ts        ← 新增
+    ├── favorite.ts   ← 新增
+    ├── index.ts      ← 新增
+    ├── order.ts      ← 新增
+    ├── review.ts     ← 新增
+    └── user.ts       ← 新增
+```
+
+
+
+### 6. Git 提交 + 合并分支
+
+前端地基三步（Step 42-44）全部完成：
+
+```bash
+git add .
+git commit -m "feat: TypeScript types + Axios API client setup"
+git push origin feature/frontend-setup
+
+# 合并回 develop
+git checkout develop
+git merge --no-ff feature/frontend-setup \
+    -m "merge: feature/frontend-setup into develop"
+git push origin develop
+git branch -D feature/frontend-setup
+git push origin --delete feature/frontend-setup
+```
+
+
+
+### Step 44 完成状态
+
+```
+✅ 安装 Axios
+✅ 所有后端 DTO 对应的 TypeScript 类型定义（6个类型文件）
+✅ 理解联合类型替代枚举的原因
+✅ 理解 const 对象 + 类型推导的模式（CarStatus / OrderStatus）
+✅ Axios 实例配置（baseURL从环境变量读取）
+✅ 请求拦截器（自动附加 Token）
+✅ 响应拦截器（统一解包、错误处理）
+✅ 7个模块 API 函数封装（auth/users/cars/favorites/orders/reviews/admin）
+✅ npm run build 无 TypeScript 错误
+✅ feature/frontend-setup 合并回 develop
+```
+
+
+
+## Step 45 · 安装核心工具库
+
+### 这一步做什么
+
+登录页需要三样东西：**管理表单**（React Hook Form + Zod）、**管理全局状态**（Zustand）。这一步把这三个工具装好、配置好，下一步做登录页时直接用。
+
+
+
+### 1. 安装依赖
+
+```bash
+npm install zustand
+npm install react-hook-form zod @hookform/resolvers
+```
+
+四个包的分工：
+
+```
+zustand              全局状态管理，存储登录状态和 Token
+react-hook-form      表单状态管理，处理输入、验证、提交
+zod                  Schema 验证，定义表单字段的规则
+@hookform/resolvers  连接 RHF 和 Zod，让两者配合工作
+```
+
+
+
+### 2. 切出认证页面分支
+
+这三个工具是为认证流程（Step 46-49）服务的，在认证分支上配置：
+
+```bash
+git checkout develop
+git checkout -b feature/auth-pages
+git push -u origin feature/auth-pages
+```
+
+
+
+### 3. Zustand 原理和核心语法
+
+#### 3.1 原理
+
+Zustand 本质是一个**发布订阅模式**的状态容器：
+
+```
+store（状态容器）
+  ├── state（数据）
+  └── actions（修改数据的方法）
+
+组件 A 订阅 store → store 变化 → 组件 A 自动重新渲染
+组件 B 订阅 store → store 变化 → 组件 B 自动重新渲染
+```
+
+不需要 Context，不需要 Provider 包裹，任何组件直接读取。
+
+#### 3.2 创建 Store
+
+Zustand提供一个函数 :**
+
+```ts
+create<T>(initializer: (set, get) => T): UseBoundStore<T>
+```
+
+**create函数的**参数：初始化函数（initializer）**
+
+Zustand 调用这个初始化函数时会注入两个参数：set、get。 并进行数据初始化
+
+```ts
+create<AuthState>((set, get) => ({
+//                 ↑    ↑
+//           Zustand 注入  Zustand 注入
+  
+  // 数据初始化：普通字段，直接写值
+  user: null,
+  token: null,
+  isAuthenticated: false,
+
+  // 数据更新：用 set 修改 state
+  login: (user, token) => set({ user, token, isAuthenticated: true }),
+
+  // 数据读取：用 get 在 action 内部读当前 state
+  updateUser: (username) => {
+    const current = get().user   // 读当前值
+    set({ user: { ...current, username } })
+  }
+}))
+```
+
+初始化函数的**返回值**就是 store 的初始结构，包含所有 state 和 action。
+
+> `set` 和 `get` 的详细用法:
+>
+> ```ts
+> // set：合并更新，不需要展开整个 state
+> set({ user: newUser })          // 只更新 user，其他字段不变
+> set({ isAuthenticated: true })  // 只更新 isAuthenticated
+> 
+> // set 也可以传函数，拿到当前 state
+> set(state => ({
+>   user: { ...state.user, username: 'new' }
+> }))
+> 
+> // get：在 action 内部读当前 state
+> const currentToken = get().token
+> ```
+
+
+
+**create函数的返回值**，是自定义的**Hook 函数**，不是普通对象：
+
+```ts
+const useAuthStore = create<AuthState>()(...)
+//    ↑ 这是一个 Hook 函数，约定用 use 开头
+```
+
+所以：
+
+```TS
+// 在组件里调用这个 Hook，才能拿到 store 里的数据
+const { user, login } = useAuthStore()
+//                       ↑ 调用 Hook，返回的才是 store 对象
+
+// useAuthStore 本身是函数，不能直接用
+console.log(useAuthStore.user)  // ❌ 错误，Hook 必须在组件里调用
+```
+
+**store 对象是什么？**
+
+调用 `useAuthStore()` 之后返回的才是 store 对象，结构就是初始化函数返回的那个对象：
+
+```TS
+{
+  // state
+  user: null,
+  token: null,
+  isAuthenticated: false,
+
+  // actions
+  login: (user, token) => ...,
+  logout: () => ...,
+  setUser: (user) => ...,
+}
+```
+
+准确的层次是：
+
+```tex
+create        → 生产 Hook 的工厂函数
+useAuthStore  → Hook 函数
+useAuthStore() → 真正的 store 对象（只能在组件里调用）
+```
+
+#### 3.3 如何在组件里使用？
+
+可以订阅整个store
+
+```tsx
+function Navbar() {
+  // 订阅整个 store
+  const { user, isAuthenticated, logout } = useAuthStore()
+
+  return (
+    <div>
+      {isAuthenticated ? (
+        <>
+          <span>{user?.username}</span>
+          <button onClick={logout}>退出</button>
+        </>
+      ) : (
+        <a href="/login">登录</a>
+      )}
+    </div>
+  )
+}
+```
+
+也可以**精准订阅（性能优化）**
+
+```tsx
+// 订阅整个 store：任何字段变化都会重新渲染
+const store = useAuthStore()
+
+// 只订阅需要的字段：只有 isAuthenticated 变化才重新渲染
+const isAuthenticated = useAuthStore(state => state.isAuthenticated)
+const user = useAuthStore(state => state.user)
+
+// 只订阅 action：action 不会变化，组件永远不会因此重新渲染
+const logout = useAuthStore(state => state.logout)
+
+```
+
+#### 3.4 如何持久化（配合 localStorage）？
+
+**什么问题？**
+
+```ts
+const useAuthStore = create<AuthState>((set) => ({
+  token: null,
+  user: null,
+  login: (user, token) => set({ user, token })
+}))
+
+// 用户登录后 token 存在内存里
+// 刷新页面 → 内存清空 → token 没了 → 用户被迫重新登录
+```
+
+使用Zustand 内置的**中间件`persist` **，能够把 store 的数据自动同步到 localStorage，页面刷新后数据不丢失。
+
+**如何使用persist？**
+
+```tsx
+import { create } from 'zustand'
+import { persist } from 'zustand/middleware'
+
+const useAuthStore = create<AuthState>()(
+  persist(
+    // 原来的初始化函数，完全不变
+    (set, get) => ({
+      user: null,
+      token: null,
+      isAuthenticated: false,
+      login: (user, token) => set({ user, token, isAuthenticated: true }),
+      logout: () => set({ user: null, token: null, isAuthenticated: false }),
+    }),
+    // persist 的配置
+    {
+      name: 'auth-storage',  // localStorage 的 key 名
+    }
+  )
+)
+```
+
+> persist 做了什么??
+>
+> ```bash
+> 第一次登录
+>   login(user, token) 被调用
+>     → set({ user, token, isAuthenticated: true })
+>     → persist 监听到 state 变化
+>     → 自动写入 localStorage:
+>       key:   "auth-storage"
+>       value: { "state": { "user": {...}, "token": "eyJ..." }, "version": 0 }
+> 
+> 刷新页面
+>   → Zustand 初始化
+>   → persist 自动从 localStorage 读取数据
+>   → 恢复 state：user、token、isAuthenticated 全部还原
+>   → 用户无感知，还是登录状态
+> ```
+>
+> 
+
+**只持久化部分字段?**
+
+persist 默认会把所有 state 都存进 localStorage，但 action 函数不需要存，可以用 `partialize` 过滤：
+
+```ts
+persist(
+  (set) => ({...}),
+  {
+    name: 'auth-storage',
+    partialize: (state) => ({
+      user: state.user,
+      token: state.token,
+      // isAuthenticated 不存，刷新后根据 token 是否存在来判断
+      // action 函数自动不存，Zustand 内部处理了
+    })
+  }
+)
+```
+
+
+
+### 4. 配置 Zustand：authStore
+
+Zustand 是全局状态管理库。在这个项目里它的主要职责是：**存储登录状态**——用户信息、Token、是否已登录。
+
+**为什么需要全局状态管理？**
+
+登录状态需要在很多地方用到：导航栏显示用户名、路由保护判断是否登录、请求拦截器附加 Token……这些组件分布在页面的各个角落，没有直接的父子关系。如果靠 Props 传递，要一层一层往下传，非常繁琐。Zustand 提供一个全局 store，任何组件都可以直接读取和修改，不需要 Props 传递。
+
+```ts
+touch src/stores/authStore.ts
+// src/stores/authStore.ts
+import { create } from 'zustand'
+import { persist } from 'zustand/middleware'
+import type { User } from '@/types'
+
+interface AuthState {
+  user: User | null
+  accessToken: string | null
+
+  // 登录成功后调用：保存用户信息和 Token
+  setAuth: (user: User, token: string) => void
+
+  // 退出登录：清除所有状态
+  logout: () => void
+
+  // 判断当前是否已登录
+  isAuthenticated: () => boolean
+}
+
+export const useAuthStore = create<AuthState>()(
+  // persist 中间件：把 store 的状态同步到 localStorage
+  // 页面刷新后状态不会丢失，用户不需要重新登录
+  persist(
+    (set, get) => ({
+      user: null,
+      accessToken: null,
+
+      setAuth: (user, token) => {
+        // 同时更新 Zustand 状态和 localStorage
+        // localStorage 里的 accessToken 供 Axios 拦截器读取
+        localStorage.setItem('accessToken', token)
+        set({ user, accessToken: token })
+      },
+
+      logout: () => {
+        localStorage.removeItem('accessToken')
+        set({ user: null, accessToken: null })
+      },
+
+      isAuthenticated: () => {
+        return get().accessToken !== null && get().user !== null
+      },
+    }),
+    {
+      name: 'auth-storage',    // localStorage 里的 key 名称
+      // 只持久化这两个字段，方法不需要持久化
+      partialize: (state) => ({
+        user: state.user,
+        accessToken: state.accessToken,
+      }),
+    }
+  )
+)
+```
+
+> **为什么 `setAuth` 里要同时写 localStorage 和 Zustand？**
+>
+>  persist 中间件会把 `accessToken` 存到 `auth-storage` 这个 key 里，但 Axios 拦截器读的是单独的 `accessToken` key（`localStorage.getItem('accessToken')`）。手动写一次 `localStorage.setItem('accessToken', token)` 是为了让拦截器能直接读到 Token，不依赖 persist 的存储结构。
+
+
+
+### 5. React Hook Form + Zod 的工作方式
+
+在写登录页之前，需要对表单数据进行验证。
+
+#### 5.1 后端验证 vs 前端验证
+
+后端验证是保证数据安全
+
+```c#
+// 后端 C# 验证
+public class LoginRequest {
+  [Required]
+  [EmailAddress]
+  public string Email { get; set; }
+  
+  [MinLength(6)]
+  public string Password { get; set; }
+}
+```
+
+用户完全可以绕过前端，直接用 Postman 或者修改 JS 代码发请求，后端验证保证无论请求从哪来，数据都是合法的。
+
+前端验证**不是为了安全**，是为了提升用户体验
+
+```bash
+没有前端验证：
+  用户填完表单 → 点提交 → 等待网络请求 → 后端返回错误 → 用户才看到提示
+  耗时：500ms ~ 2s
+
+有前端验证：
+  用户填完表单 → 点提交 → 立即显示错误（0ms）
+  甚至：用户还没点提交，输完就实时提示
+```
+
+#### 5.2 原生表单验证
+
+原生 React 处理表单很繁琐：
+
+```tsx
+// 原生写法：每个字段都要手动管理
+const [email, setEmail] = useState('')
+const [password, setPassword] = useState('')
+const [emailError, setEmailError] = useState('')
+const [passwordError, setPasswordError] = useState('')
+
+const handleSubmit = () => {
+  if (!email.includes('@')) setEmailError('邮箱格式错误')
+  if (password.length < 6) setPasswordError('密码太短')
+  // ...字段越多越痛苦
+}
+```
+
+#### 5.3 工具协作
+
+**前端使用以下3个工具的协作**
+
+- **Zod** 负责定义验证规则：邮箱格式是否正确、密码最少几位。
+
+- **React Hook Form（RHF）** 负责管理表单状态：哪些字段、当前的值、是否提交过、错误信息在哪里显示。
+
+- **`@hookform/resolvers`** 是连接两者的桥梁：把 Zod Schema 传给 RHF，RHF 在验证时自动调用 Zod。
+
+三者的协作流程：
+
+```
+定义 Zod Schema（规则）
+        ↓
+useForm({ resolver: zodResolver(schema) })
+        ↓
+用户填写表单、点击提交
+        ↓
+RHF 调用 Zod 验证
+        ↓
+验证失败 → 错误信息显示在对应字段下方
+验证通过 → 调用 onSubmit 处理函数
+```
+
+#### 5.4 Zod：只负责定义验证规则
+
+```tsx
+import { z } from 'zod'
+
+const loginSchema = z.object({
+  email: z.string()
+            .min(1, '邮箱不能为空')
+            .email('邮箱格式不正确'),
+  password: z.string()
+               .min(6, '密码至少6位')
+               .max(20, '密码最多20位'),
+})
+
+// Zod 还能自动推导出 TypeScript 类型，不需要重复定义
+type LoginForm = z.infer<typeof loginSchema>
+// 等价于：{ email: string, password: string }
+```
+
+Zod 只管规则，不管表单，不管 UI，就是一个验证器。
+
+#### 5.5 React Hook Form：只负责管理表单状态
+
+```tsx
+import { useForm } from 'react-hook-form'
+
+const { 
+  register,       // 注册字段（绑定到 input）
+  handleSubmit,   // 包装提交事件
+  formState: { errors, isSubmitting }  // 错误信息、提交状态
+} = useForm<LoginForm>()
+```
+
+RHF 管理的是：当前每个字段的值、是否已触碰、错误信息在哪、提交状态等。它本身不做验证，只是管理状态。
+
+#### 5.6 zodResolver：把两者连接起来
+
+```ts
+import { zodResolver } from '@hookform/resolvers/zod'
+
+const { register, handleSubmit, formState: { errors } } = useForm<LoginForm>({
+  resolver: zodResolver(loginSchema)
+  //        ↑ 告诉 RHF：验证时用这个 Zod schema
+})
+```
+
+有了这一行，RHF 在需要验证时会自动调用 Zod，不需要手动写验证逻辑。
+
+
+
+**完整流程**:
+
+```bash
+用户填写表单，点击提交
+        ↓
+handleSubmit 拦截原生 submit 事件
+        ↓
+RHF 调用 zodResolver → Zod 执行验证
+        ↓
+    验证失败                    验证通过
+        ↓                          ↓
+errors 对象被填充            调用 onSubmit(data)
+input 下方显示错误信息        data 是完全合法的数据
+用户修改后再次触发验证         调用 API
+```
+
+
+
+### 6. 验证安装
+
+```bash
+npm run build
+```
+
+预期没有错误。
+
+
+
+### 7. 此时的目录变化
+
+```
+src/
+└── stores/
+    └── authStore.ts    ← 新增
+```
+
+
+
+### 8. Git 提交
+
+```bash
+git add .
+git commit -m "feat: Zustand authStore + install RHF + Zod"
+git push origin feature/auth-pages
+```
+
+
+
+### Step 45 完成状态
+
+```
+✅ 切出 feature/auth-pages 分支
+✅ 安装 zustand / react-hook-form / zod / @hookform/resolvers
+✅ authStore 配置完成（user / accessToken / setAuth / logout / isAuthenticated）
+✅ 理解 persist 中间件（刷新不丢失登录状态）
+✅ 理解 setAuth 同时写 localStorage 的原因（供 Axios 拦截器读取）
+✅ 理解 RHF + Zod + resolver 三者协作流程
+✅ npm run build 无错误
+✅ Git commit 完成
+```
