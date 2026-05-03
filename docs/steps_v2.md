@@ -7193,3 +7193,1050 @@ git push origin feature/auth-pages
 ✅ 测试通过（未登录跳转 / 登录后正常访问）
 ✅ Git commit 完成
 ```
+
+
+
+## Step 48 · 注册页 + 密码相关页面
+
+### 这一步做什么
+
+Step 46 做了登录页，Step 47 搭好了路由框架。这一步把剩余的认证页面全部做完：注册、邮箱验证、忘记密码、重置密码。
+
+
+
+### 1. 注册页
+
+#### 1.1 验证规则
+
+登录页的 Schema 很简单：邮箱格式 + 密码不为空。
+
+注册页的密码需要更严格的规则：至少8位、包含大写字母、包含小写字母、包含数字。
+
+**Zod 支持链式调用多个验证规则：**
+
+```tsx
+// 每个 .xxx() 是一条规则，第二个参数是这条规则失败时的提示
+z.string()
+  .min(8, 'At least 8 characters')
+  .regex(/(?=.*[a-z])/, 'Must contain lowercase letter')
+  .regex(/(?=.*[A-Z])/, 'Must contain uppercase letter')
+  .regex(/(?=.*\d)/, 'Must contain number')
+```
+
+规则从上到下依次验证，第一条失败就停下来显示对应的错误信息。
+
+#### 1.2 注册成功后不跳转
+
+登录成功后直接跳转首页，但注册成功后不一样：
+
+用户还需要去邮箱点验证链接，跳转到首页没有意义。
+
+更好的做法是：注册成功后**显示一个提示页面**，告诉用户"请检查邮箱"。
+
+可以用一个 `isSuccess` 状态来控制显示哪个内容：
+
+```tsx
+const [isSuccess, setIsSuccess] = useState(false)
+
+// 注册成功后
+setIsSuccess(true)
+
+// 根据状态决定显示什么
+if (isSuccess) {
+  return <div>请检查邮箱...</div>
+}
+ 
+return <div>注册表单...</div>
+```
+
+#### 1.3 实现注册页
+
+打开 `src/pages/RegisterPage.tsx`，一步一步构建：
+
+**第一步：Schema 和类型**
+
+```tsx
+import { useState } from 'react'
+import { useForm } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { z } from 'zod'
+import { Link, useNavigate } from 'react-router-dom'
+import { authApi } from '@/api'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card'
+
+const registerSchema = z.object({
+  username: z
+    .string()
+    .min(2, 'Username must be at least 2 characters')
+    .max(50, 'Username must not exceed 50 characters'),
+  email: z
+    .string()
+    .min(1, 'Email is required')
+    .email('Please enter a valid email'),
+  password: z
+    .string()
+    .min(8, 'Password must be at least 8 characters')
+    .regex(/(?=.*[a-z])/, 'Must contain at least one lowercase letter')
+    .regex(/(?=.*[A-Z])/, 'Must contain at least one uppercase letter')
+    .regex(/(?=.*\d)/, 'Must contain at least one number'),
+})
+
+type RegisterForm = z.infer<typeof registerSchema>
+```
+
+**第二步：组件骨架 + 状态**
+
+```tsx
+import { useState } from 'react'
+import { useForm } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { useNavigate } from "react-router-dom"
+
+export default function RegisterPage() {
+  const [serverError, setServerError] = useState<string | null>(null)
+  const [isSuccess, setIsSuccess] = useState(false)
+  const navigate = useNavigate();
+
+  const {
+    register,
+    handleSubmit,
+    formState: { errors, isSubmitting },
+  } = useForm<RegisterForm>({
+    resolver: zodResolver(registerSchema),
+  })
+
+  const onSubmit = async (data: RegisterForm) => {
+    setServerError(null)
+    try {
+      await authApi.register(data)
+      // 注册成功：显示"请检查邮箱"提示
+      setIsSuccess(true)
+    } catch (error) {
+      if (error instanceof Error) {
+        setServerError(error.message)
+      }
+    }
+  }
+
+  // 注册成功后显示提示
+  if (isSuccess) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-gray-50">
+        <Card className="w-full max-w-md">
+          <CardHeader>
+            <CardTitle>Check your email</CardTitle>
+            <CardDescription>
+              We've sent a verification link to your email.
+              Please click the link to activate your account.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Button
+              variant="outline"
+              className="w-full"
+              onClick={() => navigate('/login')}
+            >
+              Back to sign in
+            </Button>
+          </CardContent>
+        </Card>
+      </div>
+    )
+  }
+
+  // 注册表单
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-gray-50">
+      <Card className="w-full max-w-md">
+        <CardHeader className="space-y-1">
+          <CardTitle className="text-2xl font-bold">Create account</CardTitle>
+          <CardDescription>
+            Enter your details to create a new account
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+
+            {serverError && (
+              <div className="rounded-md bg-red-50 p-3 text-sm text-red-600">
+                {serverError}
+              </div>
+            )}
+
+            <div className="space-y-2">
+              <Label htmlFor="username">Username</Label>
+              <Input
+                id="username"
+                placeholder="johndoe"
+                {...register('username')}
+              />
+              {errors.username && (
+                <p className="text-sm text-red-500">{errors.username.message}</p>
+              )}
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="email">Email</Label>
+              <Input
+                id="email"
+                type="email"
+                placeholder="you@example.com"
+                {...register('email')}
+              />
+              {errors.email && (
+                <p className="text-sm text-red-500">{errors.email.message}</p>
+              )}
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="password">Password</Label>
+              <Input
+                id="password"
+                type="password"
+                placeholder="••••••••"
+                {...register('password')}
+              />
+              {errors.password && (
+                <p className="text-sm text-red-500">{errors.password.message}</p>
+              )}
+            </div>
+
+            <Button
+              type="submit"
+              className="w-full"
+              disabled={isSubmitting}
+            >
+              {isSubmitting ? 'Creating account...' : 'Create account'}
+            </Button>
+
+            <p className="text-center text-sm text-gray-600">
+              Already have an account?{' '}
+              <Link to="/login" className="text-blue-600 hover:underline">
+                Sign in
+              </Link>
+            </p>
+
+          </form>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+```
+
+#### 1.4 把注册路由加进去
+
+打开 `src/router.tsx`，在公开路由里加上注册页：
+
+```tsx
+import RegisterPage from '@/pages/RegisterPage'
+
+// 在公开路由里添加
+{
+  path: '/register',
+  element: <RegisterPage />,
+},
+```
+
+**测试注册流程：**
+
+访问 `/register`，不填内容直接提交，看到字段验证错误。
+
+密码只填 `abc123`（不满足大写字母要求），看到 `Must contain at least one uppercase letter`。
+
+正确填写所有字段，提交后看到"Check your email"提示，同时真实邮箱收到验证邮件。
+
+
+
+### 2. 邮箱验证页
+
+#### 2.1 怎么读取 URL 参数?
+
+邮件里的验证链接格式是：
+
+```
+http://localhost:5173/verify-email?token=abc123xyz
+```
+
+`?token=abc123xyz` 是 URL 的查询参数（Query String）。前端需要把 `token` 的值读出来，传给后端验证接口。
+
+React Router 提供了 `useSearchParams` Hook 专门读取 URL 查询参数：
+
+```tsx
+// URL: /verify-email?token=abc123
+const [searchParams] = useSearchParams()
+
+// .get('token') 读取名为 token 的参数值
+const token = searchParams.get('token')  // → "abc123"
+
+// 参数不存在时返回 null
+const missing = searchParams.get('notexist')  // → null
+```
+
+`useSearchParams` 返回一个数组，第一个元素是参数对象，第二个是修改参数的函数。这里只需要读取，所以只用第一个。
+
+#### 2.2 页面加载时自动触发请求?
+
+登录页和注册页都是用户主动点提交按钮才发请求。但邮箱验证页不一样——用户点击链接进入页面后，应该**自动触发验证请求**，不需要用户再点任何按钮。
+
+这需要用到 `useEffect`。
+
+**useEffect 是什么？**
+
+`useEffect` 是 React 提供的一个 Hook，用来处理"副作用"。
+
+**副作用**是指不属于渲染本身的操作，比如：发 API 请求、设置定时器、操作浏览器 API 等。
+
+为什么要把这些操作放进 `useEffect` 而不是直接写在组件函数体里？
+
+```tsx
+// 错误做法：直接在组件里发请求
+function VerifyEmailPage() {
+  // 每次组件重新渲染都会发一次请求！
+  // React 可能因为各种原因重新渲染组件，这会导致请求被重复发送
+  authApi.verifyEmail(token)
+
+  return <div>...</div>
+}
+```
+
+`useEffect` 让你控制**什么时候**执行这些操作：
+
+```tsx
+useEffect(() => {
+  // 这里的代码在组件渲染之后执行
+  // 第二个参数是依赖数组
+
+}, [依赖项])
+// 依赖数组为空 []：只在组件第一次渲染后执行一次
+// 依赖数组有值 [a, b]：a 或 b 变化时重新执行
+// 不传第二个参数：每次渲染后都执行（通常不想要这个）
+```
+
+邮箱验证页的场景：进入页面时执行一次验证，之后不再重复，用空依赖数组：
+
+```tsx
+useEffect(() => {
+  // 页面第一次渲染后自动执行
+  verify()
+}, [])
+```
+
+#### 2.3 用状态机管理验证过程
+
+验证有三种可能的结果：进行中、成功、失败。用一个状态来表示当前处于哪个阶段：
+
+```tsx
+// 用联合类型定义所有可能的状态
+type VerifyStatus = 'loading' | 'success' | 'error'
+
+const [status, setStatus] = useState<VerifyStatus>('loading')
+```
+
+这种用一个状态值表示多种互斥状态的方式，叫**状态机**思维。比用多个 boolean 状态（`isLoading`、`isSuccess`、`isError`）清晰得多，因为互斥的状态不可能同时为 true。
+
+#### 2.4 实现邮箱验证页
+
+打开 `src/pages/VerifyEmailPage.tsx`：
+
+**第一步：定义状态**
+
+```tsx
+import { useEffect, useState } from 'react'
+import { useSearchParams, Link } from 'react-router-dom'
+import { authApi } from '@/api'
+
+type VerifyStatus = 'loading' | 'success' | 'error'
+
+export default function VerifyEmailPage() {
+  const [searchParams] = useSearchParams()
+  const [status, setStatus] = useState<VerifyStatus>('loading')
+  const [errorMessage, setErrorMessage] = useState<string | null>(null)
+
+  // 组件渲染后自动触发验证
+    useEffect(() => {
+      const verify = async () => {
+        const token = searchParams.get("token")
+
+        if (!token) {
+          setStatus("error")
+          setErrorMessage("Invalid verification link.")
+          return
+        }
+
+        try {
+          await authApi.verifyEmail(token)
+          setStatus("success")
+        } catch (error) {
+          setStatus("error")
+          if (error instanceof Error) {
+            setErrorMessage(error.message)
+          }
+        }
+      }
+
+      verify()
+    }, [searchParams])
+
+  // 根据状态渲染不同内容
+  // ...
+}
+```
+
+**第二步：根据状态渲染对应内容**
+
+```tsx
+import { useEffect, useState } from "react";
+import { useSearchParams, Link } from "react-router-dom";
+import { authApi } from "@/api";
+import { Button } from "@/components/ui/button";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+
+type VerifyStatus = "loading" | "success" | "error";
+
+export default function VerifyEmailPage() {
+  const [searchParams] = useSearchParams();
+  const [status, setStatus] = useState<VerifyStatus>("loading");
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+	...
+  }, [searchParams]);
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-gray-50">
+      <Card className="w-full max-w-md">
+        {status === "loading" && (
+          <CardHeader>
+            <CardTitle>Verifying your email...</CardTitle>
+            <CardDescription>Please wait a moment.</CardDescription>
+          </CardHeader>
+        )}
+
+        {status === "success" && (
+          <>
+            <CardHeader>
+              <CardTitle>Email verified!</CardTitle>
+              <CardDescription>
+                Your account is now active. You can sign in.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              {/*
+                Button asChild 是 shadcn 的特殊用法：
+                把 Button 的样式应用到子元素（Link）上
+                而不是渲染一个 <button> 标签包着 <a> 标签
+                （button 包 a 是不合法的 HTML 写法）
+              */}
+              <Button asChild className="w-full">
+                <Link to="/login">Sign in</Link>
+              </Button>
+            </CardContent>
+          </>
+        )}
+
+        {status === "error" && (
+          <>
+            <CardHeader>
+              <CardTitle>Verification failed</CardTitle>
+              <CardDescription className="text-red-500">
+                {errorMessage ?? "The link is invalid or has expired."}
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <Button asChild variant="outline" className="w-full">
+                <Link to="/login">Back to sign in</Link>
+              </Button>
+            </CardContent>
+          </>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+```
+
+#### 2.5 加入路由
+
+打开 `src/router.tsx`，添加：
+
+```tsx
+import VerifyEmailPage from '@/pages/VerifyEmailPage'
+
+// 公开路由里添加
+{
+  path: '/verify-email',
+  element: <VerifyEmailPage />,
+},
+```
+
+**测试：** 注册后收到验证邮件，点击邮件里的链接，页面先短暂显示 "Verifying..."，然后跳转到 "Email verified!" 成功状态。
+
+> **注意：由于使用了严格模式:**
+>
+> ```tsx
+> createRoot(document.getElementById("root")!).render(
+>   <StrictMode>
+>     {/* 包裹rowserRouter组件 */}
+>     <RouterProvider router={router} />
+>   </StrictMode>,
+> );
+> ```
+>
+> React 开发模式下 `StrictMode` 会**故意把 `useEffect` 执行两次**，用来帮助发现副作用问题。
+>
+> 执行顺序：
+>
+> ```bash
+> 第一次挂载 → useEffect 执行 → verify() 发出第一次请求
+>            → StrictMode 故意卸载
+>            → 再次挂载 → useEffect 再次执行 → verify() 发出第二次请求
+> ```
+>
+> 对于邮箱验证这种**一次性操作**，第一次请求成功后 token 已经被消费（数据库里清空了），第二次请求用同一个 token 去验证，后端找不到, 发送验证请求返回
+>
+> ```json
+> {
+>     "success": false,
+>     "data": null,
+>     "message": "The token is invalid or has expired.",
+>     "errors": null
+> }
+> ```
+>
+> 从而让status='error', 导致前端渲染错误提示内容。
+>
+> 解决方案：使用useRef hook函数
+>
+> - 直接删除严格模式 ： 导致无法使用严格模式发现其他副作用潜在的问题
+> - 使用useRef hook函数
+
+#### 2.6 使用useRef hook函数优化
+
+`useRef` 返回一个容器对象 `{ current: value }`，这个对象保存在 React 内部的 **Fiber 节点**上，不在函数作用域里：
+
+```bash
+
+React 内部维护了一张表：
+
+Fiber 节点（组件实例）
+  ├── useState 的值    → [status, setStatus]
+  ├── useState 的值    → [errorMessage, setErrorMessage]  
+  ├── useRef 的值      → { current: false }，跨渲染共享同一个对
+  └── useEffect 的依赖 → [searchParams]
+  
+```
+
+每次组件重新渲染，函数体重新执行，但 React 不会重新创建这张表，而是复用已有的，把最新的值填进去。
+
+和普通变量、useState 的区别：
+
+```bash
+普通变量  → 每次渲染重新创建，渲染结束销毁
+useState → 值在 Fiber 节点，变化触发重新渲染
+useRef   → 值在 Fiber 节点，变化不触发重新渲染  ← 适合做标志位
+```
+
+useRef 的两种用途:
+
+```tsx
+// 用途一：获取 DOM 引用（最常见）
+const inputRef = useRef<HTMLInputElement>(null)
+<input ref={inputRef} />
+// inputRef.current 就是 input 的 DOM 元素
+// 可以直接操作：inputRef.current.focus()
+
+// 用途二：跨渲染保存值
+const hasVerified = useRef(false)
+// 存的不是 DOM，是普通值
+// 值变化不触发渲染，但在多次渲染/effect 间共享
+```
+
+两种用途本质一样——都是**在渲染之间持久保存一个可变值**，只是存的内容不同。
+
+对于严格模式导致双重执行 useEffect，发出两次请求的问题，使用useRef解决
+
+```tsx
+export default function VerifyEmailPage() {
+  const [searchParams] = useSearchParams()
+  const [status, setStatus] = useState<VerifyStatus>("loading")
+  const [errorMessage, setErrorMessage] = useState<string | null>(null)
+  const hasVerified = useRef(false)  // ← 标志位，防止重复请求
+
+  useEffect(() => {
+    if (hasVerified.current) return  // 第二次执行直接跳过
+    hasVerified.current = true       // 标记已执行
+
+    const verify = async () => {
+      const token = searchParams.get("token")
+
+      if (!token) {
+        setStatus("error")
+        setErrorMessage("Invalid verification link.")
+        return
+      }
+
+      try {
+        await authApi.verifyEmail(token)
+        setStatus("success")
+      } catch (error) {
+        setStatus("error")
+        if (error instanceof Error) {
+          setErrorMessage(error.message)
+        }
+      }
+    }
+
+    verify()
+  }, [searchParams])
+}
+```
+
+完整执行流程
+
+```bash
+const hasVerified = useRef(false)
+→ Fiber 节点里创建 { current: false }
+
+第一次挂载
+  → useEffect 执行
+      → hasVerified.current === false → 不跳过
+      → hasVerified.current = true   ← 修改 Fiber 节点里的值
+      → verify() 发出请求
+      → 验证成功，EmailConfirmed = true，token 清空
+      → setStatus("success")
+
+StrictMode 卸载
+  → hasVerified.current 还是 true（Fiber 节点不受卸载影响）
+
+再次挂载
+  → useEffect 再次执行
+      → hasVerified.current === true → 直接 return
+      → verify() 不执行，请求不发出去 ✅
+```
+
+
+
+### 3. 忘记密码页
+
+这是最简单的一个页面：只有一个邮箱字段，提交后显示成功提示。
+
+不引入新知识点，直接和注册页的结构完全一样：
+
+```tsx
+// src/pages/ForgotPasswordPage.tsx
+import { useState } from 'react'
+import { useForm } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { z } from 'zod'
+import { Link } from 'react-router-dom'
+import { authApi } from '@/api'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card'
+
+const forgotPasswordSchema = z.object({
+  email: z.string().min(1, 'Email is required').email('Invalid email format'),
+})
+
+type ForgotPasswordForm = z.infer<typeof forgotPasswordSchema>
+
+export default function ForgotPasswordPage() {
+  const [isSuccess, setIsSuccess] = useState(false)
+
+  const {
+    register,
+    handleSubmit,
+    formState: { errors, isSubmitting },
+  } = useForm<ForgotPasswordForm>({
+    resolver: zodResolver(forgotPasswordSchema),
+  })
+
+  const onSubmit = async (data: ForgotPasswordForm) => {
+    // 后端设计：无论邮箱是否存在，始终返回成功
+    // 前端同样不需要处理错误，直接显示成功提示
+    await authApi.forgotPassword(data.email)
+    setIsSuccess(true)
+  }
+
+  if (isSuccess) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-gray-50">
+        <Card className="w-full max-w-md">
+          <CardHeader>
+            <CardTitle>Check your email</CardTitle>
+            <CardDescription>
+              If this email is registered, you'll receive
+              a password reset link shortly.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Button asChild variant="outline" className="w-full">
+              <Link to="/login">Back to sign in</Link>
+            </Button>
+          </CardContent>
+        </Card>
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-gray-50">
+      <Card className="w-full max-w-md">
+        <CardHeader className="space-y-1">
+          <CardTitle className="text-2xl font-bold">Forgot password</CardTitle>
+          <CardDescription>
+            Enter your email and we'll send you a reset link
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+
+            <div className="space-y-2">
+              <Label htmlFor="email">Email</Label>
+              <Input
+                id="email"
+                type="email"
+                placeholder="you@example.com"
+                {...register('email')}
+              />
+              {errors.email && (
+                <p className="text-sm text-red-500">{errors.email.message}</p>
+              )}
+            </div>
+
+            <Button
+              type="submit"
+              className="w-full"
+              disabled={isSubmitting}
+            >
+              {isSubmitting ? 'Sending...' : 'Send reset link'}
+            </Button>
+
+            <p className="text-center text-sm text-gray-600">
+              <Link to="/login" className="text-blue-600 hover:underline">
+                Back to sign in
+              </Link>
+            </p>
+
+          </form>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+```
+
+加入路由：
+
+```tsx
+import ForgotPasswordPage from '@/pages/ForgotPasswordPage'
+
+{
+  path: '/forgot-password',
+  element: <ForgotPasswordPage />,
+},
+```
+
+
+
+### 4. 重置密码页
+
+#### 4.1 跨字段验证
+
+重置密码页有两个字段：新密码和确认密码，需要验证**两者必须相同**。
+
+这不是单个字段的规则，而是两个字段之间的比较。Zod 的普通字段验证做不到这一点，需要用 `refine`。
+
+**`refine` 是什么？**
+
+`refine` 是 Zod 提供的**自定义验证**方法，在整个对象层面执行，可以访问所有字段：
+
+```tsx
+const schema = z.object({
+  newPassword: z.string().min(8),
+  confirmPassword: z.string().min(1),
+})
+.refine(
+  // 第一个参数：验证函数，返回 true 表示通过，false 表示失败
+  (data) => data.newPassword === data.confirmPassword,
+  // 第二个参数：失败时的配置
+  {
+    message: "Passwords don't match",
+    // path 指定错误显示在哪个字段下方
+    path: ['confirmPassword'],
+  }
+)
+```
+
+`.refine()` 是在 `.object()` 之后链式调用的，执行时机是**所有字段验证通过之后**。如果 `newPassword` 或 `confirmPassword` 本身就不合法，`refine` 不会执行。
+
+#### 4.2 实现重置密码页
+
+同样一步一步来。
+
+**第一步：Schema**
+
+```tsx
+// src/pages/ResetPasswordPage.tsx
+
+const resetPasswordSchema = z
+  .object({
+    newPassword: z
+      .string()
+      .min(8, 'Password must be at least 8 characters')
+      .regex(/(?=.*[a-z])/, 'Must contain at least one lowercase letter')
+      .regex(/(?=.*[A-Z])/, 'Must contain at least one uppercase letter')
+      .regex(/(?=.*\d)/, 'Must contain at least one number'),
+    confirmPassword: z
+      .string()
+      .min(1, 'Please confirm your password'),
+  })
+  // 在整个对象层面验证两个密码是否一致
+  .refine(
+    (data) => data.newPassword === data.confirmPassword,
+    {
+      message: "Passwords don't match",
+      path: ['confirmPassword'],
+    }
+  )
+
+type ResetPasswordForm = z.infer<typeof resetPasswordSchema>
+```
+
+**第二步：组件逻辑**
+
+从 URL 读取 token（和邮箱验证页一样用 `useSearchParams`），提交时把 token 和新密码一起发给后端：
+
+```tsx
+export default function ResetPasswordPage() {
+  const [searchParams] = useSearchParams()
+  const navigate = useNavigate()
+  const [serverError, setServerError] = useState<string | null>(null)
+
+  const {
+    register,
+    handleSubmit,
+    formState: { errors, isSubmitting },
+  } = useForm<ResetPasswordForm>({
+    resolver: zodResolver(resetPasswordSchema),
+  })
+
+  const onSubmit = async (data: ResetPasswordForm) => {
+    setServerError(null)
+
+    const token = searchParams.get('token')
+    if (!token) {
+      setServerError('Invalid reset link.')
+      return
+    }
+
+    try {
+      await authApi.resetPassword(token, data.newPassword)
+      // 重置成功，跳转登录页
+      navigate('/login')
+    } catch (error) {
+      if (error instanceof Error) {
+        setServerError(error.message)
+      }
+    }
+  }
+
+  // 表单 JSX...
+}
+```
+
+**第三步：表单 JSX**
+
+```tsx
+import { useState } from "react";
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { z } from "zod";
+import { useSearchParams, Link, useNavigate } from "react-router-dom";
+import { authApi } from "@/api";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+
+
+...
+
+export default function ResetPasswordPage() {
+  
+    ...
+
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-gray-50">
+      <Card className="w-full max-w-md">
+        <CardHeader className="space-y-1">
+          <CardTitle className="text-2xl font-bold">Reset password</CardTitle>
+          <CardDescription>Enter your new password below</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+            {serverError && (
+              <div className="rounded-md bg-red-50 p-3 text-sm text-red-600">
+                {serverError}
+              </div>
+            )}
+
+            <div className="space-y-2">
+              <Label htmlFor="newPassword">New password</Label>
+              <Input
+                id="newPassword"
+                type="password"
+                placeholder="••••••••"
+                {...register("newPassword")}
+              />
+              {errors.newPassword && (
+                <p className="text-sm text-red-500">
+                  {errors.newPassword.message}
+                </p>
+              )}
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="confirmPassword">Confirm password</Label>
+              <Input
+                id="confirmPassword"
+                type="password"
+                placeholder="••••••••"
+                {...register("confirmPassword")}
+              />
+              {/* refine 的错误和普通字段错误一样，通过 errors 读取 */}
+              {errors.confirmPassword && (
+                <p className="text-sm text-red-500">
+                  {errors.confirmPassword.message}
+                </p>
+              )}
+            </div>
+
+            <Button type="submit" className="w-full" disabled={isSubmitting}>
+              {isSubmitting ? "Resetting..." : "Reset password"}
+            </Button>
+
+            <p className="text-center text-sm text-gray-600">
+              <Link to="/login" className="text-blue-600 hover:underline">
+                Back to sign in
+              </Link>
+            </p>
+          </form>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+```
+
+
+
+#### 4.3 加入路由：
+
+```tsx
+import ResetPasswordPage from '@/pages/ResetPasswordPage'
+
+{
+  path: '/reset-password',
+  element: <ResetPasswordPage />,
+},
+```
+
+
+
+### 5. 完整测试
+
+```bash
+npm run dev
+```
+
+**注册流程：**
+
+访问 `/register` → 填写信息提交 → 看到"Check your email" → 收到验证邮件 → 点击链接 → 看到"Email verified!" → 点击"Sign in" → 登录成功。
+
+**密码重置流程：**
+
+访问 `/forgot-password` → 填写邮箱 → 看到"Check your email" → 收到重置邮件 → 点击链接 → 进入 `/reset-password?token=...` → 输入新密码 → 两次输入不一致看到错误提示 → 两次输入一致提交 → 跳转登录页 → 用新密码登录成功。
+
+
+
+### 6. 此时的目录变化
+
+```
+src/
+├── pages/
+│   ├── RegisterPage.tsx        ← 已更新（完整实现）
+│   ├── VerifyEmailPage.tsx     ← 已更新（完整实现）
+│   ├── ForgotPasswordPage.tsx  ← 已更新（完整实现）
+│   └── ResetPasswordPage.tsx   ← 已更新（完整实现）
+└── router.tsx                  ← 已更新（加入四个路由）
+```
+
+
+
+### 7. Git 提交
+
+```bash
+git add .
+git commit -m "feat: register + email verify + forgot/reset password pages"
+git push origin feature/auth-pages
+```
+
+合并回 `develop`：
+
+```bash
+git checkout develop
+git merge --no-ff feature/auth-pages \
+    -m "merge: feature/auth-pages into develop"
+git push origin develop
+git branch -D feature/auth-pages
+git push origin --delete feature/auth-pages
+```
+
+
+
+### Step 48 完成状态
+
+```
+✅ 注册页（多条链式 Zod 规则 + 注册成功提示）
+✅ 理解 useSearchParams（读取 URL 查询参数）
+✅ 理解 useEffect（副作用、依赖数组、执行时机）
+✅ 理解状态机思维（用一个状态值表示互斥的多种状态）
+✅ 邮箱验证页（自动触发验证 + 三种状态）
+✅ 理解 Button asChild（避免非法 HTML 嵌套）
+✅ 忘记密码页（简单表单 + 成功提示）
+✅ 理解 Zod refine（跨字段验证、path 指定错误位置）
+✅ 重置密码页（密码确认验证）
+✅ 完整认证流程端到端测试通过
+✅ feature/auth-pages 合并回 develop
+```
