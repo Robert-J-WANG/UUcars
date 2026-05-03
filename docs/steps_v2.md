@@ -4418,3 +4418,3825 @@ git checkout develop
 ✅ Scalar 端到端流程验证通过（含安全边界测试）
 ✅ feature/v2-backend 合并回 develop，v2.0-backend tag 打完
 ```
+
+
+
+## Step 42 · 前端工程初始化
+
+### 这一步做什么
+
+搭建前端项目骨架。目标是一个能跑起来、目录结构清晰、能连接后端 API 的空白项目。后续所有页面都建立在这个基础上。
+
+切出前端专用分支
+
+```BASH
+# 确认在 develop 分支
+git checkout develop
+
+# 切出前端专用分支
+git checkout -b feature/frontend-setup
+git push -u origin feature/frontend-setup
+```
+
+
+
+### 1. 创建项目
+
+在项目根目录（和 `UUcars.API` 同级）执行：
+
+```bash
+npm create vite@latest uucars-web -- --template react-ts
+cd uucars-web
+npm install
+```
+
+此时目录结构：
+
+```
+UUcars/
+├── UUcars.API/         ← 后端
+├── UUcars.Tests/       ← 后端测试
+└── uucars-web/         ← 前端（新增）
+```
+
+验证能跑起来：
+
+```bash
+npm run dev
+```
+
+浏览器打开 `http://localhost:5173`，看到 Vite + React 的默认页面，说明项目创建成功。`Ctrl+C` 停止。
+
+
+
+### 2. 配置路径别名
+
+默认情况下导入文件要写相对路径，层级深时很难看：
+
+```typescript
+// 没有别名：很难看
+import { Button } from '../../../components/ui/Button'
+
+// 有别名：清晰
+import { Button } from '@/components/ui/Button'
+```
+
+`@/` 是前端项目的通用约定，指向 `src/` 目录。需要同时在两个地方配置：一个告诉 Vite 怎么解析，一个告诉 TypeScript 怎么识别。
+
+#### 2.1 安装 node 类型包
+
+```bash
+npm install -D @types/node
+```
+
+#### 2.2 更新 vite.config.ts
+
+```typescript
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+import path from 'path'
+
+export default defineConfig({
+  plugins: [react()],
+  resolve: {
+    alias: {
+      '@': path.resolve(__dirname, './src'),
+    },
+  },
+})
+```
+
+#### 2.3 更新 tsconfig.app.json
+
+打开 `tsconfig.app.json`，在 `compilerOptions` 里添加：
+
+```json
+{
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.app.tsbuildinfo",
+    "target": "es2023",
+    "lib": ["ES2023", "DOM"],
+    "module": "esnext",
+    "types": ["vite/client"],
+    "skipLibCheck": true,
+
+    /* Bundler mode */
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+    "jsx": "react-jsx",
+
+    /* Linting */
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "erasableSyntaxOnly": true,
+    "noFallthroughCasesInSwitch": true,
+
+    /* Path aliases */
+    // "baseUrl": ".",
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  },
+
+  "include": ["src"]
+}
+
+```
+
+
+
+### 3. 配置环境变量
+
+前端需要知道后端 API 的地址。开发时是 `http://localhost:5065`，生产时是真实域名。用 Vite 的环境变量机制管理，不硬编码在代码里。
+
+在 `uucars-web/` 目录下创建两个文件：
+
+```bash
+touch .env.local
+touch .env.production
+```
+
+`.env.local`（开发环境，不进 Git）：
+
+```
+VITE_API_BASE_URL=http://localhost:5065
+```
+
+`.env.production`（生产环境，进 Git）：
+
+```
+VITE_API_BASE_URL=https://你的生产域名
+```
+
+在 `.gitignore` 里确认 `.env.local` 已排除：
+
+```bash
+echo ".env.local" >> .gitignore
+```
+
+> **Vite 环境变量的规则：** 只有以 `VITE_` 开头的变量才会暴露给前端代码，其他变量不会。在代码里通过 `import.meta.env.VITE_API_BASE_URL` 读取。这是 Vite 的安全设计，防止把服务端的敏感环境变量意外暴露给浏览器。
+
+
+
+### 4. 规划目录结构
+
+把 `src/` 目录按职责划分清楚，后面每一步往对应位置放文件：
+
+```bash
+cd src
+mkdir -p api components features hooks lib pages stores types
+cd ..
+```
+
+各目录的职责：
+
+```
+src/
+├── api/          Axios封装和各模块API函数
+├── components/   可复用的UI组件（Button、Card等）
+├── features/     按功能模块组织的业务组件
+├── hooks/        自定义Hooks
+├── lib/          工具函数（cn等）
+├── pages/        路由页面组件
+├── stores/       Zustand全局状态
+├── types/        TypeScript类型定义
+├── App.tsx
+└── main.tsx
+```
+
+同时清理掉 Vite 模板自带的示例文件，保持干净：
+
+```bash
+# 删除模板示例文件
+
+rm src/App.css
+rm src/assets/react.svg
+rm public/vite.svg
+```
+
+把 `src/App.tsx` 清理成最简单的起点：
+
+```tsx
+function App() {
+  return (
+    <div>
+      <h1>UUcars</h1>
+    </div>
+  )
+}
+
+export default App
+```
+
+把 `src/index.css` 内容清空（后面 Tailwind 会接管样式）：
+
+```bash
+echo "" > src/index.css
+```
+
+
+
+### 5. 验证配置
+
+```bash
+npm run dev
+```
+
+浏览器打开 `http://localhost:5173`，看到 "UUcars" 文字，说明清理和配置都正确。
+
+验证路径别名是否生效——在 `App.tsx` 里临时写一行导入测试：
+
+```tsx
+// 临时测试，验证后删掉
+import {} from '@/types'
+```
+
+如果没有 TypeScript 报错，说明别名配置正确。删掉这行测试代码。
+
+
+
+### 6. 此时的目录结构
+
+```
+uucars-web/
+├── public/
+├── src/
+│   ├── api/
+│   ├── components/
+│   ├── features/
+│   ├── hooks/
+│   ├── lib/
+│   ├── pages/
+│   ├── stores/
+│   ├── types/
+│   ├── App.tsx
+│   ├── index.css
+│   └── main.tsx
+├── .env.local          ← 不进 Git
+├── .env.production     ← 进 Git
+├── .gitignore
+├── index.html
+├── package.json
+├── tsconfig.json
+└── vite.config.ts
+```
+
+
+
+### 7. Git 提交
+
+```bash
+git add .
+git commit -m "feat: frontend project setup with Vite + React + TypeScript"
+```
+
+
+
+### Step 42 完成状态
+
+```
+✅ Vite + React + TypeScript 项目创建
+✅ 路径别名 @/ 配置（vite.config.ts + tsconfig.json）
+✅ 环境变量配置（VITE_API_BASE_URL）
+✅ 目录结构规划完成
+✅ 模板示例文件清理干净
+✅ npm run dev 验证通过
+✅ Git commit 完成
+```
+
+
+
+## Step 43 · Tailwind CSS + shadcn/ui
+
+### 这一步做什么
+
+搭建 UI 基础——安装样式系统和组件库，后续所有页面直接使用，不需要从零写 CSS。
+
+
+
+### 1. 安装 Tailwind CSS
+
+```bash
+npm install -D tailwindcss @tailwindcss/vite
+```
+
+更新 `vite.config.ts`，加入 Tailwind 插件：
+
+```typescript
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+import tailwindcss from '@tailwindcss/vite'
+import path from 'path'
+
+export default defineConfig({
+  plugins: [
+    react(),
+    tailwindcss(),
+  ],
+  resolve: {
+    alias: {
+      '@': path.resolve(__dirname, './src'),
+    },
+  },
+})
+```
+
+把 `src/index.css` 内容替换为：
+
+```css
+@import "tailwindcss";
+```
+
+验证 Tailwind 是否生效——打开 `src/App.tsx`，临时加一个样式测试：
+
+```tsx
+function App() {
+  return (
+    <div className="flex min-h-screen items-center justify-center">
+      <h1 className="text-3xl font-bold text-blue-600">UUcars</h1>
+    </div>
+  )
+}
+
+export default App
+npm run dev
+```
+
+浏览器里看到蓝色加粗居中的 "UUcars"，说明 Tailwind 配置正确。
+
+
+
+### 2. 安装 shadcn/ui
+
+shadcn/ui 不是普通的组件库——它不是一个 npm 包，而是把组件源代码直接生成到你的项目里，你可以随意修改。
+
+shadcn需要识别tsconfig.json里的别名路径，因此先配置（注意tsconfig.app.json里也要配置）
+
+```json
+{
+  "files": [],
+  "references": [
+    { "path": "./tsconfig.app.json" },
+    { "path": "./tsconfig.node.json" }
+  ],
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["src/*"]
+    }
+  }
+}
+```
+
+
+
+#### 2.1 初始化 shadcn/ui
+
+```bash
+npx shadcn@latest init
+```
+
+过程中会有几个选项，按如下选择：
+
+```
+Which style would you like to use? › Default
+Which color would you like to use as base color? › Slate
+Would you like to use CSS variables for colors? › yes
+```
+
+初始化完成后，`src/` 下会自动生成 `lib/utils.ts` 和 `components/ui/` 目录。
+
+#### 2.2 cn() 工具函数
+
+打开 `src/lib/utils.ts`，shadcn 已经自动生成了这个文件：
+
+```typescript
+import { clsx, type ClassValue } from "clsx"
+import { twMerge } from "tailwind-merge"
+
+export function cn(...inputs: ClassValue[]) {
+  return twMerge(clsx(inputs))
+}
+```
+
+**`cn()` 是什么？** 它解决了 Tailwind 里一个常见问题：当你需要根据条件动态组合 class 名时，直接用字符串拼接可能产生冲突（比如同时有 `text-red-500` 和 `text-blue-500`）。`cn()` 用 `clsx` 处理条件逻辑，用 `tailwind-merge` 智能合并冲突的类名，保留最后一个有效的：
+
+```typescript
+// 使用场景：根据 props 动态切换样式
+cn(
+  "base-class",           // 始终应用
+  isError && "text-red-500",  // 条件应用
+  className               // 外部传入的类名（可覆盖默认样式）
+)
+```
+
+后续写组件时会大量用到这个函数。
+
+#### 2.3 安装现在就会用到的组件
+
+Step 47 开始做登录页，马上需要这几个组件：
+
+```bash
+npx shadcn@latest add button
+npx shadcn@latest add input
+npx shadcn@latest add form
+npx shadcn@latest add card
+npx shadcn@latest add label
+```
+
+安装完后这些组件的源代码会出现在 `src/components/ui/` 目录里，可以直接查看和修改。
+
+
+
+### 3. 验证
+
+```bash
+npm run dev
+```
+
+确认没有报错，项目正常运行。
+
+
+
+### 4. 此时的目录变化
+
+```
+uucars-web/
+└── src/
+    ├── components/
+    │   └── ui/              ← shadcn 生成
+    │       ├── button.tsx
+    │       ├── card.tsx
+    │       ├── form.tsx
+    │       ├── input.tsx
+    │       └── label.tsx
+    ├── lib/
+    │   └── utils.ts         ← cn() 工具函数
+    └── index.css            ← 已更新（Tailwind）
+```
+
+
+
+### 5. Git 提交
+
+```bash
+git add .
+git commit -m "feat: Tailwind CSS + shadcn/ui setup"
+git push origin feature/frontend-setup
+```
+
+
+
+### Step 43 完成状态
+
+```
+✅ Tailwind CSS 安装配置（@tailwindcss/vite 插件方式）
+✅ 验证 Tailwind 样式生效
+✅ shadcn/ui 初始化完成
+✅ cn() 工具函数就绪（理解其作用）
+✅ 核心组件安装（Button/Input/Form/Card/Label）
+✅ Git commit 完成
+```
+
+
+
+## Step 44 · 类型定义层 + Axios 封装
+
+### 这一步做什么
+
+前端和后端通信需要两样东西：**知道数据长什么样**（TypeScript 类型），**知道怎么发请求**（Axios 封装）。
+
+这一步把这两件事都做好，后续每个页面直接调用封装好的 API 函数，有完整的类型提示，不需要写任何重复的请求代码。
+
+
+
+### 1. 安装依赖
+
+```bash
+npm install axios
+```
+
+
+
+### 2. TypeScript 类型定义
+
+TypeScript 的核心价值在于：**在编译阶段发现错误，而不是在运行时**。把后端所有 DTO 定义成 TypeScript 类型后，调用 API 时 IDE 会自动提示有哪些字段、字段是什么类型，写错了编译器直接报错。
+
+#### 2.1 通用响应类型
+
+后端所有接口都用 `ApiResponse<T>` 和 `PagedResponse<T>` 包装，前端对应定义：
+
+```bash
+touch src/types/api.ts
+// src/types/api.ts
+
+// 对应后端 ApiResponse<T>
+export interface ApiResponse<T> {
+  success: boolean
+  data: T | null
+  message: string | null
+  errors: string[] | null
+}
+
+// 对应后端 PagedResponse<T>
+export interface PagedResponse<T> {
+  items: T[]
+  totalCount: number
+  page: number
+  pageSize: number
+  totalPages: number
+}
+```
+
+#### 2.2 用户相关类型
+
+```bash
+touch src/types/user.ts
+// src/types/user.ts
+
+// 对应后端 UserResponse
+export interface User {
+  id: number
+  username: string
+  email: string
+  role: 'User' | 'Admin'    // 联合类型：只能是这两个值之一
+  createdAt: string
+}
+
+// 对应后端 LoginResponse
+export interface LoginResponse {
+  token: string
+  expiresAt: string
+  user: User
+}
+
+// 对应后端 RegisterRequest
+export interface RegisterRequest {
+  username: string
+  email: string
+  password: string
+}
+
+// 对应后端 LoginRequest
+export interface LoginRequest {
+  email: string
+  password: string
+}
+```
+
+> **为什么 `role` 用联合类型 `'User' | 'Admin'` 而不是 `string`？** 用 `string` 的话，你写 `user.role === 'admin'`（小写）编译器不会报错，但逻辑永远不会成立，因为后端返回的是 `'Admin'`（首字母大写）。用联合类型，编译器会直接告诉你只能比较 `'User'` 或 `'Admin'`，在写代码时就发现问题，而不是在运行时排查 Bug。
+
+#### 2.3 车辆相关类型
+
+```bash
+touch src/types/car.ts
+// src/types/car.ts
+
+// 车辆状态枚举——对应后端 CarStatus
+// 用 const 对象而不是 enum，原因：
+// TypeScript 的 enum 编译后会生成额外的 JS 代码
+// const 对象 + 类型推导更轻量，是目前的主流做法
+export const CarStatus = {
+  Draft: 'Draft',
+  PendingReview: 'PendingReview',
+  Published: 'Published',
+  Sold: 'Sold',
+  Deleted: 'Deleted',
+} as const
+
+// 从 const 对象推导出联合类型：'Draft' | 'PendingReview' | 'Published' | 'Sold' | 'Deleted'
+export type CarStatus = typeof CarStatus[keyof typeof CarStatus]
+
+// 对应后端 CarResponse
+export interface Car {
+  id: number
+  title: string
+  brand: string
+  model: string
+  year: number
+  price: number
+  mileage: number
+  description: string | null
+  status: CarStatus
+  sellerId: number
+  sellerUsername: string
+  createdAt: string
+  updatedAt: string
+}
+
+// 对应后端 CarDetailResponse（含图片列表）
+export interface CarDetail extends Car {
+  images: CarImage[]
+}
+
+// 对应后端 CarImageResponse
+export interface CarImage {
+  id: number
+  imageUrl: string
+  sortOrder: number
+  carId: number
+}
+
+// 对应后端 CarCreateRequest
+export interface CarCreateRequest {
+  title: string
+  brand: string
+  model: string
+  year: number
+  price: number
+  mileage: number
+  description?: string   // ? 表示可选字段，对应后端的 nullable
+}
+
+// 对应后端 CarUpdateRequest（和 Create 字段一样，单独定义保持灵活性）
+export type CarUpdateRequest = CarCreateRequest; // 直接使用类型别名，简化代码  
+
+// 对应后端 CarQueryRequest
+export interface CarQueryRequest {
+  page?: number
+  pageSize?: number
+  brand?: string
+  minPrice?: number
+  maxPrice?: number
+  minYear?: number
+  maxYear?: number
+}
+```
+
+#### 2.4 订单相关类型
+
+```bash
+touch src/types/order.ts
+// src/types/order.ts
+
+export const OrderStatus = {
+  Pending: 'Pending',
+  Completed: 'Completed',
+  Cancelled: 'Cancelled',
+} as const
+
+export type OrderStatus = typeof OrderStatus[keyof typeof OrderStatus]
+
+// 对应后端 OrderResponse
+export interface Order {
+  id: number
+  carId: number
+  carTitle: string
+  buyerId: number
+  buyerUsername: string
+  sellerId: number
+  sellerUsername: string
+  price: number
+  status: OrderStatus
+  createdAt: string
+  updatedAt: string
+}
+
+// 对应后端 OrderCreateRequest
+export interface OrderCreateRequest {
+  carId: number
+}
+```
+
+#### 2.5 收藏相关类型
+
+```bash
+touch src/types/favorite.ts
+// src/types/favorite.ts
+import type { Car } from './car'
+
+// 对应后端 FavoriteResponse
+export interface Favorite {
+  carId: number
+  userId: number
+  createdAt: string
+  car: Car | null
+}
+```
+
+#### 2.6 评价相关类型
+
+```bash
+touch src/types/review.ts
+// src/types/review.ts
+
+// 对应后端 ReviewResponse
+export interface Review {
+  id: number
+  orderId: number
+  reviewerId: number
+  reviewerUsername: string
+  rating: number
+  comment: string | null
+  createdAt: string
+}
+
+// 对应后端 SellerRatingResponse
+export interface SellerRating {
+  sellerId: number
+  averageRating: number
+  totalReviews: number
+  reviews: Review[]
+}
+
+// 对应后端 CreateReviewRequest
+export interface CreateReviewRequest {
+  orderId: number
+  rating: number
+  comment?: string
+}
+```
+
+#### 2.7 统一导出
+
+```bash
+touch src/types/index.ts
+// src/types/index.ts
+// 统一从这里导入，不需要记每个类型在哪个文件里
+export * from './api'
+export * from './user'
+export * from './car'
+export * from './order'
+export * from './favorite'
+export * from './review'
+```
+
+导入使用时类似
+
+```ts
+import type { Car } from "@/types";
+```
+
+
+
+### 3. Axios 封装
+
+#### 3.1 为什么要封装 Axios
+
+直接用 Axios 发请求可以工作，但每次都要：
+
+```typescript
+// 没有封装时，每次请求都要重复这些
+const response = await axios.get('http://localhost:5065/cars', {
+  headers: {
+    Authorization: `Bearer ${token}`,
+    'Content-Type': 'application/json',
+  }
+})
+// 还要手动处理错误、解包数据...
+```
+
+封装之后：
+
+```typescript
+// 封装后
+const cars = await carsApi.getPaged({ page: 1 })
+// token 自动附加，错误自动处理，数据自动解包
+```
+
+
+
+#### 3.2 创建 Axios 实例
+
+```bash
+touch src/api/client.ts
+```
+
+```ts
+
+// src/api/client.ts
+import axios from 'axios'
+import type { ApiResponse } from '@/types'
+
+// 创建 Axios 实例
+// 所有请求都基于这个实例，统一配置 baseURL 和超时
+const apiClient = axios.create({
+  baseURL: import.meta.env.VITE_API_BASE_URL,
+  timeout: 10000,   // 10秒超时
+  headers: {
+    'Content-Type': 'application/json',
+  },
+})
+
+// =============================================
+// 请求拦截器：自动附加 JWT Token
+// =============================================
+// 每次请求发出前，从 localStorage 取出 Token 附加到请求头
+// 这样所有需要认证的接口不需要手动传 Token
+apiClient.interceptors.request.use((config) => {
+  const token = localStorage.getItem('accessToken')
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`
+  }
+  return config
+})
+
+// =============================================
+// 响应拦截器：统一处理响应和错误
+// =============================================
+apiClient.interceptors.response.use(
+  (response) => {
+    // 请求成功（HTTP 2xx）
+    // 后端所有接口都用 ApiResponse<T> 包装
+    // 直接解包返回 data 字段，调用方不需要每次都写 response.data.data
+    const apiResponse = response.data as ApiResponse<unknown>
+
+    if (!apiResponse.success) {
+      // HTTP 状态码是 2xx，但业务逻辑失败（success: false）
+      // 把业务错误信息包装成 Error 抛出，调用方统一用 catch 处理
+      return Promise.reject(new Error(apiResponse.message ?? 'Request failed'))
+    }
+
+    return response
+  },
+  (error) => {
+    // 请求失败（HTTP 4xx / 5xx / 网络错误）
+    if (error.response) {
+      // 服务端返回了错误响应
+      const apiResponse = error.response.data as ApiResponse<unknown>
+      const message = apiResponse?.message ?? 'An error occurred'
+      return Promise.reject(new Error(message))
+    }
+
+    if (error.code === 'ECONNABORTED') {
+      return Promise.reject(new Error('Request timeout, please try again'))
+    }
+
+    // 网络错误（断网等）
+    return Promise.reject(new Error('Network error, please check your connection'))
+  }
+)
+
+export default apiClient
+```
+
+> **为什么从 localStorage 读 Token 而不是从 Zustand？** Zustand 的状态在 `apiClient.ts` 这个模块层面还没有初始化，如果在这里直接导入 Zustand store 会有循环依赖的风险。从 localStorage 读取是更安全的做法，Step 47 配置 Zustand 时会保证 Token 同步写入 localStorage。
+
+#### 3.3 封装各模块 API 函数
+
+**认证模块：**
+
+```ts
+touch src/api/auth.ts
+// src/api/auth.ts
+import apiClient from './client'
+import type {
+  LoginRequest,
+  LoginResponse,
+  RegisterRequest,
+  User,
+  ApiResponse
+} from '@/types'
+
+export const authApi = {
+  register: async (data: RegisterRequest): Promise<User> => {
+    const response = await apiClient.post<ApiResponse<User>>(
+      '/auth/register', data)
+    return response.data.data!
+  },
+
+  login: async (data: LoginRequest): Promise<LoginResponse> => {
+    const response = await apiClient.post<ApiResponse<LoginResponse>>(
+      '/auth/login', data)
+    return response.data.data!
+  },
+
+  verifyEmail: async (token: string): Promise<void> => {
+    await apiClient.get('/auth/verify-email', { params: { token } })
+  },
+
+  resendVerification: async (email: string): Promise<void> => {
+    await apiClient.post('/auth/resend-verification', { email })
+  },
+
+  forgotPassword: async (email: string): Promise<void> => {
+    await apiClient.post('/auth/forgot-password', { email })
+  },
+
+  resetPassword: async (token: string, newPassword: string): Promise<void> => {
+    await apiClient.post('/auth/reset-password', { token, newPassword })
+  },
+}
+```
+
+**用户模块：**
+
+```ts
+touch src/api/users.ts
+// src/api/users.ts
+import apiClient from './client'
+import type { User, ApiResponse } from '@/types'
+
+export const usersApi = {
+  getMe: async (): Promise<User> => {
+    const response = await apiClient.get<ApiResponse<User>>('/users/me')
+    return response.data.data!
+  },
+
+  updateMe: async (data: { username: string; email: string }): Promise<User> => {
+    const response = await apiClient.put<ApiResponse<User>>('/users/me', data)
+    return response.data.data!
+  },
+}
+```
+
+**车辆模块：**
+
+```c#
+touch src/api/cars.ts
+// src/api/cars.ts
+import apiClient from './client'
+import type {
+  Car,
+  CarDetail,
+  CarImage,
+  CarCreateRequest,
+  CarUpdateRequest,
+  CarQueryRequest,
+  PagedResponse,
+  ApiResponse
+} from '@/types'
+
+export const carsApi = {
+  // 公开列表（含搜索过滤）
+  getPaged: async (params?: CarQueryRequest): Promise<PagedResponse<Car>> => {
+    const response = await apiClient.get<ApiResponse<PagedResponse<Car>>>(
+      '/cars', { params })
+    return response.data.data!
+  },
+
+  // 车辆详情
+  getById: async (id: number): Promise<CarDetail> => {
+    const response = await apiClient.get<ApiResponse<CarDetail>>(`/cars/${id}`)
+    return response.data.data!
+  },
+
+  // 我的车辆列表
+  getMyListings: async (params?: CarQueryRequest): Promise<PagedResponse<Car>> => {
+    const response = await apiClient.get<ApiResponse<PagedResponse<Car>>>(
+      '/cars/my-listings', { params })
+    return response.data.data!
+  },
+
+  // 创建草稿
+  create: async (data: CarCreateRequest): Promise<Car> => {
+    const response = await apiClient.post<ApiResponse<Car>>('/cars', data)
+    return response.data.data!
+  },
+
+  // 修改草稿
+  update: async (id: number, data: CarUpdateRequest): Promise<Car> => {
+    const response = await apiClient.put<ApiResponse<Car>>(`/cars/${id}`, data)
+    return response.data.data!
+  },
+
+  // 逻辑删除
+  delete: async (id: number): Promise<void> => {
+    await apiClient.delete(`/cars/${id}`)
+  },
+
+  // 提交审核
+  submit: async (id: number): Promise<Car> => {
+    const response = await apiClient.post<ApiResponse<Car>>(
+      `/cars/${id}/submit`)
+    return response.data.data!
+  },
+
+  // 上传图片（multipart/form-data）
+  uploadImage: async (carId: number, file: File, sortOrder = 0): Promise<CarImage> => {
+    const formData = new FormData()
+    formData.append('file', file)
+    formData.append('sortOrder', sortOrder.toString())
+    const response = await apiClient.post<ApiResponse<CarImage>>(
+      `/cars/${carId}/images`,
+      formData,
+      { headers: { 'Content-Type': 'multipart/form-data' } }
+    )
+    return response.data.data!
+  },
+
+  // 删除图片
+  deleteImage: async (carId: number, imageId: number): Promise<void> => {
+    await apiClient.delete(`/cars/${carId}/images/${imageId}`)
+  },
+}
+```
+
+**收藏模块：**
+
+```ts
+touch src/api/favorites.ts
+// src/api/favorites.ts
+import apiClient from './client'
+import type { Favorite, PagedResponse, ApiResponse } from '@/types'
+
+export const favoritesApi = {
+  add: async (carId: number): Promise<Favorite> => {
+    const response = await apiClient.post<ApiResponse<Favorite>>(
+      `/favorites/${carId}`)
+    return response.data.data!
+  },
+
+  remove: async (carId: number): Promise<void> => {
+    await apiClient.delete(`/favorites/${carId}`)
+  },
+
+  getMyFavorites: async (page = 1, pageSize = 20): Promise<PagedResponse<Favorite>> => {
+    const response = await apiClient.get<ApiResponse<PagedResponse<Favorite>>>(
+      '/favorites', { params: { page, pageSize } })
+    return response.data.data!
+  },
+}
+```
+
+**订单模块：**
+
+```bash
+touch src/api/orders.ts
+// src/api/orders.ts
+import apiClient from './client'
+import type { Order, OrderCreateRequest, PagedResponse, ApiResponse } from '@/types'
+
+export const ordersApi = {
+  create: async (data: OrderCreateRequest): Promise<Order> => {
+    const response = await apiClient.post<ApiResponse<Order>>('/orders', data)
+    return response.data.data!
+  },
+
+  cancel: async (id: number): Promise<Order> => {
+    const response = await apiClient.post<ApiResponse<Order>>(
+      `/orders/${id}/cancel`)
+    return response.data.data!
+  },
+
+  complete: async (id: number): Promise<Order> => {
+    const response = await apiClient.post<ApiResponse<Order>>(
+      `/orders/${id}/complete`)
+    return response.data.data!
+  },
+
+  getMyPurchases: async (page = 1, pageSize = 20): Promise<PagedResponse<Order>> => {
+    const response = await apiClient.get<ApiResponse<PagedResponse<Order>>>(
+      '/orders/my-purchases', { params: { page, pageSize } })
+    return response.data.data!
+  },
+
+  getMySales: async (page = 1, pageSize = 20): Promise<PagedResponse<Order>> => {
+    const response = await apiClient.get<ApiResponse<PagedResponse<Order>>>(
+      '/orders/my-sales', { params: { page, pageSize } })
+    return response.data.data!
+  },
+}
+```
+
+**评价模块：**
+
+```bash
+touch src/api/reviews.ts
+// src/api/reviews.ts
+import apiClient from './client'
+import type {
+  Review,
+  SellerRating,
+  CreateReviewRequest,
+  ApiResponse
+} from '@/types'
+
+export const reviewsApi = {
+  create: async (data: CreateReviewRequest): Promise<Review> => {
+    const response = await apiClient.post<ApiResponse<Review>>('/reviews', data)
+    return response.data.data!
+  },
+
+  getSellerRating: async (sellerId: number): Promise<SellerRating> => {
+    const response = await apiClient.get<ApiResponse<SellerRating>>(
+      `/reviews/seller/${sellerId}`)
+    return response.data.data!
+  },
+}
+```
+
+**Admin 模块：**
+
+```bash
+touch src/api/admin.ts
+// src/api/admin.ts
+import apiClient from './client'
+import type { Car, PagedResponse, ApiResponse } from '@/types'
+
+export const adminApi = {
+  getPendingCars: async (page = 1, pageSize = 20): Promise<PagedResponse<Car>> => {
+    const response = await apiClient.get<ApiResponse<PagedResponse<Car>>>(
+      '/admin/cars/pending', { params: { page, pageSize } })
+    return response.data.data!
+  },
+
+  approve: async (carId: number): Promise<Car> => {
+    const response = await apiClient.post<ApiResponse<Car>>(
+      `/admin/cars/${carId}/approve`)
+    return response.data.data!
+  },
+
+  reject: async (carId: number): Promise<Car> => {
+    const response = await apiClient.post<ApiResponse<Car>>(
+      `/admin/cars/${carId}/reject`)
+    return response.data.data!
+  },
+
+  deleteCar: async (carId: number): Promise<void> => {
+    await apiClient.delete(`/admin/cars/${carId}`)
+  },
+}
+```
+
+**统一导出：**
+
+```bash
+touch src/api/index.ts
+// src/api/index.ts
+export * from './auth'
+export * from './users'
+export * from './cars'
+export * from './favorites'
+export * from './orders'
+export * from './reviews'
+export * from './admin'
+```
+
+
+
+### 4. 验证编译
+
+```bash
+npm run build
+```
+
+预期没有 TypeScript 错误。如果有，根据错误信息修正类型定义。
+
+
+
+### 5. 此时的目录变化
+
+```
+src/
+├── api/
+│   ├── admin.ts      ← 新增
+│   ├── auth.ts       ← 新增
+│   ├── cars.ts       ← 新增
+│   ├── client.ts     ← 新增
+│   ├── favorites.ts  ← 新增
+│   ├── index.ts      ← 新增
+│   ├── orders.ts     ← 新增
+│   ├── reviews.ts    ← 新增
+│   └── users.ts      ← 新增
+└── types/
+    ├── api.ts        ← 新增
+    ├── car.ts        ← 新增
+    ├── favorite.ts   ← 新增
+    ├── index.ts      ← 新增
+    ├── order.ts      ← 新增
+    ├── review.ts     ← 新增
+    └── user.ts       ← 新增
+```
+
+
+
+### 6. Git 提交 + 合并分支
+
+前端地基三步（Step 42-44）全部完成：
+
+```bash
+git add .
+git commit -m "feat: TypeScript types + Axios API client setup"
+git push origin feature/frontend-setup
+
+# 合并回 develop
+git checkout develop
+git merge --no-ff feature/frontend-setup \
+    -m "merge: feature/frontend-setup into develop"
+git push origin develop
+git branch -D feature/frontend-setup
+git push origin --delete feature/frontend-setup
+```
+
+
+
+### Step 44 完成状态
+
+```
+✅ 安装 Axios
+✅ 所有后端 DTO 对应的 TypeScript 类型定义（6个类型文件）
+✅ 理解联合类型替代枚举的原因
+✅ 理解 const 对象 + 类型推导的模式（CarStatus / OrderStatus）
+✅ Axios 实例配置（baseURL从环境变量读取）
+✅ 请求拦截器（自动附加 Token）
+✅ 响应拦截器（统一解包、错误处理）
+✅ 7个模块 API 函数封装（auth/users/cars/favorites/orders/reviews/admin）
+✅ npm run build 无 TypeScript 错误
+✅ feature/frontend-setup 合并回 develop
+```
+
+
+
+## Step 45 · 安装核心工具库
+
+### 这一步做什么
+
+登录页需要三样东西：**管理表单**（React Hook Form + Zod）、**管理全局状态**（Zustand）。这一步把这三个工具装好、配置好，下一步做登录页时直接用。
+
+
+
+### 1. 安装依赖
+
+```bash
+npm install zustand
+npm install react-hook-form zod @hookform/resolvers
+```
+
+四个包的分工：
+
+```
+zustand              全局状态管理，存储登录状态和 Token
+react-hook-form      表单状态管理，处理输入、验证、提交
+zod                  Schema 验证，定义表单字段的规则
+@hookform/resolvers  连接 RHF 和 Zod，让两者配合工作
+```
+
+
+
+### 2. 切出认证页面分支
+
+这三个工具是为认证流程（Step 46-49）服务的，在认证分支上配置：
+
+```bash
+git checkout develop
+git checkout -b feature/auth-pages
+git push -u origin feature/auth-pages
+```
+
+
+
+### 3. Zustand 原理和核心语法
+
+#### 3.1 原理
+
+Zustand 本质是一个**发布订阅模式**的状态容器：
+
+```
+store（状态容器）
+  ├── state（数据）
+  └── actions（修改数据的方法）
+
+组件 A 订阅 store → store 变化 → 组件 A 自动重新渲染
+组件 B 订阅 store → store 变化 → 组件 B 自动重新渲染
+```
+
+不需要 Context，不需要 Provider 包裹，任何组件直接读取。
+
+#### 3.2 创建 Store
+
+Zustand提供一个函数 :**
+
+```ts
+create<T>(initializer: (set, get) => T): UseBoundStore<T>
+```
+
+**create函数的**参数：初始化函数（initializer）**
+
+Zustand 调用这个初始化函数时会注入两个参数：set、get。 并进行数据初始化
+
+```ts
+create<AuthState>((set, get) => ({
+//                 ↑    ↑
+//           Zustand 注入  Zustand 注入
+  
+  // 数据初始化：普通字段，直接写值
+  user: null,
+  token: null,
+  isAuthenticated: false,
+
+  // 数据更新：用 set 修改 state
+  login: (user, token) => set({ user, token, isAuthenticated: true }),
+
+  // 数据读取：用 get 在 action 内部读当前 state
+  updateUser: (username) => {
+    const current = get().user   // 读当前值
+    set({ user: { ...current, username } })
+  }
+}))
+```
+
+初始化函数的**返回值**就是 store 的初始结构，包含所有 state 和 action。
+
+> `set` 和 `get` 的详细用法:
+>
+> ```ts
+> // set：合并更新，不需要展开整个 state
+> set({ user: newUser })          // 只更新 user，其他字段不变
+> set({ isAuthenticated: true })  // 只更新 isAuthenticated
+> 
+> // set 也可以传函数，拿到当前 state
+> set(state => ({
+>   user: { ...state.user, username: 'new' }
+> }))
+> 
+> // get：在 action 内部读当前 state
+> const currentToken = get().token
+> ```
+
+
+
+**create函数的返回值**，是自定义的**Hook 函数**，不是普通对象：
+
+```ts
+const useAuthStore = create<AuthState>()(...)
+//    ↑ 这是一个 Hook 函数，约定用 use 开头
+```
+
+所以：
+
+```TS
+// 在组件里调用这个 Hook，才能拿到 store 里的数据
+const { user, login } = useAuthStore()
+//                       ↑ 调用 Hook，返回的才是 store 对象
+
+// useAuthStore 本身是函数，不能直接用
+console.log(useAuthStore.user)  // ❌ 错误，Hook 必须在组件里调用
+```
+
+**store 对象是什么？**
+
+调用 `useAuthStore()` 之后返回的才是 store 对象，结构就是初始化函数返回的那个对象：
+
+```TS
+{
+  // state
+  user: null,
+  token: null,
+  isAuthenticated: false,
+
+  // actions
+  login: (user, token) => ...,
+  logout: () => ...,
+  setUser: (user) => ...,
+}
+```
+
+准确的层次是：
+
+```tex
+create        → 生产 Hook 的工厂函数
+useAuthStore  → Hook 函数
+useAuthStore() → 真正的 store 对象（只能在组件里调用）
+```
+
+#### 3.3 如何在组件里使用？
+
+可以订阅整个store
+
+```tsx
+function Navbar() {
+  // 订阅整个 store
+  const { user, isAuthenticated, logout } = useAuthStore()
+
+  return (
+    <div>
+      {isAuthenticated ? (
+        <>
+          <span>{user?.username}</span>
+          <button onClick={logout}>退出</button>
+        </>
+      ) : (
+        <a href="/login">登录</a>
+      )}
+    </div>
+  )
+}
+```
+
+也可以**精准订阅（性能优化）**
+
+```tsx
+// 订阅整个 store：任何字段变化都会重新渲染
+const store = useAuthStore()
+
+// 只订阅需要的字段：只有 isAuthenticated 变化才重新渲染
+const isAuthenticated = useAuthStore(state => state.isAuthenticated)
+const user = useAuthStore(state => state.user)
+
+// 只订阅 action：action 不会变化，组件永远不会因此重新渲染
+const logout = useAuthStore(state => state.logout)
+
+```
+
+#### 3.4 如何持久化（配合 localStorage）？
+
+**什么问题？**
+
+```ts
+const useAuthStore = create<AuthState>((set) => ({
+  token: null,
+  user: null,
+  login: (user, token) => set({ user, token })
+}))
+
+// 用户登录后 token 存在内存里
+// 刷新页面 → 内存清空 → token 没了 → 用户被迫重新登录
+```
+
+使用Zustand 内置的**中间件`persist` **，能够把 store 的数据自动同步到 localStorage，页面刷新后数据不丢失。
+
+**如何使用persist？**
+
+```tsx
+import { create } from 'zustand'
+import { persist } from 'zustand/middleware'
+
+const useAuthStore = create<AuthState>()(
+  persist(
+    // 原来的初始化函数，完全不变
+    (set, get) => ({
+      user: null,
+      token: null,
+      isAuthenticated: false,
+      login: (user, token) => set({ user, token, isAuthenticated: true }),
+      logout: () => set({ user: null, token: null, isAuthenticated: false }),
+    }),
+    // persist 的配置
+    {
+      name: 'auth-storage',  // localStorage 的 key 名
+    }
+  )
+)
+```
+
+> persist 做了什么??
+>
+> ```bash
+> 第一次登录
+>   login(user, token) 被调用
+>     → set({ user, token, isAuthenticated: true })
+>     → persist 监听到 state 变化
+>     → 自动写入 localStorage:
+>       key:   "auth-storage"
+>       value: { "state": { "user": {...}, "token": "eyJ..." }, "version": 0 }
+> 
+> 刷新页面
+>   → Zustand 初始化
+>   → persist 自动从 localStorage 读取数据
+>   → 恢复 state：user、token、isAuthenticated 全部还原
+>   → 用户无感知，还是登录状态
+> ```
+>
+> 
+
+**只持久化部分字段?**
+
+persist 默认会把所有 state 都存进 localStorage，但 action 函数不需要存，可以用 `partialize` 过滤：
+
+```ts
+persist(
+  (set) => ({...}),
+  {
+    name: 'auth-storage',
+    partialize: (state) => ({
+      user: state.user,
+      token: state.token,
+      // isAuthenticated 不存，刷新后根据 token 是否存在来判断
+      // action 函数自动不存，Zustand 内部处理了
+    })
+  }
+)
+```
+
+
+
+### 4. 配置 Zustand：authStore
+
+Zustand 是全局状态管理库。在这个项目里它的主要职责是：**存储登录状态**——用户信息、Token、是否已登录。
+
+**为什么需要全局状态管理？**
+
+登录状态需要在很多地方用到：导航栏显示用户名、路由保护判断是否登录、请求拦截器附加 Token……这些组件分布在页面的各个角落，没有直接的父子关系。如果靠 Props 传递，要一层一层往下传，非常繁琐。Zustand 提供一个全局 store，任何组件都可以直接读取和修改，不需要 Props 传递。
+
+```ts
+touch src/stores/authStore.ts
+// src/stores/authStore.ts
+import { create } from 'zustand'
+import { persist } from 'zustand/middleware'
+import type { User } from '@/types'
+
+interface AuthState {
+  user: User | null
+  accessToken: string | null
+
+  // 登录成功后调用：保存用户信息和 Token
+  setAuth: (user: User, token: string) => void
+
+  // 退出登录：清除所有状态
+  logout: () => void
+
+  // 判断当前是否已登录
+  isAuthenticated: () => boolean
+}
+
+export const useAuthStore = create<AuthState>()(
+  // persist 中间件：把 store 的状态同步到 localStorage
+  // 页面刷新后状态不会丢失，用户不需要重新登录
+  persist(
+    (set, get) => ({
+      user: null,
+      accessToken: null,
+
+      setAuth: (user, token) => {
+        // 同时更新 Zustand 状态和 localStorage
+        // localStorage 里的 accessToken 供 Axios 拦截器读取
+        localStorage.setItem('accessToken', token)
+        set({ user, accessToken: token })
+      },
+
+      logout: () => {
+        localStorage.removeItem('accessToken')
+        set({ user: null, accessToken: null })
+      },
+
+      isAuthenticated: () => {
+        return get().accessToken !== null && get().user !== null
+      },
+    }),
+    {
+      name: 'auth-storage',    // localStorage 里的 key 名称
+      // 只持久化这两个字段，方法不需要持久化
+      partialize: (state) => ({
+        user: state.user,
+        accessToken: state.accessToken,
+      }),
+    }
+  )
+)
+```
+
+> **为什么 `setAuth` 里要同时写 localStorage 和 Zustand？**
+>
+>  persist 中间件会把 `accessToken` 存到 `auth-storage` 这个 key 里，但 Axios 拦截器读的是单独的 `accessToken` key（`localStorage.getItem('accessToken')`）。手动写一次 `localStorage.setItem('accessToken', token)` 是为了让拦截器能直接读到 Token，不依赖 persist 的存储结构。
+
+
+
+### 5. React Hook Form + Zod 的工作方式
+
+在写登录页之前，需要对表单数据进行验证。
+
+#### 5.1 后端验证 vs 前端验证
+
+后端验证是保证数据安全
+
+```c#
+// 后端 C# 验证
+public class LoginRequest {
+  [Required]
+  [EmailAddress]
+  public string Email { get; set; }
+  
+  [MinLength(6)]
+  public string Password { get; set; }
+}
+```
+
+用户完全可以绕过前端，直接用 Postman 或者修改 JS 代码发请求，后端验证保证无论请求从哪来，数据都是合法的。
+
+前端验证**不是为了安全**，是为了提升用户体验
+
+```bash
+没有前端验证：
+  用户填完表单 → 点提交 → 等待网络请求 → 后端返回错误 → 用户才看到提示
+  耗时：500ms ~ 2s
+
+有前端验证：
+  用户填完表单 → 点提交 → 立即显示错误（0ms）
+  甚至：用户还没点提交，输完就实时提示
+```
+
+#### 5.2 原生表单验证
+
+原生 React 处理表单很繁琐：
+
+```tsx
+// 原生写法：每个字段都要手动管理
+const [email, setEmail] = useState('')
+const [password, setPassword] = useState('')
+const [emailError, setEmailError] = useState('')
+const [passwordError, setPasswordError] = useState('')
+
+const handleSubmit = () => {
+  if (!email.includes('@')) setEmailError('邮箱格式错误')
+  if (password.length < 6) setPasswordError('密码太短')
+  // ...字段越多越痛苦
+}
+```
+
+#### 5.3 工具协作
+
+**前端使用以下3个工具的协作**
+
+- **Zod** 负责定义验证规则：邮箱格式是否正确、密码最少几位。
+
+- **React Hook Form（RHF）** 负责管理表单状态：哪些字段、当前的值、是否提交过、错误信息在哪里显示。
+
+- **`@hookform/resolvers`** 是连接两者的桥梁：把 Zod Schema 传给 RHF，RHF 在验证时自动调用 Zod。
+
+三者的协作流程：
+
+```
+定义 Zod Schema（规则）
+        ↓
+useForm({ resolver: zodResolver(schema) })
+        ↓
+用户填写表单、点击提交
+        ↓
+RHF 调用 Zod 验证
+        ↓
+验证失败 → 错误信息显示在对应字段下方
+验证通过 → 调用 onSubmit 处理函数
+```
+
+#### 5.4 Zod：只负责定义验证规则
+
+```tsx
+import { z } from 'zod'
+
+const loginSchema = z.object({
+  email: z.string()
+            .min(1, '邮箱不能为空')
+            .email('邮箱格式不正确'),
+  password: z.string()
+               .min(6, '密码至少6位')
+               .max(20, '密码最多20位'),
+})
+
+// Zod 还能自动推导出 TypeScript 类型，不需要重复定义
+type LoginForm = z.infer<typeof loginSchema>
+// 等价于：{ email: string, password: string }
+```
+
+Zod 只管规则，不管表单，不管 UI，就是一个验证器。
+
+#### 5.5 React Hook Form：只负责管理表单状态
+
+```tsx
+import { useForm } from 'react-hook-form'
+
+const { 
+  register,       // 注册字段（绑定到 input）
+  handleSubmit,   // 包装提交事件
+  formState: { errors, isSubmitting }  // 错误信息、提交状态
+} = useForm<LoginForm>()
+```
+
+RHF 管理的是：当前每个字段的值、是否已触碰、错误信息在哪、提交状态等。它本身不做验证，只是管理状态。
+
+#### 5.6 zodResolver：把两者连接起来
+
+```ts
+import { zodResolver } from '@hookform/resolvers/zod'
+
+const { register, handleSubmit, formState: { errors } } = useForm<LoginForm>({
+  resolver: zodResolver(loginSchema)
+  //        ↑ 告诉 RHF：验证时用这个 Zod schema
+})
+```
+
+有了这一行，RHF 在需要验证时会自动调用 Zod，不需要手动写验证逻辑。
+
+
+
+**完整流程**:
+
+```bash
+用户填写表单，点击提交
+        ↓
+handleSubmit 拦截原生 submit 事件
+        ↓
+RHF 调用 zodResolver → Zod 执行验证
+        ↓
+    验证失败                    验证通过
+        ↓                          ↓
+errors 对象被填充            调用 onSubmit(data)
+input 下方显示错误信息        data 是完全合法的数据
+用户修改后再次触发验证         调用 API
+```
+
+
+
+### 6. 验证安装
+
+```bash
+npm run build
+```
+
+预期没有错误。
+
+
+
+### 7. 此时的目录变化
+
+```
+src/
+└── stores/
+    └── authStore.ts    ← 新增
+```
+
+
+
+### 8. Git 提交
+
+```bash
+git add .
+git commit -m "feat: Zustand authStore + install RHF + Zod"
+git push origin feature/auth-pages
+```
+
+
+
+### Step 45 完成状态
+
+```
+✅ 切出 feature/auth-pages 分支
+✅ 安装 zustand / react-hook-form / zod / @hookform/resolvers
+✅ authStore 配置完成（user / accessToken / setAuth / logout / isAuthenticated）
+✅ 理解 persist 中间件（刷新不丢失登录状态）
+✅ 理解 setAuth 同时写 localStorage 的原因（供 Axios 拦截器读取）
+✅ 理解 RHF + Zod + resolver 三者协作流程
+✅ npm run build 无错误
+✅ Git commit 完成
+```
+
+
+
+## Step 46 · 登录页
+
+### 这一步做什么
+
+实现第一个真实可用的页面——登录。完成后用户可以输入邮箱密码，点击登录，Token 存入 localStorage，跳转到首页。
+
+这是前端最核心的一步。做完这步，就掌握了后续所有页面的开发模式: 
+
+- 表单验证
+- API调用
+- 状态更新
+- 页面跳转
+
+后面每个页面都是这套模式的重复和扩展。
+
+
+
+### 1. 安装 React Router
+
+登录成功后需要跳转页面，先装路由库：
+
+```bash
+npm install react-router-dom
+```
+
+先做最简单的路由配置，只有两个路由，够登录页用就行。后续 Step 47 会做完整的路由结构。
+
+打开 `src/main.tsx`：
+
+```tsx
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import { BrowserRouter } from 'react-router-dom'
+import './index.css'
+import App from './App.tsx'
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    {/* 包裹rowserRouter组件 */}
+    <BrowserRouter>
+      <App />
+    </BrowserRouter>
+  </StrictMode>
+)
+```
+
+打开 `src/App.tsx`，配置临时路由：
+
+```tsx
+import { Routes, Route } from 'react-router-dom'
+import LoginPage from '@/pages/LoginPage'
+
+function App() {
+  return (
+    <Routes>
+      <Route path="/login" element={<LoginPage />} />
+      <Route path="/" element={<div className="p-8">首页（占位）</div>} />
+    </Routes>
+  )
+}
+
+export default App
+```
+
+
+
+### 2. React 组件是什么
+
+React 组件就是**一个返回 UI 的函数**。
+
+描述"这个界面长什么样"，React 负责把它渲染到浏览器里：
+
+```tsx
+// 最简单的组件
+function LoginPage() {
+  return <div>登录页</div>
+}
+```
+
+这里的 `<div>` 不是真正的 HTML，而是 **JSX**：一种在 JavaScript 里写类似 HTML 的语法，React 会把它转换成真正的 DOM 操作。
+
+**组件里的状态（useState）**
+
+组件里的普通变量不会触发界面更新。如果想"数据变了，界面跟着变"，需要用 `useState`：
+
+```tsx
+// count 变化时，React 会重新渲染这个组件
+const [count, setCount] = useState(0)
+
+// count 是当前值
+// setCount 是修改它的函数
+// 0 是初始值
+```
+
+登录页需要两个状态：
+
+- `isLoading`：是否正在提交（控制按钮的禁用和文字）
+- `serverError`：服务端返回的错误信息（密码错误等）
+
+**TypeScript 在组件里的作用**
+
+TypeScript 给变量加类型标注，让 IDE 有提示，写错了编译器报错：
+
+```tsx
+// <boolean> 是泛型，告诉 TS 这个状态是布尔类型
+const [isLoading, setIsLoading] = useState<boolean>(false)
+
+// <string | null> 表示可以是字符串或 null
+const [serverError, setServerError] = useState<string | null>(null)
+```
+
+
+
+### 3. 表单数据怎么处理
+
+现在来想一个问题：用户在输入框里打字，怎么拿到这个值？
+
+**最直接的想法（受控组件）：**
+
+```tsx
+const [email, setEmail] = useState('')
+
+<input
+  value={email}
+  onChange={(e) => setEmail(e.target.value)}
+/>
+```
+
+每次用户打一个字，`onChange` 就触发一次，更新 `email` 状态。但表单字段多了，就要写很多个 `useState` 和 `onChange`，而且每次打字都触发重渲染，性能不好。
+
+**React Hook Form 的方式（非受控组件）：**
+
+RHF 不用 `useState` 追踪每个字段，而是直接操作 DOM 读取值，只在需要的时候（比如提交时）才收集所有字段的值。性能更好，代码更少。
+
+RHF 的用法是通过 `register` 函数把输入框"注册"进来：
+
+```tsx
+const { register } = useForm()
+
+// register('email') 返回一些 props（onChange、onBlur、ref 等）
+// 展开传给 input，RHF 就能追踪这个字段了
+<input {...register('email')} />
+```
+
+`register` 返回的是一个普通对象，里面是几个事件处理函数和属性：
+
+```ts
+register('email') 返回：
+{
+  name: 'email',
+  ref: (el) => { /* RHF 保存 DOM 引用 */ },
+  onChange: (e) => { /* 用户输入时更新 RHF 内部状态 */ },
+  onBlur: (e) => { /* 失焦时触发验证 */ },
+}
+```
+
+用展开运算符 `{...register('email')}` 把这些属性全部传给 input：
+
+```ts
+<input {...register('email')} />
+
+// 等价于：
+<input
+  name="email"
+  ref={...}
+  onChange={...}
+  onBlur={...}
+/>
+```
+
+
+
+### 4. 验证规则怎么定义
+
+光收集数据不够，还需要验证格式是否正确。这里用 Zod。
+
+Zod 的思路是：**先描述数据应该长什么样（Schema），再用这个 Schema 验证实际数据**：
+
+```tsx
+import { z } from 'zod'
+
+// 描述登录表单的 Schema
+const loginSchema = z.object({
+  // email 字段：必须是字符串，不能为空，必须是邮箱格式
+  email: z.string()
+    .min(1, 'Email is required')        // 不能为空，错误提示是第二个参数
+    .email('Please enter a valid email'), // 必须是邮箱格式
+
+  // password 字段：必须是字符串，不能为空
+  password: z.string()
+    .min(1, 'Password is required'),
+})
+```
+
+有了 Schema 之后，可以用 TypeScript 的类型推导功能，**从 Schema 自动生成类型**，不需要手动写 interface：
+
+```tsx
+// z.infer 从 Schema 推导出对应的 TypeScript 类型
+// LoginForm 的类型等价于 { email: string; password: string }
+type LoginForm = z.infer<typeof loginSchema>
+```
+
+这样做的好处是：验证规则和类型定义只写一次，永远保持一致。
+
+
+
+### 5. RHF 和 Zod 怎么连接
+
+RHF 负责管理表单，Zod 负责验证规则，两者通过 `zodResolver` 连接：
+
+```tsx
+import { useForm } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+
+const {
+  register,       // 注册字段
+  handleSubmit,   // 包装提交函数
+  formState: { errors, isSubmitting }  // 表单状态
+} = useForm<LoginForm>({
+  // 告诉 RHF：用 loginSchema 来验证表单
+  resolver: zodResolver(loginSchema),
+})
+```
+
+`formState` 里有两个重要的东西：
+
+- `errors`：验证失败时，每个字段的错误信息。`errors.email?.message` 就是邮箱字段的错误文字
+
+    ```ts
+    // 验证失败时 errors 的结构：
+    errors = {
+      email: {
+        message: '邮箱格式不正确',  // ← Zod schema 里定义的错误信息
+        type: 'invalid_string',     // ← 错误类型
+        ref: input DOM 元素          // ← 对应的 input 引用
+      },
+      password: {
+        message: '密码至少6位',
+        type: 'too_small',
+        ref: input DOM 元素
+      }
+    }
+    
+    // 验证通过时对应字段是 undefined
+    errors = {}  // 全部通过，空对象
+    errors.email     // undefined
+    errors.password  // undefined
+    ```
+
+- `isSubmitting`：表单正在提交时为 `true`，提交完成后变回 `false`。用来控制按钮禁用状态
+
+
+
+### 6. 登录页
+
+先创建文件：
+
+```bash
+touch src/pages/LoginPage.tsx
+```
+
+**第一步：最骨架的组件**
+
+先写能跑起来的最简单版本：
+
+```tsx
+export default function LoginPage() {
+  return (
+    <div>
+      <h1>Sign in</h1>
+    </div>
+  )
+}
+```
+
+**第二步：加入状态**
+
+登录页需要两个状态——加进来：
+
+```tsx
+import { useState } from 'react'
+
+export default function LoginPage() {
+  // 服务端错误信息（密码错误、邮箱未验证等）
+  const [serverError, setServerError] = useState<string | null>(null)
+
+  return (
+    <div>
+      <h1>Sign in</h1>
+      {/* serverError 有值时才显示错误提示 */}
+      {serverError && <p>{serverError}</p>}
+    </div>
+  )
+}
+```
+
+**第三步：加入表单和 RHF**
+
+引入 RHF 和 Zod，定义 Schema，注册字段：
+
+```tsx
+import { useState } from 'react'
+import { useForm } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { z } from 'zod'
+
+// 定义验证规则
+const loginSchema = z.object({
+  email: z.string().min(1, 'Email is required').email('Invalid email'),
+  password: z.string().min(1, 'Password is required'),
+})
+
+// 从 Schema 推导类型
+type LoginForm = z.infer<typeof loginSchema>
+
+export default function LoginPage() {
+  const [serverError, setServerError] = useState<string | null>(null)
+
+  // 初始化 RHF，连接 Zod
+  const {
+    register,
+    handleSubmit,
+    formState: { errors, isSubmitting },
+  } = useForm<LoginForm>({
+    resolver: zodResolver(loginSchema),
+  })
+
+  return (
+    <div>
+      <h1>Sign in</h1>
+
+      {serverError && <p>{serverError}</p>}
+
+      {/* handleSubmit 包装 onSubmit，先验证再提交 */}
+      {/* onSubmit 现在还没定义，下一步加 */}
+      <form>
+        <div>
+          <label>Email</label>
+          {/* register('email') 展开传给 input，RHF 开始追踪这个字段 */}
+          <input type="email" {...register('email')} />
+          {/* errors.email 验证失败时有值 */}
+          {errors.email && <p>{errors.email.message}</p>}
+        </div>
+
+        <div>
+          <label>Password</label>
+          <input type="password" {...register('password')} />
+          {errors.password && <p>{errors.password.message}</p>}
+        </div>
+
+        <button type="submit" disabled={isSubmitting}>
+          {isSubmitting ? 'Signing in...' : 'Sign in'}
+        </button>
+      </form>
+    </div>
+  )
+}
+```
+
+在浏览器里测试一下：
+
+- 什么都不填直接点提交，没有错误提示。
+- 填了不是邮箱格式的内容，应该看到格式错误提示。
+
+注意：现在RHF + Zod 的验证还没生效，因为 `<form>` 标签没有绑定 `handleSubmit`，RHF 根本没有拦截到提交事件，验证从来没有被触发。上面邮箱格式错误提示的功能是来自  `<input type="email">` 触发的是**浏览器原生验证**。
+
+**第四步：加入提交处理**
+
+编写onSubmit逻辑，并绑定到`handleSubmit`。
+
+验证通过后，调用 API 登录， 因此我们也引入API 和路由
+
+```tsx
+// 引入 API 和路由
+import { useNavigate } from 'react-router-dom'
+import { authApi } from '@/api'
+import { useAuthStore } from '@/stores/authStore'
+
+export default function LoginPage() {
+  const navigate = useNavigate()
+  const { setAuth } = useAuthStore()
+  const [serverError, setServerError] = useState<string | null>(null)
+
+  const { register, handleSubmit, formState: { errors, isSubmitting } }
+    = useForm<LoginForm>({ resolver: zodResolver(loginSchema) })
+
+  // onSubmit 只在 RHF 验证通过后才会被调用
+  // data 是表单所有字段的值，类型是 LoginForm
+  const onSubmit = async (data: LoginForm) => {
+    // 清除上次的服务端错误
+    setServerError(null)
+
+    try {
+      // 调用登录 API
+      const result = await authApi.login(data)
+
+      // 登录成功：把用户信息和 Token 存入 Zustand
+      // setAuth 内部会同时写入 localStorage
+      setAuth(result.user, result.token)
+
+      // 跳转首页
+      navigate('/')
+    } catch (error) {
+      // Axios 拦截器已经把错误提取成 Error 对象
+      // 直接读 message 显示给用户
+      if (error instanceof Error) {
+        setServerError(error.message)
+      }
+    }
+  }
+
+  return (
+    <div>
+      {serverError && <p>{serverError}</p>}
+
+      {/* 把 onSubmit 传给 handleSubmit */}
+      <form onSubmit={handleSubmit(onSubmit)}>
+        {/* ... 字段不变 ... */}
+      </form>
+    </div>
+  )
+}
+```
+
+**第五步：换上 shadcn 组件**
+
+现在逻辑完全正确了，把原生 HTML 标签换成 shadcn 组件，加上 Tailwind 样式：
+
+```tsx
+// src/pages/LoginPage.tsx
+import { useState } from 'react'
+import { useForm } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { z } from 'zod'
+import { useNavigate, Link } from 'react-router-dom'
+import { authApi } from '@/api'
+import { useAuthStore } from '@/stores/authStore'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card'
+
+const loginSchema = z.object({
+  email: z.string().min(1, 'Email is required').email('Invalid email format'),
+  password: z.string().min(1, 'Password is required'),
+})
+
+type LoginForm = z.infer<typeof loginSchema>
+
+export default function LoginPage() {
+  const navigate = useNavigate()
+  const { setAuth } = useAuthStore()
+  const [serverError, setServerError] = useState<string | null>(null)
+
+  const {
+    register,
+    handleSubmit,
+    formState: { errors, isSubmitting },
+  } = useForm<LoginForm>({
+    resolver: zodResolver(loginSchema),
+  })
+
+  const onSubmit = async (data: LoginForm) => {
+    setServerError(null)
+    try {
+      const result = await authApi.login(data)
+      setAuth(result.user, result.token)
+      navigate('/')
+    } catch (error) {
+      if (error instanceof Error) {
+        setServerError(error.message)
+      }
+    }
+  }
+
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-gray-50">
+      <Card className="w-full max-w-md">
+        <CardHeader className="space-y-1">
+          <CardTitle className="text-2xl font-bold">Sign in</CardTitle>
+          <CardDescription>
+            Enter your email and password to sign in
+          </CardDescription>
+        </CardHeader>
+
+        <CardContent>
+          <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+
+            {serverError && (
+              <div className="rounded-md bg-red-50 p-3 text-sm text-red-600">
+                {serverError}
+              </div>
+            )}
+
+            <div className="space-y-2">
+              <Label htmlFor="email">Email</Label>
+              <Input
+                id="email"
+                type="email"
+                placeholder="you@example.com"
+                {...register('email')}
+              />
+              {errors.email && (
+                <p className="text-sm text-red-500">{errors.email.message}</p>
+              )}
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="password">Password</Label>
+              <Input
+                id="password"
+                type="password"
+                placeholder="••••••••"
+                {...register('password')}
+              />
+              {errors.password && (
+                <p className="text-sm text-red-500">{errors.password.message}</p>
+              )}
+            </div>
+
+            <div className="flex justify-end">
+              <Link
+                to="/forgot-password"
+                className="text-sm text-blue-600 hover:underline"
+              >
+                Forgot password?
+              </Link>
+            </div>
+
+            <Button type="submit" className="w-full" disabled={isSubmitting}>
+              {isSubmitting ? 'Signing in...' : 'Sign in'}
+            </Button>
+
+            <p className="text-center text-sm text-gray-600">
+              Don't have an account?{' '}
+              <Link to="/register" className="text-blue-600 hover:underline">
+                Sign up
+              </Link>
+            </p>
+
+          </form>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+```
+
+
+
+### 7. 更新入口配置
+
+更新 `src/main.tsx` 加入路由支持：
+
+```tsx
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import { BrowserRouter } from 'react-router-dom'
+import './index.css'
+import App from './App.tsx'
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <BrowserRouter>
+      <App />
+    </BrowserRouter>
+  </StrictMode>,
+)
+```
+
+更新 `src/App.tsx` 加入临时路由：
+
+```tsx
+import { Routes, Route } from 'react-router-dom'
+import LoginPage from '@/pages/LoginPage'
+
+function App() {
+  return (
+    <Routes>
+      <Route path="/login" element={<LoginPage />} />
+      <Route path="/" element={<div className="p-8">首页（占位）</div>} />
+    </Routes>
+  )
+}
+
+export default App
+```
+
+
+
+### 8. 完整测试
+
+启动后端和前端，打开 `http://localhost:5173/login`。
+
+**测试一：表单验证**
+
+什么都不填直接点提交 → 两个字段下方出现红色错误提示，请求没有发出去。
+
+填写格式错误的邮箱（比如 `abc`）→ 看到 `Invalid email format` 提示。
+
+**测试二：服务端错误**
+
+填写正确格式的邮箱但密码错误 → 表单验证通过，请求发出去，服务端返回错误，红色错误提示出现在表单顶部。
+
+填写未验证邮箱的账号 → 看到 `Please verify your email address before logging in.`
+
+**测试三：正常登录**
+
+用注册过且已验证的账号登录 → 跳转到首页（占位文字），打开浏览器开发者工具 → Application → Local Storage，看到 `accessToken` 已存入。
+
+
+
+### 9. 此时的目录变化
+
+```
+src/
+├── pages/
+│   └── LoginPage.tsx    ← 新增
+├── App.tsx              ← 已更新
+└── main.tsx             ← 已更新
+```
+
+
+
+### 10. Git 提交
+
+```bash
+git add .
+git commit -m "feat: login page with RHF + Zod validation"
+git push origin feature/auth-pages
+```
+
+
+
+### Step 46 完成状态
+
+```
+✅ 理解 React 函数组件和 JSX
+✅ 理解 useState（状态变化驱动界面更新）
+✅ 理解 RHF 非受控表单的工作方式（register / handleSubmit / errors）
+✅ 理解 Zod Schema 定义验证规则
+✅ 理解 z.infer 从 Schema 推导 TypeScript 类型
+✅ 理解 zodResolver 连接 RHF 和 Zod
+✅ 理解提交流程（验证 → onSubmit → API → setAuth → navigate）
+✅ 五步逐步构建：骨架 → 状态 → 表单 → 提交逻辑 → 样式
+✅ 三种场景测试通过（验证错误 / 服务端错误 / 正常登录）
+✅ Git commit 完成
+```
+
+
+
+## Step 47 · 路由结构
+
+### 这一步做什么
+
+Step 46 用了最简单的临时路由——`BrowserRouter` 包着两个 `Route`，够登录页用就行。
+
+这一步把路由系统做完整：切换到 React Router v6 推荐的方式，搭建完整的路由结构，实现"未登录时自动跳转登录页"的受保护路由。
+
+
+
+### 1. 路由是什么？
+
+浏览器地址栏里的 URL 变化时，页面应该显示不同的内容。这就是前端路由要解决的问题。
+
+传统的多页应用是服务器决定的：访问 `/login` 服务器返回登录页的 HTML，访问 `/cars` 服务器返回车辆列表页的 HTML，每次都是完整的页面刷新。
+
+React 应用是**单页应用（SPA）**：整个应用只有一个 HTML 文件，URL 变化时不请求服务器，而是由 JavaScript 决定渲染哪个组件。React Router 就是做这件事的库。
+
+
+
+### 2. BrowserRouter vs createBrowserRouter
+
+Step 46 用的是 `BrowserRouter`：
+
+```tsx
+// Step 46 的临时方式
+<BrowserRouter>
+  <Routes>
+    <Route path="/login" element={<LoginPage />} />
+    <Route path="/" element={<div>首页</div>} />
+  </Routes>
+</BrowserRouter>
+```
+
+这种写法把路由配置**散落在组件树里**。当路由越来越多时，要找某个路由的配置，需要在组件树里到处翻。
+
+React Router v6 推荐用 `createBrowserRouter`，把所有路由配置**集中在一个地方**：
+
+```tsx
+// v6 推荐方式
+const router = createBrowserRouter([
+  { path: '/', element: <HomePage /> },
+  { path: '/login', element: <LoginPage /> },
+])
+
+// 入口文件
+<RouterProvider router={router} />
+```
+
+路由配置就是一个数组，每个元素描述一条路由：`path` 是 URL，`element` 是要渲染的组件。结构清晰，集中管理。
+
+
+
+### 3. 把路由配置迁移到独立文件
+
+现在路由配置在 `App.tsx` 里，随着路由增多会越来越乱。把它移到独立的 `router.tsx` 文件里。
+
+先创建文件：
+
+```bash
+touch src/router.tsx
+```
+
+把登录页和首页的路由配置迁移进去：
+
+```tsx
+// src/router.tsx
+import { createBrowserRouter } from 'react-router-dom'
+import LoginPage from '@/pages/LoginPage'
+
+export const router = createBrowserRouter([
+  {
+    path: '/',
+    element: <div className="p-8">首页（占位）</div>,
+  },
+  {
+    path: '/login',
+    element: <LoginPage />,
+  },
+])
+```
+
+更新 `src/main.tsx`，用 `RouterProvider` 替换 `BrowserRouter`：
+
+```tsx
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import { RouterProvider } from 'react-router-dom'
+import { router } from './router'
+import './index.css'
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <RouterProvider router={router} />
+  </StrictMode>,
+)
+```
+
+`App.tsx` 现在不再需要了，路由配置已经移到 `router.tsx`：
+
+```bash
+rm src/App.tsx
+```
+
+验证：
+
+```bash
+npm run dev
+```
+
+访问 `http://localhost:5173/login`，登录页正常显示。访问 `http://localhost:5173/`，显示占位文字。和之前行为完全一致，只是路由配置的组织方式变了。
+
+
+
+### 4. 受保护路由：问题在哪里
+
+现在 `/` 是公开的，任何人都能访问。但后面会有很多需要登录才能访问的页面——发布车辆、个人中心、订单列表等。
+
+最直接的想法是在每个需要登录的页面组件里检查：
+
+```tsx
+// 在每个需要登录的页面里都这样写
+export default function CreateCarPage() {
+  const { isAuthenticated } = useAuthStore()
+
+  if (!isAuthenticated()) {
+    return <Navigate to="/login" />
+  }
+
+  return <div>发布车辆</div>
+}
+```
+
+这能工作，但有个问题：**每个需要登录的页面都要复制这段逻辑**。如果将来要改跳转逻辑，要改很多个文件。
+
+更好的做法是把这个检查逻辑**抽成一个组件**，在路由配置里统一处理。
+
+
+
+### 5. Outlet 是什么
+
+在实现受保护路由之前，先理解 `Outlet`，因为受保护路由依赖它。
+
+`Outlet` 是 React Router 提供的一个组件，它是**子路由的渲染占位符**。
+
+先看一个具体例子理解它：
+
+```tsx
+// 假设有这样的路由配置
+{
+  path: '/dashboard',
+  element: <DashboardLayout />,  // 父路由
+  children: [
+    { path: 'profile', element: <ProfilePage /> },  // 子路由
+    { path: 'settings', element: <SettingsPage /> }, // 子路由
+  ]
+}
+// DashboardLayout 组件
+function DashboardLayout() {
+  return (
+    <div>
+      <nav>导航栏（始终显示）</nav>
+
+      {/* Outlet 是子路由内容的渲染位置 */}
+      {/* 访问 /dashboard/profile 时，这里渲染 ProfilePage */}
+      {/* 访问 /dashboard/settings 时，这里渲染 SettingsPage */}
+      <Outlet />
+    </div>
+  )
+}
+```
+
+访问 `/dashboard/profile`：
+
+```
+渲染 DashboardLayout
+  → 导航栏（始终显示）
+  → Outlet 位置渲染 ProfilePage
+```
+
+访问 `/dashboard/settings`：
+
+```
+渲染 DashboardLayout
+  → 导航栏（始终显示）
+  → Outlet 位置渲染 SettingsPage
+```
+
+导航栏只写一次，子路由切换时只有 `Outlet` 的内容变化，外层布局保持不动。
+
+
+
+### 6. 用 Outlet 实现受保护路由
+
+理解了 `Outlet` 之后，受保护路由的实现思路就很自然了：
+
+```
+创建一个 ProtectedRoute 组件
+  → 检查是否已登录
+  → 未登录：跳转到登录页（不渲染子路由）
+  → 已登录：渲染 Outlet（让子路由正常显示）
+```
+
+在路由配置里，把需要登录的路由都放在 `ProtectedRoute` 的 `children` 里：
+
+```tsx
+{
+  element: <ProtectedRoute />,   // 父路由：做权限检查
+  children: [
+    { path: '/cars/new', element: <CreateCarPage /> },   // 子路由
+    { path: '/profile', element: <ProfilePage /> },      // 子路由
+  ]
+}
+```
+
+这样权限检查逻辑只写一次，所有子路由都受到保护。
+
+现在来实现它：
+
+```bash
+touch src/components/ProtectedRoute.tsx
+// src/components/ProtectedRoute.tsx
+import { Navigate, Outlet } from 'react-router-dom'
+import { useAuthStore } from '@/stores/authStore'
+
+export default function ProtectedRoute() {
+  const { isAuthenticated } = useAuthStore()
+
+  if (!isAuthenticated()) {
+    // replace 参数：用登录页替换当前历史记录
+    // 不加 replace 的话，用户登录后点返回键会回到被拦截的页面，再被拦截，死循环
+    return <Navigate to="/login" replace />
+  }
+
+  // 已登录：渲染子路由的内容
+  return <Outlet />
+}
+```
+
+
+
+### 7. 更新路由配置，使用 ProtectedRoute
+
+现在把 `router.tsx` 更新，加入受保护路由。暂时只加一个占位页面测试效果：
+
+```bash
+touch src/pages/CreateCarPage.tsx
+// src/pages/CreateCarPage.tsx（占位）
+export default function CreateCarPage() {
+  return <div className="p-8">发布车辆（占位）</div>
+}
+```
+
+更新 `src/router.tsx`：
+
+```tsx
+// src/router.tsx
+import { createBrowserRouter } from 'react-router-dom'
+import LoginPage from '@/pages/LoginPage'
+import CreateCarPage from '@/pages/CreateCarPage'
+import ProtectedRoute from '@/components/ProtectedRoute'
+
+export const router = createBrowserRouter([
+  // 公开路由
+  {
+    path: '/',
+    element: <div className="p-8">首页（占位）</div>,
+  },
+  {
+    path: '/login',
+    element: <LoginPage />,
+  },
+
+  // 受保护路由
+  // element 是 ProtectedRoute，它负责权限检查
+  // children 里的页面只有登录后才能访问
+  {
+    element: <ProtectedRoute />,
+    children: [
+      {
+        path: '/cars/new',
+        element: <CreateCarPage />,
+      },
+    ],
+  },
+])
+```
+
+
+
+### 8. 验证受保护路由是否工作
+
+```bash
+npm run dev
+```
+
+**测试一：未登录访问受保护路由**
+
+清除 localStorage（浏览器开发者工具 → Application → Local Storage → 全部清除），然后访问：
+
+```
+http://localhost:5173/cars/new
+```
+
+应该自动跳转到 `/login`。
+
+**测试二：登录后访问受保护路由**
+
+用正确账号登录，登录成功后手动访问：
+
+```
+http://localhost:5173/cars/new
+```
+
+应该正常显示"发布车辆（占位）"，不再被跳转。
+
+两个测试都通过，说明受保护路由工作正常。
+
+
+
+### 9. 此时的目录变化
+
+```
+src/
+├── components/
+│   └── ProtectedRoute.tsx    ← 新增
+├── pages/
+│   ├── LoginPage.tsx         （已有）
+│   └── CreateCarPage.tsx     ← 新增（占位）
+├── router.tsx                ← 新增
+└── main.tsx                  ← 已更新
+```
+
+`App.tsx` 已删除。
+
+
+
+### 10. Git 提交
+
+```bash
+git add .
+git commit -m "feat: router setup with ProtectedRoute"
+git push origin feature/auth-pages
+```
+
+
+
+### Step 47 完成状态
+
+```
+✅ 理解 SPA 前端路由的工作原理
+✅ 理解 createBrowserRouter vs BrowserRouter 的区别
+✅ 路由配置迁移到独立的 router.tsx
+✅ RouterProvider 替换 BrowserRouter
+✅ 理解 Outlet（子路由渲染占位符）
+✅ 理解受保护路由的实现思路（一处检查保护所有子路由）
+✅ ProtectedRoute 组件实现（未登录跳转 + Outlet）
+✅ 受保护路由配置（children 结构）
+✅ 测试通过（未登录跳转 / 登录后正常访问）
+✅ Git commit 完成
+```
+
+
+
+## Step 48 · 注册页 + 密码相关页面
+
+### 这一步做什么
+
+Step 46 做了登录页，Step 47 搭好了路由框架。这一步把剩余的认证页面全部做完：注册、邮箱验证、忘记密码、重置密码。
+
+
+
+### 1. 注册页
+
+#### 1.1 验证规则
+
+登录页的 Schema 很简单：邮箱格式 + 密码不为空。
+
+注册页的密码需要更严格的规则：至少8位、包含大写字母、包含小写字母、包含数字。
+
+**Zod 支持链式调用多个验证规则：**
+
+```tsx
+// 每个 .xxx() 是一条规则，第二个参数是这条规则失败时的提示
+z.string()
+  .min(8, 'At least 8 characters')
+  .regex(/(?=.*[a-z])/, 'Must contain lowercase letter')
+  .regex(/(?=.*[A-Z])/, 'Must contain uppercase letter')
+  .regex(/(?=.*\d)/, 'Must contain number')
+```
+
+规则从上到下依次验证，第一条失败就停下来显示对应的错误信息。
+
+#### 1.2 注册成功后不跳转
+
+登录成功后直接跳转首页，但注册成功后不一样：
+
+用户还需要去邮箱点验证链接，跳转到首页没有意义。
+
+更好的做法是：注册成功后**显示一个提示页面**，告诉用户"请检查邮箱"。
+
+可以用一个 `isSuccess` 状态来控制显示哪个内容：
+
+```tsx
+const [isSuccess, setIsSuccess] = useState(false)
+
+// 注册成功后
+setIsSuccess(true)
+
+// 根据状态决定显示什么
+if (isSuccess) {
+  return <div>请检查邮箱...</div>
+}
+ 
+return <div>注册表单...</div>
+```
+
+#### 1.3 实现注册页
+
+打开 `src/pages/RegisterPage.tsx`，一步一步构建：
+
+**第一步：Schema 和类型**
+
+```tsx
+import { useState } from 'react'
+import { useForm } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { z } from 'zod'
+import { Link, useNavigate } from 'react-router-dom'
+import { authApi } from '@/api'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card'
+
+const registerSchema = z.object({
+  username: z
+    .string()
+    .min(2, 'Username must be at least 2 characters')
+    .max(50, 'Username must not exceed 50 characters'),
+  email: z
+    .string()
+    .min(1, 'Email is required')
+    .email('Please enter a valid email'),
+  password: z
+    .string()
+    .min(8, 'Password must be at least 8 characters')
+    .regex(/(?=.*[a-z])/, 'Must contain at least one lowercase letter')
+    .regex(/(?=.*[A-Z])/, 'Must contain at least one uppercase letter')
+    .regex(/(?=.*\d)/, 'Must contain at least one number'),
+})
+
+type RegisterForm = z.infer<typeof registerSchema>
+```
+
+**第二步：组件骨架 + 状态**
+
+```tsx
+import { useState } from 'react'
+import { useForm } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { useNavigate } from "react-router-dom"
+
+export default function RegisterPage() {
+  const [serverError, setServerError] = useState<string | null>(null)
+  const [isSuccess, setIsSuccess] = useState(false)
+  const navigate = useNavigate();
+
+  const {
+    register,
+    handleSubmit,
+    formState: { errors, isSubmitting },
+  } = useForm<RegisterForm>({
+    resolver: zodResolver(registerSchema),
+  })
+
+  const onSubmit = async (data: RegisterForm) => {
+    setServerError(null)
+    try {
+      await authApi.register(data)
+      // 注册成功：显示"请检查邮箱"提示
+      setIsSuccess(true)
+    } catch (error) {
+      if (error instanceof Error) {
+        setServerError(error.message)
+      }
+    }
+  }
+
+  // 注册成功后显示提示
+  if (isSuccess) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-gray-50">
+        <Card className="w-full max-w-md">
+          <CardHeader>
+            <CardTitle>Check your email</CardTitle>
+            <CardDescription>
+              We've sent a verification link to your email.
+              Please click the link to activate your account.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Button
+              variant="outline"
+              className="w-full"
+              onClick={() => navigate('/login')}
+            >
+              Back to sign in
+            </Button>
+          </CardContent>
+        </Card>
+      </div>
+    )
+  }
+
+  // 注册表单
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-gray-50">
+      <Card className="w-full max-w-md">
+        <CardHeader className="space-y-1">
+          <CardTitle className="text-2xl font-bold">Create account</CardTitle>
+          <CardDescription>
+            Enter your details to create a new account
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+
+            {serverError && (
+              <div className="rounded-md bg-red-50 p-3 text-sm text-red-600">
+                {serverError}
+              </div>
+            )}
+
+            <div className="space-y-2">
+              <Label htmlFor="username">Username</Label>
+              <Input
+                id="username"
+                placeholder="johndoe"
+                {...register('username')}
+              />
+              {errors.username && (
+                <p className="text-sm text-red-500">{errors.username.message}</p>
+              )}
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="email">Email</Label>
+              <Input
+                id="email"
+                type="email"
+                placeholder="you@example.com"
+                {...register('email')}
+              />
+              {errors.email && (
+                <p className="text-sm text-red-500">{errors.email.message}</p>
+              )}
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="password">Password</Label>
+              <Input
+                id="password"
+                type="password"
+                placeholder="••••••••"
+                {...register('password')}
+              />
+              {errors.password && (
+                <p className="text-sm text-red-500">{errors.password.message}</p>
+              )}
+            </div>
+
+            <Button
+              type="submit"
+              className="w-full"
+              disabled={isSubmitting}
+            >
+              {isSubmitting ? 'Creating account...' : 'Create account'}
+            </Button>
+
+            <p className="text-center text-sm text-gray-600">
+              Already have an account?{' '}
+              <Link to="/login" className="text-blue-600 hover:underline">
+                Sign in
+              </Link>
+            </p>
+
+          </form>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+```
+
+#### 1.4 把注册路由加进去
+
+打开 `src/router.tsx`，在公开路由里加上注册页：
+
+```tsx
+import RegisterPage from '@/pages/RegisterPage'
+
+// 在公开路由里添加
+{
+  path: '/register',
+  element: <RegisterPage />,
+},
+```
+
+**测试注册流程：**
+
+访问 `/register`，不填内容直接提交，看到字段验证错误。
+
+密码只填 `abc123`（不满足大写字母要求），看到 `Must contain at least one uppercase letter`。
+
+正确填写所有字段，提交后看到"Check your email"提示，同时真实邮箱收到验证邮件。
+
+
+
+### 2. 邮箱验证页
+
+#### 2.1 怎么读取 URL 参数?
+
+邮件里的验证链接格式是：
+
+```
+http://localhost:5173/verify-email?token=abc123xyz
+```
+
+`?token=abc123xyz` 是 URL 的查询参数（Query String）。前端需要把 `token` 的值读出来，传给后端验证接口。
+
+React Router 提供了 `useSearchParams` Hook 专门读取 URL 查询参数：
+
+```tsx
+// URL: /verify-email?token=abc123
+const [searchParams] = useSearchParams()
+
+// .get('token') 读取名为 token 的参数值
+const token = searchParams.get('token')  // → "abc123"
+
+// 参数不存在时返回 null
+const missing = searchParams.get('notexist')  // → null
+```
+
+`useSearchParams` 返回一个数组，第一个元素是参数对象，第二个是修改参数的函数。这里只需要读取，所以只用第一个。
+
+#### 2.2 页面加载时自动触发请求?
+
+登录页和注册页都是用户主动点提交按钮才发请求。但邮箱验证页不一样——用户点击链接进入页面后，应该**自动触发验证请求**，不需要用户再点任何按钮。
+
+这需要用到 `useEffect`。
+
+**useEffect 是什么？**
+
+`useEffect` 是 React 提供的一个 Hook，用来处理"副作用"。
+
+**副作用**是指不属于渲染本身的操作，比如：发 API 请求、设置定时器、操作浏览器 API 等。
+
+为什么要把这些操作放进 `useEffect` 而不是直接写在组件函数体里？
+
+```tsx
+// 错误做法：直接在组件里发请求
+function VerifyEmailPage() {
+  // 每次组件重新渲染都会发一次请求！
+  // React 可能因为各种原因重新渲染组件，这会导致请求被重复发送
+  authApi.verifyEmail(token)
+
+  return <div>...</div>
+}
+```
+
+`useEffect` 让你控制**什么时候**执行这些操作：
+
+```tsx
+useEffect(() => {
+  // 这里的代码在组件渲染之后执行
+  // 第二个参数是依赖数组
+
+}, [依赖项])
+// 依赖数组为空 []：只在组件第一次渲染后执行一次
+// 依赖数组有值 [a, b]：a 或 b 变化时重新执行
+// 不传第二个参数：每次渲染后都执行（通常不想要这个）
+```
+
+邮箱验证页的场景：进入页面时执行一次验证，之后不再重复，用空依赖数组：
+
+```tsx
+useEffect(() => {
+  // 页面第一次渲染后自动执行
+  verify()
+}, [])
+```
+
+#### 2.3 用状态机管理验证过程
+
+验证有三种可能的结果：进行中、成功、失败。用一个状态来表示当前处于哪个阶段：
+
+```tsx
+// 用联合类型定义所有可能的状态
+type VerifyStatus = 'loading' | 'success' | 'error'
+
+const [status, setStatus] = useState<VerifyStatus>('loading')
+```
+
+这种用一个状态值表示多种互斥状态的方式，叫**状态机**思维。比用多个 boolean 状态（`isLoading`、`isSuccess`、`isError`）清晰得多，因为互斥的状态不可能同时为 true。
+
+#### 2.4 实现邮箱验证页
+
+打开 `src/pages/VerifyEmailPage.tsx`：
+
+**第一步：定义状态**
+
+```tsx
+import { useEffect, useState } from 'react'
+import { useSearchParams, Link } from 'react-router-dom'
+import { authApi } from '@/api'
+
+type VerifyStatus = 'loading' | 'success' | 'error'
+
+export default function VerifyEmailPage() {
+  const [searchParams] = useSearchParams()
+  const [status, setStatus] = useState<VerifyStatus>('loading')
+  const [errorMessage, setErrorMessage] = useState<string | null>(null)
+
+  // 组件渲染后自动触发验证
+    useEffect(() => {
+      const verify = async () => {
+        const token = searchParams.get("token")
+
+        if (!token) {
+          setStatus("error")
+          setErrorMessage("Invalid verification link.")
+          return
+        }
+
+        try {
+          await authApi.verifyEmail(token)
+          setStatus("success")
+        } catch (error) {
+          setStatus("error")
+          if (error instanceof Error) {
+            setErrorMessage(error.message)
+          }
+        }
+      }
+
+      verify()
+    }, [searchParams])
+
+  // 根据状态渲染不同内容
+  // ...
+}
+```
+
+**第二步：根据状态渲染对应内容**
+
+```tsx
+import { useEffect, useState } from "react";
+import { useSearchParams, Link } from "react-router-dom";
+import { authApi } from "@/api";
+import { Button } from "@/components/ui/button";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+
+type VerifyStatus = "loading" | "success" | "error";
+
+export default function VerifyEmailPage() {
+  const [searchParams] = useSearchParams();
+  const [status, setStatus] = useState<VerifyStatus>("loading");
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+	...
+  }, [searchParams]);
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-gray-50">
+      <Card className="w-full max-w-md">
+        {status === "loading" && (
+          <CardHeader>
+            <CardTitle>Verifying your email...</CardTitle>
+            <CardDescription>Please wait a moment.</CardDescription>
+          </CardHeader>
+        )}
+
+        {status === "success" && (
+          <>
+            <CardHeader>
+              <CardTitle>Email verified!</CardTitle>
+              <CardDescription>
+                Your account is now active. You can sign in.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              {/*
+                Button asChild 是 shadcn 的特殊用法：
+                把 Button 的样式应用到子元素（Link）上
+                而不是渲染一个 <button> 标签包着 <a> 标签
+                （button 包 a 是不合法的 HTML 写法）
+              */}
+              <Button asChild className="w-full">
+                <Link to="/login">Sign in</Link>
+              </Button>
+            </CardContent>
+          </>
+        )}
+
+        {status === "error" && (
+          <>
+            <CardHeader>
+              <CardTitle>Verification failed</CardTitle>
+              <CardDescription className="text-red-500">
+                {errorMessage ?? "The link is invalid or has expired."}
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <Button asChild variant="outline" className="w-full">
+                <Link to="/login">Back to sign in</Link>
+              </Button>
+            </CardContent>
+          </>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+```
+
+#### 2.5 加入路由
+
+打开 `src/router.tsx`，添加：
+
+```tsx
+import VerifyEmailPage from '@/pages/VerifyEmailPage'
+
+// 公开路由里添加
+{
+  path: '/verify-email',
+  element: <VerifyEmailPage />,
+},
+```
+
+**测试：** 注册后收到验证邮件，点击邮件里的链接，页面先短暂显示 "Verifying..."，然后跳转到 "Email verified!" 成功状态。
+
+> **注意：由于使用了严格模式:**
+>
+> ```tsx
+> createRoot(document.getElementById("root")!).render(
+>   <StrictMode>
+>     {/* 包裹rowserRouter组件 */}
+>     <RouterProvider router={router} />
+>   </StrictMode>,
+> );
+> ```
+>
+> React 开发模式下 `StrictMode` 会**故意把 `useEffect` 执行两次**，用来帮助发现副作用问题。
+>
+> 执行顺序：
+>
+> ```bash
+> 第一次挂载 → useEffect 执行 → verify() 发出第一次请求
+>            → StrictMode 故意卸载
+>            → 再次挂载 → useEffect 再次执行 → verify() 发出第二次请求
+> ```
+>
+> 对于邮箱验证这种**一次性操作**，第一次请求成功后 token 已经被消费（数据库里清空了），第二次请求用同一个 token 去验证，后端找不到, 发送验证请求返回
+>
+> ```json
+> {
+>     "success": false,
+>     "data": null,
+>     "message": "The token is invalid or has expired.",
+>     "errors": null
+> }
+> ```
+>
+> 从而让status='error', 导致前端渲染错误提示内容。
+>
+> 解决方案：使用useRef hook函数
+>
+> - 直接删除严格模式 ： 导致无法使用严格模式发现其他副作用潜在的问题
+> - 使用useRef hook函数
+
+#### 2.6 使用useRef hook函数优化
+
+`useRef` 返回一个容器对象 `{ current: value }`，这个对象保存在 React 内部的 **Fiber 节点**上，不在函数作用域里：
+
+```bash
+
+React 内部维护了一张表：
+
+Fiber 节点（组件实例）
+  ├── useState 的值    → [status, setStatus]
+  ├── useState 的值    → [errorMessage, setErrorMessage]  
+  ├── useRef 的值      → { current: false }，跨渲染共享同一个对
+  └── useEffect 的依赖 → [searchParams]
+  
+```
+
+每次组件重新渲染，函数体重新执行，但 React 不会重新创建这张表，而是复用已有的，把最新的值填进去。
+
+和普通变量、useState 的区别：
+
+```bash
+普通变量  → 每次渲染重新创建，渲染结束销毁
+useState → 值在 Fiber 节点，变化触发重新渲染
+useRef   → 值在 Fiber 节点，变化不触发重新渲染  ← 适合做标志位
+```
+
+useRef 的两种用途:
+
+```tsx
+// 用途一：获取 DOM 引用（最常见）
+const inputRef = useRef<HTMLInputElement>(null)
+<input ref={inputRef} />
+// inputRef.current 就是 input 的 DOM 元素
+// 可以直接操作：inputRef.current.focus()
+
+// 用途二：跨渲染保存值
+const hasVerified = useRef(false)
+// 存的不是 DOM，是普通值
+// 值变化不触发渲染，但在多次渲染/effect 间共享
+```
+
+两种用途本质一样——都是**在渲染之间持久保存一个可变值**，只是存的内容不同。
+
+对于严格模式导致双重执行 useEffect，发出两次请求的问题，使用useRef解决
+
+```tsx
+export default function VerifyEmailPage() {
+  const [searchParams] = useSearchParams()
+  const [status, setStatus] = useState<VerifyStatus>("loading")
+  const [errorMessage, setErrorMessage] = useState<string | null>(null)
+  const hasVerified = useRef(false)  // ← 标志位，防止重复请求
+
+  useEffect(() => {
+    if (hasVerified.current) return  // 第二次执行直接跳过
+    hasVerified.current = true       // 标记已执行
+
+    const verify = async () => {
+      const token = searchParams.get("token")
+
+      if (!token) {
+        setStatus("error")
+        setErrorMessage("Invalid verification link.")
+        return
+      }
+
+      try {
+        await authApi.verifyEmail(token)
+        setStatus("success")
+      } catch (error) {
+        setStatus("error")
+        if (error instanceof Error) {
+          setErrorMessage(error.message)
+        }
+      }
+    }
+
+    verify()
+  }, [searchParams])
+}
+```
+
+完整执行流程
+
+```bash
+const hasVerified = useRef(false)
+→ Fiber 节点里创建 { current: false }
+
+第一次挂载
+  → useEffect 执行
+      → hasVerified.current === false → 不跳过
+      → hasVerified.current = true   ← 修改 Fiber 节点里的值
+      → verify() 发出请求
+      → 验证成功，EmailConfirmed = true，token 清空
+      → setStatus("success")
+
+StrictMode 卸载
+  → hasVerified.current 还是 true（Fiber 节点不受卸载影响）
+
+再次挂载
+  → useEffect 再次执行
+      → hasVerified.current === true → 直接 return
+      → verify() 不执行，请求不发出去 ✅
+```
+
+
+
+### 3. 忘记密码页
+
+这是最简单的一个页面：只有一个邮箱字段，提交后显示成功提示。
+
+不引入新知识点，直接和注册页的结构完全一样：
+
+```tsx
+// src/pages/ForgotPasswordPage.tsx
+import { useState } from 'react'
+import { useForm } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { z } from 'zod'
+import { Link } from 'react-router-dom'
+import { authApi } from '@/api'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card'
+
+const forgotPasswordSchema = z.object({
+  email: z.string().min(1, 'Email is required').email('Invalid email format'),
+})
+
+type ForgotPasswordForm = z.infer<typeof forgotPasswordSchema>
+
+export default function ForgotPasswordPage() {
+  const [isSuccess, setIsSuccess] = useState(false)
+
+  const {
+    register,
+    handleSubmit,
+    formState: { errors, isSubmitting },
+  } = useForm<ForgotPasswordForm>({
+    resolver: zodResolver(forgotPasswordSchema),
+  })
+
+  const onSubmit = async (data: ForgotPasswordForm) => {
+    // 后端设计：无论邮箱是否存在，始终返回成功
+    // 前端同样不需要处理错误，直接显示成功提示
+    await authApi.forgotPassword(data.email)
+    setIsSuccess(true)
+  }
+
+  if (isSuccess) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-gray-50">
+        <Card className="w-full max-w-md">
+          <CardHeader>
+            <CardTitle>Check your email</CardTitle>
+            <CardDescription>
+              If this email is registered, you'll receive
+              a password reset link shortly.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Button asChild variant="outline" className="w-full">
+              <Link to="/login">Back to sign in</Link>
+            </Button>
+          </CardContent>
+        </Card>
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-gray-50">
+      <Card className="w-full max-w-md">
+        <CardHeader className="space-y-1">
+          <CardTitle className="text-2xl font-bold">Forgot password</CardTitle>
+          <CardDescription>
+            Enter your email and we'll send you a reset link
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+
+            <div className="space-y-2">
+              <Label htmlFor="email">Email</Label>
+              <Input
+                id="email"
+                type="email"
+                placeholder="you@example.com"
+                {...register('email')}
+              />
+              {errors.email && (
+                <p className="text-sm text-red-500">{errors.email.message}</p>
+              )}
+            </div>
+
+            <Button
+              type="submit"
+              className="w-full"
+              disabled={isSubmitting}
+            >
+              {isSubmitting ? 'Sending...' : 'Send reset link'}
+            </Button>
+
+            <p className="text-center text-sm text-gray-600">
+              <Link to="/login" className="text-blue-600 hover:underline">
+                Back to sign in
+              </Link>
+            </p>
+
+          </form>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+```
+
+加入路由：
+
+```tsx
+import ForgotPasswordPage from '@/pages/ForgotPasswordPage'
+
+{
+  path: '/forgot-password',
+  element: <ForgotPasswordPage />,
+},
+```
+
+
+
+### 4. 重置密码页
+
+#### 4.1 跨字段验证
+
+重置密码页有两个字段：新密码和确认密码，需要验证**两者必须相同**。
+
+这不是单个字段的规则，而是两个字段之间的比较。Zod 的普通字段验证做不到这一点，需要用 `refine`。
+
+**`refine` 是什么？**
+
+`refine` 是 Zod 提供的**自定义验证**方法，在整个对象层面执行，可以访问所有字段：
+
+```tsx
+const schema = z.object({
+  newPassword: z.string().min(8),
+  confirmPassword: z.string().min(1),
+})
+.refine(
+  // 第一个参数：验证函数，返回 true 表示通过，false 表示失败
+  (data) => data.newPassword === data.confirmPassword,
+  // 第二个参数：失败时的配置
+  {
+    message: "Passwords don't match",
+    // path 指定错误显示在哪个字段下方
+    path: ['confirmPassword'],
+  }
+)
+```
+
+`.refine()` 是在 `.object()` 之后链式调用的，执行时机是**所有字段验证通过之后**。如果 `newPassword` 或 `confirmPassword` 本身就不合法，`refine` 不会执行。
+
+#### 4.2 实现重置密码页
+
+同样一步一步来。
+
+**第一步：Schema**
+
+```tsx
+// src/pages/ResetPasswordPage.tsx
+
+const resetPasswordSchema = z
+  .object({
+    newPassword: z
+      .string()
+      .min(8, 'Password must be at least 8 characters')
+      .regex(/(?=.*[a-z])/, 'Must contain at least one lowercase letter')
+      .regex(/(?=.*[A-Z])/, 'Must contain at least one uppercase letter')
+      .regex(/(?=.*\d)/, 'Must contain at least one number'),
+    confirmPassword: z
+      .string()
+      .min(1, 'Please confirm your password'),
+  })
+  // 在整个对象层面验证两个密码是否一致
+  .refine(
+    (data) => data.newPassword === data.confirmPassword,
+    {
+      message: "Passwords don't match",
+      path: ['confirmPassword'],
+    }
+  )
+
+type ResetPasswordForm = z.infer<typeof resetPasswordSchema>
+```
+
+**第二步：组件逻辑**
+
+从 URL 读取 token（和邮箱验证页一样用 `useSearchParams`），提交时把 token 和新密码一起发给后端：
+
+```tsx
+export default function ResetPasswordPage() {
+  const [searchParams] = useSearchParams()
+  const navigate = useNavigate()
+  const [serverError, setServerError] = useState<string | null>(null)
+
+  const {
+    register,
+    handleSubmit,
+    formState: { errors, isSubmitting },
+  } = useForm<ResetPasswordForm>({
+    resolver: zodResolver(resetPasswordSchema),
+  })
+
+  const onSubmit = async (data: ResetPasswordForm) => {
+    setServerError(null)
+
+    const token = searchParams.get('token')
+    if (!token) {
+      setServerError('Invalid reset link.')
+      return
+    }
+
+    try {
+      await authApi.resetPassword(token, data.newPassword)
+      // 重置成功，跳转登录页
+      navigate('/login')
+    } catch (error) {
+      if (error instanceof Error) {
+        setServerError(error.message)
+      }
+    }
+  }
+
+  // 表单 JSX...
+}
+```
+
+**第三步：表单 JSX**
+
+```tsx
+import { useState } from "react";
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { z } from "zod";
+import { useSearchParams, Link, useNavigate } from "react-router-dom";
+import { authApi } from "@/api";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+
+
+...
+
+export default function ResetPasswordPage() {
+  
+    ...
+
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-gray-50">
+      <Card className="w-full max-w-md">
+        <CardHeader className="space-y-1">
+          <CardTitle className="text-2xl font-bold">Reset password</CardTitle>
+          <CardDescription>Enter your new password below</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+            {serverError && (
+              <div className="rounded-md bg-red-50 p-3 text-sm text-red-600">
+                {serverError}
+              </div>
+            )}
+
+            <div className="space-y-2">
+              <Label htmlFor="newPassword">New password</Label>
+              <Input
+                id="newPassword"
+                type="password"
+                placeholder="••••••••"
+                {...register("newPassword")}
+              />
+              {errors.newPassword && (
+                <p className="text-sm text-red-500">
+                  {errors.newPassword.message}
+                </p>
+              )}
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="confirmPassword">Confirm password</Label>
+              <Input
+                id="confirmPassword"
+                type="password"
+                placeholder="••••••••"
+                {...register("confirmPassword")}
+              />
+              {/* refine 的错误和普通字段错误一样，通过 errors 读取 */}
+              {errors.confirmPassword && (
+                <p className="text-sm text-red-500">
+                  {errors.confirmPassword.message}
+                </p>
+              )}
+            </div>
+
+            <Button type="submit" className="w-full" disabled={isSubmitting}>
+              {isSubmitting ? "Resetting..." : "Reset password"}
+            </Button>
+
+            <p className="text-center text-sm text-gray-600">
+              <Link to="/login" className="text-blue-600 hover:underline">
+                Back to sign in
+              </Link>
+            </p>
+          </form>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+```
+
+
+
+#### 4.3 加入路由：
+
+```tsx
+import ResetPasswordPage from '@/pages/ResetPasswordPage'
+
+{
+  path: '/reset-password',
+  element: <ResetPasswordPage />,
+},
+```
+
+
+
+### 5. 完整测试
+
+```bash
+npm run dev
+```
+
+**注册流程：**
+
+访问 `/register` → 填写信息提交 → 看到"Check your email" → 收到验证邮件 → 点击链接 → 看到"Email verified!" → 点击"Sign in" → 登录成功。
+
+**密码重置流程：**
+
+访问 `/forgot-password` → 填写邮箱 → 看到"Check your email" → 收到重置邮件 → 点击链接 → 进入 `/reset-password?token=...` → 输入新密码 → 两次输入不一致看到错误提示 → 两次输入一致提交 → 跳转登录页 → 用新密码登录成功。
+
+
+
+### 6. 此时的目录变化
+
+```
+src/
+├── pages/
+│   ├── RegisterPage.tsx        ← 已更新（完整实现）
+│   ├── VerifyEmailPage.tsx     ← 已更新（完整实现）
+│   ├── ForgotPasswordPage.tsx  ← 已更新（完整实现）
+│   └── ResetPasswordPage.tsx   ← 已更新（完整实现）
+└── router.tsx                  ← 已更新（加入四个路由）
+```
+
+
+
+### 7. Git 提交
+
+```bash
+git add .
+git commit -m "feat: register + email verify + forgot/reset password pages"
+git push origin feature/auth-pages
+```
+
+合并回 `develop`：
+
+```bash
+git checkout develop
+git merge --no-ff feature/auth-pages \
+    -m "merge: feature/auth-pages into develop"
+git push origin develop
+git branch -D feature/auth-pages
+git push origin --delete feature/auth-pages
+```
+
+
+
+### Step 48 完成状态
+
+```
+✅ 注册页（多条链式 Zod 规则 + 注册成功提示）
+✅ 理解 useSearchParams（读取 URL 查询参数）
+✅ 理解 useEffect（副作用、依赖数组、执行时机）
+✅ 理解状态机思维（用一个状态值表示互斥的多种状态）
+✅ 邮箱验证页（自动触发验证 + 三种状态）
+✅ 理解 Button asChild（避免非法 HTML 嵌套）
+✅ 忘记密码页（简单表单 + 成功提示）
+✅ 理解 Zod refine（跨字段验证、path 指定错误位置）
+✅ 重置密码页（密码确认验证）
+✅ 完整认证流程端到端测试通过
+✅ feature/auth-pages 合并回 develop
+```
