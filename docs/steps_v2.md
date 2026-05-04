@@ -8240,3 +8240,724 @@ git push origin --delete feature/auth-pages
 ✅ 完整认证流程端到端测试通过
 ✅ feature/auth-pages 合并回 develop
 ```
+
+
+
+好，先核查 Step 49 的内容。
+
+
+
+## 
+
+
+
+## Step 49 · 首页：车辆列表
+
+### 这一步做什么
+
+认证流程已经完整了。这一步开始做平台的核心页面——车辆列表。
+
+同时引入这个项目里**最重要的前端库之一：TanStack Query**。它彻底改变了前端数据请求的方式，理解它之后，会觉得之前用 `useEffect` 发请求的方式非常原始。
+
+
+
+### 1. 先做基础布局
+
+在做列表页之前，先把页面的基本结构搭起来:
+
+- 导航栏
+- 内容区域
+
+切出分支
+
+```bash
+git checkout develop
+git checkout -b feature/browse-pages
+git push -u origin feature/browse-pages
+```
+
+
+
+#### 1.1 为什么需要布局组件
+
+现在每个页面都是完全独立的，用户从登录页成功登录后跳到首页，首页只显示一行占位文字，没有任何导航。
+
+需要一个**布局组件**，提供：
+
+- 顶部导航栏（Logo、链接、登录/注册按钮）
+- 内容区域（每个页面的内容渲染在这里）
+
+布局组件只写一次，所有页面共享。
+
+#### 1.2 创建布局组件
+
+```bash
+touch src/components/Layout.tsx
+```
+
+先从最简单的骨架开始：
+
+```tsx
+import { Outlet } from 'react-router-dom'
+
+export default function Layout() {
+  return (
+    <div className="min-h-screen bg-gray-50">
+      {/* 导航栏 */}
+      <header className="border-b bg-white">
+        <div className="mx-auto max-w-7xl px-4 py-4">
+          <span className="text-xl font-bold">UUcars</span>
+        </div>
+      </header>
+
+      {/* 页面内容：Outlet 渲染子路由 */}
+      <main className="mx-auto max-w-7xl px-4 py-8">
+        <Outlet />
+      </main>
+    </div>
+  )
+}
+```
+
+这里又用到了 `Outlet`——导航栏始终显示，`Outlet` 位置根据当前路由渲染对应页面。
+
+#### 1.3 导航栏需要显示登录状态
+
+导航栏要根据是否登录显示不同内容：
+
+- 未登录：显示"Sign in"和"Sign up"链接
+- 已登录：显示用户名和"Sign out"按钮
+
+从 Zustand 读取登录状态，做条件渲染：
+
+```tsx
+import { Link, Outlet, useNavigate } from 'react-router-dom'
+import { useAuthStore } from '@/stores/authStore'
+import { Button } from '@/components/ui/button'
+
+export default function Layout() {
+  const { user, isAuthenticated, logout } = useAuthStore()
+  const navigate = useNavigate()
+
+  const handleLogout = () => {
+    logout()
+    navigate('/login')
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50">
+      <header className="border-b bg-white">
+        <div className="mx-auto flex max-w-7xl items-center
+                        justify-between px-4 py-4">
+          {/* Logo */}
+          <Link to="/" className="text-xl font-bold text-blue-600">
+            UUcars
+          </Link>
+
+          {/* 右侧导航 */}
+          <div className="flex items-center gap-4">
+            {isAuthenticated() ? (
+              // 已登录：显示用户名和退出按钮
+              <>
+                <span className="text-sm text-gray-600">
+                  {user?.username}
+                </span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleLogout}
+                >
+                  Sign out
+                </Button>
+              </>
+            ) : (
+              // 未登录：显示登录和注册链接
+              <>
+                <Link
+                  to="/login"
+                  className="text-sm text-gray-600 hover:text-gray-900"
+                >
+                  Sign in
+                </Link>
+                <Button asChild size="sm">
+                  <Link to="/register">Sign up</Link>
+                </Button>
+              </>
+            )}
+          </div>
+        </div>
+      </header>
+
+      <main className="mx-auto max-w-7xl px-4 py-8">
+        <Outlet />
+      </main>
+    </div>
+  )
+}
+```
+
+#### 1.4 在路由里使用布局组件
+
+Layout 组件通过路由的嵌套结构来使用——把需要显示导航栏的路由都放在 Layout 的 children 里：
+
+打开 `src/router.tsx`，更新：
+
+```tsx
+import { createBrowserRouter } from 'react-router-dom'
+import Layout from '@/components/Layout'
+import LoginPage from '@/pages/LoginPage'
+import RegisterPage from '@/pages/RegisterPage'
+import VerifyEmailPage from '@/pages/VerifyEmailPage'
+import ForgotPasswordPage from '@/pages/ForgotPasswordPage'
+import ResetPasswordPage from '@/pages/ResetPasswordPage'
+import CreateCarPage from '@/pages/CreateCarPage'
+import ProtectedRoute from '@/components/ProtectedRoute'
+
+export const router = createBrowserRouter([
+  // 认证页面：不需要导航栏（全屏居中布局）
+  { path: '/login', element: <LoginPage /> },
+  { path: '/register', element: <RegisterPage /> },
+  { path: '/verify-email', element: <VerifyEmailPage /> },
+  { path: '/forgot-password', element: <ForgotPasswordPage /> },
+  { path: '/reset-password', element: <ResetPasswordPage /> },
+
+  // 有导航栏的页面：都放在 Layout 里
+  {
+    element: <Layout />,
+    children: [
+      // 公开路由
+      {
+        path: '/',
+        element: <div>首页（占位）</div>,
+      },
+
+      // 受保护路由
+      {
+        element: <ProtectedRoute />,
+        children: [
+          { path: '/cars/new', element: <CreateCarPage /> },
+        ],
+      },
+    ],
+  },
+])
+```
+
+验证：
+
+```bash
+npm run dev
+```
+
+访问 `http://localhost:5173/`，应该看到顶部有导航栏，Logo 是 "UUcars"，右侧根据登录状态显示不同内容。
+
+
+
+### 2. 引入 TanStack Query
+
+#### 2.1  useEffect 发请求有什么问题?
+
+如果用 `useEffect` 来请求车辆列表数据，代码会是什么样：
+
+```tsx
+// 用 useEffect 发请求（不推荐）
+function HomePage() {
+  const [cars, setCars] = useState([])
+  const [isLoading, setIsLoading] = useState(true)
+  const [error, setError] = useState(null)
+
+  useEffect(() => {
+    setIsLoading(true)
+    carsApi.getPaged()
+      .then(data => setCars(data.items))
+      .catch(err => setError(err))
+      .finally(() => setIsLoading(false))
+  }, [])
+
+  if (isLoading) return <div>加载中...</div>
+  if (error) return <div>出错了</div>
+  return <div>{/* 渲染数据 */}</div>
+}
+```
+
+什么问题？
+
+每个组件都要写 loading、error、useEffect，而且没有缓存：同一个数据在不同组件里各请求一次。
+
+#### 2.2 TanStack Query 的核心概念
+
+TanStack Query（原名 React Query）是一个**服务端状态管理库**，专门处理"从服务器获取数据"这件事。
+
+TanStack Query 的核心思路是：**把服务端数据当作一种特殊的状态来管理**。
+
+TanStack Query 解决的核心问题：
+
+```bash
+缓存          → 同一个接口的数据缓存起来，不重复请求
+自动重新获取  → 窗口重新聚焦、网络重连时自动刷新数据
+loading/error → 自动管理，不需要手写 useState
+数据同步      → 多个组件用同一份数据，一处更新全部同步
+后台刷新      → 展示缓存数据的同时，后台悄悄刷新
+```
+
+它封装了2个主要Hook:
+
+```bash
+useQuery  → 获取数据（GET 请求）
+useMutation → 修改数据（POST/PUT/DELETE 请求）
+```
+
+useQuery 用法
+
+```tsx
+import { useQuery } from '@tanstack/react-query'
+
+function CarList() {
+    const { data, isLoading, error } = useQuery({
+      // queryKey：这个查询的唯一标识
+      // 用数组表示，可以包含参数
+      queryKey: ['cars', { page: 1 }],
+
+      // queryFn：实际发请求的函数，返回 Promise
+      queryFn: () => carsApi.getPaged({ page: 1 }),
+    })
+    if (isLoading) return <div>Loading...</div>
+      if (isError) return <div>{error.message}</div>
+
+      return <div>{data?.items.map(...)}</div>
+}
+
+```
+
+对比手写方式，省掉了 `useState` + `useEffect` + 手动管理 loading/error。
+
+**queryKey 是什么？**
+
+`queryKey` 是查询的唯一标识，类似于缓存的 key。TanStack Query 用它来：
+
+- 识别不同的查询（`['cars']` 和 `['cars', { page: 2 }]` 是两个不同的查询）
+- 缓存数据（相同 key 的查询结果会被缓存，不重复请求）
+- 自动刷新（key 变化时自动重新请求）
+
+**数据的生命周期：**
+
+```
+第一次请求 → 数据返回 → 存入缓存
+        ↓
+再次访问同一页面 → 立刻显示缓存数据（不等待）
+                → 后台悄悄重新请求（更新缓存）
+                → 新数据到了 → 更新显示
+```
+
+用户感知到的是：页面秒开，数据始终是最新的。
+
+~~**useMutation 的用法**后面的步骤里说明~~
+
+**和 Zustand 的分工:**
+
+```bash
+Zustand         → 客户端状态（登录信息、UI 状态、用户偏好）
+                  这些数据不来自服务器，是前端自己维护的
+
+TanStack Query  → 服务端状态（车辆列表、订单、用户资料）
+                  这些数据来自服务器，需要缓存、同步、刷新
+```
+
+```tsx
+// Zustand 管的：
+const { user, isAuthenticated, login, logout } = useAuthStore()
+
+// TanStack Query 管的：
+const { data: cars } = useQuery({ queryKey: ['cars'], queryFn: carApi.getPaged })
+const { data: orders } = useQuery({ queryKey: ['orders'], queryFn: orderApi.getMine })
+```
+
+#### 2.3 安装并配置
+
+```bash
+npm install @tanstack/react-query
+```
+
+TanStack Query 需要一个 `QueryClient` 实例来管理缓存，用 `QueryClientProvider` 在应用顶层提供：
+
+打开 `src/main.tsx`，更新：
+
+```tsx
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import { RouterProvider } from 'react-router-dom'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { router } from './router'
+import './index.css'
+
+// 创建 QueryClient 实例
+// 所有查询的缓存都存在这个实例里
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      // staleTime：数据多久后被认为"过时"
+      // 过时之前，重新访问页面不会重新请求，直接用缓存
+      // 设为 1 分钟：1 分钟内数据被认为是新鲜的
+      staleTime: 1000 * 60,
+
+      // retry：请求失败时重试次数，默认 3 次，改为 1 次
+      retry: 1,
+    },
+  },
+})
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    {/* QueryClientProvider 必须包在 RouterProvider 外面 */}
+    {/* 这样路由里的所有组件都能使用 TanStack Query */}
+    <QueryClientProvider client={queryClient}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>
+  </StrictMode>,
+)
+```
+
+
+
+### 3. 做车辆列表页
+
+现在来实现 `HomePage`，用 `useQuery` 请求车辆列表数据。
+
+#### 3.1 先想清楚这个页面需要什么
+
+车辆列表页需要：
+
+- 展示车辆卡片列表（标题、品牌、价格、里程）
+- 加载中时显示骨架屏
+- 出错时显示错误信息
+- 分页
+
+按照这个思路，一步一步来。
+
+#### 3.2 第一步：用 useQuery 请求数据
+
+打开 `src/pages/HomePage.tsx`，先把数据请求做好，暂时不管样式：
+
+```tsx
+import { useQuery } from '@tanstack/react-query'
+import { carsApi } from '@/api'
+
+export default function HomePage() {
+  const { data, isLoading, error } = useQuery({
+    queryKey: ['cars'],
+    queryFn: () => carsApi.getPaged(),
+  })
+
+  // 先用最简单的方式验证数据是否请求成功
+  if (isLoading) return <div>Loading...</div>
+  if (error) return <div>Error: {error.message}</div>
+
+  return (
+    <div>
+      <p>共 {data?.totalCount} 辆车</p>
+      {data?.items.map(car => (
+        <div key={car.id}>
+          <p>{car.title}</p>
+          <p>{car.price}</p>
+        </div>
+      ))}
+    </div>
+  )
+}
+```
+
+更新路由，把首页占位替换掉：
+
+```tsx
+import HomePage from '@/pages/HomePage'
+
+// 把原来的占位替换
+{ path: '/', element: <HomePage /> },
+```
+
+启动项目，确保后端也在运行（数据库里要有 Published 状态的车辆）。访问 `http://localhost:5173/`，应该能看到车辆数据。数据请求通了，再来优化展示。
+
+#### 3.3 第二步：做车辆卡片组件
+
+列表里每一项都是一张车辆卡片，把它抽成独立的组件，列表页只管布局和数据，卡片只管显示单辆车的信息。
+
+```bash
+touch src/components/CarCard.tsx
+import { Link } from 'react-router-dom'
+import type { Car } from '@/types'
+import {
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card'
+import { Badge } from '@/components/ui/badge'
+```
+
+> **`Badge` 组件还没安装，先装上：**
+>
+> ```bash
+> npx shadcn@latest add badge
+> ```
+
+继续写 `CarCard`：
+
+```tsx
+interface CarCardProps {
+  car: Car
+}
+
+export default function CarCard({ car }: CarCardProps) {
+  return (
+    <Link to={`/cars/${car.id}`}>
+      <Card className="cursor-pointer transition-shadow hover:shadow-md">
+        <CardHeader className="pb-2">
+          <CardTitle className="line-clamp-2 text-base">
+            {car.title}
+          </CardTitle>
+          <Badge variant="secondary" className="w-fit">
+            {car.brand}
+          </Badge>
+        </CardHeader>
+        <CardContent className="space-y-1">
+          <p className="text-2xl font-bold text-blue-600">
+            ${car.price.toLocaleString()}
+          </p>
+          <p className="text-sm text-gray-500">
+            {car.year} · {car.mileage.toLocaleString()} km
+          </p>
+        </CardContent>
+      </Card>
+    </Link>
+  )
+}
+```
+
+> **`CarCardProps` 是什么？** 这是 TypeScript 的 Props 类型定义。React 组件通过 Props 接收外部传入的数据，在 TypeScript 里需要定义这些 Props 的类型，让 IDE 知道这个组件需要什么数据、数据是什么类型。
+>
+> ```tsx
+> // 定义 Props 的形状
+> interface CarCardProps {
+>   car: Car   // car 是 Car 类型，必须传
+> }
+> 
+> // 在组件参数里使用这个类型
+> function CarCard({ car }: CarCardProps) { ... }
+> // { car } 是解构语法，从 props 对象里取出 car 字段
+> ```
+
+#### 3.4 第三步：骨架屏
+
+骨架屏是加载时的占位效果，让用户看到页面大致结构，而不是一片空白。
+
+先安装 Skeleton 组件：
+
+```bash
+npx shadcn@latest add skeleton
+```
+
+创建车辆卡片的骨架屏：
+
+```bash
+touch src/components/CarCardSkeleton.tsx
+import { Card, CardContent, CardHeader } from '@/components/ui/card'
+import { Skeleton } from '@/components/ui/skeleton'
+
+export default function CarCardSkeleton() {
+  return (
+    <Card>
+      <CardHeader className="pb-2">
+        {/* Skeleton 组件：显示灰色闪烁的占位块 */}
+        {/* className 控制它的大小，和真实内容的大小保持一致 */}
+        <Skeleton className="h-5 w-3/4" />
+        <Skeleton className="h-5 w-1/4" />
+      </CardHeader>
+      <CardContent className="space-y-2">
+        <Skeleton className="h-8 w-1/3" />
+        <Skeleton className="h-4 w-1/2" />
+      </CardContent>
+    </Card>
+  )
+}
+```
+
+#### 3.5 第四步：分页
+
+分页需要知道当前是第几页，页码变化时重新请求数据。
+
+先看 `queryKey` 是怎么配合分页工作的：
+
+```tsx
+// page 是状态，变化时触发重新请求
+const [page, setPage] = useState(1)
+
+const { data } = useQuery({
+  // queryKey 包含 page，page 变化时 key 不同，自动重新请求
+  queryKey: ['cars', { page }],
+  queryFn: () => carsApi.getPaged({ page }),
+})
+```
+
+```bash
+useState 管的是"用户想看第几页"（输入）
+	- page  → 用户当前在第几页，是前端 UI 的状态
+              用户点"下一页"→ page 变化 → 触发新的请求
+              这是前端自己维护的，和服务器无关
+              
+useQuery 管的是"这一页的数据是什么"（输出）
+	- cars 列表 → 从服务器获取的数据
+```
+
+这就是 `queryKey` 的精妙之处——把查询参数放进 key，参数变化时自动触发新的请求，不需要手动管理。
+
+#### 3.6 第五步：把所有部分组合起来
+
+现在把 `HomePage` 更新成完整版本：
+
+```tsx
+import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { carsApi } from "@/api";
+import CarCard from "@/components/CarCard";
+import CarCardSkeleton from "@/components/CarCardSkeleton";
+import { Button } from "@/components/ui/button";
+
+// 配置每页显示的数量
+// 前端单独维护显示的数量
+const PAGE_SIZE = 10;
+
+export default function HomePage() {
+  const [page, setPage] = useState(1);
+
+  const { data, isLoading, error } = useQuery({
+    queryKey: ["cars", { page, pageSize: PAGE_SIZE }],
+    queryFn: () => carsApi.getPaged({ page, pageSize: PAGE_SIZE }),
+  });
+
+  if (error) {
+    return (
+      <div className="py-12 text-center text-gray-500">
+        Failed to load cars. Please try again.
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      <h1 className="text-2xl font-bold">Browse Cars</h1>
+
+      {/* 车辆卡片网格 */}
+      <div
+        className="grid grid-cols-1 gap-4
+                      sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"
+      >
+        {isLoading
+          ? // 加载中：显示 PAGE_SIZE 个骨架屏
+            Array.from({ length: PAGE_SIZE }).map((_, i) => (
+              <CarCardSkeleton key={i} />
+            ))
+          : // 加载完成：显示真实数据
+            data?.items.map((car) => <CarCard key={car.id} car={car} />)}
+      </div>
+
+      {/* 没有数据时的提示 */}
+      {!isLoading && data?.items.length === 0 && (
+        <div className="py-12 text-center text-gray-500">
+          No cars available at the moment.
+        </div>
+      )}
+
+      {/* 分页控制 */}
+      {data && data.totalPages > 1 && (
+        <div className="flex items-center justify-center gap-4">
+          <Button
+            variant="outline"
+            onClick={() => setPage((p) => p - 1)}
+            disabled={page === 1}
+          >
+            Previous
+          </Button>
+
+          <span className="text-sm text-gray-600">
+            Page {page} of {data.totalPages}
+          </span>
+
+          <Button
+            variant="outline"
+            onClick={() => setPage((p) => p + 1)}
+            disabled={page === data.totalPages}
+          >
+            Next
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+```
+
+**`Array.from({ length: PAGE_SIZE }).map((_, i) => ...)`** 是什么？
+
+这是 JavaScript 生成固定数量元素的常用写法。`Array.from({ length: PAGE_SIZE })` 创建一个有 PAGE_SIZE(比如10 )个空元素的数组，`.map()` 遍历它，`_` 表示我们不关心元素的值（占位符），`i` 是索引，用作 `key`。
+
+
+
+### 4. 验证完整效果
+
+```bash
+npm run dev
+```
+
+确保后端运行，数据库里有 Published 状态的车辆。
+
+**测试加载状态：** 刷新页面，短暂看到骨架屏，数据加载完成后骨架屏消失，显示真实车辆卡片。
+
+**测试分页：** 如果数据库里有超过 PAGE_SIZE 辆 Published 状态的车，分页按钮会显示。点击 Next，页码变化，数据自动更新。
+
+**测试缓存：** 点击一辆车进入详情页（现在是占位），返回列表页，数据立刻显示（不需要重新等待加载），这就是 TanStack Query 的缓存效果。
+
+
+
+### 5. 此时的目录变化
+
+```
+src/
+├── components/
+│   ├── Layout.tsx          ← 新增
+│   ├── CarCard.tsx         ← 新增
+│   └── CarCardSkeleton.tsx ← 新增
+├── pages/
+│   └── HomePage.tsx        ← 已更新（完整实现）
+├── router.tsx              ← 已更新
+└── main.tsx                ← 已更新（QueryClientProvider）
+```
+
+
+
+### 6. Git 提交
+
+```bash
+git add .
+git commit -m "feat: home page with car listing, skeleton, pagination"
+git push origin feature/browse-pages
+```
+
+
+
+### Step 49 完成状态
+
+```
+✅ Layout 组件（导航栏 + Outlet，登录状态条件渲染）
+✅ 理解为什么用布局组件（一处定义，所有页面共享）
+✅ 安装 TanStack Query，配置 QueryClientProvider
+✅ 理解 useEffect 发请求的问题（重复代码/无缓存/竞态）
+✅ 理解 useQuery 的工作方式（queryKey/queryFn/缓存机制）
+✅ 理解 queryKey 如何驱动自动重新请求（分页的核心）
+✅ 理解 staleTime（数据新鲜度控制）
+✅ CarCard 组件（Props类型定义 + 解构语法）
+✅ 骨架屏 CarCardSkeleton
+✅ 首页列表（加载/错误/空数据/分页四种状态）
+✅ 测试通过（骨架屏 → 数据 → 分页 → 缓存）
+✅ Git commit 完成
+```
