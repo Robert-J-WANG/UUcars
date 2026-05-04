@@ -8961,3 +8961,600 @@ git push origin feature/browse-pages
 ✅ 测试通过（骨架屏 → 数据 → 分页 → 缓存）
 ✅ Git commit 完成
 ```
+
+
+
+好，先核查 Step 50 的内容。
+
+
+
+## Step 50 · 搜索过滤
+
+### 这一步做什么
+
+Step 49 做的车辆列表只有分页，没有任何过滤条件。买家想找"10万以内的丰田"，现在只能一页一页翻。
+
+这一步给列表页加上搜索过滤：按品牌、价格区间过滤。
+
+同时解决一个体验问题：**搜索条件要和 URL 同步**。现在如果用户筛选了"品牌：BMW，最高价格：20万"，把这个页面的 URL 发给朋友，朋友打开是空的列表，过滤条件全没了。
+
+URL 同步解决这个问题——过滤条件存在 URL 里，分享链接就是分享搜索结果。
+
+
+
+### 1. 数据流
+
+加了搜索过滤之后，数据流是这样的：
+
+```
+用户修改过滤条件（输入品牌、选择价格）
+        ↓
+过滤条件更新到 URL 参数
+        ↓
+从 URL 参数读取过滤条件
+        ↓
+作为 queryKey 的一部分传给 useQuery
+        ↓
+useQuery 检测到 queryKey 变化，自动重新请求
+        ↓
+列表更新
+```
+
+URL 是过滤条件的"单一数据源"——所有组件都从 URL 读取当前的过滤条件，修改条件也通过更新 URL 来完成。
+
+
+
+### 2. useSearchParams 深入
+
+Step 48 里用过 `useSearchParams` 读取单个参数，这一步要用它做双向同步。
+
+**读取参数（Step 48 已用过）：**
+
+```tsx
+const [searchParams] = useSearchParams()
+const token = searchParams.get('token')
+```
+
+**修改参数（这一步新用到）：**
+
+`useSearchParams` 返回数组的第二个元素是**设置参数的函数**：
+
+```tsx
+const [searchParams, setSearchParams] = useSearchParams()
+
+// 修改 URL 参数
+// 调用后 URL 会变成 /cars?brand=BMW&maxPrice=200000
+setSearchParams({ brand: 'BMW', maxPrice: '200000' })
+```
+
+注意：URL 里的参数值全部是字符串，即使你设置的是数字，在 URL 里也是字符串，读取后需要转换：
+
+```tsx
+// URL: /?maxPrice=200000
+const maxPrice = searchParams.get('maxPrice')  // → "200000"（字符串）
+const maxPriceNumber = Number(maxPrice)         // → 200000（数字）
+```
+
+
+
+### 3. 防抖（Debounce）是什么
+
+过滤条件里有一个输入框——品牌搜索。用户每输入一个字符就触发一次请求，用户输入 "BMW" 会发三次请求（B、BM、BMW），其中前两次完全是浪费。
+
+**防抖**解决这个问题：用户停止输入一段时间后（比如 500ms），才触发请求。用户输入过程中不发请求。
+
+```
+用户输入 B        → 重置计时器，等待 500ms
+用户输入 BM       → 重置计时器，等待 500ms
+用户输入 BMW      → 重置计时器，等待 500ms
+500ms 内没有新输入 → 触发请求（只发一次）
+```
+
+
+
+### 4. 实现 useDebounce 自定义 Hook
+
+React 允许你把可复用的逻辑封装成**自定义 Hook**。自定义 Hook 就是一个函数，函数名以 `use` 开头，内部可以使用其他 Hook。
+
+**为什么要封装成 Hook 而不是普通函数？**
+
+防抖需要用到 `useState` 和 `useEffect`，而这两个只能在 React 组件或自定义 Hook 里使用，不能在普通函数里用。封装成 Hook，防抖逻辑就可以在任何组件里复用。
+
+先理解防抖的实现思路：
+
+```
+用户输入时：
+  设置一个定时器，500ms 后更新"防抖后的值"
+  如果在 500ms 内又有新输入：
+    清除上一个定时器（重置）
+    重新设置定时器
+500ms 内没有新输入：
+  定时器触发，更新"防抖后的值"
+```
+
+用 `useState` 存防抖后的值，用 `useEffect` 管理定时器：
+
+```ts
+touch src/hooks/useDebounce.ts
+import { useState, useEffect } from 'react'
+
+// 泛型 T：让这个 Hook 能处理任意类型的值
+// 不只是字符串，数字、对象都可以防抖
+function useDebounce<T>(value: T, delay: number): T {
+  // debouncedValue：防抖后的值，这才是真正用来发请求的值
+  const [debouncedValue, setDebouncedValue] = useState<T>(value)
+
+  useEffect(() => {
+    // value 变化时，设置一个定时器
+    // delay 毫秒后，把 debouncedValue 更新为最新的 value
+    const timer = setTimeout(() => {
+      setDebouncedValue(value)
+    }, delay)
+
+    // useEffect 的清理函数：在下次 effect 执行前调用
+    // 如果 value 在 delay 内又变化了，先清除上一个定时器
+    // 这就实现了"重置计时器"的效果
+    return () => {
+      clearTimeout(timer)
+    }
+
+    // value 或 delay 变化时重新执行这个 effect
+  }, [value, delay])
+
+  return debouncedValue
+}
+
+export default useDebounce
+```
+
+验证理解：
+
+```
+value 变成 "B"
+  → effect 执行，设置 timer A（500ms 后更新 debouncedValue 为 "B"）
+
+value 变成 "BM"（500ms 内）
+  → 清理函数执行，清除 timer A
+  → effect 重新执行，设置 timer B（500ms 后更新 debouncedValue 为 "BM"）
+
+value 变成 "BMW"（500ms 内）
+  → 清理函数执行，清除 timer B
+  → effect 重新执行，设置 timer C（500ms 后更新 debouncedValue 为 "BMW"）
+
+500ms 内没有新变化
+  → timer C 触发，debouncedValue 更新为 "BMW"
+  → useQuery 的 queryKey 变化，发起请求
+```
+
+
+
+### 5. 做搜索过滤 UI
+
+先创建一个独立的搜索过滤组件，不和列表页混在一起：
+
+```bash
+touch src/components/CarFilters.tsx
+```
+
+**第一步：想清楚这个组件需要什么**
+
+过滤组件需要：
+
+- 读取 URL 里当前的过滤条件（初始化输入框的值）
+- 用户修改时更新 URL
+
+它不需要知道列表数据，只负责过滤条件的读写：
+
+```tsx
+import { useSearchParams } from 'react-router-dom'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Button } from '@/components/ui/button'
+```
+
+**第二步：读取当前过滤条件初始化输入框**
+
+```tsx
+import { useSearchParams } from 'react-router-dom'
+
+export default function CarFilters() {
+  const [searchParams, setSearchParams] = useSearchParams()
+
+  // 从 URL 读取当前的过滤条件，作为输入框的初始值
+  // 没有对应参数时用空字符串或 undefined
+  const brand = searchParams.get('brand') ?? ''
+  const minPrice = searchParams.get('minPrice') ?? ''
+  const maxPrice = searchParams.get('maxPrice') ?? ''
+```
+
+**第三步：更新过滤条件**
+
+用户修改过滤条件时，更新 URL 参数。注意要保留已有的参数（比如已有 brand，再加 maxPrice 时不能把 brand 清掉）：
+
+```tsx
+  const updateFilter = (key: string, value: string) => {
+    // 用当前的所有参数构建新的参数对象
+    const current = Object.fromEntries(searchParams.entries())
+
+    if (value) {
+      // 有值：更新这个参数
+      current[key] = value
+    } else {
+      // 空值：删除这个参数（不在 URL 里显示空参数）
+      // 比如用户清空了品牌输入框
+      // updateFilter("brand", "")
+      // → value 是空字符串 → delete current["brand"]
+      // → URL 里 brand 参数消失，不会变成 ?brand=
+      delete current[key]
+    }
+
+    // 每次改过滤条件，把 page 参数从 URL 里删掉
+	// 效果是重置回第一页
+	// 防止出现"第5页但只有2页数据"的情况
+    delete current['page']
+
+    setSearchParams(current)
+  }
+```
+
+>`Object.fromEntries(searchParams.entries())`的用法：
+>
+>```tsx
+>// searchParams 是 URL 参数对象，不是普通对象
+>// 比如 URL 是 ?brand=Toyota&minPrice=50000
+>// searchParams.entries() 返回迭代器：[["brand","Toyota"], ["minPrice","50000"]]
+>// Object.fromEntries 把它转成普通对象
+>const current = Object.fromEntries(searchParams.entries())
+>// current = { brand: "Toyota", minPrice: "50000" }
+>```
+>
+>为什么要转？因为 `searchParams` 不能直接修改，需要先转成普通对象再操作。
+>
+>`delete`是什么？？？
+>
+>`delete` 是 JavaScript **内置运算符**，不是方法，专门用来删除对象的属性：
+>
+>```ts
+>const obj = { a: 1, b: 2, c: 3 }
+>delete obj.b
+>// obj = { a: 1, c: 3 }
+>
+>// 两种写法都行
+>delete obj.b        // 点语法
+>delete obj["b"]     // 方括号语法，适合动态 key
+>```
+
+完整流程举例：
+
+```bash
+当前 URL：?brand=Toyota&minPrice=50000&page=3
+
+用户把品牌改成 Honda
+  → updateFilter("brand", "Honda")
+  → current = { brand: "Toyota", minPrice: "50000", page: "3" }
+  → current["brand"] = "Honda"
+  → delete current["page"]
+  → current = { brand: "Honda", minPrice: "50000" }
+  → setSearchParams(current)
+  → 新 URL：?brand=Honda&minPrice=50000  ← page 消失，回到第一页
+```
+
+
+
+**第四步：清空所有过滤条件**
+
+```tsx
+  const clearFilters = () => {
+    setSearchParams({}) // URL 变成完全干净，没有任何参数
+  }
+```
+
+**第五步：渲染 UI**
+
+```tsx
+import { useSearchParams } from 'react-router-dom'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Button } from '@/components/ui/button'
+
+...
+
+// 派生的 UI 状态
+const hasFilters = brand || minPrice || maxPrice
+
+return (
+    <div className="rounded-lg border bg-white p-4 space-y-4">
+      <h2 className="font-semibold">Filters</h2>
+
+      {/* 品牌搜索 */}
+      <div className="space-y-1">
+        <Label htmlFor="brand">Brand</Label>
+        <Input
+          id="brand"
+          placeholder="e.g. BMW, Toyota"
+          value={brand}
+          onChange={(e) => updateFilter('brand', e.target.value)}
+        />
+      </div>
+
+      {/* 价格区间 */}
+      <div className="space-y-1">
+        <Label>Price Range</Label>
+        <div className="flex gap-2">
+          <Input
+            placeholder="Min"
+            type="number"
+            value={minPrice}
+            onChange={(e) => updateFilter('minPrice', e.target.value)}
+          />
+          <Input
+            placeholder="Max"
+            type="number"
+            value={maxPrice}
+            onChange={(e) => updateFilter('maxPrice', e.target.value)}
+          />
+        </div>
+      </div>
+
+      {/* 清空过滤条件 */}
+      {hasFilters && (
+        <Button
+          variant="outline"
+          className="w-full"
+          onClick={clearFilters}
+        >
+          Clear filters
+        </Button>
+      )}
+    </div>
+  )
+}
+```
+
+注意：<Input/>里使用value而不是defaultValue，**否则，清空过滤后输入框不会清空**
+
+```tsx
+// defaultValue：非受控输入，只设置初始值，之后 React 不管它
+<Input defaultValue={brand} onChange={...} />
+
+// value：受控输入，值始终和变量绑定，变量变了输入框跟着变
+<Input value={brand} onChange={...} />
+```
+
+这样 `clearFilters` 清空 `searchParams` 后，`brand`/`minPrice`/`maxPrice` 都变成空字符串，输入框跟着清空。
+
+### 6. 在 HomePage 里使用过滤条件
+
+现在 `CarFilters` 负责把过滤条件写入 URL，`HomePage` 负责从 URL 读取过滤条件发请求。
+
+打开 `src/pages/HomePage.tsx`，更新：
+
+**第一步：从 URL 读取过滤条件**
+
+```tsx
+import { useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
+import { useQuery } from '@tanstack/react-query'
+import { carsApi } from '@/api'
+import useDebounce from '@/hooks/useDebounce'
+import CarCard from '@/components/CarCard'
+import CarCardSkeleton from '@/components/CarCardSkeleton'
+import CarFilters from '@/components/CarFilters'
+import { Button } from '@/components/ui/button'
+
+// 前端单独维护显示的数量
+const PAGE_SIZE = 10;
+
+export default function HomePage() {
+  const [searchParams, setSearchParams] = useSearchParams()
+
+  // 从 URL 读取当前过滤条件
+  const brand = searchParams.get('brand') ?? ''
+  const minPrice = searchParams.get('minPrice') ?? ''
+  const maxPrice = searchParams.get('maxPrice') ?? ''
+  const page = Number(searchParams.get('page') ?? '1')
+```
+
+**第二步：对品牌搜索加防抖**
+
+品牌是输入框，每次按键都会触发，需要防抖。价格是数字输入框，用户通常输完再改，防抖影响不大但加上也无妨：
+
+```tsx
+  // 加防抖：用户停止输入 500ms 后才触发请求
+  const debouncedBrand = useDebounce(brand, 500);
+  const debouncedMinPrice = useDebounce(minPrice, 800);
+  const debouncedMaxPrice = useDebounce(maxPrice, 800);
+```
+
+**第三步：用防抖后的值作为 queryKey 和请求参数**
+
+```tsx
+  const { data, isLoading, error } = useQuery({
+    // queryKey 用防抖后的 brand，不用原始的 brand
+    // 这样用户打字过程中 queryKey 不变，不触发请求
+    // 停止输入 500ms 后 debouncedBrand 变化，queryKey 变化，才触发请求
+    queryKey: [
+      "cars",
+      {
+        page,
+        pageSize: PAGE_SIZE,
+        brand: debouncedBrand,
+        minPrice: debouncedMinPrice,
+        maxPrice: debouncedMaxPrice,
+      },
+    ],
+    queryFn: () =>
+      carsApi.getPaged({
+        page,
+        pageSize: PAGE_SIZE,
+        brand: debouncedBrand || undefined,
+        minPrice: debouncedMinPrice ? Number(debouncedMinPrice) : undefined,
+        maxPrice: debouncedMaxPrice ? Number(debouncedMaxPrice) : undefined,
+      }),
+  });
+```
+
+**第四步：分页通过 URL 参数控制**
+
+分页不再用 `useState`，改为通过 URL 参数控制，和过滤条件保持一致：
+
+```tsx
+  const handlePageChange = (newPage: number) => {
+    const current = Object.fromEntries(searchParams.entries())
+    setSearchParams({ ...current, page: String(newPage) })
+  }
+```
+
+**第五步：更新 JSX，加入过滤组件**
+
+```tsx
+  if (error) {
+    return (
+      <div className="py-12 text-center text-gray-500">
+        Failed to load cars. Please try again.
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex gap-6">
+      {/* 左侧：过滤条件 */}
+      <aside className="hidden w-64 shrink-0 lg:block">
+        <CarFilters />
+      </aside>
+
+      {/* 右侧：列表 */}
+      <div className="flex-1 space-y-6">
+        <div className="flex items-center justify-between">
+          <h1 className="text-2xl font-bold">Browse Cars</h1>
+          {data && (
+            <p className="text-sm text-gray-500">
+              {data.totalCount} cars found
+            </p>
+          )}
+        </div>
+
+        {/* 车辆卡片网格 */}
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+          {isLoading
+            ? Array.from({ length: pageSize }).map((_, i) => (
+                <CarCardSkeleton key={i} />
+              ))
+            : data?.items.map(car => (
+                <CarCard key={car.id} car={car} />
+              ))
+          }
+        </div>
+
+        {/* 没有数据 */}
+        {!isLoading && data?.items.length === 0 && (
+          <div className="py-12 text-center text-gray-500">
+            No cars found. Try adjusting your filters.
+          </div>
+        )}
+
+        {/* 分页 */}
+        {data && data.totalPages > 1 && (
+          <div className="flex items-center justify-center gap-4">
+            <Button
+              variant="outline"
+              onClick={() => handlePageChange(page - 1)}
+              disabled={page === 1}
+            >
+              Previous
+            </Button>
+            <span className="text-sm text-gray-600">
+              Page {page} of {data.totalPages}
+            </span>
+            <Button
+              variant="outline"
+              onClick={() => handlePageChange(page + 1)}
+              disabled={page === data.totalPages}
+            >
+              Next
+            </Button>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+```
+
+
+
+### 7. 完整测试
+
+```bash
+npm run dev
+```
+
+**测试防抖效果：**
+
+打开浏览器开发者工具 → Network 面板，在品牌输入框快速输入 "BMW"。观察网络请求，应该只有一次请求（停止输入 500ms 后），而不是每个字母一次。
+
+**测试 URL 同步：**
+
+在品牌输入框输入 "BMW"，设置最高价格 200000。观察浏览器地址栏，URL 应该变成：
+
+```
+http://localhost:5173/?brand=BMW&maxPrice=200000
+```
+
+复制这个 URL，开新标签页粘贴打开。过滤条件应该自动恢复——输入框有值，列表已经过滤好了。
+
+**测试分页 + 过滤组合：**
+
+设置过滤条件后翻页，URL 应该同时包含过滤参数和页码参数：
+
+```
+http://localhost:5173/?brand=BMW&page=2
+```
+
+**测试清空过滤：**
+
+点击 "Clear filters"，URL 回到 `/`，列表显示所有车辆。
+
+
+
+### 8. 此时的目录变化
+
+```
+src/
+├── components/
+│   ├── CarFilters.tsx      ← 新增
+│   └── CarCard.tsx         （已有）
+├── hooks/
+│   └── useDebounce.ts      ← 新增
+└── pages/
+    └── HomePage.tsx        ← 已更新
+```
+
+
+
+### 9. Git 提交
+
+```bash
+git add .
+git commit -m "feat: car search filters with URL sync and debounce"
+git push origin feature/browse-pages
+```
+
+
+
+### Step 50 完成状态
+
+```
+✅ 理解搜索条件和 URL 同步的意义（分享链接=分享结果）
+✅ 理解 useSearchParams 双向用法（读取 + 修改）
+✅ 理解 URL 参数全是字符串，数字需要转换
+✅ 理解防抖的原理（重置计时器）
+✅ 理解 useEffect 清理函数（clearTimeout）
+✅ 理解自定义 Hook（用 use 开头，内部可用其他 Hook）
+✅ useDebounce 实现（泛型 + useState + useEffect）
+✅ CarFilters 组件（读写 URL 参数，保留已有参数）
+✅ HomePage 更新（URL 驱动查询，防抖品牌搜索）
+✅ 分页通过 URL 参数控制（和过滤条件统一管理）
+✅ 测试通过（防抖/URL同步/分页+过滤组合/清空）
+✅ Git commit 完成
+```
