@@ -9575,7 +9575,7 @@ git push origin feature/browse-pages
 
 这一步引入两个新东西：`useParams`（从 URL 读取车辆 ID）和 `useMutation`（处理修改数据的操作）。
 
-------
+
 
 ### 1. useParams 是什么
 
@@ -9598,7 +9598,7 @@ const { id } = useParams()
 const carId = Number(id)  // 转成数字
 ```
 
-------
+
 
 ### 2. useMutation 是什么
 
@@ -9651,7 +9651,7 @@ mutation.mutate(carId)
 // mutation.isSuccess  → 执行成功
 ```
 
-------
+
 
 ### 3. 安装 sonner（Toast 通知）
 
@@ -9703,7 +9703,7 @@ toast.success('Order placed successfully!')
 toast.error('Something went wrong.')
 ```
 
-------
+
 
 ### 4. 安装 Dialog 组件
 
@@ -9744,7 +9744,7 @@ const [open, setOpen] = useState(false)
 </Dialog>
 ```
 
-------
+
 
 ### 5. 实现详情页
 
@@ -10233,7 +10233,7 @@ export default function CarDetailPage() {
 }
 ```
 
-------
+
 
 ### 6. 完整测试
 
@@ -10261,7 +10261,7 @@ npm run dev
 
 下单成功后返回详情页，刷新，车辆状态应该变成 "Sold"，按钮消失。
 
-------
+
 
 ### 7. 此时的目录变化
 
@@ -10272,7 +10272,7 @@ src/
 └── main.tsx                ← 已更新（Toaster）
 ```
 
-------
+
 
 ### 8. Git 提交
 
@@ -10282,7 +10282,7 @@ git commit -m "feat: car detail page with buy and favorite actions"
 git push origin feature/browse-pages
 ```
 
-------
+
 
 ### Step 51 完成状态
 
@@ -10298,4 +10298,384 @@ git push origin feature/browse-pages
 ✅ 下单功能（Dialog 确认 + useMutation）
 ✅ 测试通过（权限渲染/收藏/下单/缓存刷新）
 ✅ Git commit 完成
+```
+
+
+
+## Step 52 · 完善导航布局
+
+### 这一步做什么
+
+Step 49 做的 `Layout` 组件只有最基础的导航栏，功能缺失：
+
+```
+现在：Logo + 用户名 + Sign out
+缺少：发布车辆链接、个人中心链接、当前页面高亮
+```
+
+这一步把导航栏完善，同时引入 `NavLink`——它和 `Link` 的区别是能感知当前路由，自动给当前页面的链接加高亮样式。
+
+
+
+### 1. NavLink 和 Link 的区别
+
+Step 46 开始一直在用 `Link` 做页面跳转。`Link` 只负责跳转，不关心当前在哪个页面。
+
+`NavLink` 多了一个能力：**知道自己指向的路由是不是当前激活的路由**，并且可以根据这个状态改变样式。
+
+```tsx
+// Link：固定样式，不感知当前路由
+<Link to="/cars" className="text-gray-600">
+  Browse Cars
+</Link>
+
+// NavLink：当前在 /cars 时，className 函数里的 isActive 为 true
+<NavLink
+  to="/cars"
+  className={({ isActive }) =>
+    isActive
+      ? "text-blue-600 font-semibold"   // 当前页面的样式
+      : "text-gray-600 hover:text-gray-900"  // 其他页面的样式
+  }
+>
+  Browse Cars
+</NavLink>
+```
+
+`className` 接收一个函数，函数参数里有 `isActive` 布尔值，根据它返回不同的类名字符串。这比手动判断路由再设置样式简洁得多。
+
+
+
+### 2. 安装下拉菜单组件
+
+用户登录后，点击用户名显示下拉菜单（个人中心、退出登录等）。用 shadcn 的 DropdownMenu 组件：
+
+```bash
+npx shadcn@latest add dropdown-menu
+```
+
+**DropdownMenu 的基本用法：**
+
+```tsx
+<DropdownMenu>
+  {/* 触发元素：点击它显示菜单 */}
+  <DropdownMenuTrigger asChild>
+    <Button variant="ghost">用户名</Button>
+  </DropdownMenuTrigger>
+
+  {/* 菜单内容 */}
+  <DropdownMenuContent align="end">
+    <DropdownMenuItem onClick={handleLogout}>
+      Sign out
+    </DropdownMenuItem>
+  </DropdownMenuContent>
+</DropdownMenu>
+```
+
+`align="end"` 让菜单从右侧对齐弹出，不会超出屏幕右边缘。
+
+
+
+### 3. 完善 Layout 组件
+
+打开 `src/components/Layout.tsx
+
+先想清楚导航栏需要什么
+
+```
+左侧：Logo（点击回首页）+ 主导航链接（Browse Cars）
+右侧：
+  未登录 → Sign in 链接 + Sign up 按钮
+  已登录 → Sell a Car 按钮 + 用户下拉菜单
+             下拉菜单里：My Profile、My Listings、Sign out
+```
+
+定义 NavLink 的样式函数
+
+这个样式逻辑会用到多次，抽成一个变量：
+
+```tsx
+// 导航链接的样式函数
+// isActive 为 true 时：蓝色加粗
+// isActive 为 false 时：灰色，hover 时变深
+const navLinkClass = ({ isActive }: { isActive: boolean }) =>
+  isActive
+    ? 'text-blue-600 font-semibold text-sm'
+    : 'text-gray-600 hover:text-gray-900 text-sm'
+```
+
+实现左侧：替换为`<NavLink/>`标签，并给主导航链接添加 `navLinkClass` 类名
+
+```tsx
+import { NavLink, Outlet, useNavigate } from "react-router-dom";
+
+...
+
+  return (
+    <div className="min-h-screen bg-gray-50">
+      <header className="border-b bg-white">
+        <div className="mx-auto flex max-w-7xl items-center
+                        justify-between px-4 py-4">
+
+          {/* 左侧*/}
+          <div className="flex items-center gap-8">
+              
+            {/* Logo */}
+            <NavLink to="/" className="text-xl font-bold text-blue-600">
+              UUcars
+            </NavLink>
+			
+            {/* 主导航 */}
+            <nav className="flex items-center gap-6">
+              <NavLink to="/" className={navLinkClass} end>
+                Browse Cars
+              </NavLink>
+            </nav>
+          </div>
+
+          {/* 右侧：登录状态 */}
+          <div className="flex items-center gap-3">
+            ...
+          </div>
+
+        </div>
+      </header>
+
+      <main className="mx-auto max-w-7xl px-4 py-8">
+        <Outlet />
+      </main>
+    </div>
+  )
+}
+```
+
+实现右侧：未登录状态
+
+```tsx
+...
+  return (
+    <div className="min-h-screen bg-gray-50">
+      <header className="border-b bg-white">
+        <div className="mx-auto flex max-w-7xl items-center
+                        justify-between px-4 py-4">
+
+          {/* 左侧 */}
+          <div className="flex items-center gap-8">
+           ...
+          </div>
+
+          {/* 右侧*/}
+          <div className="flex items-center gap-3">
+            {isAuthenticated() ? (
+              // 登录状态
+              <>
+                ...
+              </>
+            ) : (
+              // 未登录状态
+              <>
+                {/* 登录 */} 
+                <NavLink
+                  to="/login"
+                  className="text-sm text-gray-600 hover:text-gray-900"
+                >
+                  Sign in
+                </NavLink>
+              	{/* 注册 */}
+                <Button asChild size="sm">
+                  <NavLink to="/register">Sign up</NavLink>
+                </Button>
+              </>
+            )}
+          </div>
+
+        </div>
+      </header>
+      ...
+    </div>
+  )
+}
+```
+
+实现右侧：登录状态 - 使用下拉菜单组件
+
+```tsx
+
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "./ui/dropdown-menu";
+
+...
+
+  return (
+    <div className="min-h-screen bg-gray-50">
+      <header className="border-b bg-white">
+        <div
+          className="mx-auto flex max-w-7xl items-center
+                        justify-between px-4 py-4"
+        >
+          {/* 左侧*/}
+          <div className="flex items-center gap-8">
+           ...
+          </div>
+
+          {/* 右侧 */}
+          <div className="flex items-center gap-3">
+            {isAuthenticated() ? (
+              // 登录状态
+              <>
+                {/* 发布车辆按钮 */}
+                <Button asChild size="sm" variant="outline">
+                  <NavLink to="/cars/new">Sell a Car</NavLink>
+                </Button>
+
+                {/* 用户下拉菜单 */}
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button variant="ghost" size="sm">
+                      {user?.username}
+                    </Button>
+                  </DropdownMenuTrigger>
+
+                  <DropdownMenuContent align="end" className="w-48">
+                     
+                    {/* 用户资料 */} 
+                    <DropdownMenuItem onClick={() => navigate("/profile")}>
+                      My Profile
+                    </DropdownMenuItem>
+                      
+                    {/* 车辆发布列表 */}  
+                    <DropdownMenuItem
+                      onClick={() => navigate("/profile/listings")}
+                    >
+                      My Listings
+                    </DropdownMenuItem>
+                      
+                    {/* 购买列表 */}
+                    <DropdownMenuItem
+                      onClick={() => navigate("/profile/purchases")}
+                    >
+                      My Purchases
+                    </DropdownMenuItem>
+
+                    {/* 分隔线 */}
+                    <DropdownMenuSeparator />
+
+                    {/* Admin 入口：只有 Admin 角色才显示 */}
+                    {user?.role === "Admin" && (
+                      <>
+                        <DropdownMenuItem onClick={() => navigate("/admin")}>
+                          Admin Panel
+                        </DropdownMenuItem>
+                        <DropdownMenuSeparator />
+                      </>
+                    )}
+                      
+					{/* 退出登录 */}
+                    <DropdownMenuItem
+                      onClick={handleLogout}
+                      className="text-red-600"
+                    >
+                      Sign out
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </>
+            ) : (
+              // 未登录状态
+              <>
+               ...
+              </>
+            )}
+          </div>
+        </div>
+      </header>
+     ...
+    </div>
+  );
+}
+
+```
+
+> **`NavLink to="/" end` 里的 `end` 是什么？** 默认情况下，`/` 会匹配所有以 `/` 开头的路由（几乎所有路由），导致 "Browse Cars" 这个链接在任何页面都显示为激活状态。`end` 属性让它只在**完全匹配** `/` 时才激活，访问 `/cars/1` 时就不会激活了。
+
+
+
+### 4. 验证
+
+```bash
+npm run dev
+```
+
+**测试 NavLink 高亮：**
+
+访问首页 `/`，"Browse Cars" 链接应该是蓝色加粗。跳转到其他页面，它变回灰色。
+
+**测试未登录状态：**
+
+清除 localStorage，刷新，导航栏右侧显示 "Sign in" 和 "Sign up"。
+
+**测试已登录状态：**
+
+登录后，导航栏右侧显示 "Sell a Car" 按钮和用户名。点击用户名，下拉菜单出现，有 "My Profile"、"My Listings"、"My Purchases"、"Sign out" 等选项。
+
+**测试 Admin 菜单：**
+
+用 Admin 账号登录（`admin@uucars.com`），下拉菜单里额外显示 "Admin Panel" 选项。
+
+**测试退出登录：**
+
+点击 "Sign out"，跳转到登录页，导航栏恢复未登录状态。
+
+
+
+### 5. 此时的目录变化
+
+```
+src/
+└── components/
+    └── Layout.tsx    ← 已更新（NavLink + 下拉菜单）
+```
+
+
+
+### 6. Git 提交
+
+```bash
+git add .
+git commit -m "feat: complete navigation with NavLink and dropdown menu"
+git push origin feature/browse-pages
+```
+
+这一步完成，`feature/browse-pages` 分支包含了 Step 49、50、51、52 的所有内容，可以合并回 `develop`：
+
+```bash
+git checkout develop
+git merge --no-ff feature/browse-pages \
+    -m "merge: feature/browse-pages into develop"
+git push origin develop
+git branch -D feature/browse-pages
+git push origin --delete feature/browse-pages
+```
+
+
+
+### Step 52 完成状态
+
+```
+✅ 理解 NavLink 和 Link 的区别（感知当前路由）
+✅ 理解 NavLink className 函数（isActive 参数）
+✅ 理解 end 属性（精确匹配 /）
+✅ 安装 DropdownMenu 组件
+✅ 理解 DropdownMenu 基本用法（Trigger/Content/Item）
+✅ Layout 完善（左侧导航 + 右侧登录状态）
+✅ 已登录：Sell a Car + 用户下拉菜单
+✅ 未登录：Sign in + Sign up
+✅ Admin 角色额外显示 Admin Panel 入口
+✅ 测试通过（NavLink高亮/下拉菜单/退出登录/Admin菜单）
+✅ feature/browse-pages 合并回 develop
 ```

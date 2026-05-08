@@ -1,10 +1,25 @@
-import { Link, Outlet, useNavigate } from "react-router-dom";
+import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { useAuthStore } from "@/stores/authStore";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "./ui/dropdown-menu";
 
 export default function Layout() {
   const { user, isAuthenticated, logout } = useAuthStore();
   const navigate = useNavigate();
+
+  /* ------------ 导航链接的样式函数 ----------- */
+  // isActive 为 true 时：蓝色加粗
+  // isActive 为 false 时：灰色，hover 时变深
+  const navLinkClass = ({ isActive }: { isActive: boolean }) =>
+    isActive
+      ? "text-blue-600 font-semibold text-sm"
+      : "text-gray-600 hover:text-gray-900 text-sm";
 
   const handleLogout = () => {
     logout();
@@ -18,32 +33,94 @@ export default function Layout() {
           className="mx-auto flex max-w-7xl items-center
                         justify-between px-4 py-4"
         >
-          {/* Logo */}
-          <Link to="/" className="text-xl font-bold text-blue-600">
-            UUcars
-          </Link>
+          {/* 左侧*/}
+          <div className="flex items-center gap-8">
+            {/* Logo */}
+            <NavLink to="/" className="text-xl font-bold text-blue-600">
+              UUcars
+            </NavLink>
+            {/* 主导航 */}
+            <nav className="flex items-center gap-6">
+              <NavLink to="/" className={navLinkClass} end>
+                Browse Cars
+              </NavLink>
+            </nav>
+          </div>
 
-          {/* 右侧导航 */}
-          <div className="flex items-center gap-4">
+          {/* 右侧 */}
+          <div className="flex items-center gap-3">
             {isAuthenticated() ? (
-              // 已登录：显示用户名和退出按钮
+              // 登录状态
               <>
-                <span className="text-sm text-gray-600">{user?.username}</span>
-                <Button variant="outline" size="sm" onClick={handleLogout}>
-                  Sign out
+                {/* 发布车辆按钮 */}
+                <Button asChild size="sm" variant="outline">
+                  <NavLink to="/cars/new">Sell a Car</NavLink>
                 </Button>
+
+                {/* 用户下拉菜单 */}
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button variant="ghost" size="sm">
+                      {user?.username}
+                    </Button>
+                  </DropdownMenuTrigger>
+
+                  <DropdownMenuContent align="end" className="w-48">
+                    {/* 用户资料 */}
+                    <DropdownMenuItem onClick={() => navigate("/profile")}>
+                      My Profile
+                    </DropdownMenuItem>
+
+                    {/* 车辆发布列表 */}
+                    <DropdownMenuItem
+                      onClick={() => navigate("/profile/listings")}
+                    >
+                      My Listings
+                    </DropdownMenuItem>
+
+                    {/* 购买列表 */}
+                    <DropdownMenuItem
+                      onClick={() => navigate("/profile/purchases")}
+                    >
+                      My Purchases
+                    </DropdownMenuItem>
+
+                    {/* 分隔线 */}
+                    <DropdownMenuSeparator />
+
+                    {/* Admin 入口：只有 Admin 角色才显示 */}
+                    {user?.role === "Admin" && (
+                      <>
+                        <DropdownMenuItem onClick={() => navigate("/admin")}>
+                          Admin Panel
+                        </DropdownMenuItem>
+                        <DropdownMenuSeparator />
+                      </>
+                    )}
+
+                    {/* 退出登录 */}
+                    <DropdownMenuItem
+                      onClick={handleLogout}
+                      className="text-red-600"
+                    >
+                      Sign out
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
               </>
             ) : (
-              // 未登录：显示登录和注册链接
+              // 未登录状态
               <>
-                <Link
+                {/* 登录 */}
+                <NavLink
                   to="/login"
                   className="text-sm text-gray-600 hover:text-gray-900"
                 >
                   Sign in
-                </Link>
+                </NavLink>
+                {/* 注册 */}
                 <Button asChild size="sm">
-                  <Link to="/register">Sign up</Link>
+                  <NavLink to="/register">Sign up</NavLink>
                 </Button>
               </>
             )}
