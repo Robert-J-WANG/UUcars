@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import { RouterProvider } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { router } from "./router";
+import { Toaster } from "sonner";
 import "./index.css";
 
 // 创建 QueryClient 实例
@@ -27,6 +28,8 @@ createRoot(document.getElementById("root")!).render(
     {/* 这样路由里的所有组件都能使用 TanStack Query */}
     <QueryClientProvider client={queryClient}>
       <RouterProvider router={router} />
+      {/* Toaster 放在最外层，所有页面都能用 */}
+      <Toaster position="bottom-right" />
     </QueryClientProvider>
   </StrictMode>,
 );

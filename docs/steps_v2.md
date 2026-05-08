@@ -9558,3 +9558,744 @@ git push origin feature/browse-pages
 ✅ 测试通过（防抖/URL同步/分页+过滤组合/清空）
 ✅ Git commit 完成
 ```
+
+
+
+## Step 51 · 车辆详情页
+
+### 这一步做什么
+
+用户在列表页点击一辆车，进入详情页。详情页要展示车辆的完整信息、图片、卖家信息，以及根据用户身份显示不同的操作按钮：
+
+```
+未登录用户    → 显示"Sign in to purchase"
+买家         → 显示"Buy Now"和收藏按钮
+车主（卖家）  → 显示"Edit"和"Submit for Review"按钮
+```
+
+这一步引入两个新东西：`useParams`（从 URL 读取车辆 ID）和 `useMutation`（处理修改数据的操作）。
+
+------
+
+### 1. useParams 是什么
+
+详情页的 URL 是 `/cars/1`、`/cars/42` 这样的格式，URL 里的数字是车辆 ID。
+
+React Router 提供 `useParams` Hook 读取 URL 里的动态参数：
+
+```tsx
+// 路由配置：{ path: '/cars/:id', element: <CarDetailPage /> }
+// URL：/cars/42
+
+const { id } = useParams()
+// id → "42"（字符串，需要转成数字）
+```
+
+`useParams` 返回的值类型是 `string | undefined`，因为参数可能不存在。使用时需要处理这两种情况：
+
+```tsx
+const { id } = useParams()
+const carId = Number(id)  // 转成数字
+```
+
+------
+
+### 2. useMutation 是什么
+
+Step 49 里用 `useQuery` 请求数据（读操作）。`useMutation` 是 TanStack Query 提供的另一个 Hook，专门处理**写操作**——创建、修改、删除。
+
+**为什么不直接在事件处理函数里调用 API？**
+
+直接调用也能工作：
+
+```tsx
+const handleBuy = async () => {
+  setIsLoading(true)
+  try {
+    await ordersApi.create({ carId })
+    // 成功后做什么...
+  } catch (error) {
+    // 处理错误...
+  } finally {
+    setIsLoading(false)
+  }
+}
+```
+
+但 `useMutation` 的好处是：它帮你管理 loading 状态、错误状态、成功回调，不需要自己写这些样板代码。而且它和 TanStack Query 的缓存系统集成——操作成功后可以让相关查询自动刷新。
+
+**useMutation 的用法：**
+
+```tsx
+const mutation = useMutation({
+  // mutationFn：实际执行的操作
+  mutationFn: (carId: number) => ordersApi.create({ carId }),
+
+  // onSuccess：操作成功后的回调
+  onSuccess: () => {
+    // 比如刷新数据、显示成功提示
+  },
+
+  // onError：操作失败后的回调
+  onError: (error) => {
+    // 处理错误
+  },
+})
+
+// 调用：执行操作
+mutation.mutate(carId)
+
+// 状态：
+// mutation.isPending  → 正在执行
+// mutation.isError    → 执行失败
+// mutation.isSuccess  → 执行成功
+```
+
+------
+
+### 3. 安装 sonner（Toast 通知）
+
+操作成功或失败时，需要给用户一个提示。用弹窗太重，更常见的做法是右下角弹出一个短暂显示的通知——叫 Toast。
+
+安装 sonner（shadcn 推荐的 Toast 库）：
+
+```bash
+npm install sonner
+```
+
+在 `main.tsx` 里加入 `Toaster` 组件（负责渲染所有 Toast 通知）：
+
+```tsx
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import { RouterProvider } from 'react-router-dom'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { Toaster } from 'sonner'
+import { router } from './router'
+import './index.css'
+
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 1000 * 60,
+      retry: 1,
+    },
+  },
+})
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <QueryClientProvider client={queryClient}>
+      <RouterProvider router={router} />
+      {/* Toaster 放在最外层，所有页面都能用 */}
+      <Toaster position="bottom-right" />
+    </QueryClientProvider>
+  </StrictMode>,
+)
+```
+
+使用方式很简单，在任何地方调用 `toast()` 就会显示通知：
+
+```tsx
+import { toast } from 'sonner'
+
+toast.success('Order placed successfully!')
+toast.error('Something went wrong.')
+```
+
+------
+
+### 4. 安装 Dialog 组件
+
+下单前需要一个确认弹窗，防止用户误点。用 shadcn 的 Dialog 组件：
+
+```bash
+npx shadcn@latest add dialog
+```
+
+**Dialog 的工作方式：**
+
+Dialog 是一个受控组件，用 `open` 状态控制显示和隐藏：
+
+```tsx
+const [open, setOpen] = useState(false)
+
+<Dialog open={open} onOpenChange={setOpen}>
+  {/* 触发按钮 */}
+  <DialogTrigger asChild>
+    <Button onClick={() => setOpen(true)}>Buy Now</Button>
+  </DialogTrigger>
+
+  {/* 弹窗内容 */}
+  <DialogContent>
+    <DialogHeader>
+      <DialogTitle>Confirm Purchase</DialogTitle>
+      <DialogDescription>
+        Are you sure you want to buy this car?
+      </DialogDescription>
+    </DialogHeader>
+    <DialogFooter>
+      <Button variant="outline" onClick={() => setOpen(false)}>
+        Cancel
+      </Button>
+      <Button onClick={handleConfirm}>Confirm</Button>
+    </DialogFooter>
+  </DialogContent>
+</Dialog>
+```
+
+------
+
+### 5. 实现详情页
+
+打开 `src/pages/CarDetailPage.tsx`，一步一步来。
+
+**第一步：读取 URL 参数，请求数据**
+
+```tsx
+import { useParams } from 'react-router-dom'
+import { useQuery } from '@tanstack/react-query'
+import { carsApi } from '@/api'
+
+export default function CarDetailPage() {
+  const { id } = useParams()
+  const carId = Number(id)
+
+  const { data: car, isLoading, error } = useQuery({
+    queryKey: ['car', carId],
+    queryFn: () => carsApi.getById(carId),
+    // enabled：只有 carId 是有效数字时才发请求
+    // 防止 id 是 undefined 或 NaN 时发出无效请求
+    enabled: !isNaN(carId),
+  })
+
+  if (isLoading) return <div className="p-8">Loading...</div>
+  if (error || !car) return <div className="p-8">Car not found.</div>
+
+  return (
+    <div>
+      <h1>{car.title}</h1>
+      <p>{car.price}</p>
+    </div>
+  )
+}
+```
+
+在路由里把详情页加上。打开 `src/router.tsx`：
+
+```tsx
+import CarDetailPage from '@/pages/CarDetailPage'
+
+// 在 Layout 的公开路由里添加
+{ path: '/cars/:id', element: <CarDetailPage /> },
+```
+
+验证：访问 `/cars/1`（用真实的车辆 ID），应该能看到车辆标题和价格。数据通了，再往下做。
+
+**第二步：显示完整车辆信息**
+
+更新 `CarDetailPage`，展示完整信息：
+
+```tsx
+import { useParams } from 'react-router-dom'
+import { useQuery } from '@tanstack/react-query'
+import { carsApi } from '@/api'
+import { Badge } from '@/components/ui/badge'
+
+export default function CarDetailPage() {
+  const { id } = useParams()
+  const carId = Number(id)
+
+  const { data: car, isLoading, error } = useQuery({
+    queryKey: ['car', carId],
+    queryFn: () => carsApi.getById(carId),
+    enabled: !isNaN(carId),
+  })
+
+  if (isLoading) return <div className="p-8">Loading...</div>
+  if (error || !car) return <div className="p-8">Car not found.</div>
+
+  return (
+    <div className="mx-auto max-w-4xl space-y-6">
+
+      {/* 图片区域 */}
+      {car.images.length > 0 ? (
+        <div className="overflow-hidden rounded-lg">
+          <img
+            src={car.images[0].imageUrl}
+            alt={car.title}
+            className="h-96 w-full object-cover"
+          />
+        </div>
+      ) : (
+        <div className="flex h-96 items-center justify-center
+                        rounded-lg bg-gray-100 text-gray-400">
+          No images available
+        </div>
+      )}
+
+      {/* 基本信息 */}
+      <div className="space-y-2">
+        <div className="flex items-start justify-between">
+          <h1 className="text-2xl font-bold">{car.title}</h1>
+          <Badge variant="secondary">{car.status}</Badge>
+        </div>
+        <p className="text-3xl font-bold text-blue-600">
+          ${car.price.toLocaleString()}
+        </p>
+        <p className="text-gray-500">
+          {car.year} · {car.brand} {car.model} ·{' '}
+          {car.mileage.toLocaleString()} km
+        </p>
+        <p className="text-sm text-gray-500">
+          Seller: {car.sellerUsername}
+        </p>
+      </div>
+
+      {/* 描述 */}
+      {car.description && (
+        <div className="space-y-2">
+          <h2 className="font-semibold">Description</h2>
+          <p className="whitespace-pre-line text-gray-600">
+            {car.description}
+          </p>
+        </div>
+      )}
+
+    </div>
+  )
+}
+```
+
+**第三步：权限判断，显示不同按钮**
+
+不同身份的用户看到不同的操作区域。先从 Zustand 读取当前用户信息，判断身份：
+
+```tsx
+import { useAuthStore } from '@/stores/authStore'
+
+  // 权限判断，显示不同按钮
+  // 在组件里获取当前用户
+  const { user, isAuthenticated } = useAuthStore();
+
+  // 判断当前用户是不是这辆车的车主
+  const isOwner = user?.id === car?.sellerId;
+
+  // 判断是否可以购买：已登录 + 不是车主 + 车辆是 Published 状态
+  const canBuy = isAuthenticated() && !isOwner && car?.status === "Published";
+```
+
+根据这些判断，在详情页底部显示对应的按钮区域：
+
+```tsx
+import { Link } from 'react-router-dom'
+import { Button } from '@/components/ui/button'
+
+// 在 JSX 的合适位置加入操作区域
+  {/* 权限判断，显示不同按钮 */}
+  <div className="border-t pt-4">
+    {!isAuthenticated() && (
+      // 未登录：引导去登录
+      <Button asChild className="w-full">
+        <Link to="/login">Sign in to purchase</Link>
+      </Button>
+    )}
+
+    {isOwner && (
+      // 车主：显示管理操作
+      <div className="flex gap-2">
+        <Button asChild variant="outline" className="flex-1">
+          <Link to={`/cars/${car.id}/edit`}>Edit</Link>
+        </Button>
+        {car.status === "Draft" && (
+          <Button asChild className="flex-1">
+            <Link to={`/cars/${car.id}/submit`}>Submit for Review</Link>
+          </Button>
+        )}
+      </div>
+    )}
+
+    {canBuy && (
+      // 买家：显示购买和收藏操作（下一步实现）
+      <Button className="w-full">Buy Now</Button>
+    )}
+  </div>
+```
+
+**第四步：实现收藏功能**
+
+用 `useMutation` 处理收藏操作：
+
+```tsx
+import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { favoritesApi } from '@/api'
+import { toast } from 'sonner'
+
+// useQueryClient：获取 QueryClient 实例，用于操作缓存
+const queryClient = useQueryClient()
+
+const favoriteMutation = useMutation({
+  mutationFn: () => favoritesApi.add(carId),
+  onSuccess: () => {
+    toast.success('Added to favorites!')
+    // 让收藏列表的缓存失效，下次访问收藏页时会重新请求
+    queryClient.invalidateQueries({ queryKey: ['favorites'] })
+  },
+  onError: (error) => {
+    toast.error(error.message)
+  },
+})
+```
+
+> **`invalidateQueries` 是什么？** 它告诉 TanStack Query："这个 key 对应的缓存数据已经过时了，下次有人用这个 key 查数据时，重新请求。" 收藏成功后，收藏列表数据变了，所以让 `['favorites']` 缓存失效，保证下次访问收藏页时看到最新数据。
+
+把收藏按钮加到买家操作区域：
+
+```tsx
+{canBuy && (
+  <div className="flex gap-2">
+    <Button
+      variant="outline"
+      // 调用mutate()执行更新
+      onClick={() => favoriteMutation.mutate()}
+      disabled={favoriteMutation.isPending}
+    >
+      {favoriteMutation.isPending ? "Saving..." : "♡ Favorite"}
+    </Button>
+    <Button className="flex-1">Buy Now</Button>
+  </div>
+)}
+```
+
+**第五步：实现下单确认弹窗**
+
+```tsx
+import { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { ordersApi } from '@/api'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+
+const navigate = useNavigate()
+const [dialogOpen, setDialogOpen] = useState(false)
+
+const orderMutation = useMutation({
+  mutationFn: () => ordersApi.create({ carId }),
+  onSuccess: () => {
+    setDialogOpen(false)
+    toast.success('Order placed successfully!')
+    // 让车辆详情缓存失效（车辆状态变成 Sold 了）
+    queryClient.invalidateQueries({ queryKey: ['car', carId] })
+    // 让列表缓存失效（这辆车不再出现在列表里）
+    queryClient.invalidateQueries({ queryKey: ['cars'] })
+    navigate('/profile/purchases')
+  },
+  onError: (error) => {
+    setDialogOpen(false)
+    toast.error(error.message)
+  },
+})
+```
+
+在 JSX 里加入 Dialog：
+
+```tsx
+<Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
+  <DialogContent>
+    <DialogHeader>
+      <DialogTitle>Confirm Purchase</DialogTitle>
+      <DialogDescription>
+        You are about to purchase{' '}
+        <span className="font-semibold">{car.title}</span>{' '}
+        for{' '}
+        <span className="font-semibold text-blue-600">
+          ${car.price.toLocaleString()}
+        </span>.
+        This action cannot be undone.
+      </DialogDescription>
+    </DialogHeader>
+    <DialogFooter>
+      <Button
+        variant="outline"
+        onClick={() => setDialogOpen(false)}
+        disabled={orderMutation.isPending}
+      >
+        Cancel
+      </Button>
+      <Button
+        onClick={() => orderMutation.mutate()}
+        disabled={orderMutation.isPending}
+      >
+        {orderMutation.isPending ? 'Processing...' : 'Confirm Purchase'}
+      </Button>
+    </DialogFooter>
+  </DialogContent>
+</Dialog>
+```
+
+**第六步：把所有部分组合成完整组件**
+
+现在把所有 import 和逻辑整理到一起，形成完整的 `CarDetailPage.tsx`：
+
+```tsx
+import { useState } from 'react'
+import { useParams, Link, useNavigate } from 'react-router-dom'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { toast } from 'sonner'
+import { carsApi, favoritesApi, ordersApi } from '@/api'
+import { useAuthStore } from '@/stores/authStore'
+import { Button } from '@/components/ui/button'
+import { Badge } from '@/components/ui/badge'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+
+export default function CarDetailPage() {
+  const { id } = useParams()
+  const carId = Number(id)
+  const navigate = useNavigate()
+  const queryClient = useQueryClient()
+  const { user, isAuthenticated } = useAuthStore()
+  const [dialogOpen, setDialogOpen] = useState(false)
+
+  // 请求车辆详情
+  const { data: car, isLoading, error } = useQuery({
+    queryKey: ['car', carId],
+    queryFn: () => carsApi.getById(carId),
+    enabled: !isNaN(carId),
+  })
+
+  // 收藏 mutation
+  const favoriteMutation = useMutation({
+    mutationFn: () => favoritesApi.add(carId),
+    onSuccess: () => {
+      toast.success('Added to favorites!')
+      queryClient.invalidateQueries({ queryKey: ['favorites'] })
+    },
+    onError: (error) => {
+      toast.error(error.message)
+    },
+  })
+
+  // 下单 mutation
+  const orderMutation = useMutation({
+    mutationFn: () => ordersApi.create({ carId }),
+    onSuccess: () => {
+      setDialogOpen(false)
+      toast.success('Order placed successfully!')
+      queryClient.invalidateQueries({ queryKey: ['car', carId] })
+      queryClient.invalidateQueries({ queryKey: ['cars'] })
+      navigate('/profile/purchases')
+    },
+    onError: (error) => {
+      setDialogOpen(false)
+      toast.error(error.message)
+    },
+  })
+
+  if (isLoading) return <div className="p-8">Loading...</div>
+  if (error || !car) return <div className="p-8">Car not found.</div>
+
+  const isOwner = user?.id === car.sellerId
+  const canBuy = isAuthenticated() && !isOwner && car.status === 'Published'
+
+  return (
+    <div className="mx-auto max-w-4xl space-y-6">
+
+      {/* 图片 */}
+      {car.images.length > 0 ? (
+        <div className="overflow-hidden rounded-lg">
+          <img
+            src={car.images[0].imageUrl}
+            alt={car.title}
+            className="h-96 w-full object-cover"
+          />
+        </div>
+      ) : (
+        <div className="flex h-96 items-center justify-center
+                        rounded-lg bg-gray-100 text-gray-400">
+          No images available
+        </div>
+      )}
+
+      {/* 信息 */}
+      <div className="space-y-2">
+        <div className="flex items-start justify-between">
+          <h1 className="text-2xl font-bold">{car.title}</h1>
+          <Badge variant="secondary">{car.status}</Badge>
+        </div>
+        <p className="text-3xl font-bold text-blue-600">
+          ${car.price.toLocaleString()}
+        </p>
+        <p className="text-gray-500">
+          {car.year} · {car.brand} {car.model} ·{' '}
+          {car.mileage.toLocaleString()} km
+        </p>
+        <p className="text-sm text-gray-500">
+          Seller: {car.sellerUsername}
+        </p>
+      </div>
+
+      {/* 描述 */}
+      {car.description && (
+        <div className="space-y-2">
+          <h2 className="font-semibold">Description</h2>
+          <p className="whitespace-pre-line text-gray-600">
+            {car.description}
+          </p>
+        </div>
+      )}
+
+      {/* 操作按钮 */}
+      <div className="border-t pt-4">
+        {!isAuthenticated() && (
+          <Button asChild className="w-full">
+            <Link to="/login">Sign in to purchase</Link>
+          </Button>
+        )}
+
+        {isOwner && (
+          <div className="flex gap-2">
+            <Button asChild variant="outline" className="flex-1">
+              <Link to={`/cars/${car.id}/edit`}>Edit</Link>
+            </Button>
+            {car.status === 'Draft' && (
+              <Button className="flex-1">Submit for Review</Button>
+            )}
+          </div>
+        )}
+
+        {canBuy && (
+          <div className="flex gap-2">
+            <Button
+              variant="outline"
+              onClick={() => favoriteMutation.mutate()}
+              disabled={favoriteMutation.isPending}
+            >
+              {favoriteMutation.isPending ? 'Saving...' : '♡ Favorite'}
+            </Button>
+            <Button
+              className="flex-1"
+              onClick={() => setDialogOpen(true)}
+            >
+              Buy Now
+            </Button>
+          </div>
+        )}
+      </div>
+
+      {/* 下单确认弹窗 */}
+      <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Confirm Purchase</DialogTitle>
+            <DialogDescription>
+              You are about to purchase{' '}
+              <span className="font-semibold">{car.title}</span>{' '}
+              for{' '}
+              <span className="font-semibold text-blue-600">
+                ${car.price.toLocaleString()}
+              </span>.
+              This action cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setDialogOpen(false)}
+              disabled={orderMutation.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={() => orderMutation.mutate()}
+              disabled={orderMutation.isPending}
+            >
+              {orderMutation.isPending ? 'Processing...' : 'Confirm Purchase'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+    </div>
+  )
+}
+```
+
+------
+
+### 6. 完整测试
+
+```bash
+npm run dev
+```
+
+**测试权限渲染：**
+
+未登录访问详情页 → 看到 "Sign in to purchase" 按钮。
+
+用车主账号登录，访问自己的车辆详情 → 看到 "Edit" 和 "Submit for Review" 按钮。
+
+用买家账号登录，访问别人的 Published 车辆 → 看到 "Favorite" 和 "Buy Now" 按钮。
+
+**测试收藏：**
+
+点击 "♡ Favorite" → 按钮短暂显示 "Saving..." → 右下角出现 "Added to favorites!" 通知。
+
+**测试下单：**
+
+点击 "Buy Now" → 弹出确认弹窗 → 点 Confirm → 按钮显示 "Processing..." → 成功后通知出现 → 跳转到 `/profile/purchases`（当前是占位页面）。
+
+**测试 invalidateQueries：**
+
+下单成功后返回详情页，刷新，车辆状态应该变成 "Sold"，按钮消失。
+
+------
+
+### 7. 此时的目录变化
+
+```
+src/
+├── pages/
+│   └── CarDetailPage.tsx   ← 已更新（完整实现）
+└── main.tsx                ← 已更新（Toaster）
+```
+
+------
+
+### 8. Git 提交
+
+```bash
+git add .
+git commit -m "feat: car detail page with buy and favorite actions"
+git push origin feature/browse-pages
+```
+
+------
+
+### Step 51 完成状态
+
+```
+✅ 理解 useParams（读取 URL 动态参数）
+✅ 理解 enabled 选项（条件性发请求）
+✅ 安装 sonner，配置 Toaster
+✅ 理解 useMutation（写操作的状态管理）
+✅ 理解 invalidateQueries（操作后让缓存失效）
+✅ 理解 Dialog 受控组件用法
+✅ 权限判断逻辑（isOwner / canBuy / 未登录）
+✅ 收藏功能（useMutation + toast 通知）
+✅ 下单功能（Dialog 确认 + useMutation）
+✅ 测试通过（权限渲染/收藏/下单/缓存刷新）
+✅ Git commit 完成
+```
