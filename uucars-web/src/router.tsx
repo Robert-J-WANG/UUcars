@@ -6,13 +6,13 @@ import RegisterPage from "@/pages/RegisterPage";
 import VerifyEmailPage from "@/pages/VerifyEmailPage";
 import ForgotPasswordPage from "@/pages/ForgotPasswordPage";
 import ResetPasswordPage from "@/pages/ResetPasswordPage";
+import Layout from "@/components/Layout";
+import HomePage from "@/pages/HomePage";
+import CarDetailPage from "@/pages/CarDetailPage";
 
 export const router = createBrowserRouter([
+  // 认证页面：不需要导航栏（全屏居中布局）
   // 公开路由
-  {
-    path: "/",
-    element: <div className="p-8">首页（占位）</div>,
-  },
   {
     path: "/login",
     element: <LoginPage />,
@@ -34,15 +34,24 @@ export const router = createBrowserRouter([
     element: <ResetPasswordPage />,
   },
 
-  // 受保护路由
-  // element 是 ProtectedRoute，它负责权限检查
-  // children 里的页面只有登录后才能访问
+  // 有导航栏的页面：都放在 Layout 里
   {
-    element: <ProtectedRoute />,
+    element: <Layout />,
     children: [
+      // 公开路由
+      { path: "/", element: <HomePage /> },
+      { path: "/cars/:id", element: <CarDetailPage /> },
+      // 受保护路由
+      // element 是 ProtectedRoute，它负责权限检查
+      // children 里的页面只有登录后才能访问
       {
-        path: "/cars/new",
-        element: <CreateCarPage />,
+        element: <ProtectedRoute />,
+        children: [
+          {
+            path: `/cars/:id/submit`,
+            element: <CreateCarPage />,
+          },
+        ],
       },
     ],
   },

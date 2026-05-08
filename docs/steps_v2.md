@@ -8240,3 +8240,2442 @@ git push origin --delete feature/auth-pages
 ✅ 完整认证流程端到端测试通过
 ✅ feature/auth-pages 合并回 develop
 ```
+
+
+
+好，先核查 Step 49 的内容。
+
+
+
+## 
+
+
+
+## Step 49 · 首页：车辆列表
+
+### 这一步做什么
+
+认证流程已经完整了。这一步开始做平台的核心页面——车辆列表。
+
+同时引入这个项目里**最重要的前端库之一：TanStack Query**。它彻底改变了前端数据请求的方式，理解它之后，会觉得之前用 `useEffect` 发请求的方式非常原始。
+
+
+
+### 1. 先做基础布局
+
+在做列表页之前，先把页面的基本结构搭起来:
+
+- 导航栏
+- 内容区域
+
+切出分支
+
+```bash
+git checkout develop
+git checkout -b feature/browse-pages
+git push -u origin feature/browse-pages
+```
+
+
+
+#### 1.1 为什么需要布局组件
+
+现在每个页面都是完全独立的，用户从登录页成功登录后跳到首页，首页只显示一行占位文字，没有任何导航。
+
+需要一个**布局组件**，提供：
+
+- 顶部导航栏（Logo、链接、登录/注册按钮）
+- 内容区域（每个页面的内容渲染在这里）
+
+布局组件只写一次，所有页面共享。
+
+#### 1.2 创建布局组件
+
+```bash
+touch src/components/Layout.tsx
+```
+
+先从最简单的骨架开始：
+
+```tsx
+import { Outlet } from 'react-router-dom'
+
+export default function Layout() {
+  return (
+    <div className="min-h-screen bg-gray-50">
+      {/* 导航栏 */}
+      <header className="border-b bg-white">
+        <div className="mx-auto max-w-7xl px-4 py-4">
+          <span className="text-xl font-bold">UUcars</span>
+        </div>
+      </header>
+
+      {/* 页面内容：Outlet 渲染子路由 */}
+      <main className="mx-auto max-w-7xl px-4 py-8">
+        <Outlet />
+      </main>
+    </div>
+  )
+}
+```
+
+这里又用到了 `Outlet`——导航栏始终显示，`Outlet` 位置根据当前路由渲染对应页面。
+
+#### 1.3 导航栏需要显示登录状态
+
+导航栏要根据是否登录显示不同内容：
+
+- 未登录：显示"Sign in"和"Sign up"链接
+- 已登录：显示用户名和"Sign out"按钮
+
+从 Zustand 读取登录状态，做条件渲染：
+
+```tsx
+import { Link, Outlet, useNavigate } from 'react-router-dom'
+import { useAuthStore } from '@/stores/authStore'
+import { Button } from '@/components/ui/button'
+
+export default function Layout() {
+  const { user, isAuthenticated, logout } = useAuthStore()
+  const navigate = useNavigate()
+
+  const handleLogout = () => {
+    logout()
+    navigate('/login')
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50">
+      <header className="border-b bg-white">
+        <div className="mx-auto flex max-w-7xl items-center
+                        justify-between px-4 py-4">
+          {/* Logo */}
+          <Link to="/" className="text-xl font-bold text-blue-600">
+            UUcars
+          </Link>
+
+          {/* 右侧导航 */}
+          <div className="flex items-center gap-4">
+            {isAuthenticated() ? (
+              // 已登录：显示用户名和退出按钮
+              <>
+                <span className="text-sm text-gray-600">
+                  {user?.username}
+                </span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleLogout}
+                >
+                  Sign out
+                </Button>
+              </>
+            ) : (
+              // 未登录：显示登录和注册链接
+              <>
+                <Link
+                  to="/login"
+                  className="text-sm text-gray-600 hover:text-gray-900"
+                >
+                  Sign in
+                </Link>
+                <Button asChild size="sm">
+                  <Link to="/register">Sign up</Link>
+                </Button>
+              </>
+            )}
+          </div>
+        </div>
+      </header>
+
+      <main className="mx-auto max-w-7xl px-4 py-8">
+        <Outlet />
+      </main>
+    </div>
+  )
+}
+```
+
+#### 1.4 在路由里使用布局组件
+
+Layout 组件通过路由的嵌套结构来使用——把需要显示导航栏的路由都放在 Layout 的 children 里：
+
+打开 `src/router.tsx`，更新：
+
+```tsx
+import { createBrowserRouter } from 'react-router-dom'
+import Layout from '@/components/Layout'
+import LoginPage from '@/pages/LoginPage'
+import RegisterPage from '@/pages/RegisterPage'
+import VerifyEmailPage from '@/pages/VerifyEmailPage'
+import ForgotPasswordPage from '@/pages/ForgotPasswordPage'
+import ResetPasswordPage from '@/pages/ResetPasswordPage'
+import CreateCarPage from '@/pages/CreateCarPage'
+import ProtectedRoute from '@/components/ProtectedRoute'
+
+export const router = createBrowserRouter([
+  // 认证页面：不需要导航栏（全屏居中布局）
+  { path: '/login', element: <LoginPage /> },
+  { path: '/register', element: <RegisterPage /> },
+  { path: '/verify-email', element: <VerifyEmailPage /> },
+  { path: '/forgot-password', element: <ForgotPasswordPage /> },
+  { path: '/reset-password', element: <ResetPasswordPage /> },
+
+  // 有导航栏的页面：都放在 Layout 里
+  {
+    element: <Layout />,
+    children: [
+      // 公开路由
+      {
+        path: '/',
+        element: <div>首页（占位）</div>,
+      },
+
+      // 受保护路由
+      {
+        element: <ProtectedRoute />,
+        children: [
+          { path: '/cars/new', element: <CreateCarPage /> },
+        ],
+      },
+    ],
+  },
+])
+```
+
+验证：
+
+```bash
+npm run dev
+```
+
+访问 `http://localhost:5173/`，应该看到顶部有导航栏，Logo 是 "UUcars"，右侧根据登录状态显示不同内容。
+
+
+
+### 2. 引入 TanStack Query
+
+#### 2.1  useEffect 发请求有什么问题?
+
+如果用 `useEffect` 来请求车辆列表数据，代码会是什么样：
+
+```tsx
+// 用 useEffect 发请求（不推荐）
+function HomePage() {
+  const [cars, setCars] = useState([])
+  const [isLoading, setIsLoading] = useState(true)
+  const [error, setError] = useState(null)
+
+  useEffect(() => {
+    setIsLoading(true)
+    carsApi.getPaged()
+      .then(data => setCars(data.items))
+      .catch(err => setError(err))
+      .finally(() => setIsLoading(false))
+  }, [])
+
+  if (isLoading) return <div>加载中...</div>
+  if (error) return <div>出错了</div>
+  return <div>{/* 渲染数据 */}</div>
+}
+```
+
+什么问题？
+
+每个组件都要写 loading、error、useEffect，而且没有缓存：同一个数据在不同组件里各请求一次。
+
+#### 2.2 TanStack Query 的核心概念
+
+TanStack Query（原名 React Query）是一个**服务端状态管理库**，专门处理"从服务器获取数据"这件事。
+
+TanStack Query 的核心思路是：**把服务端数据当作一种特殊的状态来管理**。
+
+TanStack Query 解决的核心问题：
+
+```bash
+缓存          → 同一个接口的数据缓存起来，不重复请求
+自动重新获取  → 窗口重新聚焦、网络重连时自动刷新数据
+loading/error → 自动管理，不需要手写 useState
+数据同步      → 多个组件用同一份数据，一处更新全部同步
+后台刷新      → 展示缓存数据的同时，后台悄悄刷新
+```
+
+它封装了2个主要Hook:
+
+```bash
+useQuery  → 获取数据（GET 请求）
+useMutation → 修改数据（POST/PUT/DELETE 请求）
+```
+
+useQuery 用法
+
+```tsx
+import { useQuery } from '@tanstack/react-query'
+
+function CarList() {
+    const { data, isLoading, error } = useQuery({
+      // queryKey：这个查询的唯一标识
+      // 用数组表示，可以包含参数
+      queryKey: ['cars', { page: 1 }],
+
+      // queryFn：实际发请求的函数，返回 Promise
+      queryFn: () => carsApi.getPaged({ page: 1 }),
+    })
+    if (isLoading) return <div>Loading...</div>
+      if (isError) return <div>{error.message}</div>
+
+      return <div>{data?.items.map(...)}</div>
+}
+
+```
+
+对比手写方式，省掉了 `useState` + `useEffect` + 手动管理 loading/error。
+
+**queryKey 是什么？**
+
+`queryKey` 是查询的唯一标识，类似于缓存的 key。TanStack Query 用它来：
+
+- 识别不同的查询（`['cars']` 和 `['cars', { page: 2 }]` 是两个不同的查询）
+- 缓存数据（相同 key 的查询结果会被缓存，不重复请求）
+- 自动刷新（key 变化时自动重新请求）
+
+**数据的生命周期：**
+
+```
+第一次请求 → 数据返回 → 存入缓存
+        ↓
+再次访问同一页面 → 立刻显示缓存数据（不等待）
+                → 后台悄悄重新请求（更新缓存）
+                → 新数据到了 → 更新显示
+```
+
+用户感知到的是：页面秒开，数据始终是最新的。
+
+~~**useMutation 的用法**后面的步骤里说明~~
+
+**和 Zustand 的分工:**
+
+```bash
+Zustand         → 客户端状态（登录信息、UI 状态、用户偏好）
+                  这些数据不来自服务器，是前端自己维护的
+
+TanStack Query  → 服务端状态（车辆列表、订单、用户资料）
+                  这些数据来自服务器，需要缓存、同步、刷新
+```
+
+```tsx
+// Zustand 管的：
+const { user, isAuthenticated, login, logout } = useAuthStore()
+
+// TanStack Query 管的：
+const { data: cars } = useQuery({ queryKey: ['cars'], queryFn: carApi.getPaged })
+const { data: orders } = useQuery({ queryKey: ['orders'], queryFn: orderApi.getMine })
+```
+
+#### 2.3 安装并配置
+
+```bash
+npm install @tanstack/react-query
+```
+
+TanStack Query 需要一个 `QueryClient` 实例来管理缓存，用 `QueryClientProvider` 在应用顶层提供：
+
+打开 `src/main.tsx`，更新：
+
+```tsx
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import { RouterProvider } from 'react-router-dom'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { router } from './router'
+import './index.css'
+
+// 创建 QueryClient 实例
+// 所有查询的缓存都存在这个实例里
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      // staleTime：数据多久后被认为"过时"
+      // 过时之前，重新访问页面不会重新请求，直接用缓存
+      // 设为 1 分钟：1 分钟内数据被认为是新鲜的
+      staleTime: 1000 * 60,
+
+      // retry：请求失败时重试次数，默认 3 次，改为 1 次
+      retry: 1,
+    },
+  },
+})
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    {/* QueryClientProvider 必须包在 RouterProvider 外面 */}
+    {/* 这样路由里的所有组件都能使用 TanStack Query */}
+    <QueryClientProvider client={queryClient}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>
+  </StrictMode>,
+)
+```
+
+
+
+### 3. 做车辆列表页
+
+现在来实现 `HomePage`，用 `useQuery` 请求车辆列表数据。
+
+#### 3.1 先想清楚这个页面需要什么
+
+车辆列表页需要：
+
+- 展示车辆卡片列表（标题、品牌、价格、里程）
+- 加载中时显示骨架屏
+- 出错时显示错误信息
+- 分页
+
+按照这个思路，一步一步来。
+
+#### 3.2 第一步：用 useQuery 请求数据
+
+打开 `src/pages/HomePage.tsx`，先把数据请求做好，暂时不管样式：
+
+```tsx
+import { useQuery } from '@tanstack/react-query'
+import { carsApi } from '@/api'
+
+export default function HomePage() {
+  const { data, isLoading, error } = useQuery({
+    queryKey: ['cars'],
+    queryFn: () => carsApi.getPaged(),
+  })
+
+  // 先用最简单的方式验证数据是否请求成功
+  if (isLoading) return <div>Loading...</div>
+  if (error) return <div>Error: {error.message}</div>
+
+  return (
+    <div>
+      <p>共 {data?.totalCount} 辆车</p>
+      {data?.items.map(car => (
+        <div key={car.id}>
+          <p>{car.title}</p>
+          <p>{car.price}</p>
+        </div>
+      ))}
+    </div>
+  )
+}
+```
+
+更新路由，把首页占位替换掉：
+
+```tsx
+import HomePage from '@/pages/HomePage'
+
+// 把原来的占位替换
+{ path: '/', element: <HomePage /> },
+```
+
+启动项目，确保后端也在运行（数据库里要有 Published 状态的车辆）。访问 `http://localhost:5173/`，应该能看到车辆数据。数据请求通了，再来优化展示。
+
+#### 3.3 第二步：做车辆卡片组件
+
+列表里每一项都是一张车辆卡片，把它抽成独立的组件，列表页只管布局和数据，卡片只管显示单辆车的信息。
+
+```bash
+touch src/components/CarCard.tsx
+import { Link } from 'react-router-dom'
+import type { Car } from '@/types'
+import {
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card'
+import { Badge } from '@/components/ui/badge'
+```
+
+> **`Badge` 组件还没安装，先装上：**
+>
+> ```bash
+> npx shadcn@latest add badge
+> ```
+
+继续写 `CarCard`：
+
+```tsx
+interface CarCardProps {
+  car: Car
+}
+
+export default function CarCard({ car }: CarCardProps) {
+  return (
+    <Link to={`/cars/${car.id}`}>
+      <Card className="cursor-pointer transition-shadow hover:shadow-md">
+        <CardHeader className="pb-2">
+          <CardTitle className="line-clamp-2 text-base">
+            {car.title}
+          </CardTitle>
+          <Badge variant="secondary" className="w-fit">
+            {car.brand}
+          </Badge>
+        </CardHeader>
+        <CardContent className="space-y-1">
+          <p className="text-2xl font-bold text-blue-600">
+            ${car.price.toLocaleString()}
+          </p>
+          <p className="text-sm text-gray-500">
+            {car.year} · {car.mileage.toLocaleString()} km
+          </p>
+        </CardContent>
+      </Card>
+    </Link>
+  )
+}
+```
+
+> **`CarCardProps` 是什么？** 这是 TypeScript 的 Props 类型定义。React 组件通过 Props 接收外部传入的数据，在 TypeScript 里需要定义这些 Props 的类型，让 IDE 知道这个组件需要什么数据、数据是什么类型。
+>
+> ```tsx
+> // 定义 Props 的形状
+> interface CarCardProps {
+>   car: Car   // car 是 Car 类型，必须传
+> }
+> 
+> // 在组件参数里使用这个类型
+> function CarCard({ car }: CarCardProps) { ... }
+> // { car } 是解构语法，从 props 对象里取出 car 字段
+> ```
+
+#### 3.4 第三步：骨架屏
+
+骨架屏是加载时的占位效果，让用户看到页面大致结构，而不是一片空白。
+
+先安装 Skeleton 组件：
+
+```bash
+npx shadcn@latest add skeleton
+```
+
+创建车辆卡片的骨架屏：
+
+```bash
+touch src/components/CarCardSkeleton.tsx
+import { Card, CardContent, CardHeader } from '@/components/ui/card'
+import { Skeleton } from '@/components/ui/skeleton'
+
+export default function CarCardSkeleton() {
+  return (
+    <Card>
+      <CardHeader className="pb-2">
+        {/* Skeleton 组件：显示灰色闪烁的占位块 */}
+        {/* className 控制它的大小，和真实内容的大小保持一致 */}
+        <Skeleton className="h-5 w-3/4" />
+        <Skeleton className="h-5 w-1/4" />
+      </CardHeader>
+      <CardContent className="space-y-2">
+        <Skeleton className="h-8 w-1/3" />
+        <Skeleton className="h-4 w-1/2" />
+      </CardContent>
+    </Card>
+  )
+}
+```
+
+#### 3.5 第四步：分页
+
+分页需要知道当前是第几页，页码变化时重新请求数据。
+
+先看 `queryKey` 是怎么配合分页工作的：
+
+```tsx
+// page 是状态，变化时触发重新请求
+const [page, setPage] = useState(1)
+
+const { data } = useQuery({
+  // queryKey 包含 page，page 变化时 key 不同，自动重新请求
+  queryKey: ['cars', { page }],
+  queryFn: () => carsApi.getPaged({ page }),
+})
+```
+
+```bash
+useState 管的是"用户想看第几页"（输入）
+	- page  → 用户当前在第几页，是前端 UI 的状态
+              用户点"下一页"→ page 变化 → 触发新的请求
+              这是前端自己维护的，和服务器无关
+              
+useQuery 管的是"这一页的数据是什么"（输出）
+	- cars 列表 → 从服务器获取的数据
+```
+
+这就是 `queryKey` 的精妙之处——把查询参数放进 key，参数变化时自动触发新的请求，不需要手动管理。
+
+#### 3.6 第五步：把所有部分组合起来
+
+现在把 `HomePage` 更新成完整版本：
+
+```tsx
+import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { carsApi } from "@/api";
+import CarCard from "@/components/CarCard";
+import CarCardSkeleton from "@/components/CarCardSkeleton";
+import { Button } from "@/components/ui/button";
+
+// 配置每页显示的数量
+// 前端单独维护显示的数量
+const PAGE_SIZE = 10;
+
+export default function HomePage() {
+  const [page, setPage] = useState(1);
+
+  const { data, isLoading, error } = useQuery({
+    queryKey: ["cars", { page, pageSize: PAGE_SIZE }],
+    queryFn: () => carsApi.getPaged({ page, pageSize: PAGE_SIZE }),
+  });
+
+  if (error) {
+    return (
+      <div className="py-12 text-center text-gray-500">
+        Failed to load cars. Please try again.
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      <h1 className="text-2xl font-bold">Browse Cars</h1>
+
+      {/* 车辆卡片网格 */}
+      <div
+        className="grid grid-cols-1 gap-4
+                      sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"
+      >
+        {isLoading
+          ? // 加载中：显示 PAGE_SIZE 个骨架屏
+            Array.from({ length: PAGE_SIZE }).map((_, i) => (
+              <CarCardSkeleton key={i} />
+            ))
+          : // 加载完成：显示真实数据
+            data?.items.map((car) => <CarCard key={car.id} car={car} />)}
+      </div>
+
+      {/* 没有数据时的提示 */}
+      {!isLoading && data?.items.length === 0 && (
+        <div className="py-12 text-center text-gray-500">
+          No cars available at the moment.
+        </div>
+      )}
+
+      {/* 分页控制 */}
+      {data && data.totalPages > 1 && (
+        <div className="flex items-center justify-center gap-4">
+          <Button
+            variant="outline"
+            onClick={() => setPage((p) => p - 1)}
+            disabled={page === 1}
+          >
+            Previous
+          </Button>
+
+          <span className="text-sm text-gray-600">
+            Page {page} of {data.totalPages}
+          </span>
+
+          <Button
+            variant="outline"
+            onClick={() => setPage((p) => p + 1)}
+            disabled={page === data.totalPages}
+          >
+            Next
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+```
+
+**`Array.from({ length: PAGE_SIZE }).map((_, i) => ...)`** 是什么？
+
+这是 JavaScript 生成固定数量元素的常用写法。`Array.from({ length: PAGE_SIZE })` 创建一个有 PAGE_SIZE(比如10 )个空元素的数组，`.map()` 遍历它，`_` 表示我们不关心元素的值（占位符），`i` 是索引，用作 `key`。
+
+
+
+### 4. 验证完整效果
+
+```bash
+npm run dev
+```
+
+确保后端运行，数据库里有 Published 状态的车辆。
+
+**测试加载状态：** 刷新页面，短暂看到骨架屏，数据加载完成后骨架屏消失，显示真实车辆卡片。
+
+**测试分页：** 如果数据库里有超过 PAGE_SIZE 辆 Published 状态的车，分页按钮会显示。点击 Next，页码变化，数据自动更新。
+
+**测试缓存：** 点击一辆车进入详情页（现在是占位），返回列表页，数据立刻显示（不需要重新等待加载），这就是 TanStack Query 的缓存效果。
+
+
+
+### 5. 此时的目录变化
+
+```
+src/
+├── components/
+│   ├── Layout.tsx          ← 新增
+│   ├── CarCard.tsx         ← 新增
+│   └── CarCardSkeleton.tsx ← 新增
+├── pages/
+│   └── HomePage.tsx        ← 已更新（完整实现）
+├── router.tsx              ← 已更新
+└── main.tsx                ← 已更新（QueryClientProvider）
+```
+
+
+
+### 6. Git 提交
+
+```bash
+git add .
+git commit -m "feat: home page with car listing, skeleton, pagination"
+git push origin feature/browse-pages
+```
+
+
+
+### Step 49 完成状态
+
+```
+✅ Layout 组件（导航栏 + Outlet，登录状态条件渲染）
+✅ 理解为什么用布局组件（一处定义，所有页面共享）
+✅ 安装 TanStack Query，配置 QueryClientProvider
+✅ 理解 useEffect 发请求的问题（重复代码/无缓存/竞态）
+✅ 理解 useQuery 的工作方式（queryKey/queryFn/缓存机制）
+✅ 理解 queryKey 如何驱动自动重新请求（分页的核心）
+✅ 理解 staleTime（数据新鲜度控制）
+✅ CarCard 组件（Props类型定义 + 解构语法）
+✅ 骨架屏 CarCardSkeleton
+✅ 首页列表（加载/错误/空数据/分页四种状态）
+✅ 测试通过（骨架屏 → 数据 → 分页 → 缓存）
+✅ Git commit 完成
+```
+
+
+
+好，先核查 Step 50 的内容。
+
+
+
+## Step 50 · 搜索过滤
+
+### 这一步做什么
+
+Step 49 做的车辆列表只有分页，没有任何过滤条件。买家想找"10万以内的丰田"，现在只能一页一页翻。
+
+这一步给列表页加上搜索过滤：按品牌、价格区间过滤。
+
+同时解决一个体验问题：**搜索条件要和 URL 同步**。现在如果用户筛选了"品牌：BMW，最高价格：20万"，把这个页面的 URL 发给朋友，朋友打开是空的列表，过滤条件全没了。
+
+URL 同步解决这个问题——过滤条件存在 URL 里，分享链接就是分享搜索结果。
+
+
+
+### 1. 数据流
+
+加了搜索过滤之后，数据流是这样的：
+
+```
+用户修改过滤条件（输入品牌、选择价格）
+        ↓
+过滤条件更新到 URL 参数
+        ↓
+从 URL 参数读取过滤条件
+        ↓
+作为 queryKey 的一部分传给 useQuery
+        ↓
+useQuery 检测到 queryKey 变化，自动重新请求
+        ↓
+列表更新
+```
+
+URL 是过滤条件的"单一数据源"——所有组件都从 URL 读取当前的过滤条件，修改条件也通过更新 URL 来完成。
+
+
+
+### 2. useSearchParams 深入
+
+Step 48 里用过 `useSearchParams` 读取单个参数，这一步要用它做双向同步。
+
+**读取参数（Step 48 已用过）：**
+
+```tsx
+const [searchParams] = useSearchParams()
+const token = searchParams.get('token')
+```
+
+**修改参数（这一步新用到）：**
+
+`useSearchParams` 返回数组的第二个元素是**设置参数的函数**：
+
+```tsx
+const [searchParams, setSearchParams] = useSearchParams()
+
+// 修改 URL 参数
+// 调用后 URL 会变成 /cars?brand=BMW&maxPrice=200000
+setSearchParams({ brand: 'BMW', maxPrice: '200000' })
+```
+
+注意：URL 里的参数值全部是字符串，即使你设置的是数字，在 URL 里也是字符串，读取后需要转换：
+
+```tsx
+// URL: /?maxPrice=200000
+const maxPrice = searchParams.get('maxPrice')  // → "200000"（字符串）
+const maxPriceNumber = Number(maxPrice)         // → 200000（数字）
+```
+
+
+
+### 3. 防抖（Debounce）是什么
+
+过滤条件里有一个输入框——品牌搜索。用户每输入一个字符就触发一次请求，用户输入 "BMW" 会发三次请求（B、BM、BMW），其中前两次完全是浪费。
+
+**防抖**解决这个问题：用户停止输入一段时间后（比如 500ms），才触发请求。用户输入过程中不发请求。
+
+```
+用户输入 B        → 重置计时器，等待 500ms
+用户输入 BM       → 重置计时器，等待 500ms
+用户输入 BMW      → 重置计时器，等待 500ms
+500ms 内没有新输入 → 触发请求（只发一次）
+```
+
+
+
+### 4. 实现 useDebounce 自定义 Hook
+
+React 允许你把可复用的逻辑封装成**自定义 Hook**。自定义 Hook 就是一个函数，函数名以 `use` 开头，内部可以使用其他 Hook。
+
+**为什么要封装成 Hook 而不是普通函数？**
+
+防抖需要用到 `useState` 和 `useEffect`，而这两个只能在 React 组件或自定义 Hook 里使用，不能在普通函数里用。封装成 Hook，防抖逻辑就可以在任何组件里复用。
+
+先理解防抖的实现思路：
+
+```
+用户输入时：
+  设置一个定时器，500ms 后更新"防抖后的值"
+  如果在 500ms 内又有新输入：
+    清除上一个定时器（重置）
+    重新设置定时器
+500ms 内没有新输入：
+  定时器触发，更新"防抖后的值"
+```
+
+用 `useState` 存防抖后的值，用 `useEffect` 管理定时器：
+
+```ts
+touch src/hooks/useDebounce.ts
+import { useState, useEffect } from 'react'
+
+// 泛型 T：让这个 Hook 能处理任意类型的值
+// 不只是字符串，数字、对象都可以防抖
+function useDebounce<T>(value: T, delay: number): T {
+  // debouncedValue：防抖后的值，这才是真正用来发请求的值
+  const [debouncedValue, setDebouncedValue] = useState<T>(value)
+
+  useEffect(() => {
+    // value 变化时，设置一个定时器
+    // delay 毫秒后，把 debouncedValue 更新为最新的 value
+    const timer = setTimeout(() => {
+      setDebouncedValue(value)
+    }, delay)
+
+    // useEffect 的清理函数：在下次 effect 执行前调用
+    // 如果 value 在 delay 内又变化了，先清除上一个定时器
+    // 这就实现了"重置计时器"的效果
+    return () => {
+      clearTimeout(timer)
+    }
+
+    // value 或 delay 变化时重新执行这个 effect
+  }, [value, delay])
+
+  return debouncedValue
+}
+
+export default useDebounce
+```
+
+验证理解：
+
+```
+value 变成 "B"
+  → effect 执行，设置 timer A（500ms 后更新 debouncedValue 为 "B"）
+
+value 变成 "BM"（500ms 内）
+  → 清理函数执行，清除 timer A
+  → effect 重新执行，设置 timer B（500ms 后更新 debouncedValue 为 "BM"）
+
+value 变成 "BMW"（500ms 内）
+  → 清理函数执行，清除 timer B
+  → effect 重新执行，设置 timer C（500ms 后更新 debouncedValue 为 "BMW"）
+
+500ms 内没有新变化
+  → timer C 触发，debouncedValue 更新为 "BMW"
+  → useQuery 的 queryKey 变化，发起请求
+```
+
+
+
+### 5. 做搜索过滤 UI
+
+先创建一个独立的搜索过滤组件，不和列表页混在一起：
+
+```bash
+touch src/components/CarFilters.tsx
+```
+
+**第一步：想清楚这个组件需要什么**
+
+过滤组件需要：
+
+- 读取 URL 里当前的过滤条件（初始化输入框的值）
+- 用户修改时更新 URL
+
+它不需要知道列表数据，只负责过滤条件的读写：
+
+```tsx
+import { useSearchParams } from 'react-router-dom'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Button } from '@/components/ui/button'
+```
+
+**第二步：读取当前过滤条件初始化输入框**
+
+```tsx
+import { useSearchParams } from 'react-router-dom'
+
+export default function CarFilters() {
+  const [searchParams, setSearchParams] = useSearchParams()
+
+  // 从 URL 读取当前的过滤条件，作为输入框的初始值
+  // 没有对应参数时用空字符串或 undefined
+  const brand = searchParams.get('brand') ?? ''
+  const minPrice = searchParams.get('minPrice') ?? ''
+  const maxPrice = searchParams.get('maxPrice') ?? ''
+```
+
+**第三步：更新过滤条件**
+
+用户修改过滤条件时，更新 URL 参数。注意要保留已有的参数（比如已有 brand，再加 maxPrice 时不能把 brand 清掉）：
+
+```tsx
+  const updateFilter = (key: string, value: string) => {
+    // 用当前的所有参数构建新的参数对象
+    const current = Object.fromEntries(searchParams.entries())
+
+    if (value) {
+      // 有值：更新这个参数
+      current[key] = value
+    } else {
+      // 空值：删除这个参数（不在 URL 里显示空参数）
+      // 比如用户清空了品牌输入框
+      // updateFilter("brand", "")
+      // → value 是空字符串 → delete current["brand"]
+      // → URL 里 brand 参数消失，不会变成 ?brand=
+      delete current[key]
+    }
+
+    // 每次改过滤条件，把 page 参数从 URL 里删掉
+	// 效果是重置回第一页
+	// 防止出现"第5页但只有2页数据"的情况
+    delete current['page']
+
+    setSearchParams(current)
+  }
+```
+
+>`Object.fromEntries(searchParams.entries())`的用法：
+>
+>```tsx
+>// searchParams 是 URL 参数对象，不是普通对象
+>// 比如 URL 是 ?brand=Toyota&minPrice=50000
+>// searchParams.entries() 返回迭代器：[["brand","Toyota"], ["minPrice","50000"]]
+>// Object.fromEntries 把它转成普通对象
+>const current = Object.fromEntries(searchParams.entries())
+>// current = { brand: "Toyota", minPrice: "50000" }
+>```
+>
+>为什么要转？因为 `searchParams` 不能直接修改，需要先转成普通对象再操作。
+>
+>`delete`是什么？？？
+>
+>`delete` 是 JavaScript **内置运算符**，不是方法，专门用来删除对象的属性：
+>
+>```ts
+>const obj = { a: 1, b: 2, c: 3 }
+>delete obj.b
+>// obj = { a: 1, c: 3 }
+>
+>// 两种写法都行
+>delete obj.b        // 点语法
+>delete obj["b"]     // 方括号语法，适合动态 key
+>```
+
+完整流程举例：
+
+```bash
+当前 URL：?brand=Toyota&minPrice=50000&page=3
+
+用户把品牌改成 Honda
+  → updateFilter("brand", "Honda")
+  → current = { brand: "Toyota", minPrice: "50000", page: "3" }
+  → current["brand"] = "Honda"
+  → delete current["page"]
+  → current = { brand: "Honda", minPrice: "50000" }
+  → setSearchParams(current)
+  → 新 URL：?brand=Honda&minPrice=50000  ← page 消失，回到第一页
+```
+
+
+
+**第四步：清空所有过滤条件**
+
+```tsx
+  const clearFilters = () => {
+    setSearchParams({}) // URL 变成完全干净，没有任何参数
+  }
+```
+
+**第五步：渲染 UI**
+
+```tsx
+import { useSearchParams } from 'react-router-dom'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Button } from '@/components/ui/button'
+
+...
+
+// 派生的 UI 状态
+const hasFilters = brand || minPrice || maxPrice
+
+return (
+    <div className="rounded-lg border bg-white p-4 space-y-4">
+      <h2 className="font-semibold">Filters</h2>
+
+      {/* 品牌搜索 */}
+      <div className="space-y-1">
+        <Label htmlFor="brand">Brand</Label>
+        <Input
+          id="brand"
+          placeholder="e.g. BMW, Toyota"
+          value={brand}
+          onChange={(e) => updateFilter('brand', e.target.value)}
+        />
+      </div>
+
+      {/* 价格区间 */}
+      <div className="space-y-1">
+        <Label>Price Range</Label>
+        <div className="flex gap-2">
+          <Input
+            placeholder="Min"
+            type="number"
+            value={minPrice}
+            onChange={(e) => updateFilter('minPrice', e.target.value)}
+          />
+          <Input
+            placeholder="Max"
+            type="number"
+            value={maxPrice}
+            onChange={(e) => updateFilter('maxPrice', e.target.value)}
+          />
+        </div>
+      </div>
+
+      {/* 清空过滤条件 */}
+      {hasFilters && (
+        <Button
+          variant="outline"
+          className="w-full"
+          onClick={clearFilters}
+        >
+          Clear filters
+        </Button>
+      )}
+    </div>
+  )
+}
+```
+
+注意：<Input/>里使用value而不是defaultValue，**否则，清空过滤后输入框不会清空**
+
+```tsx
+// defaultValue：非受控输入，只设置初始值，之后 React 不管它
+<Input defaultValue={brand} onChange={...} />
+
+// value：受控输入，值始终和变量绑定，变量变了输入框跟着变
+<Input value={brand} onChange={...} />
+```
+
+这样 `clearFilters` 清空 `searchParams` 后，`brand`/`minPrice`/`maxPrice` 都变成空字符串，输入框跟着清空。
+
+### 6. 在 HomePage 里使用过滤条件
+
+现在 `CarFilters` 负责把过滤条件写入 URL，`HomePage` 负责从 URL 读取过滤条件发请求。
+
+打开 `src/pages/HomePage.tsx`，更新：
+
+**第一步：从 URL 读取过滤条件**
+
+```tsx
+import { useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
+import { useQuery } from '@tanstack/react-query'
+import { carsApi } from '@/api'
+import useDebounce from '@/hooks/useDebounce'
+import CarCard from '@/components/CarCard'
+import CarCardSkeleton from '@/components/CarCardSkeleton'
+import CarFilters from '@/components/CarFilters'
+import { Button } from '@/components/ui/button'
+
+// 前端单独维护显示的数量
+const PAGE_SIZE = 10;
+
+export default function HomePage() {
+  const [searchParams, setSearchParams] = useSearchParams()
+
+  // 从 URL 读取当前过滤条件
+  const brand = searchParams.get('brand') ?? ''
+  const minPrice = searchParams.get('minPrice') ?? ''
+  const maxPrice = searchParams.get('maxPrice') ?? ''
+  const page = Number(searchParams.get('page') ?? '1')
+```
+
+**第二步：对品牌搜索加防抖**
+
+品牌是输入框，每次按键都会触发，需要防抖。价格是数字输入框，用户通常输完再改，防抖影响不大但加上也无妨：
+
+```tsx
+  // 加防抖：用户停止输入 500ms 后才触发请求
+  const debouncedBrand = useDebounce(brand, 500);
+  const debouncedMinPrice = useDebounce(minPrice, 800);
+  const debouncedMaxPrice = useDebounce(maxPrice, 800);
+```
+
+**第三步：用防抖后的值作为 queryKey 和请求参数**
+
+```tsx
+  const { data, isLoading, error } = useQuery({
+    // queryKey 用防抖后的 brand，不用原始的 brand
+    // 这样用户打字过程中 queryKey 不变，不触发请求
+    // 停止输入 500ms 后 debouncedBrand 变化，queryKey 变化，才触发请求
+    queryKey: [
+      "cars",
+      {
+        page,
+        pageSize: PAGE_SIZE,
+        brand: debouncedBrand,
+        minPrice: debouncedMinPrice,
+        maxPrice: debouncedMaxPrice,
+      },
+    ],
+    queryFn: () =>
+      carsApi.getPaged({
+        page,
+        pageSize: PAGE_SIZE,
+        brand: debouncedBrand || undefined,
+        minPrice: debouncedMinPrice ? Number(debouncedMinPrice) : undefined,
+        maxPrice: debouncedMaxPrice ? Number(debouncedMaxPrice) : undefined,
+      }),
+  });
+```
+
+**第四步：分页通过 URL 参数控制**
+
+分页不再用 `useState`，改为通过 URL 参数控制，和过滤条件保持一致：
+
+```tsx
+  const handlePageChange = (newPage: number) => {
+    const current = Object.fromEntries(searchParams.entries())
+    setSearchParams({ ...current, page: String(newPage) })
+  }
+```
+
+**第五步：更新 JSX，加入过滤组件**
+
+```tsx
+  if (error) {
+    return (
+      <div className="py-12 text-center text-gray-500">
+        Failed to load cars. Please try again.
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex gap-6">
+      {/* 左侧：过滤条件 */}
+      <aside className="hidden w-64 shrink-0 lg:block">
+        <CarFilters />
+      </aside>
+
+      {/* 右侧：列表 */}
+      <div className="flex-1 space-y-6">
+        <div className="flex items-center justify-between">
+          <h1 className="text-2xl font-bold">Browse Cars</h1>
+          {data && (
+            <p className="text-sm text-gray-500">
+              {data.totalCount} cars found
+            </p>
+          )}
+        </div>
+
+        {/* 车辆卡片网格 */}
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+          {isLoading
+            ? Array.from({ length: pageSize }).map((_, i) => (
+                <CarCardSkeleton key={i} />
+              ))
+            : data?.items.map(car => (
+                <CarCard key={car.id} car={car} />
+              ))
+          }
+        </div>
+
+        {/* 没有数据 */}
+        {!isLoading && data?.items.length === 0 && (
+          <div className="py-12 text-center text-gray-500">
+            No cars found. Try adjusting your filters.
+          </div>
+        )}
+
+        {/* 分页 */}
+        {data && data.totalPages > 1 && (
+          <div className="flex items-center justify-center gap-4">
+            <Button
+              variant="outline"
+              onClick={() => handlePageChange(page - 1)}
+              disabled={page === 1}
+            >
+              Previous
+            </Button>
+            <span className="text-sm text-gray-600">
+              Page {page} of {data.totalPages}
+            </span>
+            <Button
+              variant="outline"
+              onClick={() => handlePageChange(page + 1)}
+              disabled={page === data.totalPages}
+            >
+              Next
+            </Button>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+```
+
+
+
+### 7. 完整测试
+
+```bash
+npm run dev
+```
+
+**测试防抖效果：**
+
+打开浏览器开发者工具 → Network 面板，在品牌输入框快速输入 "BMW"。观察网络请求，应该只有一次请求（停止输入 500ms 后），而不是每个字母一次。
+
+**测试 URL 同步：**
+
+在品牌输入框输入 "BMW"，设置最高价格 200000。观察浏览器地址栏，URL 应该变成：
+
+```
+http://localhost:5173/?brand=BMW&maxPrice=200000
+```
+
+复制这个 URL，开新标签页粘贴打开。过滤条件应该自动恢复——输入框有值，列表已经过滤好了。
+
+**测试分页 + 过滤组合：**
+
+设置过滤条件后翻页，URL 应该同时包含过滤参数和页码参数：
+
+```
+http://localhost:5173/?brand=BMW&page=2
+```
+
+**测试清空过滤：**
+
+点击 "Clear filters"，URL 回到 `/`，列表显示所有车辆。
+
+
+
+### 8. 此时的目录变化
+
+```
+src/
+├── components/
+│   ├── CarFilters.tsx      ← 新增
+│   └── CarCard.tsx         （已有）
+├── hooks/
+│   └── useDebounce.ts      ← 新增
+└── pages/
+    └── HomePage.tsx        ← 已更新
+```
+
+
+
+### 9. Git 提交
+
+```bash
+git add .
+git commit -m "feat: car search filters with URL sync and debounce"
+git push origin feature/browse-pages
+```
+
+
+
+### Step 50 完成状态
+
+```
+✅ 理解搜索条件和 URL 同步的意义（分享链接=分享结果）
+✅ 理解 useSearchParams 双向用法（读取 + 修改）
+✅ 理解 URL 参数全是字符串，数字需要转换
+✅ 理解防抖的原理（重置计时器）
+✅ 理解 useEffect 清理函数（clearTimeout）
+✅ 理解自定义 Hook（用 use 开头，内部可用其他 Hook）
+✅ useDebounce 实现（泛型 + useState + useEffect）
+✅ CarFilters 组件（读写 URL 参数，保留已有参数）
+✅ HomePage 更新（URL 驱动查询，防抖品牌搜索）
+✅ 分页通过 URL 参数控制（和过滤条件统一管理）
+✅ 测试通过（防抖/URL同步/分页+过滤组合/清空）
+✅ Git commit 完成
+```
+
+
+
+## Step 51 · 车辆详情页
+
+### 这一步做什么
+
+用户在列表页点击一辆车，进入详情页。详情页要展示车辆的完整信息、图片、卖家信息，以及根据用户身份显示不同的操作按钮：
+
+```
+未登录用户    → 显示"Sign in to purchase"
+买家         → 显示"Buy Now"和收藏按钮
+车主（卖家）  → 显示"Edit"和"Submit for Review"按钮
+```
+
+这一步引入两个新东西：`useParams`（从 URL 读取车辆 ID）和 `useMutation`（处理修改数据的操作）。
+
+
+
+### 1. useParams 是什么
+
+详情页的 URL 是 `/cars/1`、`/cars/42` 这样的格式，URL 里的数字是车辆 ID。
+
+React Router 提供 `useParams` Hook 读取 URL 里的动态参数：
+
+```tsx
+// 路由配置：{ path: '/cars/:id', element: <CarDetailPage /> }
+// URL：/cars/42
+
+const { id } = useParams()
+// id → "42"（字符串，需要转成数字）
+```
+
+`useParams` 返回的值类型是 `string | undefined`，因为参数可能不存在。使用时需要处理这两种情况：
+
+```tsx
+const { id } = useParams()
+const carId = Number(id)  // 转成数字
+```
+
+
+
+### 2. useMutation 是什么
+
+Step 49 里用 `useQuery` 请求数据（读操作）。`useMutation` 是 TanStack Query 提供的另一个 Hook，专门处理**写操作**——创建、修改、删除。
+
+**为什么不直接在事件处理函数里调用 API？**
+
+直接调用也能工作：
+
+```tsx
+const handleBuy = async () => {
+  setIsLoading(true)
+  try {
+    await ordersApi.create({ carId })
+    // 成功后做什么...
+  } catch (error) {
+    // 处理错误...
+  } finally {
+    setIsLoading(false)
+  }
+}
+```
+
+但 `useMutation` 的好处是：它帮你管理 loading 状态、错误状态、成功回调，不需要自己写这些样板代码。而且它和 TanStack Query 的缓存系统集成——操作成功后可以让相关查询自动刷新。
+
+**useMutation 的用法：**
+
+```tsx
+const mutation = useMutation({
+  // mutationFn：实际执行的操作
+  mutationFn: (carId: number) => ordersApi.create({ carId }),
+
+  // onSuccess：操作成功后的回调
+  onSuccess: () => {
+    // 比如刷新数据、显示成功提示
+  },
+
+  // onError：操作失败后的回调
+  onError: (error) => {
+    // 处理错误
+  },
+})
+
+// 调用：执行操作
+mutation.mutate(carId)
+
+// 状态：
+// mutation.isPending  → 正在执行
+// mutation.isError    → 执行失败
+// mutation.isSuccess  → 执行成功
+```
+
+
+
+### 3. 安装 sonner（Toast 通知）
+
+操作成功或失败时，需要给用户一个提示。用弹窗太重，更常见的做法是右下角弹出一个短暂显示的通知——叫 Toast。
+
+安装 sonner（shadcn 推荐的 Toast 库）：
+
+```bash
+npm install sonner
+```
+
+在 `main.tsx` 里加入 `Toaster` 组件（负责渲染所有 Toast 通知）：
+
+```tsx
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import { RouterProvider } from 'react-router-dom'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { Toaster } from 'sonner'
+import { router } from './router'
+import './index.css'
+
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 1000 * 60,
+      retry: 1,
+    },
+  },
+})
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <QueryClientProvider client={queryClient}>
+      <RouterProvider router={router} />
+      {/* Toaster 放在最外层，所有页面都能用 */}
+      <Toaster position="bottom-right" />
+    </QueryClientProvider>
+  </StrictMode>,
+)
+```
+
+使用方式很简单，在任何地方调用 `toast()` 就会显示通知：
+
+```tsx
+import { toast } from 'sonner'
+
+toast.success('Order placed successfully!')
+toast.error('Something went wrong.')
+```
+
+
+
+### 4. 安装 Dialog 组件
+
+下单前需要一个确认弹窗，防止用户误点。用 shadcn 的 Dialog 组件：
+
+```bash
+npx shadcn@latest add dialog
+```
+
+**Dialog 的工作方式：**
+
+Dialog 是一个受控组件，用 `open` 状态控制显示和隐藏：
+
+```tsx
+const [open, setOpen] = useState(false)
+
+<Dialog open={open} onOpenChange={setOpen}>
+  {/* 触发按钮 */}
+  <DialogTrigger asChild>
+    <Button onClick={() => setOpen(true)}>Buy Now</Button>
+  </DialogTrigger>
+
+  {/* 弹窗内容 */}
+  <DialogContent>
+    <DialogHeader>
+      <DialogTitle>Confirm Purchase</DialogTitle>
+      <DialogDescription>
+        Are you sure you want to buy this car?
+      </DialogDescription>
+    </DialogHeader>
+    <DialogFooter>
+      <Button variant="outline" onClick={() => setOpen(false)}>
+        Cancel
+      </Button>
+      <Button onClick={handleConfirm}>Confirm</Button>
+    </DialogFooter>
+  </DialogContent>
+</Dialog>
+```
+
+
+
+### 5. 实现详情页
+
+打开 `src/pages/CarDetailPage.tsx`，一步一步来。
+
+**第一步：读取 URL 参数，请求数据**
+
+```tsx
+import { useParams } from 'react-router-dom'
+import { useQuery } from '@tanstack/react-query'
+import { carsApi } from '@/api'
+
+export default function CarDetailPage() {
+  const { id } = useParams()
+  const carId = Number(id)
+
+  const { data: car, isLoading, error } = useQuery({
+    queryKey: ['car', carId],
+    queryFn: () => carsApi.getById(carId),
+    // enabled：只有 carId 是有效数字时才发请求
+    // 防止 id 是 undefined 或 NaN 时发出无效请求
+    enabled: !isNaN(carId),
+  })
+
+  if (isLoading) return <div className="p-8">Loading...</div>
+  if (error || !car) return <div className="p-8">Car not found.</div>
+
+  return (
+    <div>
+      <h1>{car.title}</h1>
+      <p>{car.price}</p>
+    </div>
+  )
+}
+```
+
+在路由里把详情页加上。打开 `src/router.tsx`：
+
+```tsx
+import CarDetailPage from '@/pages/CarDetailPage'
+
+// 在 Layout 的公开路由里添加
+{ path: '/cars/:id', element: <CarDetailPage /> },
+```
+
+验证：访问 `/cars/1`（用真实的车辆 ID），应该能看到车辆标题和价格。数据通了，再往下做。
+
+**第二步：显示完整车辆信息**
+
+更新 `CarDetailPage`，展示完整信息：
+
+```tsx
+import { useParams } from 'react-router-dom'
+import { useQuery } from '@tanstack/react-query'
+import { carsApi } from '@/api'
+import { Badge } from '@/components/ui/badge'
+
+export default function CarDetailPage() {
+  const { id } = useParams()
+  const carId = Number(id)
+
+  const { data: car, isLoading, error } = useQuery({
+    queryKey: ['car', carId],
+    queryFn: () => carsApi.getById(carId),
+    enabled: !isNaN(carId),
+  })
+
+  if (isLoading) return <div className="p-8">Loading...</div>
+  if (error || !car) return <div className="p-8">Car not found.</div>
+
+  return (
+    <div className="mx-auto max-w-4xl space-y-6">
+
+      {/* 图片区域 */}
+      {car.images.length > 0 ? (
+        <div className="overflow-hidden rounded-lg">
+          <img
+            src={car.images[0].imageUrl}
+            alt={car.title}
+            className="h-96 w-full object-cover"
+          />
+        </div>
+      ) : (
+        <div className="flex h-96 items-center justify-center
+                        rounded-lg bg-gray-100 text-gray-400">
+          No images available
+        </div>
+      )}
+
+      {/* 基本信息 */}
+      <div className="space-y-2">
+        <div className="flex items-start justify-between">
+          <h1 className="text-2xl font-bold">{car.title}</h1>
+          <Badge variant="secondary">{car.status}</Badge>
+        </div>
+        <p className="text-3xl font-bold text-blue-600">
+          ${car.price.toLocaleString()}
+        </p>
+        <p className="text-gray-500">
+          {car.year} · {car.brand} {car.model} ·{' '}
+          {car.mileage.toLocaleString()} km
+        </p>
+        <p className="text-sm text-gray-500">
+          Seller: {car.sellerUsername}
+        </p>
+      </div>
+
+      {/* 描述 */}
+      {car.description && (
+        <div className="space-y-2">
+          <h2 className="font-semibold">Description</h2>
+          <p className="whitespace-pre-line text-gray-600">
+            {car.description}
+          </p>
+        </div>
+      )}
+
+    </div>
+  )
+}
+```
+
+**第三步：权限判断，显示不同按钮**
+
+不同身份的用户看到不同的操作区域。先从 Zustand 读取当前用户信息，判断身份：
+
+```tsx
+import { useAuthStore } from '@/stores/authStore'
+
+  // 权限判断，显示不同按钮
+  // 在组件里获取当前用户
+  const { user, isAuthenticated } = useAuthStore();
+
+  // 判断当前用户是不是这辆车的车主
+  const isOwner = user?.id === car?.sellerId;
+
+  // 判断是否可以购买：已登录 + 不是车主 + 车辆是 Published 状态
+  const canBuy = isAuthenticated() && !isOwner && car?.status === "Published";
+```
+
+根据这些判断，在详情页底部显示对应的按钮区域：
+
+```tsx
+import { Link } from 'react-router-dom'
+import { Button } from '@/components/ui/button'
+
+// 在 JSX 的合适位置加入操作区域
+  {/* 权限判断，显示不同按钮 */}
+  <div className="border-t pt-4">
+    {!isAuthenticated() && (
+      // 未登录：引导去登录
+      <Button asChild className="w-full">
+        <Link to="/login">Sign in to purchase</Link>
+      </Button>
+    )}
+
+    {isOwner && (
+      // 车主：显示管理操作
+      <div className="flex gap-2">
+        <Button asChild variant="outline" className="flex-1">
+          <Link to={`/cars/${car.id}/edit`}>Edit</Link>
+        </Button>
+        {car.status === "Draft" && (
+          <Button asChild className="flex-1">
+            <Link to={`/cars/${car.id}/submit`}>Submit for Review</Link>
+          </Button>
+        )}
+      </div>
+    )}
+
+    {canBuy && (
+      // 买家：显示购买和收藏操作（下一步实现）
+      <Button className="w-full">Buy Now</Button>
+    )}
+  </div>
+```
+
+**第四步：实现收藏功能**
+
+用 `useMutation` 处理收藏操作：
+
+```tsx
+import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { favoritesApi } from '@/api'
+import { toast } from 'sonner'
+
+// useQueryClient：获取 QueryClient 实例，用于操作缓存
+const queryClient = useQueryClient()
+
+const favoriteMutation = useMutation({
+  mutationFn: () => favoritesApi.add(carId),
+  onSuccess: () => {
+    toast.success('Added to favorites!')
+    // 让收藏列表的缓存失效，下次访问收藏页时会重新请求
+    queryClient.invalidateQueries({ queryKey: ['favorites'] })
+  },
+  onError: (error) => {
+    toast.error(error.message)
+  },
+})
+```
+
+> **`invalidateQueries` 是什么？** 它告诉 TanStack Query："这个 key 对应的缓存数据已经过时了，下次有人用这个 key 查数据时，重新请求。" 收藏成功后，收藏列表数据变了，所以让 `['favorites']` 缓存失效，保证下次访问收藏页时看到最新数据。
+
+把收藏按钮加到买家操作区域：
+
+```tsx
+{canBuy && (
+  <div className="flex gap-2">
+    <Button
+      variant="outline"
+      // 调用mutate()执行更新
+      onClick={() => favoriteMutation.mutate()}
+      disabled={favoriteMutation.isPending}
+    >
+      {favoriteMutation.isPending ? "Saving..." : "♡ Favorite"}
+    </Button>
+    <Button className="flex-1">Buy Now</Button>
+  </div>
+)}
+```
+
+**第五步：实现下单确认弹窗**
+
+```tsx
+import { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { ordersApi } from '@/api'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+
+const navigate = useNavigate()
+const [dialogOpen, setDialogOpen] = useState(false)
+
+const orderMutation = useMutation({
+  mutationFn: () => ordersApi.create({ carId }),
+  onSuccess: () => {
+    setDialogOpen(false)
+    toast.success('Order placed successfully!')
+    // 让车辆详情缓存失效（车辆状态变成 Sold 了）
+    queryClient.invalidateQueries({ queryKey: ['car', carId] })
+    // 让列表缓存失效（这辆车不再出现在列表里）
+    queryClient.invalidateQueries({ queryKey: ['cars'] })
+    navigate('/profile/purchases')
+  },
+  onError: (error) => {
+    setDialogOpen(false)
+    toast.error(error.message)
+  },
+})
+```
+
+在 JSX 里加入 Dialog：
+
+```tsx
+<Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
+  <DialogContent>
+    <DialogHeader>
+      <DialogTitle>Confirm Purchase</DialogTitle>
+      <DialogDescription>
+        You are about to purchase{' '}
+        <span className="font-semibold">{car.title}</span>{' '}
+        for{' '}
+        <span className="font-semibold text-blue-600">
+          ${car.price.toLocaleString()}
+        </span>.
+        This action cannot be undone.
+      </DialogDescription>
+    </DialogHeader>
+    <DialogFooter>
+      <Button
+        variant="outline"
+        onClick={() => setDialogOpen(false)}
+        disabled={orderMutation.isPending}
+      >
+        Cancel
+      </Button>
+      <Button
+        onClick={() => orderMutation.mutate()}
+        disabled={orderMutation.isPending}
+      >
+        {orderMutation.isPending ? 'Processing...' : 'Confirm Purchase'}
+      </Button>
+    </DialogFooter>
+  </DialogContent>
+</Dialog>
+```
+
+**第六步：把所有部分组合成完整组件**
+
+现在把所有 import 和逻辑整理到一起，形成完整的 `CarDetailPage.tsx`：
+
+```tsx
+import { useState } from 'react'
+import { useParams, Link, useNavigate } from 'react-router-dom'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { toast } from 'sonner'
+import { carsApi, favoritesApi, ordersApi } from '@/api'
+import { useAuthStore } from '@/stores/authStore'
+import { Button } from '@/components/ui/button'
+import { Badge } from '@/components/ui/badge'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+
+export default function CarDetailPage() {
+  const { id } = useParams()
+  const carId = Number(id)
+  const navigate = useNavigate()
+  const queryClient = useQueryClient()
+  const { user, isAuthenticated } = useAuthStore()
+  const [dialogOpen, setDialogOpen] = useState(false)
+
+  // 请求车辆详情
+  const { data: car, isLoading, error } = useQuery({
+    queryKey: ['car', carId],
+    queryFn: () => carsApi.getById(carId),
+    enabled: !isNaN(carId),
+  })
+
+  // 收藏 mutation
+  const favoriteMutation = useMutation({
+    mutationFn: () => favoritesApi.add(carId),
+    onSuccess: () => {
+      toast.success('Added to favorites!')
+      queryClient.invalidateQueries({ queryKey: ['favorites'] })
+    },
+    onError: (error) => {
+      toast.error(error.message)
+    },
+  })
+
+  // 下单 mutation
+  const orderMutation = useMutation({
+    mutationFn: () => ordersApi.create({ carId }),
+    onSuccess: () => {
+      setDialogOpen(false)
+      toast.success('Order placed successfully!')
+      queryClient.invalidateQueries({ queryKey: ['car', carId] })
+      queryClient.invalidateQueries({ queryKey: ['cars'] })
+      navigate('/profile/purchases')
+    },
+    onError: (error) => {
+      setDialogOpen(false)
+      toast.error(error.message)
+    },
+  })
+
+  if (isLoading) return <div className="p-8">Loading...</div>
+  if (error || !car) return <div className="p-8">Car not found.</div>
+
+  const isOwner = user?.id === car.sellerId
+  const canBuy = isAuthenticated() && !isOwner && car.status === 'Published'
+
+  return (
+    <div className="mx-auto max-w-4xl space-y-6">
+
+      {/* 图片 */}
+      {car.images.length > 0 ? (
+        <div className="overflow-hidden rounded-lg">
+          <img
+            src={car.images[0].imageUrl}
+            alt={car.title}
+            className="h-96 w-full object-cover"
+          />
+        </div>
+      ) : (
+        <div className="flex h-96 items-center justify-center
+                        rounded-lg bg-gray-100 text-gray-400">
+          No images available
+        </div>
+      )}
+
+      {/* 信息 */}
+      <div className="space-y-2">
+        <div className="flex items-start justify-between">
+          <h1 className="text-2xl font-bold">{car.title}</h1>
+          <Badge variant="secondary">{car.status}</Badge>
+        </div>
+        <p className="text-3xl font-bold text-blue-600">
+          ${car.price.toLocaleString()}
+        </p>
+        <p className="text-gray-500">
+          {car.year} · {car.brand} {car.model} ·{' '}
+          {car.mileage.toLocaleString()} km
+        </p>
+        <p className="text-sm text-gray-500">
+          Seller: {car.sellerUsername}
+        </p>
+      </div>
+
+      {/* 描述 */}
+      {car.description && (
+        <div className="space-y-2">
+          <h2 className="font-semibold">Description</h2>
+          <p className="whitespace-pre-line text-gray-600">
+            {car.description}
+          </p>
+        </div>
+      )}
+
+      {/* 操作按钮 */}
+      <div className="border-t pt-4">
+        {!isAuthenticated() && (
+          <Button asChild className="w-full">
+            <Link to="/login">Sign in to purchase</Link>
+          </Button>
+        )}
+
+        {isOwner && (
+          <div className="flex gap-2">
+            <Button asChild variant="outline" className="flex-1">
+              <Link to={`/cars/${car.id}/edit`}>Edit</Link>
+            </Button>
+            {car.status === 'Draft' && (
+              <Button className="flex-1">Submit for Review</Button>
+            )}
+          </div>
+        )}
+
+        {canBuy && (
+          <div className="flex gap-2">
+            <Button
+              variant="outline"
+              onClick={() => favoriteMutation.mutate()}
+              disabled={favoriteMutation.isPending}
+            >
+              {favoriteMutation.isPending ? 'Saving...' : '♡ Favorite'}
+            </Button>
+            <Button
+              className="flex-1"
+              onClick={() => setDialogOpen(true)}
+            >
+              Buy Now
+            </Button>
+          </div>
+        )}
+      </div>
+
+      {/* 下单确认弹窗 */}
+      <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Confirm Purchase</DialogTitle>
+            <DialogDescription>
+              You are about to purchase{' '}
+              <span className="font-semibold">{car.title}</span>{' '}
+              for{' '}
+              <span className="font-semibold text-blue-600">
+                ${car.price.toLocaleString()}
+              </span>.
+              This action cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setDialogOpen(false)}
+              disabled={orderMutation.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={() => orderMutation.mutate()}
+              disabled={orderMutation.isPending}
+            >
+              {orderMutation.isPending ? 'Processing...' : 'Confirm Purchase'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+    </div>
+  )
+}
+```
+
+
+
+### 6. 完整测试
+
+```bash
+npm run dev
+```
+
+**测试权限渲染：**
+
+未登录访问详情页 → 看到 "Sign in to purchase" 按钮。
+
+用车主账号登录，访问自己的车辆详情 → 看到 "Edit" 和 "Submit for Review" 按钮。
+
+用买家账号登录，访问别人的 Published 车辆 → 看到 "Favorite" 和 "Buy Now" 按钮。
+
+**测试收藏：**
+
+点击 "♡ Favorite" → 按钮短暂显示 "Saving..." → 右下角出现 "Added to favorites!" 通知。
+
+**测试下单：**
+
+点击 "Buy Now" → 弹出确认弹窗 → 点 Confirm → 按钮显示 "Processing..." → 成功后通知出现 → 跳转到 `/profile/purchases`（当前是占位页面）。
+
+**测试 invalidateQueries：**
+
+下单成功后返回详情页，刷新，车辆状态应该变成 "Sold"，按钮消失。
+
+
+
+### 7. 此时的目录变化
+
+```
+src/
+├── pages/
+│   └── CarDetailPage.tsx   ← 已更新（完整实现）
+└── main.tsx                ← 已更新（Toaster）
+```
+
+
+
+### 8. Git 提交
+
+```bash
+git add .
+git commit -m "feat: car detail page with buy and favorite actions"
+git push origin feature/browse-pages
+```
+
+
+
+### Step 51 完成状态
+
+```
+✅ 理解 useParams（读取 URL 动态参数）
+✅ 理解 enabled 选项（条件性发请求）
+✅ 安装 sonner，配置 Toaster
+✅ 理解 useMutation（写操作的状态管理）
+✅ 理解 invalidateQueries（操作后让缓存失效）
+✅ 理解 Dialog 受控组件用法
+✅ 权限判断逻辑（isOwner / canBuy / 未登录）
+✅ 收藏功能（useMutation + toast 通知）
+✅ 下单功能（Dialog 确认 + useMutation）
+✅ 测试通过（权限渲染/收藏/下单/缓存刷新）
+✅ Git commit 完成
+```
+
+
+
+## Step 52 · 完善导航布局
+
+### 这一步做什么
+
+Step 49 做的 `Layout` 组件只有最基础的导航栏，功能缺失：
+
+```
+现在：Logo + 用户名 + Sign out
+缺少：发布车辆链接、个人中心链接、当前页面高亮
+```
+
+这一步把导航栏完善，同时引入 `NavLink`——它和 `Link` 的区别是能感知当前路由，自动给当前页面的链接加高亮样式。
+
+
+
+### 1. NavLink 和 Link 的区别
+
+Step 46 开始一直在用 `Link` 做页面跳转。`Link` 只负责跳转，不关心当前在哪个页面。
+
+`NavLink` 多了一个能力：**知道自己指向的路由是不是当前激活的路由**，并且可以根据这个状态改变样式。
+
+```tsx
+// Link：固定样式，不感知当前路由
+<Link to="/cars" className="text-gray-600">
+  Browse Cars
+</Link>
+
+// NavLink：当前在 /cars 时，className 函数里的 isActive 为 true
+<NavLink
+  to="/cars"
+  className={({ isActive }) =>
+    isActive
+      ? "text-blue-600 font-semibold"   // 当前页面的样式
+      : "text-gray-600 hover:text-gray-900"  // 其他页面的样式
+  }
+>
+  Browse Cars
+</NavLink>
+```
+
+`className` 接收一个函数，函数参数里有 `isActive` 布尔值，根据它返回不同的类名字符串。这比手动判断路由再设置样式简洁得多。
+
+
+
+### 2. 安装下拉菜单组件
+
+用户登录后，点击用户名显示下拉菜单（个人中心、退出登录等）。用 shadcn 的 DropdownMenu 组件：
+
+```bash
+npx shadcn@latest add dropdown-menu
+```
+
+**DropdownMenu 的基本用法：**
+
+```tsx
+<DropdownMenu>
+  {/* 触发元素：点击它显示菜单 */}
+  <DropdownMenuTrigger asChild>
+    <Button variant="ghost">用户名</Button>
+  </DropdownMenuTrigger>
+
+  {/* 菜单内容 */}
+  <DropdownMenuContent align="end">
+    <DropdownMenuItem onClick={handleLogout}>
+      Sign out
+    </DropdownMenuItem>
+  </DropdownMenuContent>
+</DropdownMenu>
+```
+
+`align="end"` 让菜单从右侧对齐弹出，不会超出屏幕右边缘。
+
+
+
+### 3. 完善 Layout 组件
+
+打开 `src/components/Layout.tsx
+
+先想清楚导航栏需要什么
+
+```
+左侧：Logo（点击回首页）+ 主导航链接（Browse Cars）
+右侧：
+  未登录 → Sign in 链接 + Sign up 按钮
+  已登录 → Sell a Car 按钮 + 用户下拉菜单
+             下拉菜单里：My Profile、My Listings、Sign out
+```
+
+定义 NavLink 的样式函数
+
+这个样式逻辑会用到多次，抽成一个变量：
+
+```tsx
+// 导航链接的样式函数
+// isActive 为 true 时：蓝色加粗
+// isActive 为 false 时：灰色，hover 时变深
+const navLinkClass = ({ isActive }: { isActive: boolean }) =>
+  isActive
+    ? 'text-blue-600 font-semibold text-sm'
+    : 'text-gray-600 hover:text-gray-900 text-sm'
+```
+
+实现左侧：替换为`<NavLink/>`标签，并给主导航链接添加 `navLinkClass` 类名
+
+```tsx
+import { NavLink, Outlet, useNavigate } from "react-router-dom";
+
+...
+
+  return (
+    <div className="min-h-screen bg-gray-50">
+      <header className="border-b bg-white">
+        <div className="mx-auto flex max-w-7xl items-center
+                        justify-between px-4 py-4">
+
+          {/* 左侧*/}
+          <div className="flex items-center gap-8">
+              
+            {/* Logo */}
+            <NavLink to="/" className="text-xl font-bold text-blue-600">
+              UUcars
+            </NavLink>
+			
+            {/* 主导航 */}
+            <nav className="flex items-center gap-6">
+              <NavLink to="/" className={navLinkClass} end>
+                Browse Cars
+              </NavLink>
+            </nav>
+          </div>
+
+          {/* 右侧：登录状态 */}
+          <div className="flex items-center gap-3">
+            ...
+          </div>
+
+        </div>
+      </header>
+
+      <main className="mx-auto max-w-7xl px-4 py-8">
+        <Outlet />
+      </main>
+    </div>
+  )
+}
+```
+
+实现右侧：未登录状态
+
+```tsx
+...
+  return (
+    <div className="min-h-screen bg-gray-50">
+      <header className="border-b bg-white">
+        <div className="mx-auto flex max-w-7xl items-center
+                        justify-between px-4 py-4">
+
+          {/* 左侧 */}
+          <div className="flex items-center gap-8">
+           ...
+          </div>
+
+          {/* 右侧*/}
+          <div className="flex items-center gap-3">
+            {isAuthenticated() ? (
+              // 登录状态
+              <>
+                ...
+              </>
+            ) : (
+              // 未登录状态
+              <>
+                {/* 登录 */} 
+                <NavLink
+                  to="/login"
+                  className="text-sm text-gray-600 hover:text-gray-900"
+                >
+                  Sign in
+                </NavLink>
+              	{/* 注册 */}
+                <Button asChild size="sm">
+                  <NavLink to="/register">Sign up</NavLink>
+                </Button>
+              </>
+            )}
+          </div>
+
+        </div>
+      </header>
+      ...
+    </div>
+  )
+}
+```
+
+实现右侧：登录状态 - 使用下拉菜单组件
+
+```tsx
+
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "./ui/dropdown-menu";
+
+...
+
+  return (
+    <div className="min-h-screen bg-gray-50">
+      <header className="border-b bg-white">
+        <div
+          className="mx-auto flex max-w-7xl items-center
+                        justify-between px-4 py-4"
+        >
+          {/* 左侧*/}
+          <div className="flex items-center gap-8">
+           ...
+          </div>
+
+          {/* 右侧 */}
+          <div className="flex items-center gap-3">
+            {isAuthenticated() ? (
+              // 登录状态
+              <>
+                {/* 发布车辆按钮 */}
+                <Button asChild size="sm" variant="outline">
+                  <NavLink to="/cars/new">Sell a Car</NavLink>
+                </Button>
+
+                {/* 用户下拉菜单 */}
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button variant="ghost" size="sm">
+                      {user?.username}
+                    </Button>
+                  </DropdownMenuTrigger>
+
+                  <DropdownMenuContent align="end" className="w-48">
+                     
+                    {/* 用户资料 */} 
+                    <DropdownMenuItem onClick={() => navigate("/profile")}>
+                      My Profile
+                    </DropdownMenuItem>
+                      
+                    {/* 车辆发布列表 */}  
+                    <DropdownMenuItem
+                      onClick={() => navigate("/profile/listings")}
+                    >
+                      My Listings
+                    </DropdownMenuItem>
+                      
+                    {/* 购买列表 */}
+                    <DropdownMenuItem
+                      onClick={() => navigate("/profile/purchases")}
+                    >
+                      My Purchases
+                    </DropdownMenuItem>
+
+                    {/* 分隔线 */}
+                    <DropdownMenuSeparator />
+
+                    {/* Admin 入口：只有 Admin 角色才显示 */}
+                    {user?.role === "Admin" && (
+                      <>
+                        <DropdownMenuItem onClick={() => navigate("/admin")}>
+                          Admin Panel
+                        </DropdownMenuItem>
+                        <DropdownMenuSeparator />
+                      </>
+                    )}
+                      
+					{/* 退出登录 */}
+                    <DropdownMenuItem
+                      onClick={handleLogout}
+                      className="text-red-600"
+                    >
+                      Sign out
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </>
+            ) : (
+              // 未登录状态
+              <>
+               ...
+              </>
+            )}
+          </div>
+        </div>
+      </header>
+     ...
+    </div>
+  );
+}
+
+```
+
+> **`NavLink to="/" end` 里的 `end` 是什么？** 默认情况下，`/` 会匹配所有以 `/` 开头的路由（几乎所有路由），导致 "Browse Cars" 这个链接在任何页面都显示为激活状态。`end` 属性让它只在**完全匹配** `/` 时才激活，访问 `/cars/1` 时就不会激活了。
+
+
+
+### 4. 验证
+
+```bash
+npm run dev
+```
+
+**测试 NavLink 高亮：**
+
+访问首页 `/`，"Browse Cars" 链接应该是蓝色加粗。跳转到其他页面，它变回灰色。
+
+**测试未登录状态：**
+
+清除 localStorage，刷新，导航栏右侧显示 "Sign in" 和 "Sign up"。
+
+**测试已登录状态：**
+
+登录后，导航栏右侧显示 "Sell a Car" 按钮和用户名。点击用户名，下拉菜单出现，有 "My Profile"、"My Listings"、"My Purchases"、"Sign out" 等选项。
+
+**测试 Admin 菜单：**
+
+用 Admin 账号登录（`admin@uucars.com`），下拉菜单里额外显示 "Admin Panel" 选项。
+
+**测试退出登录：**
+
+点击 "Sign out"，跳转到登录页，导航栏恢复未登录状态。
+
+
+
+### 5. 此时的目录变化
+
+```
+src/
+└── components/
+    └── Layout.tsx    ← 已更新（NavLink + 下拉菜单）
+```
+
+
+
+### 6. Git 提交
+
+```bash
+git add .
+git commit -m "feat: complete navigation with NavLink and dropdown menu"
+git push origin feature/browse-pages
+```
+
+这一步完成，`feature/browse-pages` 分支包含了 Step 49、50、51、52 的所有内容，可以合并回 `develop`：
+
+```bash
+git checkout develop
+git merge --no-ff feature/browse-pages \
+    -m "merge: feature/browse-pages into develop"
+git push origin develop
+git branch -D feature/browse-pages
+git push origin --delete feature/browse-pages
+```
+
+
+
+### Step 52 完成状态
+
+```
+✅ 理解 NavLink 和 Link 的区别（感知当前路由）
+✅ 理解 NavLink className 函数（isActive 参数）
+✅ 理解 end 属性（精确匹配 /）
+✅ 安装 DropdownMenu 组件
+✅ 理解 DropdownMenu 基本用法（Trigger/Content/Item）
+✅ Layout 完善（左侧导航 + 右侧登录状态）
+✅ 已登录：Sell a Car + 用户下拉菜单
+✅ 未登录：Sign in + Sign up
+✅ Admin 角色额外显示 Admin Panel 入口
+✅ 测试通过（NavLink高亮/下拉菜单/退出登录/Admin菜单）
+✅ feature/browse-pages 合并回 develop
+```
