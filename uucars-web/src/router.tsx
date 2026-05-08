@@ -9,6 +9,7 @@ import ResetPasswordPage from "@/pages/ResetPasswordPage";
 import Layout from "@/components/Layout";
 import HomePage from "@/pages/HomePage";
 import CarDetailPage from "@/pages/CarDetailPage";
+import EditCarPage from "./pages/EditCarPage";
 
 export const router = createBrowserRouter([
   // 认证页面：不需要导航栏（全屏居中布局）
@@ -48,9 +49,10 @@ export const router = createBrowserRouter([
         element: <ProtectedRoute />,
         children: [
           {
-            path: `/cars/:id/submit`,
+            path: `/cars/new`,
             element: <CreateCarPage />,
           },
+          { path: "/cars/:id/edit", element: <EditCarPage /> },
         ],
       },
     ],

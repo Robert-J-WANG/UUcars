@@ -10679,3 +10679,915 @@ git push origin --delete feature/browse-pages
 ✅ 测试通过（NavLink高亮/下拉菜单/退出登录/Admin菜单）
 ✅ feature/browse-pages 合并回 develop
 ```
+
+
+
+## Step 53 · 发布/编辑车辆
+
+### 这一步做什么
+
+卖家需要能发布自己的车辆。发布流程：
+
+```
+填写车辆信息 → 创建草稿
+        ↓
+上传图片
+        ↓
+提交审核
+```
+
+这一步同时做发布和编辑两个页面——两者的表单完全一样，区别只是编辑时需要把已有数据填回表单。这是一个复用表单的好机会。
+
+
+
+### 1. 页面结构
+
+**CreateCarPage（发布新车）：**
+
+- 空表单，提交后创建草稿
+- 创建成功后跳转到编辑页，继续上传图片
+
+**EditCarPage（编辑草稿）：**
+
+- 先请求车辆数据，填回表单
+- 可以修改信息、上传/删除图片
+- 提交审核按钮
+
+两个页面共用同一个表单组件 `CarForm`，区别通过 props 传入。
+
+
+
+### 2. 图片预览：URL.createObjectURL 是什么
+
+用户选择图片文件后，要在上传之前先显示预览，让用户确认选对了。
+
+`URL.createObjectURL(file)` 是浏览器提供的 API，把一个 `File` 对象转成一个**临时的本地 URL**，可以直接放进 `<img src>` 显示：
+
+```tsx
+// file 是用户选择的 File 对象
+const previewUrl = URL.createObjectURL(file)
+// previewUrl 类似 "blob:http://localhost:5173/abc123..."
+// 直接放进 img 标签就能显示图片
+<img src={previewUrl} />
+```
+
+这个 URL 只存在于当前浏览器标签页的内存里，不需要上传到服务器，所以预览速度很快。
+
+使用完之后要释放内存：
+
+```tsx
+// 不用了之后释放
+URL.revokeObjectURL(previewUrl)
+```
+
+
+
+### 3. 创建车辆表单组件
+
+切出新的分支
+
+```bash
+git checkout develop
+git checkout -b feature/seller-pages
+git push -u origin feature/seller-pages
+```
+
+表单组件负责信息填写，不负责创建或更新的 API 调用（那是页面组件的事）：
+
+```bash
+touch src/components/CarForm.tsx
+```
+
+**第一步：定义 Schema 和类型**
+
+```tsx
+import { z } from 'zod'
+
+const carSchema = z.object({
+  title: z
+    .string()
+    .min(1, 'Title is required')
+    .max(100, 'Title must not exceed 100 characters'),
+  brand: z
+    .string()
+    .min(1, 'Brand is required')
+    .max(50, 'Brand must not exceed 50 characters'),
+  model: z
+    .string()
+    .min(1, 'Model is required')
+    .max(50, 'Model must not exceed 50 characters'),
+  year: z
+    .number({error: 'Year is required' })
+    .int()
+    .min(1900, 'Year must be after 1900')
+    .max(new Date().getFullYear() + 1, 'Invalid year'),
+  price: z
+    .number({ error: 'Price is required' })
+    .positive('Price must be greater than 0'),
+  mileage: z
+    .number({ error: 'Mileage is required' })
+    .min(0, 'Mileage cannot be negative'),
+  description: z.string().max(2000).optional(),
+})
+
+export type CarFormValues = z.infer<typeof carSchema>
+```
+
+> **`z.number({ error: '...' })` 是什么？** HTML 的 `<input type="number">` 在用户没有输入时，返回的是空字符串 `""`，不是数字。Zod 默认的 `z.number()` 在收到字符串时会显示 "Expected number, received string" 这样不友好的错误。error` 让你自定义这种情况的错误信息。
+>
+> 但还有一个问题：`<input>` 返回的始终是字符串，即使用户输入了数字。需要在 RHF 的配置里告诉它把这些字段的值转成数字，稍后会处理。
+
+**第二步：定义 Props 类型**
+
+```tsx
+interface CarFormProps {
+  // defaultValues：编辑时传入已有数据，发布时不传（空表单）
+  defaultValues?: CarFormValues
+  // onSubmit：父组件（页面）负责实际的 API 调用
+  onSubmit: (values: CarFormValues) => Promise<void>
+  // isSubmitting：从父组件传入，控制按钮禁用状态
+  isSubmitting: boolean
+  // submitLabel：按钮文字（"Create Draft" 或 "Save Changes"）
+  submitLabel: string
+}
+```
+
+**第三步：实现表单**
+
+```tsx
+import { useForm } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+
+export default function CarForm({
+  defaultValues,
+  onSubmit,
+  isSubmitting,
+  submitLabel,
+}: CarFormProps) {
+  const {
+    register,
+    handleSubmit,
+    formState: { errors },
+  } = useForm<CarFormValues>({
+    resolver: zodResolver(carSchema),
+    defaultValues,
+  })
+
+  return (
+    <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+
+      <div className="space-y-2">
+        <Label htmlFor="title">Title</Label>
+        <Input
+          id="title"
+          placeholder="e.g. 2020 BMW 3 Series - Low Mileage"
+          {...register('title')}
+        />
+        {errors.title && (
+          <p className="text-sm text-red-500">{errors.title.message}</p>
+        )}
+      </div>
+
+      <div className="grid grid-cols-2 gap-4">
+        <div className="space-y-2">
+          <Label htmlFor="brand">Brand</Label>
+          <Input
+            id="brand"
+            placeholder="e.g. BMW"
+            {...register('brand')}
+          />
+          {errors.brand && (
+            <p className="text-sm text-red-500">{errors.brand.message}</p>
+          )}
+        </div>
+
+        <div className="space-y-2">
+          <Label htmlFor="model">Model</Label>
+          <Input
+            id="model"
+            placeholder="e.g. 3 Series"
+            {...register('model')}
+          />
+          {errors.model && (
+            <p className="text-sm text-red-500">{errors.model.message}</p>
+          )}
+        </div>
+      </div>
+
+      <div className="grid grid-cols-3 gap-4">
+        <div className="space-y-2">
+          <Label htmlFor="year">Year</Label>
+          <Input
+            id="year"
+            type="number"
+            placeholder="2020"
+            // valueAsNumber：告诉 RHF 把这个字段的值转成数字
+            // 不加这个，RHF 收到的是字符串，Zod 的 z.number() 会报错
+            {...register('year', { valueAsNumber: true })}
+          />
+          {errors.year && (
+            <p className="text-sm text-red-500">{errors.year.message}</p>
+          )}
+        </div>
+
+        <div className="space-y-2">
+          <Label htmlFor="price">Price ($)</Label>
+          <Input
+            id="price"
+            type="number"
+            placeholder="25000"
+            {...register('price', { valueAsNumber: true })}
+          />
+          {errors.price && (
+            <p className="text-sm text-red-500">{errors.price.message}</p>
+          )}
+        </div>
+
+        <div className="space-y-2">
+          <Label htmlFor="mileage">Mileage (km)</Label>
+          <Input
+            id="mileage"
+            type="number"
+            placeholder="50000"
+            {...register('mileage', { valueAsNumber: true })}
+          />
+          {errors.mileage && (
+            <p className="text-sm text-red-500">{errors.mileage.message}</p>
+          )}
+        </div>
+      </div>
+
+      <div className="space-y-2">
+        <Label htmlFor="description">Description (optional)</Label>
+        <textarea
+          id="description"
+          rows={4}
+          placeholder="Describe the car's condition, features, history..."
+          className="w-full rounded-md border px-3 py-2 text-sm
+                     focus:outline-none focus:ring-2 focus:ring-blue-500"
+          {...register('description')}
+        />
+        {errors.description && (
+          <p className="text-sm text-red-500">{errors.description.message}</p>
+        )}
+      </div>
+
+      <Button type="submit" disabled={isSubmitting}>
+        {isSubmitting ? 'Saving...' : submitLabel}
+      </Button>
+
+    </form>
+  )
+}
+```
+
+
+
+### 4. 图片上传组件
+
+图片上传逻辑比较独立，抽成一个组件：
+
+```bash
+touch src/components/ImageUploader.tsx
+```
+
+**思路**
+
+用户选择文件 → 本地预览 → 调用 API 上传 → 显示上传后的 URL
+
+定义参数类型
+
+```tsx
+import { carsApi } from '@/api'
+import type { CarImage } from '@/types'
+
+interface ImageUploaderProps {
+  carId: number
+  images: CarImage[]   // 已有的图片列表
+}
+
+export default function ImageUploader() {
+  return <div>ImageUploader</div>;
+}
+```
+
+**图片预览实现原理：**
+
+- 使用`URL.createObjectURL(file)` 
+
+用户选择图片文件后，要在上传之前先显示预览，让用户确认选对了。
+
+`URL.createObjectURL(file)` 是浏览器提供的 API，把一个 `File` 对象转成一个**临时的本地 URL**，可以直接放进 `<img src>` 显示：
+
+```tsx
+// file 是用户选择的 File 对象
+const previewUrl = URL.createObjectURL(file)
+// previewUrl 类似 "blob:http://localhost:5173/abc123..."
+// 直接放进 img 标签就能显示图片
+<img src={previewUrl} />
+```
+
+这个 URL 只存在于当前浏览器标签页的内存里，不需要上传到服务器，所以预览速度很快。
+
+使用完之后要释放内存：
+
+```tsx
+// 不用了之后释放
+URL.revokeObjectURL(previewUrl)
+```
+
+**选择文件和预览**
+
+```tsx
+...
+export default function ImageUploader() {
+  // previewUrl：用户选择文件后的本地预览 URL
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  // selectedFile：用户选择的文件对象，上传时用
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    // 释放上一个预览 URL（避免内存泄漏）
+    if (previewUrl) {
+      URL.revokeObjectURL(previewUrl);
+    }
+
+    // 生成本地预览 URL
+    const url = URL.createObjectURL(file);
+    setPreviewUrl(url);
+    setSelectedFile(file);
+  };
+
+  return <div>ImageUploader</div>;
+}
+
+```
+
+**上传 mutation**
+
+```tsx
+export default function ImageUploader() {
+  ...
+  const queryClient = new QueryClient();
+
+  const uploadMutation = useMutation({
+    mutationFn: (file: File) => carsApi.uploadImage(carId, file),
+    onSuccess: () => {
+      toast.success('Image uploaded!')
+      // 清除预览状态
+      setPreviewUrl(null)
+      setSelectedFile(null)
+      // 让车辆详情缓存失效，图片列表会刷新
+      queryClient.invalidateQueries({ queryKey: ['car', carId] })
+    },
+    onError: (error) => {
+      toast.error(error.message)
+    },
+  })
+
+  return <div>ImageUploader</div>;
+}
+
+
+```
+
+**渲染 UI 骨架**
+
+使用`useRef` hook， 创建一个存储input 元素的容器
+
+> **`useRef` 是什么？** `useRef` 创建一个可以存储任意值的容器，**修改它不会触发组件重新渲染**。最常见的用途是存储 DOM 元素的引用，这样可以用 JavaScript 直接操作这个元素。这里用它拿到 `<input type="file">` 的引用，实现"点击自定义按钮触发文件选择框"的效果——隐藏原生的 input，用好看的 Button 代替，点 Button 时调用 `inputRef.current.click()` 触发文件选择。
+>
+> 
+
+```tsx
+export default function ImageUploader() {
+  ...
+// useRef 拿到 input 元素的引用，点击按钮时触发文件选择
+const inputRef = useRef<HTMLInputElement>(null)
+
+return (
+      {/* 选择图片 */}
+      <div className="space-y-3">
+        {/* 隐藏的原生文件选择 input */}
+        <input
+          ref={inputRef}
+          type="file"
+          accept="image/jpeg,image/png,image/webp"
+          className="hidden"
+          onChange={handleFileChange}
+        />
+
+        {/* 点击这个按钮触发文件选择 */}
+        <Button
+          type="button"
+          variant="outline"
+          onClick={() => inputRef.current?.click()}
+        >
+          Select Image
+        </Button>
+
+        {/* 选择后显示预览 */}
+        {previewUrl && selectedFile && (
+          <div className="space-y-2">
+            <img
+              src={previewUrl}
+              alt="Preview"
+              className="h-40 w-40 rounded-lg object-cover"
+            />
+            <p className="text-sm text-gray-500">{selectedFile.name}</p>
+            <Button
+              type="button"
+              size="sm"
+              onClick={() => uploadMutation.mutate(selectedFile)}
+              disabled={uploadMutation.isPending}
+            >
+              {uploadMutation.isPending ? 'Uploading...' : 'Upload'}
+            </Button>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+```
+
+**删除 mutation**
+
+```tsx
+  const deleteMutation = useMutation({
+    mutationFn: (imageId: number) => carsApi.deleteImage(carId, imageId),
+    onSuccess: () => {
+      toast.success('Image deleted.')
+      queryClient.invalidateQueries({ queryKey: ['car', carId] })
+    },
+    onError: (error) => {
+      toast.error(error.message)
+    },
+  })
+```
+
+**补齐 UI**
+
+```tsx
+  return (
+    <div className="space-y-4">
+      <h2 className="font-semibold">Images</h2>
+
+      {/* 已上传的图片列表 */}
+      {images.length > 0 && (
+        <div className="flex flex-wrap gap-3">
+          {images.map(image => (
+            <div key={image.id} className="relative">
+              <img
+                src={image.imageUrl}
+                alt="Car"
+                className="h-24 w-24 rounded-lg object-cover"
+              />
+              {/* 删除按钮 */}
+              <button
+                onClick={() => deleteMutation.mutate(image.id)}
+                disabled={deleteMutation.isPending}
+                className="absolute -right-2 -top-2 flex h-5 w-5
+                           items-center justify-center rounded-full
+                           bg-red-500 text-xs text-white
+                           hover:bg-red-600"
+              >
+                ×
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* 选择新图片 */}
+      <div className="space-y-3">
+        {/* 隐藏的原生文件选择 input */}
+        <input
+          ref={inputRef}
+          type="file"
+          accept="image/jpeg,image/png,image/webp"
+          className="hidden"
+          onChange={handleFileChange}
+        />
+
+        {/* 点击这个按钮触发文件选择 */}
+        <Button
+          type="button"
+          variant="outline"
+          onClick={() => inputRef.current?.click()}
+        >
+          Select Image
+        </Button>
+
+        {/* 选择后显示预览 */}
+        {previewUrl && selectedFile && (
+          <div className="space-y-2">
+            <img
+              src={previewUrl}
+              alt="Preview"
+              className="h-40 w-40 rounded-lg object-cover"
+            />
+            <p className="text-sm text-gray-500">{selectedFile.name}</p>
+            <Button
+              type="button"
+              size="sm"
+              onClick={() => uploadMutation.mutate(selectedFile)}
+              disabled={uploadMutation.isPending}
+            >
+              {uploadMutation.isPending ? 'Uploading...' : 'Upload'}
+            </Button>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+```
+
+
+
+### 5. 实现 CreateCarPage
+
+打开 `src/pages/CreateCarPage.tsx`。
+
+这个页面只负责创建草稿，创建成功后跳转到编辑页：
+
+```tsx
+import { useNavigate } from 'react-router-dom'
+import { useMutation } from '@tanstack/react-query'
+import { toast } from 'sonner'
+import { carsApi } from '@/api'
+import CarForm from '@/components/CarForm'
+import type { CarFormValues } from '@/components/CarForm'
+
+export default function CreateCarPage() {
+  const navigate = useNavigate()
+
+  const createMutation = useMutation({
+    mutationFn: (values: CarFormValues) => carsApi.create(values),
+    onSuccess: (car) => {
+      toast.success('Draft created!')
+      // 创建成功后跳转到编辑页，继续上传图片
+      navigate(`/cars/${car.id}/edit`)
+    },
+    onError: (error) => {
+      toast.error(error.message)
+    },
+  })
+
+  const handleSubmit = async (values: CarFormValues) => {
+    createMutation.mutate(values)
+  }
+
+  return (
+    <div className="mx-auto max-w-2xl space-y-6">
+      <h1 className="text-2xl font-bold">List Your Car</h1>
+      <CarForm
+        onSubmit={handleSubmit}
+        isSubmitting={createMutation.isPending}
+        submitLabel="Create Draft"
+      />
+    </div>
+  )
+}
+```
+
+
+
+### 6. 实现 EditCarPage
+
+新建页面
+
+```bash
+touch src/pages/EditCarPage.tsx
+```
+
+编辑页需要先请求车辆数据，把数据填回表单，同时提供图片上传和提交审核功能：
+
+**第一步：请求车辆数据**
+
+```tsx
+import { carsApi } from "@/api";
+import { useQuery } from "@tanstack/react-query";
+import { useParams } from "react-router-dom";
+
+export default function EditCarPage() {
+  const { id } = useParams();
+  const carId = Number(id);
+
+  const { data: car, isLoading } = useQuery({
+    queryKey: ["car", carId],
+    queryFn: () => carsApi.getById(carId),
+    enabled: !isNaN(carId),
+  });
+
+  if (isLoading) return <div className="p-8">Loading...</div>;
+  if (!car) return <div className="p-8">Car not found.</div>;
+
+  return <div>EditCarPage</div>;
+}
+
+```
+
+
+
+```tsx
+import { useParams, useNavigate } from 'react-router-dom'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { toast } from 'sonner'
+import { carsApi } from '@/api'
+import CarForm from '@/components/CarForm'
+import type { CarFormValues } from '@/components/CarForm'
+import ImageUploader from '@/components/ImageUploader'
+import { Button } from '@/components/ui/button'
+
+export default function EditCarPage() {
+  const { id } = useParams()
+  const carId = Number(id)
+  const navigate = useNavigate()
+  const queryClient = useQueryClient()
+
+  const { data: car, isLoading } = useQuery({
+    queryKey: ['car', carId],
+    queryFn: () => carsApi.getById(carId),
+    enabled: !isNaN(carId),
+  })
+
+  if (isLoading) return <div className="p-8">Loading...</div>
+  if (!car) return <div className="p-8">Car not found.</div>
+```
+
+**第二步：只有 Draft 状态才能编辑**
+
+```tsx
+...
+import { useParams, useNavigate } from 'react-router-dom'
+import { Button } from "@/components/ui/button";
+
+export default function EditCarPage() {
+ ...
+ const navigate = useNavigate()
+ 
+  // 不是草稿状态，不允许编辑
+  if (car.status !== 'Draft') {
+    return (
+      <div className="mx-auto max-w-2xl p-8 text-center">
+        <p className="text-gray-500">
+          This car cannot be edited in its current status ({car.status}).
+        </p>
+        <Button
+          variant="outline"
+          className="mt-4"
+          onClick={() => navigate('/profile/listings')}
+        >
+          Back to My Listings
+        </Button>
+      </div>
+    )
+  }
+
+  return <div>EditCarPage</div>;
+}
+
+```
+
+**第三步：更新 mutation**
+
+```tsx
+...
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
+
+export default function EditCarPage() {
+ ...
+	const queryClient = useQueryClient();
+    const updateMutation = useMutation({
+        mutationFn: (values: CarFormValues) => carsApi.update(carId, values),
+        onSuccess: () => {
+          toast.success('Changes saved!')
+          queryClient.invalidateQueries({ queryKey: ['car', carId] })
+        },
+        onError: (error) => {
+          toast.error(error.message)
+        },
+      })
+    
+    const handleSubmit = async (values: CarFormValues) => {
+    updateMutation.mutate(values)
+  }
+
+  return <div>EditCarPage</div>;
+}
+```
+
+渲染UI，数据回填
+
+```tsx
+...
+
+export default function EditCarPage() {
+  ...
+  const queryClient = useQueryClient();
+
+  const updateMutation = useMutation({
+    mutationFn: (values: CarFormValues) => carsApi.update(carId, values),
+    onSuccess: () => {
+      toast.success("Changes saved!");
+      queryClient.invalidateQueries({ queryKey: ["car", carId] });
+    },
+    onError: (error) => {
+      toast.error(error.message);
+    },
+  });
+
+  const handleSubmit = async (values: CarFormValues) => {
+    updateMutation.mutate(values);
+  };
+
+ ...
+
+ return (
+    <>
+      <div>EditCarPage</div>
+      {/* 车辆信息表单，defaultValues 填入已有数据 */}
+      <CarForm
+        defaultValues={{
+          title: car.title,
+          brand: car.brand,
+          model: car.model,
+          year: car.year,
+          price: car.price,
+          mileage: car.mileage,
+          description: car.description ?? "",
+        }}
+        onSubmit={handleSubmit}
+        isSubmitting={updateMutation.isPending}
+        submitLabel="Save Changes"
+      />
+    </>
+  )
+}
+
+```
+
+
+
+**第四步：提交审核 mutation**
+
+```tsx
+  const submitMutation = useMutation({
+    mutationFn: () => carsApi.submit(carId),
+    onSuccess: () => {
+      toast.success('Submitted for review!')
+      navigate('/profile/listings')
+    },
+    onError: (error) => {
+      toast.error(error.message)
+    },
+  })
+```
+
+
+
+**第五步：渲染完整页面**
+
+```tsx
+  const handleSubmit = async (values: CarFormValues) => {
+    updateMutation.mutate(values)
+  }
+
+  return (
+    <div className="mx-auto max-w-2xl space-y-8">
+      <div className="flex items-center justify-between">
+        <h1 className="text-2xl font-bold">Edit Car</h1>
+        {/* 提交审核按钮 */}
+        <Button
+          onClick={() => submitMutation.mutate()}
+          disabled={submitMutation.isPending}
+        >
+          {submitMutation.isPending ? 'Submitting...' : 'Submit for Review'}
+        </Button>
+      </div>
+
+      {/* 车辆信息表单，defaultValues 填入已有数据 */}
+      <CarForm
+        defaultValues={{
+          title: car.title,
+          brand: car.brand,
+          model: car.model,
+          year: car.year,
+          price: car.price,
+          mileage: car.mileage,
+          description: car.description ?? '',
+        }}
+        onSubmit={handleSubmit}
+        isSubmitting={updateMutation.isPending}
+        submitLabel="Save Changes"
+      />
+
+      {/* 图片上传 */}
+      <ImageUploader carId={carId} images={car.images} />
+    </div>
+  )
+}
+```
+
+
+
+### 7. 更新路由
+
+打开 `src/router.tsx`，确认编辑页路由已经在受保护路由里：
+
+```tsx
+import EditCarPage from '@/pages/EditCarPage'
+
+// 在受保护路由的 children 里（已有 CreateCarPage）
+{ path: '/cars/:id/edit', element: <EditCarPage /> },
+```
+
+
+
+### 8. 完整测试
+
+```bash
+npm run dev
+```
+
+**测试发布流程：**
+
+登录后点导航栏 "Sell a Car" → 进入发布页面。
+
+不填内容直接提交 → 看到字段验证错误。
+
+正确填写所有字段，提交 → 看到 "Draft created!" 通知 → 自动跳转到编辑页。
+
+**测试编辑页：**
+
+编辑页表单里已经填好了刚才输入的数据。修改价格，点 "Save Changes" → 看到 "Changes saved!" 通知。
+
+**测试图片上传：**
+
+点 "Select Image" → 选择一张本地图片 → 看到预览 → 点 "Upload" → 看到 "Image uploaded!" 通知 → 图片出现在已上传列表里。
+
+**测试删除图片：**
+
+点图片右上角的 × 按钮 → 图片消失，看到 "Image deleted." 通知。
+
+**测试提交审核：**
+
+点右上角 "Submit for Review" → 看到通知 → 跳转到 `/profile/listings`（当前是占位页）。
+
+**验证状态保护：**
+
+在数据库里把一辆车的状态改成 `PendingReview`，访问它的编辑页，应该看到"This car cannot be edited"提示。
+
+
+
+### 9. 此时的目录变化
+
+```
+src/
+├── components/
+│   ├── CarForm.tsx         ← 新增
+│   └── ImageUploader.tsx   ← 新增
+└── pages/
+    ├── CreateCarPage.tsx   ← 已更新（完整实现）
+    └── EditCarPage.tsx     ← 已更新（完整实现）
+```
+
+
+
+### 10. Git 提交
+
+```bash
+git add .
+git commit -m "feat: create and edit car pages with image upload"
+git push origin feature/seller-pages
+```
+
+
+
+### Step 53 完成状态
+
+```
+✅ 理解表单组件复用（CarForm被Create和Edit共用）
+✅ 理解 valueAsNumber（让RHF把input值转成数字）
+✅ 理解 z.number invalid_type_error（自定义类型错误提示）
+✅ 理解 URL.createObjectURL（本地图片预览）
+✅ 理解 useRef（DOM引用，触发文件选择框）
+✅ 理解 URL.revokeObjectURL（释放内存）
+✅ CarForm 组件（Props类型 + defaultValues + submitLabel）
+✅ ImageUploader 组件（选择/预览/上传/删除）
+✅ CreateCarPage（创建草稿，成功后跳编辑页）
+✅ EditCarPage（加载数据/填回表单/图片管理/提交审核）
+✅ 状态保护（非Draft状态不允许编辑）
+✅ 测试通过（发布/编辑/图片上传/删除/提交审核）
+✅ Git commit 完成
+```
