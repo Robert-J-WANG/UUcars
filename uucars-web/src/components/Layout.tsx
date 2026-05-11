@@ -27,7 +27,7 @@ export default function Layout() {
   };
 
   return (
-    <div className="min-h-screen bg-gray-50">
+    <div className="min-h-screen bg-gray-100">
       <header className="border-b bg-white">
         <div
           className="mx-auto flex max-w-7xl items-center

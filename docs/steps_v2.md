@@ -11232,7 +11232,7 @@ export default function ImageUploader() {
 
 
 
-### 6. 实现 EditCarPage
+### 5. 实现 EditCarPage
 
 新建页面
 
@@ -11406,14 +11406,14 @@ export default function EditCarPage() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
 
-  /* ---------- 请求车辆数据-用于表单回填 --------- */
+  /* ---- 请求车辆数据-用于表单回填 --- */
   const { data: car, isLoading } = useQuery({
     queryKey: ["car", carId],
     queryFn: () => carsApi.getById(carId),
     enabled: !isNaN(carId),
   });
 
-  /* ----------- 更新 mutation ---------- */
+  /* ----- 更新 mutation ---- */
   const updateMutation = useMutation({
     mutationFn: (values: CarFormValues) => carsApi.update(carId, values),
     onSuccess: () => {
@@ -11429,7 +11429,7 @@ export default function EditCarPage() {
     updateMutation.mutate(values);
   };
 
-  /* ---------- 提交审核 mutation --------- */
+  /* ---- 提交审核 mutation --- */
   const submitMutation = useMutation({
     mutationFn: () => carsApi.submit(carId),
     onSuccess: () => {
@@ -11501,7 +11501,7 @@ export default function EditCarPage() {
 
 
 
-### 7. 更新路由
+### 6. 更新路由
 
 打开 `src/router.tsx`，确认编辑页路由已经在受保护路由里：
 
@@ -11514,7 +11514,7 @@ import EditCarPage from '@/pages/EditCarPage'
 
 
 
-### 8. 完整测试
+### 7. 完整测试
 
 ```bash
 npm run dev
@@ -11550,7 +11550,7 @@ npm run dev
 
 
 
-### 9. 此时的目录变化
+### 8. 此时的目录变化
 
 ```
 src/
@@ -11564,7 +11564,7 @@ src/
 
 
 
-### 10. Git 提交
+### 9. Git 提交
 
 ```bash
 git add .
@@ -11590,4 +11590,1076 @@ git push origin feature/seller-pages
 ✅ 状态保护（非Draft状态不允许编辑）
 ✅ 测试通过（发布/编辑/图片上传/删除/提交审核）
 ✅ Git commit 完成
+```
+
+
+
+## Step 54 · 个人中心
+
+### 这一步做什么
+
+个人中心有四个标签页：我的车辆、我的收藏、我买的订单、我卖的订单。
+
+用嵌套路由实现：
+
+```
+/profile           → ProfilePage（外层布局，含标签栏）
+/profile/listings  → MyListingsPage（子路由，在 Outlet 渲染）
+/profile/favorites → MyFavoritesPage
+/profile/purchases → MyPurchasesPage
+/profile/sales     → MySalesPage
+```
+
+切换标签时只有 `Outlet` 里的内容变化，标签栏本身不重新渲染。
+
+
+
+### 1. 嵌套路由实战：ProfilePage
+
+Step 47 讲了 `Outlet` 的概念，这里真正用上。
+
+`ProfilePage` 是外层布局——顶部是标签栏，下方是 `Outlet`（子路由内容渲染在这里）。
+
+**标签栏用 `NavLink` 实现：** 点击标签时跳转子路由，当前激活的标签有高亮样式。这和导航栏的 `NavLink` 完全一样的用法。
+
+先来想清楚标签栏的数据结构，把每个标签定义成一个对象，再用 `.map()` 渲染，避免重复代码：
+
+```tsx
+const tabs = [
+  { to: '/profile/listings',  label: 'My Listings' },
+  { to: '/profile/favorites', label: 'My Favorites' },
+  { to: '/profile/purchases', label: 'My Purchases' },
+  { to: '/profile/sales',     label: 'My Sales' },
+]
+```
+
+打开 `src/pages/ProfilePage.tsx`：
+
+```tsx
+import { NavLink, Outlet } from 'react-router-dom'
+import { useAuthStore } from '@/stores/authStore'
+
+const tabs = [
+  { to: '/profile/listings',  label: 'My Listings' },
+  { to: '/profile/favorites', label: 'My Favorites' },
+  { to: '/profile/purchases', label: 'My Purchases' },
+  { to: '/profile/sales',     label: 'My Sales' },
+]
+
+export default function ProfilePage() {
+  const { user } = useAuthStore()
+
+  return (
+    <div className="space-y-6">
+      {/* 页头 */}
+      <div>
+        <h1 className="text-2xl font-bold">My Profile</h1>
+        <p className="text-gray-500">{user?.email}</p>
+      </div>
+
+      {/* 标签栏 */}
+      <div className="border-b">
+        <nav className="flex gap-1">
+          {tabs.map(tab => (
+            <NavLink
+              key={tab.to}
+              to={tab.to}
+              className={({ isActive }) =>
+                isActive
+                  ? 'border-b-2 border-blue-600 px-4 py-2 text-sm font-semibold text-blue-600'
+                  : 'px-4 py-2 text-sm text-gray-600 hover:text-gray-900'
+              }
+            >
+              {tab.label}
+            </NavLink>
+          ))}
+        </nav>
+      </div>
+
+      {/* 子路由内容渲染在这里 */}
+      {/* 切换标签时，只有这里的内容变化，上方的标签栏不重新渲染 */}
+      <Outlet />
+    </div>
+  )
+}
+```
+
+验证路由配置正确。打开 `src/router.tsx`，确认个人中心的嵌套路由结构：
+
+```tsx
+import ProfilePage from '@/pages/ProfilePage'
+import MyListingsPage from '@/pages/MyListingsPage'
+import MyFavoritesPage from '@/pages/MyFavoritesPage'
+import MyPurchasesPage from '@/pages/MyPurchasesPage'
+import MySalesPage from '@/pages/MySalesPage'
+
+// 在受保护路由的 children 里
+{
+  path: '/profile',
+  element: <ProfilePage />,
+  children: [
+    // index: true 表示访问 /profile 时默认显示这个子路由
+    { index: true, element: <MyListingsPage /> },
+    { path: 'listings', element: <MyListingsPage /> },
+    { path: 'favorites', element: <MyFavoritesPage /> },
+    { path: 'purchases', element: <MyPurchasesPage /> },
+    { path: 'sales', element: <MySalesPage /> },
+  ],
+},
+```
+
+验证效果：
+
+```bash
+npm run dev
+```
+
+登录后访问 `/profile`，应该看到标签栏和默认显示的子路由内容（当前是占位）。点击不同标签，URL 变化，标签高亮切换，上方标签栏不闪烁。
+
+
+
+### 2. 我的车辆列表（MyListingsPage）
+
+卖家需要看到自己所有状态的车辆，并且能执行操作：提交审核、删除。
+
+打开 `src/pages/MyListingsPage.tsx`：
+
+**第一步：请求数据**
+
+```tsx
+import { useQuery} from '@tanstack/react-query'
+
+
+export default function MyListingsPage() {
+  const queryClient = useQueryClient()
+
+  const { data, isLoading } = useQuery({
+    queryKey: ['my-listings'],
+    queryFn: () => carsApi.getMyListings(),
+  })
+
+  if (isLoading) return <div>Loading...</div>
+```
+
+使用Badge显示车辆状态，并设置状态对应的颜色
+
+不同状态用不同颜色，让卖家一眼看清楚每辆车处于哪个阶段
+
+```ts
+ // 根据状态返回 Badge 的 variant
+  const getStatusVariant = (status: string) => {
+    switch (status) {
+      case "Published":
+        return "secondary";
+      case "PendingReview":
+        return "outline";
+      case "Sold":
+        return "destructive";
+      case "Draft":
+      default:
+        return "default";
+    }
+  };
+```
+
+渲染列表
+
+```tsx
+import { carsApi } from "@/api";
+import { Badge } from "@/components/ui/badge";
+import { useQuery } from "@tanstack/react-query";
+import { Link } from "react-router-dom";
+
+export default function MyListingsPage() {
+  /* -------------- 请求数据 -------------- */
+...
+
+  // 根据状态返回 Badge 的 variant
+...
+
+  if (isLoading) return <div>Loading...</div>;
+    
+  if (!data?.items.length) {
+    return (
+      <div className="py-12 text-center text-gray-500">
+        You haven't listed any cars yet.{" "}
+        <Link to="/cars/new" className="text-blue-600 hover:underline">
+          List your first car
+        </Link>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      {data.items.map((car) => (
+        <div
+          key={car.id}
+          className="flex items-center justify-between rounded-lg
+                     border bg-white p-4"
+        >
+          {/* 车辆信息 */}
+          <div className="space-y-1">
+            <div className="flex items-center gap-2">
+              <span className="font-medium">{car.title}</span>
+              <Badge variant={getStatusVariant(car.status)}>{car.status}</Badge>
+            </div>
+            <p className="text-sm text-gray-500">
+              ${car.price.toLocaleString()} · {car.year} ·{" "}
+              {car.mileage.toLocaleString()} km
+            </p>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+```
+
+**第二步：操作 mutation**
+
+只有 Draft 状态才有操作:
+
+- Submit for review
+- Delete
+
+```tsx
+
+export default function MyListingsPage() {
+    
+  const queryClient = useQueryClient();
+  /* -------------- 请求数据 -------------- */
+ 
+    ...
+
+  /* --------- submit Mutation -------- */
+  const submitMutation = useMutation({
+    mutationFn: (carId: number) => carsApi.submit(carId),
+    onSuccess: () => {
+      toast.success("Submitted for review!");
+      queryClient.invalidateQueries({ queryKey: ["my-listings"] });
+    },
+    onError: (error) => toast.error(error.message),
+  });
+
+  /* --------- delete mutation -------- */
+
+  const deleteMutation = useMutation({
+    mutationFn: (carId: number) => carsApi.delete(carId),
+    onSuccess: () => {
+      toast.success("Car deleted.");
+      queryClient.invalidateQueries({ queryKey: ["my-listings"] });
+    },
+    onError: (error) => toast.error(error.message),
+  });
+    
+  return (
+    <div className="space-y-3">
+    ...
+    </div>
+  );
+}
+
+```
+
+添加操作按钮
+
+```tsx
+...
+
+export default function MyListingsPage() {
+ 
+  /* -------------- 请求数据 -------------- */
+  ...
+
+  // 根据状态返回 Badge 的 variant
+	...
+
+  /* --------- submit Mutation -------- */
+  	...
+
+  /* --------- delete mutation -------- */
+
+	...
+
+  return (
+    <div className="space-y-3">
+      {data.items.map((car) => (
+        <div
+          key={car.id}
+          className="flex items-center justify-between rounded-lg
+                     border bg-white p-4"
+        >
+          {/* 左侧：车辆信息 */}
+
+                  ...
+
+          {/* 右侧：操作按钮（只有 Draft 状态才有操作） */}
+          {car.status === "Draft" && (
+            <div className="flex gap-2">
+              <Button asChild variant="outline" size="sm">
+                <Link to={`/cars/${car.id}/edit`}>Edit</Link>
+              </Button>
+              <Button
+                size="sm"
+                onClick={() => submitMutation.mutate(car.id)}
+                disabled={submitMutation.isPending}
+              >
+                Submit
+              </Button>
+              <Button
+                size="sm"
+                variant="destructive"
+                onClick={() => deleteMutation.mutate(car.id)}
+                disabled={deleteMutation.isPending}
+              >
+                Delete
+              </Button>
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+```
+
+**第三步：更新拦截器**
+
+注意：DELETE 请求返回 `204 No Content`，没有响应体。 响应拦截器把 204 No Content 当成失败了
+
+```tsx
+...
+// =============================================
+// 响应拦截器：统一处理响应和错误
+// =============================================
+apiClient.interceptors.response.use(
+  (response) => {
+    const apiResponse = response.data as ApiResponse<unknown>
+    // 204 没有响应体，response.data 是空的
+    // apiResponse.success 是 undefined → 判断为 false
+    if (!apiResponse.success) {
+      return Promise.reject(new Error(apiResponse.message ?? "Request failed"))
+      // ↑ 走到这里，抛出 "Request failed"
+    }
+
+    return response;
+  },
+  (error) => {
+  ...
+  },
+);
+
+export default apiClient;
+
+```
+
+所以：
+
+- `onSuccess` 永远不会执行 → `invalidateQueries` 不触发 → 列表不更新
+- `onError` 执行 → toast 显示 "Request failed"
+
+因此，修复拦截器：
+
+在拦截器里加 204 判断
+
+```tsx
+apiClient.interceptors.response.use(
+  (response) => {
+    // 204 No Content：没有响应体，直接放行
+    if (response.status === 204) {
+      return response
+    }
+
+    const apiResponse = response.data as ApiResponse<unknown>
+    if (!apiResponse.success) {
+      return Promise.reject(new Error(apiResponse.message ?? "Request failed"))
+    }
+    return response
+  },
+  (error) => {
+    // 失败分支不变
+    ...
+  }
+)
+```
+
+加了这个判断后：
+
+- 204 直接放行 → `onSuccess` 正常执行 → `invalidateQueries` 触发 → 列表更新
+- toast 显示 "Car deleted." ✅
+
+完整UI - 添加页码和格栅显示
+
+```tsx
+import { carsApi } from "@/api";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Link, useSearchParams } from "react-router-dom";
+import { toast } from "sonner";
+
+const PAGE_SIZE = 10;
+
+/* -------------- Badge variant -------------- */
+const getStatusVariant = (status: string) => {
+  switch (status) {
+    case "Published":
+      return "secondary";
+    case "PendingReview":
+      return "outline";
+    case "Sold":
+      return "destructive";
+    case "Draft":
+    default:
+      return "default";
+  }
+};
+
+export default function MyListingsPage() {
+  const queryClient = useQueryClient();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const page = Number(searchParams.get("page") ?? "1");
+
+  /* -------------- 请求数据 -------------- */
+  const { data, isLoading } = useQuery({
+    queryKey: ["my-listings", { page, pageSize: PAGE_SIZE }],
+    queryFn: () => carsApi.getMyListings({ page, pageSize: PAGE_SIZE }),
+  });
+
+  /* -------------- Mutations -------------- */
+  const submitMutation = useMutation({
+    mutationFn: (carId: number) => carsApi.submit(carId),
+    onSuccess: () => {
+      toast.success("Submitted for review!");
+      queryClient.invalidateQueries({ queryKey: ["my-listings"] });
+    },
+    onError: (error) => toast.error(error.message),
+  });
+
+  const deleteMutation = useMutation({
+    mutationFn: (carId: number) => carsApi.delete(carId),
+    onSuccess: () => {
+      toast.success("Car deleted.");
+      queryClient.invalidateQueries({ queryKey: ["my-listings"] });
+    },
+    onError: (error) => toast.error(error.message),
+  });
+
+  const handlePageChange = (newPage: number) => {
+    setSearchParams({ page: String(newPage) });
+  };
+
+  /* -------------- Loading -------------- */
+  if (isLoading) {
+    return (
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+        {Array.from({ length: PAGE_SIZE }).map((_, i) => (
+          <div key={i} className="h-48 animate-pulse rounded-lg bg-gray-100" />
+        ))}
+      </div>
+    );
+  }
+
+  /* -------------- 空状态 -------------- */
+  if (!data?.items.length) {
+    return (
+      <div className="py-12 text-center text-gray-500">
+        You haven't listed any cars yet.{" "}
+        <Link to="/cars/new" className="text-blue-600 hover:underline">
+          List your first car
+        </Link>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      {/* 顶部：数量统计 */}
+      <p className="text-sm text-gray-500 text-right">
+        {data.totalCount} cars total
+      </p>
+
+      {/* 网格列表 */}
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+        {data.items.map((car) => (
+          <div
+            key={car.id}
+            className="flex flex-col justify-between rounded-lg border bg-white p-4 space-y-3"
+          >
+            {/* 车辆信息 */}
+            <div className="space-y-1">
+              <div className="flex items-start justify-between gap-2">
+                <Link
+                  to={`/cars/${car.id}`}
+                  className="font-medium hover:text-blue-600 hover:underline"
+                >
+                  {car.title}
+                </Link>
+                <Badge
+                  variant={getStatusVariant(car.status)}
+                  className="shrink-0"
+                >
+                  {car.status}
+                </Badge>
+              </div>
+              <p className="text-lg font-bold text-blue-600">
+                ${car.price.toLocaleString()}
+              </p>
+              <p className="text-sm text-gray-500">
+                {car.year} · {car.mileage.toLocaleString()} km
+              </p>
+            </div>
+
+            {/* 操作按钮：只有 Draft 状态才有 */}
+            {car.status === "Draft" && (
+              <div className="flex gap-2 border-t pt-3">
+                <Button asChild variant="outline" size="sm" className="flex-1">
+                  <Link to={`/cars/${car.id}/edit`}>Edit</Link>
+                </Button>
+                <Button
+                  size="sm"
+                  className="flex-1"
+                  onClick={() => submitMutation.mutate(car.id)}
+                  disabled={submitMutation.isPending}
+                >
+                  Submit
+                </Button>
+                <Button
+                  size="sm"
+                  variant="destructive"
+                  onClick={() => deleteMutation.mutate(car.id)}
+                  disabled={deleteMutation.isPending}
+                >
+                  Delete
+                </Button>
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+
+      {/* 分页 */}
+      {data.totalPages > 1 && (
+        <div className="flex items-center justify-center gap-4">
+          <Button
+            variant="outline"
+            onClick={() => handlePageChange(page - 1)}
+            disabled={page === 1}
+          >
+            Previous
+          </Button>
+          <span className="text-sm text-gray-600">
+            Page {page} of {data.totalPages}
+          </span>
+          <Button
+            variant="outline"
+            onClick={() => handlePageChange(page + 1)}
+            disabled={page === data.totalPages}
+          >
+            Next
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+```
+
+
+
+### 3. 我的收藏列表（MyFavoritesPage）
+
+打开 `src/pages/MyFavoritesPage.tsx`：
+
+```tsx
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { Link, useSearchParams } from "react-router-dom";
+import { toast } from "sonner";
+import { favoritesApi } from "@/api";
+import { Button } from "@/components/ui/button";
+
+const PAGE_SIZE = 10;
+
+export default function MyFavoritesPage() {
+  const queryClient = useQueryClient();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const page = Number(searchParams.get("page") ?? "1");
+
+  /* -------------- 请求数据 -------------- */
+  const { data, isLoading } = useQuery({
+    queryKey: ["favorites", { page, pageSize: PAGE_SIZE }],
+    queryFn: () => favoritesApi.getMyFavorites(page, PAGE_SIZE),
+  });
+
+  /* -------------- Mutations -------------- */
+  const removeMutation = useMutation({
+    mutationFn: (carId: number) => favoritesApi.remove(carId),
+    onSuccess: () => {
+      toast.success("Removed from favorites.");
+      queryClient.invalidateQueries({ queryKey: ["favorites"] });
+    },
+    onError: (error) => toast.error(error.message),
+  });
+
+  const handlePageChange = (newPage: number) => {
+    setSearchParams({ page: String(newPage) });
+  };
+
+  /* -------------- Loading -------------- */
+  if (isLoading) {
+    return (
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+        {Array.from({ length: PAGE_SIZE }).map((_, i) => (
+          <div key={i} className="h-36 animate-pulse rounded-lg bg-gray-100" />
+        ))}
+      </div>
+    );
+  }
+
+  /* -------------- 空状态 -------------- */
+  if (!data?.items.length) {
+    return (
+      <div className="py-12 text-center text-gray-500">
+        No favorites yet.{" "}
+        <Link to="/" className="text-blue-600 hover:underline">
+          Browse cars
+        </Link>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      <p className="text-sm text-gray-500 text-right">
+        {data.totalCount} favorites
+      </p>
+
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+        {data.items.map((item) => (
+          <div
+            key={item.carId}
+            className="flex flex-col justify-between rounded-lg border bg-white p-4 space-y-3"
+          >
+            <Link
+              to={`/cars/${item.carId}`}
+              className="space-y-1 hover:opacity-80"
+            >
+              <p className="font-medium">
+                {item.car?.title ?? "Car #" + item.carId}
+              </p>
+              {item.car && (
+                <p className="text-sm text-gray-500">
+                  ${item.car.price.toLocaleString()} · {item.car.year}
+                </p>
+              )}
+            </Link>
+            <Button
+              variant="outline"
+              size="sm"
+              className="w-full"
+              onClick={() => removeMutation.mutate(item.carId)}
+              disabled={removeMutation.isPending}
+            >
+              Remove
+            </Button>
+          </div>
+        ))}
+      </div>
+
+      {/* 分页 */}
+      {data.totalPages > 1 && (
+        <div className="flex items-center justify-center gap-4">
+          <Button
+            variant="outline"
+            onClick={() => handlePageChange(page - 1)}
+            disabled={page === 1}
+          >
+            Previous
+          </Button>
+          <span className="text-sm text-gray-600">
+            Page {page} of {data.totalPages}
+          </span>
+          <Button
+            variant="outline"
+            onClick={() => handlePageChange(page + 1)}
+            disabled={page === data.totalPages}
+          >
+            Next
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+```
+
+
+
+### 4. 我的订单：买家视角（MyPurchasesPage）
+
+打开 `src/pages/MyPurchasesPage.tsx`：
+
+```tsx
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useSearchParams } from "react-router-dom";
+import { toast } from "sonner";
+import { ordersApi } from "@/api";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+
+const PAGE_SIZE = 10;
+
+/* -------------- Badge variant -------------- */
+const getStatusVariant = (status: string) => {
+  switch (status) {
+    case "Completed":
+      return "outline";
+    case "Cancelled":
+      return "destructive";
+    default:
+      return "default";
+  }
+};
+
+export default function MyPurchasesPage() {
+  const queryClient = useQueryClient();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const page = Number(searchParams.get("page") ?? "1");
+
+  /* -------------- 请求数据 -------------- */
+
+  const { data, isLoading } = useQuery({
+    queryKey: ["my-purchases", { page, pageSize: PAGE_SIZE }],
+    queryFn: () => ordersApi.getMyPurchases(page, PAGE_SIZE),
+  });
+
+  /* -------------- Mutations -------------- */
+  const cancelMutation = useMutation({
+    mutationFn: (orderId: number) => ordersApi.cancel(orderId),
+    onSuccess: () => {
+      toast.success("Order cancelled.");
+      queryClient.invalidateQueries({ queryKey: ["my-purchases"] });
+    },
+    onError: (error) => toast.error(error.message),
+  });
+
+  const handlePageChange = (newPage: number) => {
+    setSearchParams({ page: String(newPage) });
+  };
+
+  /* -------------- Loading -------------- */
+  if (isLoading) {
+    return (
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+        {Array.from({ length: PAGE_SIZE }).map((_, i) => (
+          <div key={i} className="h-36 animate-pulse rounded-lg bg-gray-100" />
+        ))}
+      </div>
+    );
+  }
+
+  /* -------------- 空状态 -------------- */
+  if (!data?.items.length) {
+    return (
+      <div className="py-12 text-center text-gray-500">No purchases yet.</div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      <p className="text-sm text-gray-500 text-right">
+        {data.totalCount} orders
+      </p>
+
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+        {data.items.map((order) => (
+          <div
+            key={order.id}
+            className="flex flex-col justify-between rounded-lg border bg-white p-4 space-y-3"
+          >
+            <div className="space-y-1">
+              <div className="flex items-start justify-between gap-2">
+                <span className="font-medium">{order.carTitle}</span>
+                <Badge
+                  variant={getStatusVariant(order.status)}
+                  className="shrink-0"
+                >
+                  {order.status}
+                </Badge>
+              </div>
+              <p className="text-lg font-bold text-blue-600">
+                ${order.price.toLocaleString()}
+              </p>
+              <p className="text-sm text-gray-500">
+                Seller: {order.sellerUsername}
+              </p>
+            </div>
+
+            {order.status === "Pending" && (
+              <Button
+                variant="destructive"
+                size="sm"
+                className="w-full"
+                onClick={() => cancelMutation.mutate(order.id)}
+                disabled={cancelMutation.isPending}
+              >
+                Cancel
+              </Button>
+            )}
+          </div>
+        ))}
+      </div>
+
+      {/* 分页 */}
+      {data.totalPages > 1 && (
+        <div className="flex items-center justify-center gap-4">
+          <Button
+            variant="outline"
+            onClick={() => handlePageChange(page - 1)}
+            disabled={page === 1}
+          >
+            Previous
+          </Button>
+          <span className="text-sm text-gray-600">
+            Page {page} of {data.totalPages}
+          </span>
+          <Button
+            variant="outline"
+            onClick={() => handlePageChange(page + 1)}
+            disabled={page === data.totalPages}
+          >
+            Next
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+```
+
+
+
+### 5. 我的订单：卖家视角（MySalesPage）
+
+打开 `src/pages/MySalesPage.tsx`：
+
+卖家可以确认订单完成（让买家可以评价）：
+
+```tsx
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useSearchParams } from "react-router-dom";
+import { toast } from "sonner";
+import { ordersApi } from "@/api";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+
+const PAGE_SIZE = 10;
+
+/* -------------- Badge variant -------------- */
+const getStatusVariant = (status: string) => {
+  switch (status) {
+    case "Completed":
+      return "outline";
+    case "Cancelled":
+      return "destructive";
+    default:
+      return "default";
+  }
+};
+
+export default function MySalesPage() {
+  const queryClient = useQueryClient();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const page = Number(searchParams.get("page") ?? "1");
+
+  /* -------------- 请求数据 -------------- */
+  const { data, isLoading } = useQuery({
+    queryKey: ["my-sales", { page, pageSize: PAGE_SIZE }],
+    queryFn: () => ordersApi.getMySales(page, PAGE_SIZE),
+  });
+
+  /* -------------- Mutations -------------- */
+  const completeMutation = useMutation({
+    mutationFn: (orderId: number) => ordersApi.complete(orderId),
+    onSuccess: () => {
+      toast.success("Order marked as completed.");
+      queryClient.invalidateQueries({ queryKey: ["my-sales"] });
+    },
+    onError: (error) => toast.error(error.message),
+  });
+
+  const handlePageChange = (newPage: number) => {
+    setSearchParams({ page: String(newPage) });
+  };
+
+  /* -------------- Loading -------------- */
+  if (isLoading) {
+    return (
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+        {Array.from({ length: PAGE_SIZE }).map((_, i) => (
+          <div key={i} className="h-36 animate-pulse rounded-lg bg-gray-100" />
+        ))}
+      </div>
+    );
+  }
+
+  /* -------------- 空状态 -------------- */
+  if (!data?.items.length) {
+    return <div className="py-12 text-center text-gray-500">No sales yet.</div>;
+  }
+
+  return (
+    <div className="space-y-6">
+      <p className="text-sm text-gray-500 text-right">
+        {data.totalCount} orders
+      </p>
+
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+        {data.items.map((order) => (
+          <div
+            key={order.id}
+            className="flex flex-col justify-between rounded-lg border bg-white p-4 space-y-3"
+          >
+            <div className="space-y-1">
+              <div className="flex items-start justify-between gap-2">
+                <span className="font-medium">{order.carTitle}</span>
+                <Badge
+                  variant={getStatusVariant(order.status)}
+                  className="shrink-0"
+                >
+                  {order.status}
+                </Badge>
+              </div>
+              <p className="text-lg font-bold text-blue-600">
+                ${order.price.toLocaleString()}
+              </p>
+              <p className="text-sm text-gray-500">
+                Buyer: {order.buyerUsername}
+              </p>
+            </div>
+
+            {order.status === "Pending" && (
+              <Button
+                size="sm"
+                className="w-full"
+                onClick={() => completeMutation.mutate(order.id)}
+                disabled={completeMutation.isPending}
+              >
+                Mark as Completed
+              </Button>
+            )}
+          </div>
+        ))}
+      </div>
+
+      {/* 分页 */}
+      {data.totalPages > 1 && (
+        <div className="flex items-center justify-center gap-4">
+          <Button
+            variant="outline"
+            onClick={() => handlePageChange(page - 1)}
+            disabled={page === 1}
+          >
+            Previous
+          </Button>
+          <span className="text-sm text-gray-600">
+            Page {page} of {data.totalPages}
+          </span>
+          <Button
+            variant="outline"
+            onClick={() => handlePageChange(page + 1)}
+            disabled={page === data.totalPages}
+          >
+            Next
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+```
+
+
+
+### 6. 完整测试
+
+```bash
+npm run dev
+```
+
+**测试嵌套路由切换：**
+
+登录后访问 `/profile`，看到标签栏和默认的 My Listings 内容。点击不同标签，URL 变化，内容区域切换，标签栏不闪烁不重新渲染。
+
+**测试 My Listings：**
+
+有草稿状态的车辆时，看到 Edit、Submit、Delete 三个按钮。点 Submit，车辆状态变成 PendingReview，按钮消失。点 Delete，车辆从列表消失。
+
+**测试 My Favorites：**
+
+之前收藏的车辆出现在列表里。点 Remove，车辆从列表消失，收藏页缓存刷新。
+
+**测试 My Purchases：**
+
+之前下单的订单出现在列表里。Pending 状态的订单有 Cancel 按钮，点击取消后订单状态变化，按钮消失。
+
+**测试 My Sales：**
+
+用卖家账号登录，在 My Sales 里看到买家的订单。点 "Mark as Completed"，状态变成 Completed，按钮消失。
+
+
+
+### 7. 此时的目录变化
+
+```
+src/
+└── pages/
+    ├── ProfilePage.tsx     ← 已更新（完整实现）
+    ├── MyListingsPage.tsx  ← 已更新（完整实现）
+    ├── MyFavoritesPage.tsx ← 已更新（完整实现）
+    ├── MyPurchasesPage.tsx ← 已更新（完整实现）
+    └── MySalesPage.tsx     ← 已更新（完整实现）
+```
+
+
+
+### 8. Git 提交
+
+```bash
+git add .
+git commit -m "feat: profile page with listings, favorites, orders"
+git push origin feature/seller-pages
+```
+
+合并回 `develop`：
+
+```bash
+git checkout develop
+git merge --no-ff feature/seller-pages \
+    -m "merge: feature/seller-pages into develop"
+git push origin develop
+git branch -D feature/seller-pages
+git push origin --delete feature/seller-pages
+```
+
+
+
+### Step 54 完成状态
+
+```
+✅ 理解嵌套路由实战（标签页对应子路由，Outlet渲染内容）
+✅ 理解 index: true（访问父路由时的默认子路由）
+✅ ProfilePage（标签栏 + Outlet，NavLink高亮）
+✅ MyListingsPage（车辆列表 + 状态Badge + 操作按钮）
+✅ MyFavoritesPage（收藏列表 + 取消收藏）
+✅ MyPurchasesPage（买家订单 + 取消操作）
+✅ MySalesPage（卖家订单 + 确认完成）
+✅ 测试通过（标签切换/车辆操作/收藏/订单操作）
+✅ feature/seller-pages 合并回 develop
 ```

@@ -30,6 +30,11 @@ apiClient.interceptors.request.use((config) => {
 // =============================================
 apiClient.interceptors.response.use(
   (response) => {
+    // 204 No Content：没有响应体（DELETE 接口），直接放行
+    if (response.status === 204) {
+      return response;
+    }
+
     // 请求成功（HTTP 2xx）
     // 后端所有接口都用 ApiResponse<T> 包装
     // 直接解包返回 data 字段，调用方不需要每次都写 response.data.data
@@ -58,9 +63,9 @@ apiClient.interceptors.response.use(
 
     // 网络错误（断网等）
     return Promise.reject(
-      new Error("Network error, please check your connection")
+      new Error("Network error, please check your connection"),
     );
-  }
+  },
 );
 
 export default apiClient;

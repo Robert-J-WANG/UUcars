@@ -10,6 +10,11 @@ import Layout from "@/components/Layout";
 import HomePage from "@/pages/HomePage";
 import CarDetailPage from "@/pages/CarDetailPage";
 import EditCarPage from "./pages/EditCarPage";
+import ProfilePage from "./pages/ProfilePage";
+import MyListingsPage from "./pages/MyListingsPage";
+import MyFavoritesPage from "./pages/MyFavoritesPage";
+import MyPurchasesPage from "./pages/MyPurchasesPage";
+import MySalesPage from "./pages/MySalesPage";
 
 export const router = createBrowserRouter([
   // 认证页面：不需要导航栏（全屏居中布局）
@@ -53,6 +58,19 @@ export const router = createBrowserRouter([
             element: <CreateCarPage />,
           },
           { path: "/cars/:id/edit", element: <EditCarPage /> },
+
+          {
+            path: "/profile",
+            element: <ProfilePage />,
+            children: [
+              // index: true 表示访问 /profile 时默认显示这个子路由
+              { index: true, element: <MyListingsPage /> },
+              { path: "listings", element: <MyListingsPage /> },
+              { path: "favorites", element: <MyFavoritesPage /> },
+              { path: "purchases", element: <MyPurchasesPage /> },
+              { path: "sales", element: <MySalesPage /> },
+            ],
+          },
         ],
       },
     ],
