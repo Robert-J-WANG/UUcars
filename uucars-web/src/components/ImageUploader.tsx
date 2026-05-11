@@ -121,6 +121,8 @@ export default function ImageUploader({ carId, images }: ImageUploaderProps) {
               className="h-40 w-40 rounded-lg object-cover"
             />
             <p className="text-sm text-gray-500">{selectedFile.name}</p>
+
+            {/* 点击按钮，实现上传 */}
             <Button
               type="button"
               size="sm"
