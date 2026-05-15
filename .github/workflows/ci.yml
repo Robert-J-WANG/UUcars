@@ -96,3 +96,27 @@ jobs:
           # 依赖 setup-buildx 提供的 BuildKit driver 才能工作
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          
+          
+  # =============================================
+  # Job 3：部署到 Azure Container Apps
+  # 只在 build-and-push 成功后执行
+  # =============================================
+  deploy:
+    name: Deploy to Azure Container Apps
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          creds: '{"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}"}'
+
+      - name: Deploy to Container Apps
+        uses: azure/container-apps-deploy-action@v1
+        with:
+          resourceGroup: uucars-rg
+          containerAppName: uucars-api
+          imageToDeploy: ghcr.io/robert-j-wang/uucars-api:latest
