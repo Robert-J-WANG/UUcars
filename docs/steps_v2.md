@@ -4418,3 +4418,9036 @@ git checkout develop
 ✅ Scalar 端到端流程验证通过（含安全边界测试）
 ✅ feature/v2-backend 合并回 develop，v2.0-backend tag 打完
 ```
+
+
+
+## Step 42 · 前端工程初始化
+
+### 这一步做什么
+
+搭建前端项目骨架。目标是一个能跑起来、目录结构清晰、能连接后端 API 的空白项目。后续所有页面都建立在这个基础上。
+
+切出前端专用分支
+
+```BASH
+# 确认在 develop 分支
+git checkout develop
+
+# 切出前端专用分支
+git checkout -b feature/frontend-setup
+git push -u origin feature/frontend-setup
+```
+
+
+
+### 1. 创建项目
+
+在项目根目录（和 `UUcars.API` 同级）执行：
+
+```bash
+npm create vite@latest uucars-web -- --template react-ts
+cd uucars-web
+npm install
+```
+
+此时目录结构：
+
+```
+UUcars/
+├── UUcars.API/         ← 后端
+├── UUcars.Tests/       ← 后端测试
+└── uucars-web/         ← 前端（新增）
+```
+
+验证能跑起来：
+
+```bash
+npm run dev
+```
+
+浏览器打开 `http://localhost:5173`，看到 Vite + React 的默认页面，说明项目创建成功。`Ctrl+C` 停止。
+
+
+
+### 2. 配置路径别名
+
+默认情况下导入文件要写相对路径，层级深时很难看：
+
+```typescript
+// 没有别名：很难看
+import { Button } from '../../../components/ui/Button'
+
+// 有别名：清晰
+import { Button } from '@/components/ui/Button'
+```
+
+`@/` 是前端项目的通用约定，指向 `src/` 目录。需要同时在两个地方配置：一个告诉 Vite 怎么解析，一个告诉 TypeScript 怎么识别。
+
+#### 2.1 安装 node 类型包
+
+```bash
+npm install -D @types/node
+```
+
+#### 2.2 更新 vite.config.ts
+
+```typescript
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+import path from 'path'
+
+export default defineConfig({
+  plugins: [react()],
+  resolve: {
+    alias: {
+      '@': path.resolve(__dirname, './src'),
+    },
+  },
+})
+```
+
+#### 2.3 更新 tsconfig.app.json
+
+打开 `tsconfig.app.json`，在 `compilerOptions` 里添加：
+
+```json
+{
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.app.tsbuildinfo",
+    "target": "es2023",
+    "lib": ["ES2023", "DOM"],
+    "module": "esnext",
+    "types": ["vite/client"],
+    "skipLibCheck": true,
+
+    /* Bundler mode */
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+    "jsx": "react-jsx",
+
+    /* Linting */
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "erasableSyntaxOnly": true,
+    "noFallthroughCasesInSwitch": true,
+
+    /* Path aliases */
+    // "baseUrl": ".",
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  },
+
+  "include": ["src"]
+}
+
+```
+
+
+
+### 3. 配置环境变量
+
+前端需要知道后端 API 的地址。开发时是 `http://localhost:5065`，生产时是真实域名。用 Vite 的环境变量机制管理，不硬编码在代码里。
+
+在 `uucars-web/` 目录下创建两个文件：
+
+```bash
+touch .env.local
+touch .env.production
+```
+
+`.env.local`（开发环境，不进 Git）：
+
+```
+VITE_API_BASE_URL=http://localhost:5065
+```
+
+`.env.production`（生产环境，进 Git）：
+
+```
+VITE_API_BASE_URL=https://你的生产域名
+```
+
+在 `.gitignore` 里确认 `.env.local` 已排除：
+
+```bash
+echo ".env.local" >> .gitignore
+```
+
+> **Vite 环境变量的规则：** 只有以 `VITE_` 开头的变量才会暴露给前端代码，其他变量不会。在代码里通过 `import.meta.env.VITE_API_BASE_URL` 读取。这是 Vite 的安全设计，防止把服务端的敏感环境变量意外暴露给浏览器。
+
+
+
+### 4. 规划目录结构
+
+把 `src/` 目录按职责划分清楚，后面每一步往对应位置放文件：
+
+```bash
+cd src
+mkdir -p api components features hooks lib pages stores types
+cd ..
+```
+
+各目录的职责：
+
+```
+src/
+├── api/          Axios封装和各模块API函数
+├── components/   可复用的UI组件（Button、Card等）
+├── features/     按功能模块组织的业务组件
+├── hooks/        自定义Hooks
+├── lib/          工具函数（cn等）
+├── pages/        路由页面组件
+├── stores/       Zustand全局状态
+├── types/        TypeScript类型定义
+├── App.tsx
+└── main.tsx
+```
+
+同时清理掉 Vite 模板自带的示例文件，保持干净：
+
+```bash
+# 删除模板示例文件
+
+rm src/App.css
+rm src/assets/react.svg
+rm public/vite.svg
+```
+
+把 `src/App.tsx` 清理成最简单的起点：
+
+```tsx
+function App() {
+  return (
+    <div>
+      <h1>UUcars</h1>
+    </div>
+  )
+}
+
+export default App
+```
+
+把 `src/index.css` 内容清空（后面 Tailwind 会接管样式）：
+
+```bash
+echo "" > src/index.css
+```
+
+
+
+### 5. 验证配置
+
+```bash
+npm run dev
+```
+
+浏览器打开 `http://localhost:5173`，看到 "UUcars" 文字，说明清理和配置都正确。
+
+验证路径别名是否生效——在 `App.tsx` 里临时写一行导入测试：
+
+```tsx
+// 临时测试，验证后删掉
+import {} from '@/types'
+```
+
+如果没有 TypeScript 报错，说明别名配置正确。删掉这行测试代码。
+
+
+
+### 6. 此时的目录结构
+
+```
+uucars-web/
+├── public/
+├── src/
+│   ├── api/
+│   ├── components/
+│   ├── features/
+│   ├── hooks/
+│   ├── lib/
+│   ├── pages/
+│   ├── stores/
+│   ├── types/
+│   ├── App.tsx
+│   ├── index.css
+│   └── main.tsx
+├── .env.local          ← 不进 Git
+├── .env.production     ← 进 Git
+├── .gitignore
+├── index.html
+├── package.json
+├── tsconfig.json
+└── vite.config.ts
+```
+
+
+
+### 7. Git 提交
+
+```bash
+git add .
+git commit -m "feat: frontend project setup with Vite + React + TypeScript"
+```
+
+
+
+### Step 42 完成状态
+
+```
+✅ Vite + React + TypeScript 项目创建
+✅ 路径别名 @/ 配置（vite.config.ts + tsconfig.json）
+✅ 环境变量配置（VITE_API_BASE_URL）
+✅ 目录结构规划完成
+✅ 模板示例文件清理干净
+✅ npm run dev 验证通过
+✅ Git commit 完成
+```
+
+
+
+## Step 43 · Tailwind CSS + shadcn/ui
+
+### 这一步做什么
+
+搭建 UI 基础——安装样式系统和组件库，后续所有页面直接使用，不需要从零写 CSS。
+
+
+
+### 1. 安装 Tailwind CSS
+
+```bash
+npm install -D tailwindcss @tailwindcss/vite
+```
+
+更新 `vite.config.ts`，加入 Tailwind 插件：
+
+```typescript
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+import tailwindcss from '@tailwindcss/vite'
+import path from 'path'
+
+export default defineConfig({
+  plugins: [
+    react(),
+    tailwindcss(),
+  ],
+  resolve: {
+    alias: {
+      '@': path.resolve(__dirname, './src'),
+    },
+  },
+})
+```
+
+把 `src/index.css` 内容替换为：
+
+```css
+@import "tailwindcss";
+```
+
+验证 Tailwind 是否生效——打开 `src/App.tsx`，临时加一个样式测试：
+
+```tsx
+function App() {
+  return (
+    <div className="flex min-h-screen items-center justify-center">
+      <h1 className="text-3xl font-bold text-blue-600">UUcars</h1>
+    </div>
+  )
+}
+
+export default App
+npm run dev
+```
+
+浏览器里看到蓝色加粗居中的 "UUcars"，说明 Tailwind 配置正确。
+
+
+
+### 2. 安装 shadcn/ui
+
+shadcn/ui 不是普通的组件库——它不是一个 npm 包，而是把组件源代码直接生成到你的项目里，你可以随意修改。
+
+shadcn需要识别tsconfig.json里的别名路径，因此先配置（注意tsconfig.app.json里也要配置）
+
+```json
+{
+  "files": [],
+  "references": [
+    { "path": "./tsconfig.app.json" },
+    { "path": "./tsconfig.node.json" }
+  ],
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["src/*"]
+    }
+  }
+}
+```
+
+
+
+#### 2.1 初始化 shadcn/ui
+
+```bash
+npx shadcn@latest init
+```
+
+过程中会有几个选项，按如下选择：
+
+```
+Which style would you like to use? › Default
+Which color would you like to use as base color? › Slate
+Would you like to use CSS variables for colors? › yes
+```
+
+初始化完成后，`src/` 下会自动生成 `lib/utils.ts` 和 `components/ui/` 目录。
+
+#### 2.2 cn() 工具函数
+
+打开 `src/lib/utils.ts`，shadcn 已经自动生成了这个文件：
+
+```typescript
+import { clsx, type ClassValue } from "clsx"
+import { twMerge } from "tailwind-merge"
+
+export function cn(...inputs: ClassValue[]) {
+  return twMerge(clsx(inputs))
+}
+```
+
+**`cn()` 是什么？** 它解决了 Tailwind 里一个常见问题：当你需要根据条件动态组合 class 名时，直接用字符串拼接可能产生冲突（比如同时有 `text-red-500` 和 `text-blue-500`）。`cn()` 用 `clsx` 处理条件逻辑，用 `tailwind-merge` 智能合并冲突的类名，保留最后一个有效的：
+
+```typescript
+// 使用场景：根据 props 动态切换样式
+cn(
+  "base-class",           // 始终应用
+  isError && "text-red-500",  // 条件应用
+  className               // 外部传入的类名（可覆盖默认样式）
+)
+```
+
+后续写组件时会大量用到这个函数。
+
+#### 2.3 安装现在就会用到的组件
+
+Step 47 开始做登录页，马上需要这几个组件：
+
+```bash
+npx shadcn@latest add button
+npx shadcn@latest add input
+npx shadcn@latest add form
+npx shadcn@latest add card
+npx shadcn@latest add label
+```
+
+安装完后这些组件的源代码会出现在 `src/components/ui/` 目录里，可以直接查看和修改。
+
+
+
+### 3. 验证
+
+```bash
+npm run dev
+```
+
+确认没有报错，项目正常运行。
+
+
+
+### 4. 此时的目录变化
+
+```
+uucars-web/
+└── src/
+    ├── components/
+    │   └── ui/              ← shadcn 生成
+    │       ├── button.tsx
+    │       ├── card.tsx
+    │       ├── form.tsx
+    │       ├── input.tsx
+    │       └── label.tsx
+    ├── lib/
+    │   └── utils.ts         ← cn() 工具函数
+    └── index.css            ← 已更新（Tailwind）
+```
+
+
+
+### 5. Git 提交
+
+```bash
+git add .
+git commit -m "feat: Tailwind CSS + shadcn/ui setup"
+git push origin feature/frontend-setup
+```
+
+
+
+### Step 43 完成状态
+
+```
+✅ Tailwind CSS 安装配置（@tailwindcss/vite 插件方式）
+✅ 验证 Tailwind 样式生效
+✅ shadcn/ui 初始化完成
+✅ cn() 工具函数就绪（理解其作用）
+✅ 核心组件安装（Button/Input/Form/Card/Label）
+✅ Git commit 完成
+```
+
+
+
+## Step 44 · 类型定义层 + Axios 封装
+
+### 这一步做什么
+
+前端和后端通信需要两样东西：**知道数据长什么样**（TypeScript 类型），**知道怎么发请求**（Axios 封装）。
+
+这一步把这两件事都做好，后续每个页面直接调用封装好的 API 函数，有完整的类型提示，不需要写任何重复的请求代码。
+
+
+
+### 1. 安装依赖
+
+```bash
+npm install axios
+```
+
+
+
+### 2. TypeScript 类型定义
+
+TypeScript 的核心价值在于：**在编译阶段发现错误，而不是在运行时**。把后端所有 DTO 定义成 TypeScript 类型后，调用 API 时 IDE 会自动提示有哪些字段、字段是什么类型，写错了编译器直接报错。
+
+#### 2.1 通用响应类型
+
+后端所有接口都用 `ApiResponse<T>` 和 `PagedResponse<T>` 包装，前端对应定义：
+
+```bash
+touch src/types/api.ts
+// src/types/api.ts
+
+// 对应后端 ApiResponse<T>
+export interface ApiResponse<T> {
+  success: boolean
+  data: T | null
+  message: string | null
+  errors: string[] | null
+}
+
+// 对应后端 PagedResponse<T>
+export interface PagedResponse<T> {
+  items: T[]
+  totalCount: number
+  page: number
+  pageSize: number
+  totalPages: number
+}
+```
+
+#### 2.2 用户相关类型
+
+```bash
+touch src/types/user.ts
+// src/types/user.ts
+
+// 对应后端 UserResponse
+export interface User {
+  id: number
+  username: string
+  email: string
+  role: 'User' | 'Admin'    // 联合类型：只能是这两个值之一
+  createdAt: string
+}
+
+// 对应后端 LoginResponse
+export interface LoginResponse {
+  token: string
+  expiresAt: string
+  user: User
+}
+
+// 对应后端 RegisterRequest
+export interface RegisterRequest {
+  username: string
+  email: string
+  password: string
+}
+
+// 对应后端 LoginRequest
+export interface LoginRequest {
+  email: string
+  password: string
+}
+```
+
+> **为什么 `role` 用联合类型 `'User' | 'Admin'` 而不是 `string`？** 用 `string` 的话，你写 `user.role === 'admin'`（小写）编译器不会报错，但逻辑永远不会成立，因为后端返回的是 `'Admin'`（首字母大写）。用联合类型，编译器会直接告诉你只能比较 `'User'` 或 `'Admin'`，在写代码时就发现问题，而不是在运行时排查 Bug。
+
+#### 2.3 车辆相关类型
+
+```bash
+touch src/types/car.ts
+// src/types/car.ts
+
+// 车辆状态枚举——对应后端 CarStatus
+// 用 const 对象而不是 enum，原因：
+// TypeScript 的 enum 编译后会生成额外的 JS 代码
+// const 对象 + 类型推导更轻量，是目前的主流做法
+export const CarStatus = {
+  Draft: 'Draft',
+  PendingReview: 'PendingReview',
+  Published: 'Published',
+  Sold: 'Sold',
+  Deleted: 'Deleted',
+} as const
+
+// 从 const 对象推导出联合类型：'Draft' | 'PendingReview' | 'Published' | 'Sold' | 'Deleted'
+export type CarStatus = typeof CarStatus[keyof typeof CarStatus]
+
+// 对应后端 CarResponse
+export interface Car {
+  id: number
+  title: string
+  brand: string
+  model: string
+  year: number
+  price: number
+  mileage: number
+  description: string | null
+  status: CarStatus
+  sellerId: number
+  sellerUsername: string
+  createdAt: string
+  updatedAt: string
+}
+
+// 对应后端 CarDetailResponse（含图片列表）
+export interface CarDetail extends Car {
+  images: CarImage[]
+}
+
+// 对应后端 CarImageResponse
+export interface CarImage {
+  id: number
+  imageUrl: string
+  sortOrder: number
+  carId: number
+}
+
+// 对应后端 CarCreateRequest
+export interface CarCreateRequest {
+  title: string
+  brand: string
+  model: string
+  year: number
+  price: number
+  mileage: number
+  description?: string   // ? 表示可选字段，对应后端的 nullable
+}
+
+// 对应后端 CarUpdateRequest（和 Create 字段一样，单独定义保持灵活性）
+export type CarUpdateRequest = CarCreateRequest; // 直接使用类型别名，简化代码  
+
+// 对应后端 CarQueryRequest
+export interface CarQueryRequest {
+  page?: number
+  pageSize?: number
+  brand?: string
+  minPrice?: number
+  maxPrice?: number
+  minYear?: number
+  maxYear?: number
+}
+```
+
+#### 2.4 订单相关类型
+
+```bash
+touch src/types/order.ts
+// src/types/order.ts
+
+export const OrderStatus = {
+  Pending: 'Pending',
+  Completed: 'Completed',
+  Cancelled: 'Cancelled',
+} as const
+
+export type OrderStatus = typeof OrderStatus[keyof typeof OrderStatus]
+
+// 对应后端 OrderResponse
+export interface Order {
+  id: number
+  carId: number
+  carTitle: string
+  buyerId: number
+  buyerUsername: string
+  sellerId: number
+  sellerUsername: string
+  price: number
+  status: OrderStatus
+  createdAt: string
+  updatedAt: string
+}
+
+// 对应后端 OrderCreateRequest
+export interface OrderCreateRequest {
+  carId: number
+}
+```
+
+#### 2.5 收藏相关类型
+
+```bash
+touch src/types/favorite.ts
+// src/types/favorite.ts
+import type { Car } from './car'
+
+// 对应后端 FavoriteResponse
+export interface Favorite {
+  carId: number
+  userId: number
+  createdAt: string
+  car: Car | null
+}
+```
+
+#### 2.6 评价相关类型
+
+```bash
+touch src/types/review.ts
+// src/types/review.ts
+
+// 对应后端 ReviewResponse
+export interface Review {
+  id: number
+  orderId: number
+  reviewerId: number
+  reviewerUsername: string
+  rating: number
+  comment: string | null
+  createdAt: string
+}
+
+// 对应后端 SellerRatingResponse
+export interface SellerRating {
+  sellerId: number
+  averageRating: number
+  totalReviews: number
+  reviews: Review[]
+}
+
+// 对应后端 CreateReviewRequest
+export interface CreateReviewRequest {
+  orderId: number
+  rating: number
+  comment?: string
+}
+```
+
+#### 2.7 统一导出
+
+```bash
+touch src/types/index.ts
+// src/types/index.ts
+// 统一从这里导入，不需要记每个类型在哪个文件里
+export * from './api'
+export * from './user'
+export * from './car'
+export * from './order'
+export * from './favorite'
+export * from './review'
+```
+
+导入使用时类似
+
+```ts
+import type { Car } from "@/types";
+```
+
+
+
+### 3. Axios 封装
+
+#### 3.1 为什么要封装 Axios
+
+直接用 Axios 发请求可以工作，但每次都要：
+
+```typescript
+// 没有封装时，每次请求都要重复这些
+const response = await axios.get('http://localhost:5065/cars', {
+  headers: {
+    Authorization: `Bearer ${token}`,
+    'Content-Type': 'application/json',
+  }
+})
+// 还要手动处理错误、解包数据...
+```
+
+封装之后：
+
+```typescript
+// 封装后
+const cars = await carsApi.getPaged({ page: 1 })
+// token 自动附加，错误自动处理，数据自动解包
+```
+
+
+
+#### 3.2 创建 Axios 实例
+
+```bash
+touch src/api/client.ts
+```
+
+```ts
+
+// src/api/client.ts
+import axios from 'axios'
+import type { ApiResponse } from '@/types'
+
+// 创建 Axios 实例
+// 所有请求都基于这个实例，统一配置 baseURL 和超时
+const apiClient = axios.create({
+  baseURL: import.meta.env.VITE_API_BASE_URL,
+  timeout: 10000,   // 10秒超时
+  headers: {
+    'Content-Type': 'application/json',
+  },
+})
+
+// =============================================
+// 请求拦截器：自动附加 JWT Token
+// =============================================
+// 每次请求发出前，从 localStorage 取出 Token 附加到请求头
+// 这样所有需要认证的接口不需要手动传 Token
+apiClient.interceptors.request.use((config) => {
+  const token = localStorage.getItem('accessToken')
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`
+  }
+  return config
+})
+
+// =============================================
+// 响应拦截器：统一处理响应和错误
+// =============================================
+apiClient.interceptors.response.use(
+  (response) => {
+    // 请求成功（HTTP 2xx）
+    // 后端所有接口都用 ApiResponse<T> 包装
+    // 直接解包返回 data 字段，调用方不需要每次都写 response.data.data
+    const apiResponse = response.data as ApiResponse<unknown>
+
+    if (!apiResponse.success) {
+      // HTTP 状态码是 2xx，但业务逻辑失败（success: false）
+      // 把业务错误信息包装成 Error 抛出，调用方统一用 catch 处理
+      return Promise.reject(new Error(apiResponse.message ?? 'Request failed'))
+    }
+
+    return response
+  },
+  (error) => {
+    // 请求失败（HTTP 4xx / 5xx / 网络错误）
+    if (error.response) {
+      // 服务端返回了错误响应
+      const apiResponse = error.response.data as ApiResponse<unknown>
+      const message = apiResponse?.message ?? 'An error occurred'
+      return Promise.reject(new Error(message))
+    }
+
+    if (error.code === 'ECONNABORTED') {
+      return Promise.reject(new Error('Request timeout, please try again'))
+    }
+
+    // 网络错误（断网等）
+    return Promise.reject(new Error('Network error, please check your connection'))
+  }
+)
+
+export default apiClient
+```
+
+> **为什么从 localStorage 读 Token 而不是从 Zustand？** Zustand 的状态在 `apiClient.ts` 这个模块层面还没有初始化，如果在这里直接导入 Zustand store 会有循环依赖的风险。从 localStorage 读取是更安全的做法，Step 47 配置 Zustand 时会保证 Token 同步写入 localStorage。
+
+#### 3.3 封装各模块 API 函数
+
+**认证模块：**
+
+```ts
+touch src/api/auth.ts
+// src/api/auth.ts
+import apiClient from './client'
+import type {
+  LoginRequest,
+  LoginResponse,
+  RegisterRequest,
+  User,
+  ApiResponse
+} from '@/types'
+
+export const authApi = {
+  register: async (data: RegisterRequest): Promise<User> => {
+    const response = await apiClient.post<ApiResponse<User>>(
+      '/auth/register', data)
+    return response.data.data!
+  },
+
+  login: async (data: LoginRequest): Promise<LoginResponse> => {
+    const response = await apiClient.post<ApiResponse<LoginResponse>>(
+      '/auth/login', data)
+    return response.data.data!
+  },
+
+  verifyEmail: async (token: string): Promise<void> => {
+    await apiClient.get('/auth/verify-email', { params: { token } })
+  },
+
+  resendVerification: async (email: string): Promise<void> => {
+    await apiClient.post('/auth/resend-verification', { email })
+  },
+
+  forgotPassword: async (email: string): Promise<void> => {
+    await apiClient.post('/auth/forgot-password', { email })
+  },
+
+  resetPassword: async (token: string, newPassword: string): Promise<void> => {
+    await apiClient.post('/auth/reset-password', { token, newPassword })
+  },
+}
+```
+
+**用户模块：**
+
+```ts
+touch src/api/users.ts
+// src/api/users.ts
+import apiClient from './client'
+import type { User, ApiResponse } from '@/types'
+
+export const usersApi = {
+  getMe: async (): Promise<User> => {
+    const response = await apiClient.get<ApiResponse<User>>('/users/me')
+    return response.data.data!
+  },
+
+  updateMe: async (data: { username: string; email: string }): Promise<User> => {
+    const response = await apiClient.put<ApiResponse<User>>('/users/me', data)
+    return response.data.data!
+  },
+}
+```
+
+**车辆模块：**
+
+```c#
+touch src/api/cars.ts
+// src/api/cars.ts
+import apiClient from './client'
+import type {
+  Car,
+  CarDetail,
+  CarImage,
+  CarCreateRequest,
+  CarUpdateRequest,
+  CarQueryRequest,
+  PagedResponse,
+  ApiResponse
+} from '@/types'
+
+export const carsApi = {
+  // 公开列表（含搜索过滤）
+  getPaged: async (params?: CarQueryRequest): Promise<PagedResponse<Car>> => {
+    const response = await apiClient.get<ApiResponse<PagedResponse<Car>>>(
+      '/cars', { params })
+    return response.data.data!
+  },
+
+  // 车辆详情
+  getById: async (id: number): Promise<CarDetail> => {
+    const response = await apiClient.get<ApiResponse<CarDetail>>(`/cars/${id}`)
+    return response.data.data!
+  },
+
+  // 我的车辆列表
+  getMyListings: async (params?: CarQueryRequest): Promise<PagedResponse<Car>> => {
+    const response = await apiClient.get<ApiResponse<PagedResponse<Car>>>(
+      '/cars/my-listings', { params })
+    return response.data.data!
+  },
+
+  // 创建草稿
+  create: async (data: CarCreateRequest): Promise<Car> => {
+    const response = await apiClient.post<ApiResponse<Car>>('/cars', data)
+    return response.data.data!
+  },
+
+  // 修改草稿
+  update: async (id: number, data: CarUpdateRequest): Promise<Car> => {
+    const response = await apiClient.put<ApiResponse<Car>>(`/cars/${id}`, data)
+    return response.data.data!
+  },
+
+  // 逻辑删除
+  delete: async (id: number): Promise<void> => {
+    await apiClient.delete(`/cars/${id}`)
+  },
+
+  // 提交审核
+  submit: async (id: number): Promise<Car> => {
+    const response = await apiClient.post<ApiResponse<Car>>(
+      `/cars/${id}/submit`)
+    return response.data.data!
+  },
+
+  // 上传图片（multipart/form-data）
+  uploadImage: async (carId: number, file: File, sortOrder = 0): Promise<CarImage> => {
+    const formData = new FormData()
+    formData.append('file', file)
+    formData.append('sortOrder', sortOrder.toString())
+    const response = await apiClient.post<ApiResponse<CarImage>>(
+      `/cars/${carId}/images`,
+      formData,
+      { headers: { 'Content-Type': 'multipart/form-data' } }
+    )
+    return response.data.data!
+  },
+
+  // 删除图片
+  deleteImage: async (carId: number, imageId: number): Promise<void> => {
+    await apiClient.delete(`/cars/${carId}/images/${imageId}`)
+  },
+}
+```
+
+**收藏模块：**
+
+```ts
+touch src/api/favorites.ts
+// src/api/favorites.ts
+import apiClient from './client'
+import type { Favorite, PagedResponse, ApiResponse } from '@/types'
+
+export const favoritesApi = {
+  add: async (carId: number): Promise<Favorite> => {
+    const response = await apiClient.post<ApiResponse<Favorite>>(
+      `/favorites/${carId}`)
+    return response.data.data!
+  },
+
+  remove: async (carId: number): Promise<void> => {
+    await apiClient.delete(`/favorites/${carId}`)
+  },
+
+  getMyFavorites: async (page = 1, pageSize = 20): Promise<PagedResponse<Favorite>> => {
+    const response = await apiClient.get<ApiResponse<PagedResponse<Favorite>>>(
+      '/favorites', { params: { page, pageSize } })
+    return response.data.data!
+  },
+}
+```
+
+**订单模块：**
+
+```bash
+touch src/api/orders.ts
+// src/api/orders.ts
+import apiClient from './client'
+import type { Order, OrderCreateRequest, PagedResponse, ApiResponse } from '@/types'
+
+export const ordersApi = {
+  create: async (data: OrderCreateRequest): Promise<Order> => {
+    const response = await apiClient.post<ApiResponse<Order>>('/orders', data)
+    return response.data.data!
+  },
+
+  cancel: async (id: number): Promise<Order> => {
+    const response = await apiClient.post<ApiResponse<Order>>(
+      `/orders/${id}/cancel`)
+    return response.data.data!
+  },
+
+  complete: async (id: number): Promise<Order> => {
+    const response = await apiClient.post<ApiResponse<Order>>(
+      `/orders/${id}/complete`)
+    return response.data.data!
+  },
+
+  getMyPurchases: async (page = 1, pageSize = 20): Promise<PagedResponse<Order>> => {
+    const response = await apiClient.get<ApiResponse<PagedResponse<Order>>>(
+      '/orders/my-purchases', { params: { page, pageSize } })
+    return response.data.data!
+  },
+
+  getMySales: async (page = 1, pageSize = 20): Promise<PagedResponse<Order>> => {
+    const response = await apiClient.get<ApiResponse<PagedResponse<Order>>>(
+      '/orders/my-sales', { params: { page, pageSize } })
+    return response.data.data!
+  },
+}
+```
+
+**评价模块：**
+
+```bash
+touch src/api/reviews.ts
+// src/api/reviews.ts
+import apiClient from './client'
+import type {
+  Review,
+  SellerRating,
+  CreateReviewRequest,
+  ApiResponse
+} from '@/types'
+
+export const reviewsApi = {
+  create: async (data: CreateReviewRequest): Promise<Review> => {
+    const response = await apiClient.post<ApiResponse<Review>>('/reviews', data)
+    return response.data.data!
+  },
+
+  getSellerRating: async (sellerId: number): Promise<SellerRating> => {
+    const response = await apiClient.get<ApiResponse<SellerRating>>(
+      `/reviews/seller/${sellerId}`)
+    return response.data.data!
+  },
+}
+```
+
+**Admin 模块：**
+
+```bash
+touch src/api/admin.ts
+// src/api/admin.ts
+import apiClient from './client'
+import type { Car, PagedResponse, ApiResponse } from '@/types'
+
+export const adminApi = {
+  getPendingCars: async (page = 1, pageSize = 20): Promise<PagedResponse<Car>> => {
+    const response = await apiClient.get<ApiResponse<PagedResponse<Car>>>(
+      '/admin/cars/pending', { params: { page, pageSize } })
+    return response.data.data!
+  },
+
+  approve: async (carId: number): Promise<Car> => {
+    const response = await apiClient.post<ApiResponse<Car>>(
+      `/admin/cars/${carId}/approve`)
+    return response.data.data!
+  },
+
+  reject: async (carId: number): Promise<Car> => {
+    const response = await apiClient.post<ApiResponse<Car>>(
+      `/admin/cars/${carId}/reject`)
+    return response.data.data!
+  },
+
+  deleteCar: async (carId: number): Promise<void> => {
+    await apiClient.delete(`/admin/cars/${carId}`)
+  },
+}
+```
+
+**统一导出：**
+
+```bash
+touch src/api/index.ts
+// src/api/index.ts
+export * from './auth'
+export * from './users'
+export * from './cars'
+export * from './favorites'
+export * from './orders'
+export * from './reviews'
+export * from './admin'
+```
+
+
+
+### 4. 验证编译
+
+```bash
+npm run build
+```
+
+预期没有 TypeScript 错误。如果有，根据错误信息修正类型定义。
+
+
+
+### 5. 此时的目录变化
+
+```
+src/
+├── api/
+│   ├── admin.ts      ← 新增
+│   ├── auth.ts       ← 新增
+│   ├── cars.ts       ← 新增
+│   ├── client.ts     ← 新增
+│   ├── favorites.ts  ← 新增
+│   ├── index.ts      ← 新增
+│   ├── orders.ts     ← 新增
+│   ├── reviews.ts    ← 新增
+│   └── users.ts      ← 新增
+└── types/
+    ├── api.ts        ← 新增
+    ├── car.ts        ← 新增
+    ├── favorite.ts   ← 新增
+    ├── index.ts      ← 新增
+    ├── order.ts      ← 新增
+    ├── review.ts     ← 新增
+    └── user.ts       ← 新增
+```
+
+
+
+### 6. Git 提交 + 合并分支
+
+前端地基三步（Step 42-44）全部完成：
+
+```bash
+git add .
+git commit -m "feat: TypeScript types + Axios API client setup"
+git push origin feature/frontend-setup
+
+# 合并回 develop
+git checkout develop
+git merge --no-ff feature/frontend-setup \
+    -m "merge: feature/frontend-setup into develop"
+git push origin develop
+git branch -D feature/frontend-setup
+git push origin --delete feature/frontend-setup
+```
+
+
+
+### Step 44 完成状态
+
+```
+✅ 安装 Axios
+✅ 所有后端 DTO 对应的 TypeScript 类型定义（6个类型文件）
+✅ 理解联合类型替代枚举的原因
+✅ 理解 const 对象 + 类型推导的模式（CarStatus / OrderStatus）
+✅ Axios 实例配置（baseURL从环境变量读取）
+✅ 请求拦截器（自动附加 Token）
+✅ 响应拦截器（统一解包、错误处理）
+✅ 7个模块 API 函数封装（auth/users/cars/favorites/orders/reviews/admin）
+✅ npm run build 无 TypeScript 错误
+✅ feature/frontend-setup 合并回 develop
+```
+
+
+
+## Step 45 · 安装核心工具库
+
+### 这一步做什么
+
+登录页需要三样东西：**管理表单**（React Hook Form + Zod）、**管理全局状态**（Zustand）。这一步把这三个工具装好、配置好，下一步做登录页时直接用。
+
+
+
+### 1. 安装依赖
+
+```bash
+npm install zustand
+npm install react-hook-form zod @hookform/resolvers
+```
+
+四个包的分工：
+
+```
+zustand              全局状态管理，存储登录状态和 Token
+react-hook-form      表单状态管理，处理输入、验证、提交
+zod                  Schema 验证，定义表单字段的规则
+@hookform/resolvers  连接 RHF 和 Zod，让两者配合工作
+```
+
+
+
+### 2. 切出认证页面分支
+
+这三个工具是为认证流程（Step 46-49）服务的，在认证分支上配置：
+
+```bash
+git checkout develop
+git checkout -b feature/auth-pages
+git push -u origin feature/auth-pages
+```
+
+
+
+### 3. Zustand 原理和核心语法
+
+#### 3.1 原理
+
+Zustand 本质是一个**发布订阅模式**的状态容器：
+
+```
+store（状态容器）
+  ├── state（数据）
+  └── actions（修改数据的方法）
+
+组件 A 订阅 store → store 变化 → 组件 A 自动重新渲染
+组件 B 订阅 store → store 变化 → 组件 B 自动重新渲染
+```
+
+不需要 Context，不需要 Provider 包裹，任何组件直接读取。
+
+#### 3.2 创建 Store
+
+Zustand提供一个函数 :**
+
+```ts
+create<T>(initializer: (set, get) => T): UseBoundStore<T>
+```
+
+**create函数的**参数：初始化函数（initializer）**
+
+Zustand 调用这个初始化函数时会注入两个参数：set、get。 并进行数据初始化
+
+```ts
+create<AuthState>((set, get) => ({
+//                 ↑    ↑
+//           Zustand 注入  Zustand 注入
+  
+  // 数据初始化：普通字段，直接写值
+  user: null,
+  token: null,
+  isAuthenticated: false,
+
+  // 数据更新：用 set 修改 state
+  login: (user, token) => set({ user, token, isAuthenticated: true }),
+
+  // 数据读取：用 get 在 action 内部读当前 state
+  updateUser: (username) => {
+    const current = get().user   // 读当前值
+    set({ user: { ...current, username } })
+  }
+}))
+```
+
+初始化函数的**返回值**就是 store 的初始结构，包含所有 state 和 action。
+
+> `set` 和 `get` 的详细用法:
+>
+> ```ts
+> // set：合并更新，不需要展开整个 state
+> set({ user: newUser })          // 只更新 user，其他字段不变
+> set({ isAuthenticated: true })  // 只更新 isAuthenticated
+> 
+> // set 也可以传函数，拿到当前 state
+> set(state => ({
+>   user: { ...state.user, username: 'new' }
+> }))
+> 
+> // get：在 action 内部读当前 state
+> const currentToken = get().token
+> ```
+
+
+
+**create函数的返回值**，是自定义的**Hook 函数**，不是普通对象：
+
+```ts
+const useAuthStore = create<AuthState>()(...)
+//    ↑ 这是一个 Hook 函数，约定用 use 开头
+```
+
+所以：
+
+```TS
+// 在组件里调用这个 Hook，才能拿到 store 里的数据
+const { user, login } = useAuthStore()
+//                       ↑ 调用 Hook，返回的才是 store 对象
+
+// useAuthStore 本身是函数，不能直接用
+console.log(useAuthStore.user)  // ❌ 错误，Hook 必须在组件里调用
+```
+
+**store 对象是什么？**
+
+调用 `useAuthStore()` 之后返回的才是 store 对象，结构就是初始化函数返回的那个对象：
+
+```TS
+{
+  // state
+  user: null,
+  token: null,
+  isAuthenticated: false,
+
+  // actions
+  login: (user, token) => ...,
+  logout: () => ...,
+  setUser: (user) => ...,
+}
+```
+
+准确的层次是：
+
+```tex
+create        → 生产 Hook 的工厂函数
+useAuthStore  → Hook 函数
+useAuthStore() → 真正的 store 对象（只能在组件里调用）
+```
+
+#### 3.3 如何在组件里使用？
+
+可以订阅整个store
+
+```tsx
+function Navbar() {
+  // 订阅整个 store
+  const { user, isAuthenticated, logout } = useAuthStore()
+
+  return (
+    <div>
+      {isAuthenticated ? (
+        <>
+          <span>{user?.username}</span>
+          <button onClick={logout}>退出</button>
+        </>
+      ) : (
+        <a href="/login">登录</a>
+      )}
+    </div>
+  )
+}
+```
+
+也可以**精准订阅（性能优化）**
+
+```tsx
+// 订阅整个 store：任何字段变化都会重新渲染
+const store = useAuthStore()
+
+// 只订阅需要的字段：只有 isAuthenticated 变化才重新渲染
+const isAuthenticated = useAuthStore(state => state.isAuthenticated)
+const user = useAuthStore(state => state.user)
+
+// 只订阅 action：action 不会变化，组件永远不会因此重新渲染
+const logout = useAuthStore(state => state.logout)
+
+```
+
+#### 3.4 如何持久化（配合 localStorage）？
+
+**什么问题？**
+
+```ts
+const useAuthStore = create<AuthState>((set) => ({
+  token: null,
+  user: null,
+  login: (user, token) => set({ user, token })
+}))
+
+// 用户登录后 token 存在内存里
+// 刷新页面 → 内存清空 → token 没了 → 用户被迫重新登录
+```
+
+使用Zustand 内置的**中间件`persist` **，能够把 store 的数据自动同步到 localStorage，页面刷新后数据不丢失。
+
+**如何使用persist？**
+
+```tsx
+import { create } from 'zustand'
+import { persist } from 'zustand/middleware'
+
+const useAuthStore = create<AuthState>()(
+  persist(
+    // 原来的初始化函数，完全不变
+    (set, get) => ({
+      user: null,
+      token: null,
+      isAuthenticated: false,
+      login: (user, token) => set({ user, token, isAuthenticated: true }),
+      logout: () => set({ user: null, token: null, isAuthenticated: false }),
+    }),
+    // persist 的配置
+    {
+      name: 'auth-storage',  // localStorage 的 key 名
+    }
+  )
+)
+```
+
+> persist 做了什么??
+>
+> ```bash
+> 第一次登录
+>   login(user, token) 被调用
+>     → set({ user, token, isAuthenticated: true })
+>     → persist 监听到 state 变化
+>     → 自动写入 localStorage:
+>       key:   "auth-storage"
+>       value: { "state": { "user": {...}, "token": "eyJ..." }, "version": 0 }
+> 
+> 刷新页面
+>   → Zustand 初始化
+>   → persist 自动从 localStorage 读取数据
+>   → 恢复 state：user、token、isAuthenticated 全部还原
+>   → 用户无感知，还是登录状态
+> ```
+>
+> 
+
+**只持久化部分字段?**
+
+persist 默认会把所有 state 都存进 localStorage，但 action 函数不需要存，可以用 `partialize` 过滤：
+
+```ts
+persist(
+  (set) => ({...}),
+  {
+    name: 'auth-storage',
+    partialize: (state) => ({
+      user: state.user,
+      token: state.token,
+      // isAuthenticated 不存，刷新后根据 token 是否存在来判断
+      // action 函数自动不存，Zustand 内部处理了
+    })
+  }
+)
+```
+
+
+
+### 4. 配置 Zustand：authStore
+
+Zustand 是全局状态管理库。在这个项目里它的主要职责是：**存储登录状态**——用户信息、Token、是否已登录。
+
+**为什么需要全局状态管理？**
+
+登录状态需要在很多地方用到：导航栏显示用户名、路由保护判断是否登录、请求拦截器附加 Token……这些组件分布在页面的各个角落，没有直接的父子关系。如果靠 Props 传递，要一层一层往下传，非常繁琐。Zustand 提供一个全局 store，任何组件都可以直接读取和修改，不需要 Props 传递。
+
+```ts
+touch src/stores/authStore.ts
+// src/stores/authStore.ts
+import { create } from 'zustand'
+import { persist } from 'zustand/middleware'
+import type { User } from '@/types'
+
+interface AuthState {
+  user: User | null
+  accessToken: string | null
+
+  // 登录成功后调用：保存用户信息和 Token
+  setAuth: (user: User, token: string) => void
+
+  // 退出登录：清除所有状态
+  logout: () => void
+
+  // 判断当前是否已登录
+  isAuthenticated: () => boolean
+}
+
+export const useAuthStore = create<AuthState>()(
+  // persist 中间件：把 store 的状态同步到 localStorage
+  // 页面刷新后状态不会丢失，用户不需要重新登录
+  persist(
+    (set, get) => ({
+      user: null,
+      accessToken: null,
+
+      setAuth: (user, token) => {
+        // 同时更新 Zustand 状态和 localStorage
+        // localStorage 里的 accessToken 供 Axios 拦截器读取
+        localStorage.setItem('accessToken', token)
+        set({ user, accessToken: token })
+      },
+
+      logout: () => {
+        localStorage.removeItem('accessToken')
+        set({ user: null, accessToken: null })
+      },
+
+      isAuthenticated: () => {
+        return get().accessToken !== null && get().user !== null
+      },
+    }),
+    {
+      name: 'auth-storage',    // localStorage 里的 key 名称
+      // 只持久化这两个字段，方法不需要持久化
+      partialize: (state) => ({
+        user: state.user,
+        accessToken: state.accessToken,
+      }),
+    }
+  )
+)
+```
+
+> **为什么 `setAuth` 里要同时写 localStorage 和 Zustand？**
+>
+>  persist 中间件会把 `accessToken` 存到 `auth-storage` 这个 key 里，但 Axios 拦截器读的是单独的 `accessToken` key（`localStorage.getItem('accessToken')`）。手动写一次 `localStorage.setItem('accessToken', token)` 是为了让拦截器能直接读到 Token，不依赖 persist 的存储结构。
+
+
+
+### 5. React Hook Form + Zod 的工作方式
+
+在写登录页之前，需要对表单数据进行验证。
+
+#### 5.1 后端验证 vs 前端验证
+
+后端验证是保证数据安全
+
+```c#
+// 后端 C# 验证
+public class LoginRequest {
+  [Required]
+  [EmailAddress]
+  public string Email { get; set; }
+  
+  [MinLength(6)]
+  public string Password { get; set; }
+}
+```
+
+用户完全可以绕过前端，直接用 Postman 或者修改 JS 代码发请求，后端验证保证无论请求从哪来，数据都是合法的。
+
+前端验证**不是为了安全**，是为了提升用户体验
+
+```bash
+没有前端验证：
+  用户填完表单 → 点提交 → 等待网络请求 → 后端返回错误 → 用户才看到提示
+  耗时：500ms ~ 2s
+
+有前端验证：
+  用户填完表单 → 点提交 → 立即显示错误（0ms）
+  甚至：用户还没点提交，输完就实时提示
+```
+
+#### 5.2 原生表单验证
+
+原生 React 处理表单很繁琐：
+
+```tsx
+// 原生写法：每个字段都要手动管理
+const [email, setEmail] = useState('')
+const [password, setPassword] = useState('')
+const [emailError, setEmailError] = useState('')
+const [passwordError, setPasswordError] = useState('')
+
+const handleSubmit = () => {
+  if (!email.includes('@')) setEmailError('邮箱格式错误')
+  if (password.length < 6) setPasswordError('密码太短')
+  // ...字段越多越痛苦
+}
+```
+
+#### 5.3 工具协作
+
+**前端使用以下3个工具的协作**
+
+- **Zod** 负责定义验证规则：邮箱格式是否正确、密码最少几位。
+
+- **React Hook Form（RHF）** 负责管理表单状态：哪些字段、当前的值、是否提交过、错误信息在哪里显示。
+
+- **`@hookform/resolvers`** 是连接两者的桥梁：把 Zod Schema 传给 RHF，RHF 在验证时自动调用 Zod。
+
+三者的协作流程：
+
+```
+定义 Zod Schema（规则）
+        ↓
+useForm({ resolver: zodResolver(schema) })
+        ↓
+用户填写表单、点击提交
+        ↓
+RHF 调用 Zod 验证
+        ↓
+验证失败 → 错误信息显示在对应字段下方
+验证通过 → 调用 onSubmit 处理函数
+```
+
+#### 5.4 Zod：只负责定义验证规则
+
+```tsx
+import { z } from 'zod'
+
+const loginSchema = z.object({
+  email: z.string()
+            .min(1, '邮箱不能为空')
+            .email('邮箱格式不正确'),
+  password: z.string()
+               .min(6, '密码至少6位')
+               .max(20, '密码最多20位'),
+})
+
+// Zod 还能自动推导出 TypeScript 类型，不需要重复定义
+type LoginForm = z.infer<typeof loginSchema>
+// 等价于：{ email: string, password: string }
+```
+
+Zod 只管规则，不管表单，不管 UI，就是一个验证器。
+
+#### 5.5 React Hook Form：只负责管理表单状态
+
+```tsx
+import { useForm } from 'react-hook-form'
+
+const { 
+  register,       // 注册字段（绑定到 input）
+  handleSubmit,   // 包装提交事件
+  formState: { errors, isSubmitting }  // 错误信息、提交状态
+} = useForm<LoginForm>()
+```
+
+RHF 管理的是：当前每个字段的值、是否已触碰、错误信息在哪、提交状态等。它本身不做验证，只是管理状态。
+
+#### 5.6 zodResolver：把两者连接起来
+
+```ts
+import { zodResolver } from '@hookform/resolvers/zod'
+
+const { register, handleSubmit, formState: { errors } } = useForm<LoginForm>({
+  resolver: zodResolver(loginSchema)
+  //        ↑ 告诉 RHF：验证时用这个 Zod schema
+})
+```
+
+有了这一行，RHF 在需要验证时会自动调用 Zod，不需要手动写验证逻辑。
+
+
+
+**完整流程**:
+
+```bash
+用户填写表单，点击提交
+        ↓
+handleSubmit 拦截原生 submit 事件
+        ↓
+RHF 调用 zodResolver → Zod 执行验证
+        ↓
+    验证失败                    验证通过
+        ↓                          ↓
+errors 对象被填充            调用 onSubmit(data)
+input 下方显示错误信息        data 是完全合法的数据
+用户修改后再次触发验证         调用 API
+```
+
+
+
+### 6. 验证安装
+
+```bash
+npm run build
+```
+
+预期没有错误。
+
+
+
+### 7. 此时的目录变化
+
+```
+src/
+└── stores/
+    └── authStore.ts    ← 新增
+```
+
+
+
+### 8. Git 提交
+
+```bash
+git add .
+git commit -m "feat: Zustand authStore + install RHF + Zod"
+git push origin feature/auth-pages
+```
+
+
+
+### Step 45 完成状态
+
+```
+✅ 切出 feature/auth-pages 分支
+✅ 安装 zustand / react-hook-form / zod / @hookform/resolvers
+✅ authStore 配置完成（user / accessToken / setAuth / logout / isAuthenticated）
+✅ 理解 persist 中间件（刷新不丢失登录状态）
+✅ 理解 setAuth 同时写 localStorage 的原因（供 Axios 拦截器读取）
+✅ 理解 RHF + Zod + resolver 三者协作流程
+✅ npm run build 无错误
+✅ Git commit 完成
+```
+
+
+
+## Step 46 · 登录页
+
+### 这一步做什么
+
+实现第一个真实可用的页面——登录。完成后用户可以输入邮箱密码，点击登录，Token 存入 localStorage，跳转到首页。
+
+这是前端最核心的一步。做完这步，就掌握了后续所有页面的开发模式: 
+
+- 表单验证
+- API调用
+- 状态更新
+- 页面跳转
+
+后面每个页面都是这套模式的重复和扩展。
+
+
+
+### 1. 安装 React Router
+
+登录成功后需要跳转页面，先装路由库：
+
+```bash
+npm install react-router-dom
+```
+
+先做最简单的路由配置，只有两个路由，够登录页用就行。后续 Step 47 会做完整的路由结构。
+
+打开 `src/main.tsx`：
+
+```tsx
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import { BrowserRouter } from 'react-router-dom'
+import './index.css'
+import App from './App.tsx'
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    {/* 包裹rowserRouter组件 */}
+    <BrowserRouter>
+      <App />
+    </BrowserRouter>
+  </StrictMode>
+)
+```
+
+打开 `src/App.tsx`，配置临时路由：
+
+```tsx
+import { Routes, Route } from 'react-router-dom'
+import LoginPage from '@/pages/LoginPage'
+
+function App() {
+  return (
+    <Routes>
+      <Route path="/login" element={<LoginPage />} />
+      <Route path="/" element={<div className="p-8">首页（占位）</div>} />
+    </Routes>
+  )
+}
+
+export default App
+```
+
+
+
+### 2. React 组件是什么
+
+React 组件就是**一个返回 UI 的函数**。
+
+描述"这个界面长什么样"，React 负责把它渲染到浏览器里：
+
+```tsx
+// 最简单的组件
+function LoginPage() {
+  return <div>登录页</div>
+}
+```
+
+这里的 `<div>` 不是真正的 HTML，而是 **JSX**：一种在 JavaScript 里写类似 HTML 的语法，React 会把它转换成真正的 DOM 操作。
+
+**组件里的状态（useState）**
+
+组件里的普通变量不会触发界面更新。如果想"数据变了，界面跟着变"，需要用 `useState`：
+
+```tsx
+// count 变化时，React 会重新渲染这个组件
+const [count, setCount] = useState(0)
+
+// count 是当前值
+// setCount 是修改它的函数
+// 0 是初始值
+```
+
+登录页需要两个状态：
+
+- `isLoading`：是否正在提交（控制按钮的禁用和文字）
+- `serverError`：服务端返回的错误信息（密码错误等）
+
+**TypeScript 在组件里的作用**
+
+TypeScript 给变量加类型标注，让 IDE 有提示，写错了编译器报错：
+
+```tsx
+// <boolean> 是泛型，告诉 TS 这个状态是布尔类型
+const [isLoading, setIsLoading] = useState<boolean>(false)
+
+// <string | null> 表示可以是字符串或 null
+const [serverError, setServerError] = useState<string | null>(null)
+```
+
+
+
+### 3. 表单数据怎么处理
+
+现在来想一个问题：用户在输入框里打字，怎么拿到这个值？
+
+**最直接的想法（受控组件）：**
+
+```tsx
+const [email, setEmail] = useState('')
+
+<input
+  value={email}
+  onChange={(e) => setEmail(e.target.value)}
+/>
+```
+
+每次用户打一个字，`onChange` 就触发一次，更新 `email` 状态。但表单字段多了，就要写很多个 `useState` 和 `onChange`，而且每次打字都触发重渲染，性能不好。
+
+**React Hook Form 的方式（非受控组件）：**
+
+RHF 不用 `useState` 追踪每个字段，而是直接操作 DOM 读取值，只在需要的时候（比如提交时）才收集所有字段的值。性能更好，代码更少。
+
+RHF 的用法是通过 `register` 函数把输入框"注册"进来：
+
+```tsx
+const { register } = useForm()
+
+// register('email') 返回一些 props（onChange、onBlur、ref 等）
+// 展开传给 input，RHF 就能追踪这个字段了
+<input {...register('email')} />
+```
+
+`register` 返回的是一个普通对象，里面是几个事件处理函数和属性：
+
+```ts
+register('email') 返回：
+{
+  name: 'email',
+  ref: (el) => { /* RHF 保存 DOM 引用 */ },
+  onChange: (e) => { /* 用户输入时更新 RHF 内部状态 */ },
+  onBlur: (e) => { /* 失焦时触发验证 */ },
+}
+```
+
+用展开运算符 `{...register('email')}` 把这些属性全部传给 input：
+
+```ts
+<input {...register('email')} />
+
+// 等价于：
+<input
+  name="email"
+  ref={...}
+  onChange={...}
+  onBlur={...}
+/>
+```
+
+
+
+### 4. 验证规则怎么定义
+
+光收集数据不够，还需要验证格式是否正确。这里用 Zod。
+
+Zod 的思路是：**先描述数据应该长什么样（Schema），再用这个 Schema 验证实际数据**：
+
+```tsx
+import { z } from 'zod'
+
+// 描述登录表单的 Schema
+const loginSchema = z.object({
+  // email 字段：必须是字符串，不能为空，必须是邮箱格式
+  email: z.string()
+    .min(1, 'Email is required')        // 不能为空，错误提示是第二个参数
+    .email('Please enter a valid email'), // 必须是邮箱格式
+
+  // password 字段：必须是字符串，不能为空
+  password: z.string()
+    .min(1, 'Password is required'),
+})
+```
+
+有了 Schema 之后，可以用 TypeScript 的类型推导功能，**从 Schema 自动生成类型**，不需要手动写 interface：
+
+```tsx
+// z.infer 从 Schema 推导出对应的 TypeScript 类型
+// LoginForm 的类型等价于 { email: string; password: string }
+type LoginForm = z.infer<typeof loginSchema>
+```
+
+这样做的好处是：验证规则和类型定义只写一次，永远保持一致。
+
+
+
+### 5. RHF 和 Zod 怎么连接
+
+RHF 负责管理表单，Zod 负责验证规则，两者通过 `zodResolver` 连接：
+
+```tsx
+import { useForm } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+
+const {
+  register,       // 注册字段
+  handleSubmit,   // 包装提交函数
+  formState: { errors, isSubmitting }  // 表单状态
+} = useForm<LoginForm>({
+  // 告诉 RHF：用 loginSchema 来验证表单
+  resolver: zodResolver(loginSchema),
+})
+```
+
+`formState` 里有两个重要的东西：
+
+- `errors`：验证失败时，每个字段的错误信息。`errors.email?.message` 就是邮箱字段的错误文字
+
+    ```ts
+    // 验证失败时 errors 的结构：
+    errors = {
+      email: {
+        message: '邮箱格式不正确',  // ← Zod schema 里定义的错误信息
+        type: 'invalid_string',     // ← 错误类型
+        ref: input DOM 元素          // ← 对应的 input 引用
+      },
+      password: {
+        message: '密码至少6位',
+        type: 'too_small',
+        ref: input DOM 元素
+      }
+    }
+    
+    // 验证通过时对应字段是 undefined
+    errors = {}  // 全部通过，空对象
+    errors.email     // undefined
+    errors.password  // undefined
+    ```
+
+- `isSubmitting`：表单正在提交时为 `true`，提交完成后变回 `false`。用来控制按钮禁用状态
+
+
+
+### 6. 登录页
+
+先创建文件：
+
+```bash
+touch src/pages/LoginPage.tsx
+```
+
+**第一步：最骨架的组件**
+
+先写能跑起来的最简单版本：
+
+```tsx
+export default function LoginPage() {
+  return (
+    <div>
+      <h1>Sign in</h1>
+    </div>
+  )
+}
+```
+
+**第二步：加入状态**
+
+登录页需要两个状态——加进来：
+
+```tsx
+import { useState } from 'react'
+
+export default function LoginPage() {
+  // 服务端错误信息（密码错误、邮箱未验证等）
+  const [serverError, setServerError] = useState<string | null>(null)
+
+  return (
+    <div>
+      <h1>Sign in</h1>
+      {/* serverError 有值时才显示错误提示 */}
+      {serverError && <p>{serverError}</p>}
+    </div>
+  )
+}
+```
+
+**第三步：加入表单和 RHF**
+
+引入 RHF 和 Zod，定义 Schema，注册字段：
+
+```tsx
+import { useState } from 'react'
+import { useForm } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { z } from 'zod'
+
+// 定义验证规则
+const loginSchema = z.object({
+  email: z.string().min(1, 'Email is required').email('Invalid email'),
+  password: z.string().min(1, 'Password is required'),
+})
+
+// 从 Schema 推导类型
+type LoginForm = z.infer<typeof loginSchema>
+
+export default function LoginPage() {
+  const [serverError, setServerError] = useState<string | null>(null)
+
+  // 初始化 RHF，连接 Zod
+  const {
+    register,
+    handleSubmit,
+    formState: { errors, isSubmitting },
+  } = useForm<LoginForm>({
+    resolver: zodResolver(loginSchema),
+  })
+
+  return (
+    <div>
+      <h1>Sign in</h1>
+
+      {serverError && <p>{serverError}</p>}
+
+      {/* handleSubmit 包装 onSubmit，先验证再提交 */}
+      {/* onSubmit 现在还没定义，下一步加 */}
+      <form>
+        <div>
+          <label>Email</label>
+          {/* register('email') 展开传给 input，RHF 开始追踪这个字段 */}
+          <input type="email" {...register('email')} />
+          {/* errors.email 验证失败时有值 */}
+          {errors.email && <p>{errors.email.message}</p>}
+        </div>
+
+        <div>
+          <label>Password</label>
+          <input type="password" {...register('password')} />
+          {errors.password && <p>{errors.password.message}</p>}
+        </div>
+
+        <button type="submit" disabled={isSubmitting}>
+          {isSubmitting ? 'Signing in...' : 'Sign in'}
+        </button>
+      </form>
+    </div>
+  )
+}
+```
+
+在浏览器里测试一下：
+
+- 什么都不填直接点提交，没有错误提示。
+- 填了不是邮箱格式的内容，应该看到格式错误提示。
+
+注意：现在RHF + Zod 的验证还没生效，因为 `<form>` 标签没有绑定 `handleSubmit`，RHF 根本没有拦截到提交事件，验证从来没有被触发。上面邮箱格式错误提示的功能是来自  `<input type="email">` 触发的是**浏览器原生验证**。
+
+**第四步：加入提交处理**
+
+编写onSubmit逻辑，并绑定到`handleSubmit`。
+
+验证通过后，调用 API 登录， 因此我们也引入API 和路由
+
+```tsx
+// 引入 API 和路由
+import { useNavigate } from 'react-router-dom'
+import { authApi } from '@/api'
+import { useAuthStore } from '@/stores/authStore'
+
+export default function LoginPage() {
+  const navigate = useNavigate()
+  const { setAuth } = useAuthStore()
+  const [serverError, setServerError] = useState<string | null>(null)
+
+  const { register, handleSubmit, formState: { errors, isSubmitting } }
+    = useForm<LoginForm>({ resolver: zodResolver(loginSchema) })
+
+  // onSubmit 只在 RHF 验证通过后才会被调用
+  // data 是表单所有字段的值，类型是 LoginForm
+  const onSubmit = async (data: LoginForm) => {
+    // 清除上次的服务端错误
+    setServerError(null)
+
+    try {
+      // 调用登录 API
+      const result = await authApi.login(data)
+
+      // 登录成功：把用户信息和 Token 存入 Zustand
+      // setAuth 内部会同时写入 localStorage
+      setAuth(result.user, result.token)
+
+      // 跳转首页
+      navigate('/')
+    } catch (error) {
+      // Axios 拦截器已经把错误提取成 Error 对象
+      // 直接读 message 显示给用户
+      if (error instanceof Error) {
+        setServerError(error.message)
+      }
+    }
+  }
+
+  return (
+    <div>
+      {serverError && <p>{serverError}</p>}
+
+      {/* 把 onSubmit 传给 handleSubmit */}
+      <form onSubmit={handleSubmit(onSubmit)}>
+        {/* ... 字段不变 ... */}
+      </form>
+    </div>
+  )
+}
+```
+
+**第五步：换上 shadcn 组件**
+
+现在逻辑完全正确了，把原生 HTML 标签换成 shadcn 组件，加上 Tailwind 样式：
+
+```tsx
+// src/pages/LoginPage.tsx
+import { useState } from 'react'
+import { useForm } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { z } from 'zod'
+import { useNavigate, Link } from 'react-router-dom'
+import { authApi } from '@/api'
+import { useAuthStore } from '@/stores/authStore'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card'
+
+const loginSchema = z.object({
+  email: z.string().min(1, 'Email is required').email('Invalid email format'),
+  password: z.string().min(1, 'Password is required'),
+})
+
+type LoginForm = z.infer<typeof loginSchema>
+
+export default function LoginPage() {
+  const navigate = useNavigate()
+  const { setAuth } = useAuthStore()
+  const [serverError, setServerError] = useState<string | null>(null)
+
+  const {
+    register,
+    handleSubmit,
+    formState: { errors, isSubmitting },
+  } = useForm<LoginForm>({
+    resolver: zodResolver(loginSchema),
+  })
+
+  const onSubmit = async (data: LoginForm) => {
+    setServerError(null)
+    try {
+      const result = await authApi.login(data)
+      setAuth(result.user, result.token)
+      navigate('/')
+    } catch (error) {
+      if (error instanceof Error) {
+        setServerError(error.message)
+      }
+    }
+  }
+
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-gray-50">
+      <Card className="w-full max-w-md">
+        <CardHeader className="space-y-1">
+          <CardTitle className="text-2xl font-bold">Sign in</CardTitle>
+          <CardDescription>
+            Enter your email and password to sign in
+          </CardDescription>
+        </CardHeader>
+
+        <CardContent>
+          <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+
+            {serverError && (
+              <div className="rounded-md bg-red-50 p-3 text-sm text-red-600">
+                {serverError}
+              </div>
+            )}
+
+            <div className="space-y-2">
+              <Label htmlFor="email">Email</Label>
+              <Input
+                id="email"
+                type="email"
+                placeholder="you@example.com"
+                {...register('email')}
+              />
+              {errors.email && (
+                <p className="text-sm text-red-500">{errors.email.message}</p>
+              )}
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="password">Password</Label>
+              <Input
+                id="password"
+                type="password"
+                placeholder="••••••••"
+                {...register('password')}
+              />
+              {errors.password && (
+                <p className="text-sm text-red-500">{errors.password.message}</p>
+              )}
+            </div>
+
+            <div className="flex justify-end">
+              <Link
+                to="/forgot-password"
+                className="text-sm text-blue-600 hover:underline"
+              >
+                Forgot password?
+              </Link>
+            </div>
+
+            <Button type="submit" className="w-full" disabled={isSubmitting}>
+              {isSubmitting ? 'Signing in...' : 'Sign in'}
+            </Button>
+
+            <p className="text-center text-sm text-gray-600">
+              Don't have an account?{' '}
+              <Link to="/register" className="text-blue-600 hover:underline">
+                Sign up
+              </Link>
+            </p>
+
+          </form>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+```
+
+
+
+### 7. 更新入口配置
+
+更新 `src/main.tsx` 加入路由支持：
+
+```tsx
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import { BrowserRouter } from 'react-router-dom'
+import './index.css'
+import App from './App.tsx'
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <BrowserRouter>
+      <App />
+    </BrowserRouter>
+  </StrictMode>,
+)
+```
+
+更新 `src/App.tsx` 加入临时路由：
+
+```tsx
+import { Routes, Route } from 'react-router-dom'
+import LoginPage from '@/pages/LoginPage'
+
+function App() {
+  return (
+    <Routes>
+      <Route path="/login" element={<LoginPage />} />
+      <Route path="/" element={<div className="p-8">首页（占位）</div>} />
+    </Routes>
+  )
+}
+
+export default App
+```
+
+
+
+### 8. 完整测试
+
+启动后端和前端，打开 `http://localhost:5173/login`。
+
+**测试一：表单验证**
+
+什么都不填直接点提交 → 两个字段下方出现红色错误提示，请求没有发出去。
+
+填写格式错误的邮箱（比如 `abc`）→ 看到 `Invalid email format` 提示。
+
+**测试二：服务端错误**
+
+填写正确格式的邮箱但密码错误 → 表单验证通过，请求发出去，服务端返回错误，红色错误提示出现在表单顶部。
+
+填写未验证邮箱的账号 → 看到 `Please verify your email address before logging in.`
+
+**测试三：正常登录**
+
+用注册过且已验证的账号登录 → 跳转到首页（占位文字），打开浏览器开发者工具 → Application → Local Storage，看到 `accessToken` 已存入。
+
+
+
+### 9. 此时的目录变化
+
+```
+src/
+├── pages/
+│   └── LoginPage.tsx    ← 新增
+├── App.tsx              ← 已更新
+└── main.tsx             ← 已更新
+```
+
+
+
+### 10. Git 提交
+
+```bash
+git add .
+git commit -m "feat: login page with RHF + Zod validation"
+git push origin feature/auth-pages
+```
+
+
+
+### Step 46 完成状态
+
+```
+✅ 理解 React 函数组件和 JSX
+✅ 理解 useState（状态变化驱动界面更新）
+✅ 理解 RHF 非受控表单的工作方式（register / handleSubmit / errors）
+✅ 理解 Zod Schema 定义验证规则
+✅ 理解 z.infer 从 Schema 推导 TypeScript 类型
+✅ 理解 zodResolver 连接 RHF 和 Zod
+✅ 理解提交流程（验证 → onSubmit → API → setAuth → navigate）
+✅ 五步逐步构建：骨架 → 状态 → 表单 → 提交逻辑 → 样式
+✅ 三种场景测试通过（验证错误 / 服务端错误 / 正常登录）
+✅ Git commit 完成
+```
+
+
+
+## Step 47 · 路由结构
+
+### 这一步做什么
+
+Step 46 用了最简单的临时路由——`BrowserRouter` 包着两个 `Route`，够登录页用就行。
+
+这一步把路由系统做完整：切换到 React Router v6 推荐的方式，搭建完整的路由结构，实现"未登录时自动跳转登录页"的受保护路由。
+
+
+
+### 1. 路由是什么？
+
+浏览器地址栏里的 URL 变化时，页面应该显示不同的内容。这就是前端路由要解决的问题。
+
+传统的多页应用是服务器决定的：访问 `/login` 服务器返回登录页的 HTML，访问 `/cars` 服务器返回车辆列表页的 HTML，每次都是完整的页面刷新。
+
+React 应用是**单页应用（SPA）**：整个应用只有一个 HTML 文件，URL 变化时不请求服务器，而是由 JavaScript 决定渲染哪个组件。React Router 就是做这件事的库。
+
+
+
+### 2. BrowserRouter vs createBrowserRouter
+
+Step 46 用的是 `BrowserRouter`：
+
+```tsx
+// Step 46 的临时方式
+<BrowserRouter>
+  <Routes>
+    <Route path="/login" element={<LoginPage />} />
+    <Route path="/" element={<div>首页</div>} />
+  </Routes>
+</BrowserRouter>
+```
+
+这种写法把路由配置**散落在组件树里**。当路由越来越多时，要找某个路由的配置，需要在组件树里到处翻。
+
+React Router v6 推荐用 `createBrowserRouter`，把所有路由配置**集中在一个地方**：
+
+```tsx
+// v6 推荐方式
+const router = createBrowserRouter([
+  { path: '/', element: <HomePage /> },
+  { path: '/login', element: <LoginPage /> },
+])
+
+// 入口文件
+<RouterProvider router={router} />
+```
+
+路由配置就是一个数组，每个元素描述一条路由：`path` 是 URL，`element` 是要渲染的组件。结构清晰，集中管理。
+
+
+
+### 3. 把路由配置迁移到独立文件
+
+现在路由配置在 `App.tsx` 里，随着路由增多会越来越乱。把它移到独立的 `router.tsx` 文件里。
+
+先创建文件：
+
+```bash
+touch src/router.tsx
+```
+
+把登录页和首页的路由配置迁移进去：
+
+```tsx
+// src/router.tsx
+import { createBrowserRouter } from 'react-router-dom'
+import LoginPage from '@/pages/LoginPage'
+
+export const router = createBrowserRouter([
+  {
+    path: '/',
+    element: <div className="p-8">首页（占位）</div>,
+  },
+  {
+    path: '/login',
+    element: <LoginPage />,
+  },
+])
+```
+
+更新 `src/main.tsx`，用 `RouterProvider` 替换 `BrowserRouter`：
+
+```tsx
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import { RouterProvider } from 'react-router-dom'
+import { router } from './router'
+import './index.css'
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <RouterProvider router={router} />
+  </StrictMode>,
+)
+```
+
+`App.tsx` 现在不再需要了，路由配置已经移到 `router.tsx`：
+
+```bash
+rm src/App.tsx
+```
+
+验证：
+
+```bash
+npm run dev
+```
+
+访问 `http://localhost:5173/login`，登录页正常显示。访问 `http://localhost:5173/`，显示占位文字。和之前行为完全一致，只是路由配置的组织方式变了。
+
+
+
+### 4. 受保护路由：问题在哪里
+
+现在 `/` 是公开的，任何人都能访问。但后面会有很多需要登录才能访问的页面——发布车辆、个人中心、订单列表等。
+
+最直接的想法是在每个需要登录的页面组件里检查：
+
+```tsx
+// 在每个需要登录的页面里都这样写
+export default function CreateCarPage() {
+  const { isAuthenticated } = useAuthStore()
+
+  if (!isAuthenticated()) {
+    return <Navigate to="/login" />
+  }
+
+  return <div>发布车辆</div>
+}
+```
+
+这能工作，但有个问题：**每个需要登录的页面都要复制这段逻辑**。如果将来要改跳转逻辑，要改很多个文件。
+
+更好的做法是把这个检查逻辑**抽成一个组件**，在路由配置里统一处理。
+
+
+
+### 5. Outlet 是什么
+
+在实现受保护路由之前，先理解 `Outlet`，因为受保护路由依赖它。
+
+`Outlet` 是 React Router 提供的一个组件，它是**子路由的渲染占位符**。
+
+先看一个具体例子理解它：
+
+```tsx
+// 假设有这样的路由配置
+{
+  path: '/dashboard',
+  element: <DashboardLayout />,  // 父路由
+  children: [
+    { path: 'profile', element: <ProfilePage /> },  // 子路由
+    { path: 'settings', element: <SettingsPage /> }, // 子路由
+  ]
+}
+// DashboardLayout 组件
+function DashboardLayout() {
+  return (
+    <div>
+      <nav>导航栏（始终显示）</nav>
+
+      {/* Outlet 是子路由内容的渲染位置 */}
+      {/* 访问 /dashboard/profile 时，这里渲染 ProfilePage */}
+      {/* 访问 /dashboard/settings 时，这里渲染 SettingsPage */}
+      <Outlet />
+    </div>
+  )
+}
+```
+
+访问 `/dashboard/profile`：
+
+```
+渲染 DashboardLayout
+  → 导航栏（始终显示）
+  → Outlet 位置渲染 ProfilePage
+```
+
+访问 `/dashboard/settings`：
+
+```
+渲染 DashboardLayout
+  → 导航栏（始终显示）
+  → Outlet 位置渲染 SettingsPage
+```
+
+导航栏只写一次，子路由切换时只有 `Outlet` 的内容变化，外层布局保持不动。
+
+
+
+### 6. 用 Outlet 实现受保护路由
+
+理解了 `Outlet` 之后，受保护路由的实现思路就很自然了：
+
+```
+创建一个 ProtectedRoute 组件
+  → 检查是否已登录
+  → 未登录：跳转到登录页（不渲染子路由）
+  → 已登录：渲染 Outlet（让子路由正常显示）
+```
+
+在路由配置里，把需要登录的路由都放在 `ProtectedRoute` 的 `children` 里：
+
+```tsx
+{
+  element: <ProtectedRoute />,   // 父路由：做权限检查
+  children: [
+    { path: '/cars/new', element: <CreateCarPage /> },   // 子路由
+    { path: '/profile', element: <ProfilePage /> },      // 子路由
+  ]
+}
+```
+
+这样权限检查逻辑只写一次，所有子路由都受到保护。
+
+现在来实现它：
+
+```tsx
+// src/components/ProtectedRoute.tsx
+import { Navigate, Outlet } from 'react-router-dom'
+import { useAuthStore } from '@/stores/authStore'
+
+export default function ProtectedRoute() {
+  const { isAuthenticated } = useAuthStore()
+
+  if (!isAuthenticated()) {
+    // replace 参数：用登录页替换当前历史记录
+    // 不加 replace 的话，用户登录后点返回键会回到被拦截的页面，再被拦截，死循环
+    return <Navigate to="/login" replace />
+  }
+
+  // 已登录：渲染子路由的内容
+  return <Outlet />
+}
+```
+
+
+
+### 7. 更新路由配置，使用 ProtectedRoute
+
+现在把 `router.tsx` 更新，加入受保护路由。暂时只加一个占位页面测试效果：
+
+```tsx
+// src/pages/CreateCarPage.tsx（占位）
+export default function CreateCarPage() {
+  return <div className="p-8">发布车辆（占位）</div>
+}
+```
+
+更新 `src/router.tsx`：
+
+```tsx
+// src/router.tsx
+import { createBrowserRouter } from 'react-router-dom'
+import LoginPage from '@/pages/LoginPage'
+import CreateCarPage from '@/pages/CreateCarPage'
+import ProtectedRoute from '@/components/ProtectedRoute'
+
+export const router = createBrowserRouter([
+  // 公开路由
+  {
+    path: '/',
+    element: <div className="p-8">首页（占位）</div>,
+  },
+  {
+    path: '/login',
+    element: <LoginPage />,
+  },
+
+  // 受保护路由
+  // element 是 ProtectedRoute，它负责权限检查
+  // children 里的页面只有登录后才能访问
+  {
+    element: <ProtectedRoute />,
+    children: [
+      {
+        path: '/cars/new',
+        element: <CreateCarPage />,
+      },
+    ],
+  },
+])
+```
+
+
+
+### 8. 验证受保护路由是否工作
+
+```bash
+npm run dev
+```
+
+**测试一：未登录访问受保护路由**
+
+清除 localStorage（浏览器开发者工具 → Application → Local Storage → 全部清除），然后访问：
+
+```
+http://localhost:5173/cars/new
+```
+
+应该自动跳转到 `/login`。
+
+**测试二：登录后访问受保护路由**
+
+用正确账号登录，登录成功后手动访问：
+
+```
+http://localhost:5173/cars/new
+```
+
+应该正常显示"发布车辆（占位）"，不再被跳转。
+
+两个测试都通过，说明受保护路由工作正常。
+
+
+
+### 9. 此时的目录变化
+
+```
+src/
+├── components/
+│   └── ProtectedRoute.tsx    ← 新增
+├── pages/
+│   ├── LoginPage.tsx         （已有）
+│   └── CreateCarPage.tsx     ← 新增（占位）
+├── router.tsx                ← 新增
+└── main.tsx                  ← 已更新
+```
+
+`App.tsx` 已删除。
+
+
+
+### 10. Git 提交
+
+```bash
+git add .
+git commit -m "feat: router setup with ProtectedRoute"
+git push origin feature/auth-pages
+```
+
+
+
+### Step 47 完成状态
+
+```
+✅ 理解 SPA 前端路由的工作原理
+✅ 理解 createBrowserRouter vs BrowserRouter 的区别
+✅ 路由配置迁移到独立的 router.tsx
+✅ RouterProvider 替换 BrowserRouter
+✅ 理解 Outlet（子路由渲染占位符）
+✅ 理解受保护路由的实现思路（一处检查保护所有子路由）
+✅ ProtectedRoute 组件实现（未登录跳转 + Outlet）
+✅ 受保护路由配置（children 结构）
+✅ 测试通过（未登录跳转 / 登录后正常访问）
+✅ Git commit 完成
+```
+
+
+
+## Step 48 · 注册页 + 密码相关页面
+
+### 这一步做什么
+
+Step 46 做了登录页，Step 47 搭好了路由框架。这一步把剩余的认证页面全部做完：注册、邮箱验证、忘记密码、重置密码。
+
+
+
+### 1. 注册页
+
+#### 1.1 验证规则
+
+登录页的 Schema 很简单：邮箱格式 + 密码不为空。
+
+注册页的密码需要更严格的规则：至少8位、包含大写字母、包含小写字母、包含数字。
+
+**Zod 支持链式调用多个验证规则：**
+
+```tsx
+// 每个 .xxx() 是一条规则，第二个参数是这条规则失败时的提示
+z.string()
+  .min(8, 'At least 8 characters')
+  .regex(/(?=.*[a-z])/, 'Must contain lowercase letter')
+  .regex(/(?=.*[A-Z])/, 'Must contain uppercase letter')
+  .regex(/(?=.*\d)/, 'Must contain number')
+```
+
+规则从上到下依次验证，第一条失败就停下来显示对应的错误信息。
+
+#### 1.2 注册成功后不跳转
+
+登录成功后直接跳转首页，但注册成功后不一样：
+
+用户还需要去邮箱点验证链接，跳转到首页没有意义。
+
+更好的做法是：注册成功后**显示一个提示页面**，告诉用户"请检查邮箱"。
+
+可以用一个 `isSuccess` 状态来控制显示哪个内容：
+
+```tsx
+const [isSuccess, setIsSuccess] = useState(false)
+
+// 注册成功后
+setIsSuccess(true)
+
+// 根据状态决定显示什么
+if (isSuccess) {
+  return <div>请检查邮箱...</div>
+}
+ 
+return <div>注册表单...</div>
+```
+
+#### 1.3 实现注册页
+
+打开 `src/pages/RegisterPage.tsx`，一步一步构建：
+
+**第一步：Schema 和类型**
+
+```tsx
+import { useState } from 'react'
+import { useForm } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { z } from 'zod'
+import { Link, useNavigate } from 'react-router-dom'
+import { authApi } from '@/api'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card'
+
+const registerSchema = z.object({
+  username: z
+    .string()
+    .min(2, 'Username must be at least 2 characters')
+    .max(50, 'Username must not exceed 50 characters'),
+  email: z
+    .string()
+    .min(1, 'Email is required')
+    .email('Please enter a valid email'),
+  password: z
+    .string()
+    .min(8, 'Password must be at least 8 characters')
+    .regex(/(?=.*[a-z])/, 'Must contain at least one lowercase letter')
+    .regex(/(?=.*[A-Z])/, 'Must contain at least one uppercase letter')
+    .regex(/(?=.*\d)/, 'Must contain at least one number'),
+})
+
+type RegisterForm = z.infer<typeof registerSchema>
+```
+
+**第二步：组件骨架 + 状态**
+
+```tsx
+import { useState } from 'react'
+import { useForm } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { useNavigate } from "react-router-dom"
+
+export default function RegisterPage() {
+  const [serverError, setServerError] = useState<string | null>(null)
+  const [isSuccess, setIsSuccess] = useState(false)
+  const navigate = useNavigate();
+
+  const {
+    register,
+    handleSubmit,
+    formState: { errors, isSubmitting },
+  } = useForm<RegisterForm>({
+    resolver: zodResolver(registerSchema),
+  })
+
+  const onSubmit = async (data: RegisterForm) => {
+    setServerError(null)
+    try {
+      await authApi.register(data)
+      // 注册成功：显示"请检查邮箱"提示
+      setIsSuccess(true)
+    } catch (error) {
+      if (error instanceof Error) {
+        setServerError(error.message)
+      }
+    }
+  }
+
+  // 注册成功后显示提示
+  if (isSuccess) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-gray-50">
+        <Card className="w-full max-w-md">
+          <CardHeader>
+            <CardTitle>Check your email</CardTitle>
+            <CardDescription>
+              We've sent a verification link to your email.
+              Please click the link to activate your account.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Button
+              variant="outline"
+              className="w-full"
+              onClick={() => navigate('/login')}
+            >
+              Back to sign in
+            </Button>
+          </CardContent>
+        </Card>
+      </div>
+    )
+  }
+
+  // 注册表单
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-gray-50">
+      <Card className="w-full max-w-md">
+        <CardHeader className="space-y-1">
+          <CardTitle className="text-2xl font-bold">Create account</CardTitle>
+          <CardDescription>
+            Enter your details to create a new account
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+
+            {serverError && (
+              <div className="rounded-md bg-red-50 p-3 text-sm text-red-600">
+                {serverError}
+              </div>
+            )}
+
+            <div className="space-y-2">
+              <Label htmlFor="username">Username</Label>
+              <Input
+                id="username"
+                placeholder="johndoe"
+                {...register('username')}
+              />
+              {errors.username && (
+                <p className="text-sm text-red-500">{errors.username.message}</p>
+              )}
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="email">Email</Label>
+              <Input
+                id="email"
+                type="email"
+                placeholder="you@example.com"
+                {...register('email')}
+              />
+              {errors.email && (
+                <p className="text-sm text-red-500">{errors.email.message}</p>
+              )}
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="password">Password</Label>
+              <Input
+                id="password"
+                type="password"
+                placeholder="••••••••"
+                {...register('password')}
+              />
+              {errors.password && (
+                <p className="text-sm text-red-500">{errors.password.message}</p>
+              )}
+            </div>
+
+            <Button
+              type="submit"
+              className="w-full"
+              disabled={isSubmitting}
+            >
+              {isSubmitting ? 'Creating account...' : 'Create account'}
+            </Button>
+
+            <p className="text-center text-sm text-gray-600">
+              Already have an account?{' '}
+              <Link to="/login" className="text-blue-600 hover:underline">
+                Sign in
+              </Link>
+            </p>
+
+          </form>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+```
+
+#### 1.4 把注册路由加进去
+
+打开 `src/router.tsx`，在公开路由里加上注册页：
+
+```tsx
+import RegisterPage from '@/pages/RegisterPage'
+
+// 在公开路由里添加
+{
+  path: '/register',
+  element: <RegisterPage />,
+},
+```
+
+**测试注册流程：**
+
+访问 `/register`，不填内容直接提交，看到字段验证错误。
+
+密码只填 `abc123`（不满足大写字母要求），看到 `Must contain at least one uppercase letter`。
+
+正确填写所有字段，提交后看到"Check your email"提示，同时真实邮箱收到验证邮件。
+
+
+
+### 2. 邮箱验证页
+
+#### 2.1 怎么读取 URL 参数?
+
+邮件里的验证链接格式是：
+
+```
+http://localhost:5173/verify-email?token=abc123xyz
+```
+
+`?token=abc123xyz` 是 URL 的查询参数（Query String）。前端需要把 `token` 的值读出来，传给后端验证接口。
+
+React Router 提供了 `useSearchParams` Hook 专门读取 URL 查询参数：
+
+```tsx
+// URL: /verify-email?token=abc123
+const [searchParams] = useSearchParams()
+
+// .get('token') 读取名为 token 的参数值
+const token = searchParams.get('token')  // → "abc123"
+
+// 参数不存在时返回 null
+const missing = searchParams.get('notexist')  // → null
+```
+
+`useSearchParams` 返回一个数组，第一个元素是参数对象，第二个是修改参数的函数。这里只需要读取，所以只用第一个。
+
+#### 2.2 页面加载时自动触发请求?
+
+登录页和注册页都是用户主动点提交按钮才发请求。但邮箱验证页不一样——用户点击链接进入页面后，应该**自动触发验证请求**，不需要用户再点任何按钮。
+
+这需要用到 `useEffect`。
+
+**useEffect 是什么？**
+
+`useEffect` 是 React 提供的一个 Hook，用来处理"副作用"。
+
+**副作用**是指不属于渲染本身的操作，比如：发 API 请求、设置定时器、操作浏览器 API 等。
+
+为什么要把这些操作放进 `useEffect` 而不是直接写在组件函数体里？
+
+```tsx
+// 错误做法：直接在组件里发请求
+function VerifyEmailPage() {
+  // 每次组件重新渲染都会发一次请求！
+  // React 可能因为各种原因重新渲染组件，这会导致请求被重复发送
+  authApi.verifyEmail(token)
+
+  return <div>...</div>
+}
+```
+
+`useEffect` 让你控制**什么时候**执行这些操作：
+
+```tsx
+useEffect(() => {
+  // 这里的代码在组件渲染之后执行
+  // 第二个参数是依赖数组
+
+}, [依赖项])
+// 依赖数组为空 []：只在组件第一次渲染后执行一次
+// 依赖数组有值 [a, b]：a 或 b 变化时重新执行
+// 不传第二个参数：每次渲染后都执行（通常不想要这个）
+```
+
+邮箱验证页的场景：进入页面时执行一次验证，之后不再重复，用空依赖数组：
+
+```tsx
+useEffect(() => {
+  // 页面第一次渲染后自动执行
+  verify()
+}, [])
+```
+
+#### 2.3 用状态机管理验证过程
+
+验证有三种可能的结果：进行中、成功、失败。用一个状态来表示当前处于哪个阶段：
+
+```tsx
+// 用联合类型定义所有可能的状态
+type VerifyStatus = 'loading' | 'success' | 'error'
+
+const [status, setStatus] = useState<VerifyStatus>('loading')
+```
+
+这种用一个状态值表示多种互斥状态的方式，叫**状态机**思维。比用多个 boolean 状态（`isLoading`、`isSuccess`、`isError`）清晰得多，因为互斥的状态不可能同时为 true。
+
+#### 2.4 实现邮箱验证页
+
+打开 `src/pages/VerifyEmailPage.tsx`：
+
+**第一步：定义状态**
+
+```tsx
+import { useEffect, useState } from 'react'
+import { useSearchParams, Link } from 'react-router-dom'
+import { authApi } from '@/api'
+
+type VerifyStatus = 'loading' | 'success' | 'error'
+
+export default function VerifyEmailPage() {
+  const [searchParams] = useSearchParams()
+  const [status, setStatus] = useState<VerifyStatus>('loading')
+  const [errorMessage, setErrorMessage] = useState<string | null>(null)
+
+  // 组件渲染后自动触发验证
+    useEffect(() => {
+      const verify = async () => {
+        const token = searchParams.get("token")
+
+        if (!token) {
+          setStatus("error")
+          setErrorMessage("Invalid verification link.")
+          return
+        }
+
+        try {
+          await authApi.verifyEmail(token)
+          setStatus("success")
+        } catch (error) {
+          setStatus("error")
+          if (error instanceof Error) {
+            setErrorMessage(error.message)
+          }
+        }
+      }
+
+      verify()
+    }, [searchParams])
+
+  // 根据状态渲染不同内容
+  // ...
+}
+```
+
+**第二步：根据状态渲染对应内容**
+
+```tsx
+import { useEffect, useState } from "react";
+import { useSearchParams, Link } from "react-router-dom";
+import { authApi } from "@/api";
+import { Button } from "@/components/ui/button";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+
+type VerifyStatus = "loading" | "success" | "error";
+
+export default function VerifyEmailPage() {
+  const [searchParams] = useSearchParams();
+  const [status, setStatus] = useState<VerifyStatus>("loading");
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+	...
+  }, [searchParams]);
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-gray-50">
+      <Card className="w-full max-w-md">
+        {status === "loading" && (
+          <CardHeader>
+            <CardTitle>Verifying your email...</CardTitle>
+            <CardDescription>Please wait a moment.</CardDescription>
+          </CardHeader>
+        )}
+
+        {status === "success" && (
+          <>
+            <CardHeader>
+              <CardTitle>Email verified!</CardTitle>
+              <CardDescription>
+                Your account is now active. You can sign in.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              {/*
+                Button asChild 是 shadcn 的特殊用法：
+                把 Button 的样式应用到子元素（Link）上
+                而不是渲染一个 <button> 标签包着 <a> 标签
+                （button 包 a 是不合法的 HTML 写法）
+              */}
+              <Button asChild className="w-full">
+                <Link to="/login">Sign in</Link>
+              </Button>
+            </CardContent>
+          </>
+        )}
+
+        {status === "error" && (
+          <>
+            <CardHeader>
+              <CardTitle>Verification failed</CardTitle>
+              <CardDescription className="text-red-500">
+                {errorMessage ?? "The link is invalid or has expired."}
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <Button asChild variant="outline" className="w-full">
+                <Link to="/login">Back to sign in</Link>
+              </Button>
+            </CardContent>
+          </>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+```
+
+#### 2.5 加入路由
+
+打开 `src/router.tsx`，添加：
+
+```tsx
+import VerifyEmailPage from '@/pages/VerifyEmailPage'
+
+// 公开路由里添加
+{
+  path: '/verify-email',
+  element: <VerifyEmailPage />,
+},
+```
+
+**测试：** 注册后收到验证邮件，点击邮件里的链接，页面先短暂显示 "Verifying..."，然后跳转到 "Email verified!" 成功状态。
+
+> **注意：由于使用了严格模式:**
+>
+> ```tsx
+> createRoot(document.getElementById("root")!).render(
+>   <StrictMode>
+>     {/* 包裹rowserRouter组件 */}
+>     <RouterProvider router={router} />
+>   </StrictMode>,
+> );
+> ```
+>
+> React 开发模式下 `StrictMode` 会**故意把 `useEffect` 执行两次**，用来帮助发现副作用问题。
+>
+> 执行顺序：
+>
+> ```bash
+> 第一次挂载 → useEffect 执行 → verify() 发出第一次请求
+>            → StrictMode 故意卸载
+>            → 再次挂载 → useEffect 再次执行 → verify() 发出第二次请求
+> ```
+>
+> 对于邮箱验证这种**一次性操作**，第一次请求成功后 token 已经被消费（数据库里清空了），第二次请求用同一个 token 去验证，后端找不到, 发送验证请求返回
+>
+> ```json
+> {
+>     "success": false,
+>     "data": null,
+>     "message": "The token is invalid or has expired.",
+>     "errors": null
+> }
+> ```
+>
+> 从而让status='error', 导致前端渲染错误提示内容。
+>
+> 解决方案：使用useRef hook函数
+>
+> - 直接删除严格模式 ： 导致无法使用严格模式发现其他副作用潜在的问题
+> - 使用useRef hook函数
+
+#### 2.6 使用useRef hook函数优化
+
+`useRef` 返回一个容器对象 `{ current: value }`，这个对象保存在 React 内部的 **Fiber 节点**上，不在函数作用域里：
+
+```bash
+
+React 内部维护了一张表：
+
+Fiber 节点（组件实例）
+  ├── useState 的值    → [status, setStatus]
+  ├── useState 的值    → [errorMessage, setErrorMessage]  
+  ├── useRef 的值      → { current: false }，跨渲染共享同一个对
+  └── useEffect 的依赖 → [searchParams]
+  
+```
+
+每次组件重新渲染，函数体重新执行，但 React 不会重新创建这张表，而是复用已有的，把最新的值填进去。
+
+和普通变量、useState 的区别：
+
+```bash
+普通变量  → 每次渲染重新创建，渲染结束销毁
+useState → 值在 Fiber 节点，变化触发重新渲染
+useRef   → 值在 Fiber 节点，变化不触发重新渲染  ← 适合做标志位
+```
+
+useRef 的两种用途:
+
+```tsx
+// 用途一：获取 DOM 引用（最常见）
+const inputRef = useRef<HTMLInputElement>(null)
+<input ref={inputRef} />
+// inputRef.current 就是 input 的 DOM 元素
+// 可以直接操作：inputRef.current.focus()
+
+// 用途二：跨渲染保存值
+const hasVerified = useRef(false)
+// 存的不是 DOM，是普通值
+// 值变化不触发渲染，但在多次渲染/effect 间共享
+```
+
+两种用途本质一样——都是**在渲染之间持久保存一个可变值**，只是存的内容不同。
+
+对于严格模式导致双重执行 useEffect，发出两次请求的问题，使用useRef解决
+
+```tsx
+export default function VerifyEmailPage() {
+  const [searchParams] = useSearchParams()
+  const [status, setStatus] = useState<VerifyStatus>("loading")
+  const [errorMessage, setErrorMessage] = useState<string | null>(null)
+  const hasVerified = useRef(false)  // ← 标志位，防止重复请求
+
+  useEffect(() => {
+    if (hasVerified.current) return  // 第二次执行直接跳过
+    hasVerified.current = true       // 标记已执行
+
+    const verify = async () => {
+      const token = searchParams.get("token")
+
+      if (!token) {
+        setStatus("error")
+        setErrorMessage("Invalid verification link.")
+        return
+      }
+
+      try {
+        await authApi.verifyEmail(token)
+        setStatus("success")
+      } catch (error) {
+        setStatus("error")
+        if (error instanceof Error) {
+          setErrorMessage(error.message)
+        }
+      }
+    }
+
+    verify()
+  }, [searchParams])
+}
+```
+
+完整执行流程
+
+```bash
+const hasVerified = useRef(false)
+→ Fiber 节点里创建 { current: false }
+
+第一次挂载
+  → useEffect 执行
+      → hasVerified.current === false → 不跳过
+      → hasVerified.current = true   ← 修改 Fiber 节点里的值
+      → verify() 发出请求
+      → 验证成功，EmailConfirmed = true，token 清空
+      → setStatus("success")
+
+StrictMode 卸载
+  → hasVerified.current 还是 true（Fiber 节点不受卸载影响）
+
+再次挂载
+  → useEffect 再次执行
+      → hasVerified.current === true → 直接 return
+      → verify() 不执行，请求不发出去 ✅
+```
+
+
+
+### 3. 忘记密码页
+
+这是最简单的一个页面：只有一个邮箱字段，提交后显示成功提示。
+
+不引入新知识点，直接和注册页的结构完全一样：
+
+```tsx
+// src/pages/ForgotPasswordPage.tsx
+import { useState } from 'react'
+import { useForm } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { z } from 'zod'
+import { Link } from 'react-router-dom'
+import { authApi } from '@/api'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card'
+
+const forgotPasswordSchema = z.object({
+  email: z.string().min(1, 'Email is required').email('Invalid email format'),
+})
+
+type ForgotPasswordForm = z.infer<typeof forgotPasswordSchema>
+
+export default function ForgotPasswordPage() {
+  const [isSuccess, setIsSuccess] = useState(false)
+
+  const {
+    register,
+    handleSubmit,
+    formState: { errors, isSubmitting },
+  } = useForm<ForgotPasswordForm>({
+    resolver: zodResolver(forgotPasswordSchema),
+  })
+
+  const onSubmit = async (data: ForgotPasswordForm) => {
+    // 后端设计：无论邮箱是否存在，始终返回成功
+    // 前端同样不需要处理错误，直接显示成功提示
+    await authApi.forgotPassword(data.email)
+    setIsSuccess(true)
+  }
+
+  if (isSuccess) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-gray-50">
+        <Card className="w-full max-w-md">
+          <CardHeader>
+            <CardTitle>Check your email</CardTitle>
+            <CardDescription>
+              If this email is registered, you'll receive
+              a password reset link shortly.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Button asChild variant="outline" className="w-full">
+              <Link to="/login">Back to sign in</Link>
+            </Button>
+          </CardContent>
+        </Card>
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-gray-50">
+      <Card className="w-full max-w-md">
+        <CardHeader className="space-y-1">
+          <CardTitle className="text-2xl font-bold">Forgot password</CardTitle>
+          <CardDescription>
+            Enter your email and we'll send you a reset link
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+
+            <div className="space-y-2">
+              <Label htmlFor="email">Email</Label>
+              <Input
+                id="email"
+                type="email"
+                placeholder="you@example.com"
+                {...register('email')}
+              />
+              {errors.email && (
+                <p className="text-sm text-red-500">{errors.email.message}</p>
+              )}
+            </div>
+
+            <Button
+              type="submit"
+              className="w-full"
+              disabled={isSubmitting}
+            >
+              {isSubmitting ? 'Sending...' : 'Send reset link'}
+            </Button>
+
+            <p className="text-center text-sm text-gray-600">
+              <Link to="/login" className="text-blue-600 hover:underline">
+                Back to sign in
+              </Link>
+            </p>
+
+          </form>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+```
+
+加入路由：
+
+```tsx
+import ForgotPasswordPage from '@/pages/ForgotPasswordPage'
+
+{
+  path: '/forgot-password',
+  element: <ForgotPasswordPage />,
+},
+```
+
+
+
+### 4. 重置密码页
+
+#### 4.1 跨字段验证
+
+重置密码页有两个字段：新密码和确认密码，需要验证**两者必须相同**。
+
+这不是单个字段的规则，而是两个字段之间的比较。Zod 的普通字段验证做不到这一点，需要用 `refine`。
+
+**`refine` 是什么？**
+
+`refine` 是 Zod 提供的**自定义验证**方法，在整个对象层面执行，可以访问所有字段：
+
+```tsx
+const schema = z.object({
+  newPassword: z.string().min(8),
+  confirmPassword: z.string().min(1),
+})
+.refine(
+  // 第一个参数：验证函数，返回 true 表示通过，false 表示失败
+  (data) => data.newPassword === data.confirmPassword,
+  // 第二个参数：失败时的配置
+  {
+    message: "Passwords don't match",
+    // path 指定错误显示在哪个字段下方
+    path: ['confirmPassword'],
+  }
+)
+```
+
+`.refine()` 是在 `.object()` 之后链式调用的，执行时机是**所有字段验证通过之后**。如果 `newPassword` 或 `confirmPassword` 本身就不合法，`refine` 不会执行。
+
+#### 4.2 实现重置密码页
+
+同样一步一步来。
+
+**第一步：Schema**
+
+```tsx
+// src/pages/ResetPasswordPage.tsx
+
+const resetPasswordSchema = z
+  .object({
+    newPassword: z
+      .string()
+      .min(8, 'Password must be at least 8 characters')
+      .regex(/(?=.*[a-z])/, 'Must contain at least one lowercase letter')
+      .regex(/(?=.*[A-Z])/, 'Must contain at least one uppercase letter')
+      .regex(/(?=.*\d)/, 'Must contain at least one number'),
+    confirmPassword: z
+      .string()
+      .min(1, 'Please confirm your password'),
+  })
+  // 在整个对象层面验证两个密码是否一致
+  .refine(
+    (data) => data.newPassword === data.confirmPassword,
+    {
+      message: "Passwords don't match",
+      path: ['confirmPassword'],
+    }
+  )
+
+type ResetPasswordForm = z.infer<typeof resetPasswordSchema>
+```
+
+**第二步：组件逻辑**
+
+从 URL 读取 token（和邮箱验证页一样用 `useSearchParams`），提交时把 token 和新密码一起发给后端：
+
+```tsx
+export default function ResetPasswordPage() {
+  const [searchParams] = useSearchParams()
+  const navigate = useNavigate()
+  const [serverError, setServerError] = useState<string | null>(null)
+
+  const {
+    register,
+    handleSubmit,
+    formState: { errors, isSubmitting },
+  } = useForm<ResetPasswordForm>({
+    resolver: zodResolver(resetPasswordSchema),
+  })
+
+  const onSubmit = async (data: ResetPasswordForm) => {
+    setServerError(null)
+
+    const token = searchParams.get('token')
+    if (!token) {
+      setServerError('Invalid reset link.')
+      return
+    }
+
+    try {
+      await authApi.resetPassword(token, data.newPassword)
+      // 重置成功，跳转登录页
+      navigate('/login')
+    } catch (error) {
+      if (error instanceof Error) {
+        setServerError(error.message)
+      }
+    }
+  }
+
+  // 表单 JSX...
+}
+```
+
+**第三步：表单 JSX**
+
+```tsx
+import { useState } from "react";
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { z } from "zod";
+import { useSearchParams, Link, useNavigate } from "react-router-dom";
+import { authApi } from "@/api";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+
+
+...
+
+export default function ResetPasswordPage() {
+  
+    ...
+
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-gray-50">
+      <Card className="w-full max-w-md">
+        <CardHeader className="space-y-1">
+          <CardTitle className="text-2xl font-bold">Reset password</CardTitle>
+          <CardDescription>Enter your new password below</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+            {serverError && (
+              <div className="rounded-md bg-red-50 p-3 text-sm text-red-600">
+                {serverError}
+              </div>
+            )}
+
+            <div className="space-y-2">
+              <Label htmlFor="newPassword">New password</Label>
+              <Input
+                id="newPassword"
+                type="password"
+                placeholder="••••••••"
+                {...register("newPassword")}
+              />
+              {errors.newPassword && (
+                <p className="text-sm text-red-500">
+                  {errors.newPassword.message}
+                </p>
+              )}
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="confirmPassword">Confirm password</Label>
+              <Input
+                id="confirmPassword"
+                type="password"
+                placeholder="••••••••"
+                {...register("confirmPassword")}
+              />
+              {/* refine 的错误和普通字段错误一样，通过 errors 读取 */}
+              {errors.confirmPassword && (
+                <p className="text-sm text-red-500">
+                  {errors.confirmPassword.message}
+                </p>
+              )}
+            </div>
+
+            <Button type="submit" className="w-full" disabled={isSubmitting}>
+              {isSubmitting ? "Resetting..." : "Reset password"}
+            </Button>
+
+            <p className="text-center text-sm text-gray-600">
+              <Link to="/login" className="text-blue-600 hover:underline">
+                Back to sign in
+              </Link>
+            </p>
+          </form>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+```
+
+
+
+#### 4.3 加入路由：
+
+```tsx
+import ResetPasswordPage from '@/pages/ResetPasswordPage'
+
+{
+  path: '/reset-password',
+  element: <ResetPasswordPage />,
+},
+```
+
+
+
+### 5. 完整测试
+
+```bash
+npm run dev
+```
+
+**注册流程：**
+
+访问 `/register` → 填写信息提交 → 看到"Check your email" → 收到验证邮件 → 点击链接 → 看到"Email verified!" → 点击"Sign in" → 登录成功。
+
+**密码重置流程：**
+
+访问 `/forgot-password` → 填写邮箱 → 看到"Check your email" → 收到重置邮件 → 点击链接 → 进入 `/reset-password?token=...` → 输入新密码 → 两次输入不一致看到错误提示 → 两次输入一致提交 → 跳转登录页 → 用新密码登录成功。
+
+
+
+### 6. 此时的目录变化
+
+```
+src/
+├── pages/
+│   ├── RegisterPage.tsx        ← 已更新（完整实现）
+│   ├── VerifyEmailPage.tsx     ← 已更新（完整实现）
+│   ├── ForgotPasswordPage.tsx  ← 已更新（完整实现）
+│   └── ResetPasswordPage.tsx   ← 已更新（完整实现）
+└── router.tsx                  ← 已更新（加入四个路由）
+```
+
+
+
+### 7. Git 提交
+
+```bash
+git add .
+git commit -m "feat: register + email verify + forgot/reset password pages"
+git push origin feature/auth-pages
+```
+
+合并回 `develop`：
+
+```bash
+git checkout develop
+git merge --no-ff feature/auth-pages \
+    -m "merge: feature/auth-pages into develop"
+git push origin develop
+git branch -D feature/auth-pages
+git push origin --delete feature/auth-pages
+```
+
+
+
+### Step 48 完成状态
+
+```
+✅ 注册页（多条链式 Zod 规则 + 注册成功提示）
+✅ 理解 useSearchParams（读取 URL 查询参数）
+✅ 理解 useEffect（副作用、依赖数组、执行时机）
+✅ 理解状态机思维（用一个状态值表示互斥的多种状态）
+✅ 邮箱验证页（自动触发验证 + 三种状态）
+✅ 理解 Button asChild（避免非法 HTML 嵌套）
+✅ 忘记密码页（简单表单 + 成功提示）
+✅ 理解 Zod refine（跨字段验证、path 指定错误位置）
+✅ 重置密码页（密码确认验证）
+✅ 完整认证流程端到端测试通过
+✅ feature/auth-pages 合并回 develop
+```
+
+
+
+## Step 49 · 首页：车辆列表
+
+### 这一步做什么
+
+认证流程已经完整了。这一步开始做平台的核心页面——车辆列表。
+
+同时引入这个项目里**最重要的前端库之一：TanStack Query**。它彻底改变了前端数据请求的方式，理解它之后，会觉得之前用 `useEffect` 发请求的方式非常原始。
+
+
+
+### 1. 先做基础布局
+
+在做列表页之前，先把页面的基本结构搭起来:
+
+- 导航栏
+- 内容区域
+
+切出分支
+
+```bash
+git checkout develop
+git checkout -b feature/browse-pages
+git push -u origin feature/browse-pages
+```
+
+
+
+#### 1.1 为什么需要布局组件
+
+现在每个页面都是完全独立的，用户从登录页成功登录后跳到首页，首页只显示一行占位文字，没有任何导航。
+
+需要一个**布局组件**，提供：
+
+- 顶部导航栏（Logo、链接、登录/注册按钮）
+- 内容区域（每个页面的内容渲染在这里）
+
+布局组件只写一次，所有页面共享。
+
+#### 1.2 创建布局组件
+
+```bash
+touch src/components/Layout.tsx
+```
+
+先从最简单的骨架开始：
+
+```tsx
+import { Outlet } from 'react-router-dom'
+
+export default function Layout() {
+  return (
+    <div className="min-h-screen bg-gray-50">
+      {/* 导航栏 */}
+      <header className="border-b bg-white">
+        <div className="mx-auto max-w-7xl px-4 py-4">
+          <span className="text-xl font-bold">UUcars</span>
+        </div>
+      </header>
+
+      {/* 页面内容：Outlet 渲染子路由 */}
+      <main className="mx-auto max-w-7xl px-4 py-8">
+        <Outlet />
+      </main>
+    </div>
+  )
+}
+```
+
+这里又用到了 `Outlet`——导航栏始终显示，`Outlet` 位置根据当前路由渲染对应页面。
+
+#### 1.3 导航栏需要显示登录状态
+
+导航栏要根据是否登录显示不同内容：
+
+- 未登录：显示"Sign in"和"Sign up"链接
+- 已登录：显示用户名和"Sign out"按钮
+
+从 Zustand 读取登录状态，做条件渲染：
+
+```tsx
+import { Link, Outlet, useNavigate } from 'react-router-dom'
+import { useAuthStore } from '@/stores/authStore'
+import { Button } from '@/components/ui/button'
+
+export default function Layout() {
+  const { user, isAuthenticated, logout } = useAuthStore()
+  const navigate = useNavigate()
+
+  const handleLogout = () => {
+    logout()
+    navigate('/login')
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50">
+      <header className="border-b bg-white">
+        <div className="mx-auto flex max-w-7xl items-center
+                        justify-between px-4 py-4">
+          {/* Logo */}
+          <Link to="/" className="text-xl font-bold text-blue-600">
+            UUcars
+          </Link>
+
+          {/* 右侧导航 */}
+          <div className="flex items-center gap-4">
+            {isAuthenticated() ? (
+              // 已登录：显示用户名和退出按钮
+              <>
+                <span className="text-sm text-gray-600">
+                  {user?.username}
+                </span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleLogout}
+                >
+                  Sign out
+                </Button>
+              </>
+            ) : (
+              // 未登录：显示登录和注册链接
+              <>
+                <Link
+                  to="/login"
+                  className="text-sm text-gray-600 hover:text-gray-900"
+                >
+                  Sign in
+                </Link>
+                <Button asChild size="sm">
+                  <Link to="/register">Sign up</Link>
+                </Button>
+              </>
+            )}
+          </div>
+        </div>
+      </header>
+
+      <main className="mx-auto max-w-7xl px-4 py-8">
+        <Outlet />
+      </main>
+    </div>
+  )
+}
+```
+
+#### 1.4 在路由里使用布局组件
+
+Layout 组件通过路由的嵌套结构来使用——把需要显示导航栏的路由都放在 Layout 的 children 里：
+
+打开 `src/router.tsx`，更新：
+
+```tsx
+import { createBrowserRouter } from 'react-router-dom'
+import Layout from '@/components/Layout'
+import LoginPage from '@/pages/LoginPage'
+import RegisterPage from '@/pages/RegisterPage'
+import VerifyEmailPage from '@/pages/VerifyEmailPage'
+import ForgotPasswordPage from '@/pages/ForgotPasswordPage'
+import ResetPasswordPage from '@/pages/ResetPasswordPage'
+import CreateCarPage from '@/pages/CreateCarPage'
+import ProtectedRoute from '@/components/ProtectedRoute'
+
+export const router = createBrowserRouter([
+  // 认证页面：不需要导航栏（全屏居中布局）
+  { path: '/login', element: <LoginPage /> },
+  { path: '/register', element: <RegisterPage /> },
+  { path: '/verify-email', element: <VerifyEmailPage /> },
+  { path: '/forgot-password', element: <ForgotPasswordPage /> },
+  { path: '/reset-password', element: <ResetPasswordPage /> },
+
+  // 有导航栏的页面：都放在 Layout 里
+  {
+    element: <Layout />,
+    children: [
+      // 公开路由
+      {
+        path: '/',
+        element: <div>首页（占位）</div>,
+      },
+
+      // 受保护路由
+      {
+        element: <ProtectedRoute />,
+        children: [
+          { path: '/cars/new', element: <CreateCarPage /> },
+        ],
+      },
+    ],
+  },
+])
+```
+
+验证：
+
+```bash
+npm run dev
+```
+
+访问 `http://localhost:5173/`，应该看到顶部有导航栏，Logo 是 "UUcars"，右侧根据登录状态显示不同内容。
+
+
+
+### 2. 引入 TanStack Query
+
+#### 2.1  useEffect 发请求有什么问题?
+
+如果用 `useEffect` 来请求车辆列表数据，代码会是什么样：
+
+```tsx
+// 用 useEffect 发请求（不推荐）
+function HomePage() {
+  const [cars, setCars] = useState([])
+  const [isLoading, setIsLoading] = useState(true)
+  const [error, setError] = useState(null)
+
+  useEffect(() => {
+    setIsLoading(true)
+    carsApi.getPaged()
+      .then(data => setCars(data.items))
+      .catch(err => setError(err))
+      .finally(() => setIsLoading(false))
+  }, [])
+
+  if (isLoading) return <div>加载中...</div>
+  if (error) return <div>出错了</div>
+  return <div>{/* 渲染数据 */}</div>
+}
+```
+
+什么问题？
+
+每个组件都要写 loading、error、useEffect，而且没有缓存：同一个数据在不同组件里各请求一次。
+
+#### 2.2 TanStack Query 的核心概念
+
+TanStack Query（原名 React Query）是一个**服务端状态管理库**，专门处理"从服务器获取数据"这件事。
+
+TanStack Query 的核心思路是：**把服务端数据当作一种特殊的状态来管理**。
+
+TanStack Query 解决的核心问题：
+
+```bash
+缓存          → 同一个接口的数据缓存起来，不重复请求
+自动重新获取  → 窗口重新聚焦、网络重连时自动刷新数据
+loading/error → 自动管理，不需要手写 useState
+数据同步      → 多个组件用同一份数据，一处更新全部同步
+后台刷新      → 展示缓存数据的同时，后台悄悄刷新
+```
+
+它封装了2个主要Hook:
+
+```bash
+useQuery  → 获取数据（GET 请求）
+useMutation → 修改数据（POST/PUT/DELETE 请求）
+```
+
+useQuery 用法
+
+```tsx
+import { useQuery } from '@tanstack/react-query'
+
+function CarList() {
+    const { data, isLoading, error } = useQuery({
+      // queryKey：这个查询的唯一标识
+      // 用数组表示，可以包含参数
+      queryKey: ['cars', { page: 1 }],
+
+      // queryFn：实际发请求的函数，返回 Promise
+      queryFn: () => carsApi.getPaged({ page: 1 }),
+    })
+    if (isLoading) return <div>Loading...</div>
+      if (isError) return <div>{error.message}</div>
+
+      return <div>{data?.items.map(...)}</div>
+}
+
+```
+
+对比手写方式，省掉了 `useState` + `useEffect` + 手动管理 loading/error。
+
+**queryKey 是什么？**
+
+`queryKey` 是查询的唯一标识，类似于缓存的 key。TanStack Query 用它来：
+
+- 识别不同的查询（`['cars']` 和 `['cars', { page: 2 }]` 是两个不同的查询）
+- 缓存数据（相同 key 的查询结果会被缓存，不重复请求）
+- 自动刷新（key 变化时自动重新请求）
+
+**数据的生命周期：**
+
+```
+第一次请求 → 数据返回 → 存入缓存
+        ↓
+再次访问同一页面 → 立刻显示缓存数据（不等待）
+                → 后台悄悄重新请求（更新缓存）
+                → 新数据到了 → 更新显示
+```
+
+用户感知到的是：页面秒开，数据始终是最新的。
+
+~~**useMutation 的用法**后面的步骤里说明~~
+
+**和 Zustand 的分工:**
+
+```bash
+Zustand         → 客户端状态（登录信息、UI 状态、用户偏好）
+                  这些数据不来自服务器，是前端自己维护的
+
+TanStack Query  → 服务端状态（车辆列表、订单、用户资料）
+                  这些数据来自服务器，需要缓存、同步、刷新
+```
+
+```tsx
+// Zustand 管的：
+const { user, isAuthenticated, login, logout } = useAuthStore()
+
+// TanStack Query 管的：
+const { data: cars } = useQuery({ queryKey: ['cars'], queryFn: carApi.getPaged })
+const { data: orders } = useQuery({ queryKey: ['orders'], queryFn: orderApi.getMine })
+```
+
+#### 2.3 安装并配置
+
+```bash
+npm install @tanstack/react-query
+```
+
+TanStack Query 需要一个 `QueryClient` 实例来管理缓存，用 `QueryClientProvider` 在应用顶层提供：
+
+打开 `src/main.tsx`，更新：
+
+```tsx
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import { RouterProvider } from 'react-router-dom'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { router } from './router'
+import './index.css'
+
+// 创建 QueryClient 实例
+// 所有查询的缓存都存在这个实例里
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      // staleTime：数据多久后被认为"过时"
+      // 过时之前，重新访问页面不会重新请求，直接用缓存
+      // 设为 1 分钟：1 分钟内数据被认为是新鲜的
+      staleTime: 1000 * 60,
+
+      // retry：请求失败时重试次数，默认 3 次，改为 1 次
+      retry: 1,
+    },
+  },
+})
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    {/* QueryClientProvider 必须包在 RouterProvider 外面 */}
+    {/* 这样路由里的所有组件都能使用 TanStack Query */}
+    <QueryClientProvider client={queryClient}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>
+  </StrictMode>,
+)
+```
+
+
+
+### 3. 做车辆列表页
+
+现在来实现 `HomePage`，用 `useQuery` 请求车辆列表数据。
+
+#### 3.1 先想清楚这个页面需要什么
+
+车辆列表页需要：
+
+- 展示车辆卡片列表（标题、品牌、价格、里程）
+- 加载中时显示骨架屏
+- 出错时显示错误信息
+- 分页
+
+按照这个思路，一步一步来。
+
+#### 3.2 第一步：用 useQuery 请求数据
+
+打开 `src/pages/HomePage.tsx`，先把数据请求做好，暂时不管样式：
+
+```tsx
+import { useQuery } from '@tanstack/react-query'
+import { carsApi } from '@/api'
+
+export default function HomePage() {
+  const { data, isLoading, error } = useQuery({
+    queryKey: ['cars'],
+    queryFn: () => carsApi.getPaged(),
+  })
+
+  // 先用最简单的方式验证数据是否请求成功
+  if (isLoading) return <div>Loading...</div>
+  if (error) return <div>Error: {error.message}</div>
+
+  return (
+    <div>
+      <p>共 {data?.totalCount} 辆车</p>
+      {data?.items.map(car => (
+        <div key={car.id}>
+          <p>{car.title}</p>
+          <p>{car.price}</p>
+        </div>
+      ))}
+    </div>
+  )
+}
+```
+
+更新路由，把首页占位替换掉：
+
+```tsx
+import HomePage from '@/pages/HomePage'
+
+// 把原来的占位替换
+{ path: '/', element: <HomePage /> },
+```
+
+启动项目，确保后端也在运行（数据库里要有 Published 状态的车辆）。访问 `http://localhost:5173/`，应该能看到车辆数据。数据请求通了，再来优化展示。
+
+#### 3.3 第二步：做车辆卡片组件
+
+列表里每一项都是一张车辆卡片，把它抽成独立的组件，列表页只管布局和数据，卡片只管显示单辆车的信息。
+
+> **`Badge` 组件还没安装，先装上：**
+>
+> ```bash
+> npx shadcn@latest add badge
+> ```
+
+继续写 `CarCard`：
+
+```tsx
+// src/components/CarCard.tsx
+import { Link } from 'react-router-dom'
+import type { Car } from '@/types'
+import {
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card'
+import { Badge } from '@/components/ui/badge'
+
+interface CarCardProps {
+  car: Car
+}
+
+export default function CarCard({ car }: CarCardProps) {
+  return (
+    <Link to={`/cars/${car.id}`}>
+      <Card className="cursor-pointer transition-shadow hover:shadow-md">
+        <CardHeader className="pb-2">
+          <CardTitle className="line-clamp-2 text-base">
+            {car.title}
+          </CardTitle>
+          <Badge variant="secondary" className="w-fit">
+            {car.brand}
+          </Badge>
+        </CardHeader>
+        <CardContent className="space-y-1">
+          <p className="text-2xl font-bold text-blue-600">
+            ${car.price.toLocaleString()}
+          </p>
+          <p className="text-sm text-gray-500">
+            {car.year} · {car.mileage.toLocaleString()} km
+          </p>
+        </CardContent>
+      </Card>
+    </Link>
+  )
+}
+```
+
+> **`CarCardProps` 是什么？** 这是 TypeScript 的 Props 类型定义。React 组件通过 Props 接收外部传入的数据，在 TypeScript 里需要定义这些 Props 的类型，让 IDE 知道这个组件需要什么数据、数据是什么类型。
+>
+> ```tsx
+> // 定义 Props 的形状
+> interface CarCardProps {
+>   car: Car   // car 是 Car 类型，必须传
+> }
+> 
+> // 在组件参数里使用这个类型
+> function CarCard({ car }: CarCardProps) { ... }
+> // { car } 是解构语法，从 props 对象里取出 car 字段
+> ```
+
+#### 3.4 第三步：骨架屏
+
+骨架屏是加载时的占位效果，让用户看到页面大致结构，而不是一片空白。
+
+先安装 Skeleton 组件：
+
+```bash
+npx shadcn@latest add skeleton
+```
+
+创建车辆卡片的骨架屏：
+
+```tsx
+// src/components/CarCardSkeleton.tsx
+import { Card, CardContent, CardHeader } from '@/components/ui/card'
+import { Skeleton } from '@/components/ui/skeleton'
+
+export default function CarCardSkeleton() {
+  return (
+    <Card>
+      <CardHeader className="pb-2">
+        {/* Skeleton 组件：显示灰色闪烁的占位块 */}
+        {/* className 控制它的大小，和真实内容的大小保持一致 */}
+        <Skeleton className="h-5 w-3/4" />
+        <Skeleton className="h-5 w-1/4" />
+      </CardHeader>
+      <CardContent className="space-y-2">
+        <Skeleton className="h-8 w-1/3" />
+        <Skeleton className="h-4 w-1/2" />
+      </CardContent>
+    </Card>
+  )
+}
+```
+
+#### 3.5 第四步：分页
+
+分页需要知道当前是第几页，页码变化时重新请求数据。
+
+先看 `queryKey` 是怎么配合分页工作的：
+
+```tsx
+// page 是状态，变化时触发重新请求
+const [page, setPage] = useState(1)
+
+const { data } = useQuery({
+  // queryKey 包含 page，page 变化时 key 不同，自动重新请求
+  queryKey: ['cars', { page }],
+  queryFn: () => carsApi.getPaged({ page }),
+})
+```
+
+```bash
+useState 管的是"用户想看第几页"（输入）
+	- page  → 用户当前在第几页，是前端 UI 的状态
+              用户点"下一页"→ page 变化 → 触发新的请求
+              这是前端自己维护的，和服务器无关
+              
+useQuery 管的是"这一页的数据是什么"（输出）
+	- cars 列表 → 从服务器获取的数据
+```
+
+这就是 `queryKey` 的精妙之处——把查询参数放进 key，参数变化时自动触发新的请求，不需要手动管理。
+
+#### 3.6 第五步：把所有部分组合起来
+
+现在把 `HomePage` 更新成完整版本：
+
+```tsx
+import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { carsApi } from "@/api";
+import CarCard from "@/components/CarCard";
+import CarCardSkeleton from "@/components/CarCardSkeleton";
+import { Button } from "@/components/ui/button";
+
+// 配置每页显示的数量
+// 前端单独维护显示的数量
+const PAGE_SIZE = 10;
+
+export default function HomePage() {
+  const [page, setPage] = useState(1);
+
+  const { data, isLoading, error } = useQuery({
+    queryKey: ["cars", { page, pageSize: PAGE_SIZE }],
+    queryFn: () => carsApi.getPaged({ page, pageSize: PAGE_SIZE }),
+  });
+
+  if (error) {
+    return (
+      <div className="py-12 text-center text-gray-500">
+        Failed to load cars. Please try again.
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      <h1 className="text-2xl font-bold">Browse Cars</h1>
+
+      {/* 车辆卡片网格 */}
+      <div
+        className="grid grid-cols-1 gap-4
+                      sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"
+      >
+        {isLoading
+          ? // 加载中：显示 PAGE_SIZE 个骨架屏
+            Array.from({ length: PAGE_SIZE }).map((_, i) => (
+              <CarCardSkeleton key={i} />
+            ))
+          : // 加载完成：显示真实数据
+            data?.items.map((car) => <CarCard key={car.id} car={car} />)}
+      </div>
+
+      {/* 没有数据时的提示 */}
+      {!isLoading && data?.items.length === 0 && (
+        <div className="py-12 text-center text-gray-500">
+          No cars available at the moment.
+        </div>
+      )}
+
+      {/* 分页控制 */}
+      {data && data.totalPages > 1 && (
+        <div className="flex items-center justify-center gap-4">
+          <Button
+            variant="outline"
+            onClick={() => setPage((p) => p - 1)}
+            disabled={page === 1}
+          >
+            Previous
+          </Button>
+
+          <span className="text-sm text-gray-600">
+            Page {page} of {data.totalPages}
+          </span>
+
+          <Button
+            variant="outline"
+            onClick={() => setPage((p) => p + 1)}
+            disabled={page === data.totalPages}
+          >
+            Next
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+```
+
+**`Array.from({ length: PAGE_SIZE }).map((_, i) => ...)`** 是什么？
+
+这是 JavaScript 生成固定数量元素的常用写法。`Array.from({ length: PAGE_SIZE })` 创建一个有 PAGE_SIZE(比如10 )个空元素的数组，`.map()` 遍历它，`_` 表示我们不关心元素的值（占位符），`i` 是索引，用作 `key`。
+
+
+
+### 4. 验证完整效果
+
+```bash
+npm run dev
+```
+
+确保后端运行，数据库里有 Published 状态的车辆。
+
+**测试加载状态：** 刷新页面，短暂看到骨架屏，数据加载完成后骨架屏消失，显示真实车辆卡片。
+
+**测试分页：** 如果数据库里有超过 PAGE_SIZE 辆 Published 状态的车，分页按钮会显示。点击 Next，页码变化，数据自动更新。
+
+**测试缓存：** 点击一辆车进入详情页（现在是占位），返回列表页，数据立刻显示（不需要重新等待加载），这就是 TanStack Query 的缓存效果。
+
+
+
+### 5. 此时的目录变化
+
+```
+src/
+├── components/
+│   ├── Layout.tsx          ← 新增
+│   ├── CarCard.tsx         ← 新增
+│   └── CarCardSkeleton.tsx ← 新增
+├── pages/
+│   └── HomePage.tsx        ← 已更新（完整实现）
+├── router.tsx              ← 已更新
+└── main.tsx                ← 已更新（QueryClientProvider）
+```
+
+
+
+### 6. Git 提交
+
+```bash
+git add .
+git commit -m "feat: home page with car listing, skeleton, pagination"
+git push origin feature/browse-pages
+```
+
+
+
+### Step 49 完成状态
+
+```
+✅ Layout 组件（导航栏 + Outlet，登录状态条件渲染）
+✅ 理解为什么用布局组件（一处定义，所有页面共享）
+✅ 安装 TanStack Query，配置 QueryClientProvider
+✅ 理解 useEffect 发请求的问题（重复代码/无缓存/竞态）
+✅ 理解 useQuery 的工作方式（queryKey/queryFn/缓存机制）
+✅ 理解 queryKey 如何驱动自动重新请求（分页的核心）
+✅ 理解 staleTime（数据新鲜度控制）
+✅ CarCard 组件（Props类型定义 + 解构语法）
+✅ 骨架屏 CarCardSkeleton
+✅ 首页列表（加载/错误/空数据/分页四种状态）
+✅ 测试通过（骨架屏 → 数据 → 分页 → 缓存）
+✅ Git commit 完成
+```
+
+
+
+好，先核查 Step 50 的内容。
+
+
+
+## Step 50 · 搜索过滤
+
+### 这一步做什么
+
+Step 49 做的车辆列表只有分页，没有任何过滤条件。买家想找"10万以内的丰田"，现在只能一页一页翻。
+
+这一步给列表页加上搜索过滤：按品牌、价格区间过滤。
+
+同时解决一个体验问题：**搜索条件要和 URL 同步**。现在如果用户筛选了"品牌：BMW，最高价格：20万"，把这个页面的 URL 发给朋友，朋友打开是空的列表，过滤条件全没了。
+
+URL 同步解决这个问题——过滤条件存在 URL 里，分享链接就是分享搜索结果。
+
+
+
+### 1. 数据流
+
+加了搜索过滤之后，数据流是这样的：
+
+```
+用户修改过滤条件（输入品牌、选择价格）
+        ↓
+过滤条件更新到 URL 参数
+        ↓
+从 URL 参数读取过滤条件
+        ↓
+作为 queryKey 的一部分传给 useQuery
+        ↓
+useQuery 检测到 queryKey 变化，自动重新请求
+        ↓
+列表更新
+```
+
+URL 是过滤条件的"单一数据源"——所有组件都从 URL 读取当前的过滤条件，修改条件也通过更新 URL 来完成。
+
+
+
+### 2. useSearchParams 深入
+
+Step 48 里用过 `useSearchParams` 读取单个参数，这一步要用它做双向同步。
+
+**读取参数（Step 48 已用过）：**
+
+```tsx
+const [searchParams] = useSearchParams()
+const token = searchParams.get('token')
+```
+
+**修改参数（这一步新用到）：**
+
+`useSearchParams` 返回数组的第二个元素是**设置参数的函数**：
+
+```tsx
+const [searchParams, setSearchParams] = useSearchParams()
+
+// 修改 URL 参数
+// 调用后 URL 会变成 /cars?brand=BMW&maxPrice=200000
+setSearchParams({ brand: 'BMW', maxPrice: '200000' })
+```
+
+注意：URL 里的参数值全部是字符串，即使你设置的是数字，在 URL 里也是字符串，读取后需要转换：
+
+```tsx
+// URL: /?maxPrice=200000
+const maxPrice = searchParams.get('maxPrice')  // → "200000"（字符串）
+const maxPriceNumber = Number(maxPrice)         // → 200000（数字）
+```
+
+
+
+### 3. 防抖（Debounce）是什么
+
+过滤条件里有一个输入框——品牌搜索。用户每输入一个字符就触发一次请求，用户输入 "BMW" 会发三次请求（B、BM、BMW），其中前两次完全是浪费。
+
+**防抖**解决这个问题：用户停止输入一段时间后（比如 500ms），才触发请求。用户输入过程中不发请求。
+
+```
+用户输入 B        → 重置计时器，等待 500ms
+用户输入 BM       → 重置计时器，等待 500ms
+用户输入 BMW      → 重置计时器，等待 500ms
+500ms 内没有新输入 → 触发请求（只发一次）
+```
+
+
+
+### 4. 实现 useDebounce 自定义 Hook
+
+React 允许你把可复用的逻辑封装成**自定义 Hook**。自定义 Hook 就是一个函数，函数名以 `use` 开头，内部可以使用其他 Hook。
+
+**为什么要封装成 Hook 而不是普通函数？**
+
+防抖需要用到 `useState` 和 `useEffect`，而这两个只能在 React 组件或自定义 Hook 里使用，不能在普通函数里用。封装成 Hook，防抖逻辑就可以在任何组件里复用。
+
+先理解防抖的实现思路：
+
+```
+用户输入时：
+  设置一个定时器，500ms 后更新"防抖后的值"
+  如果在 500ms 内又有新输入：
+    清除上一个定时器（重置）
+    重新设置定时器
+500ms 内没有新输入：
+  定时器触发，更新"防抖后的值"
+```
+
+用 `useState` 存防抖后的值，用 `useEffect` 管理定时器：
+
+```ts
+// src/hooks/useDebounce.ts
+import { useState, useEffect } from 'react'
+
+// 泛型 T：让这个 Hook 能处理任意类型的值
+// 不只是字符串，数字、对象都可以防抖
+function useDebounce<T>(value: T, delay: number): T {
+  // debouncedValue：防抖后的值，这才是真正用来发请求的值
+  const [debouncedValue, setDebouncedValue] = useState<T>(value)
+
+  useEffect(() => {
+    // value 变化时，设置一个定时器
+    // delay 毫秒后，把 debouncedValue 更新为最新的 value
+    const timer = setTimeout(() => {
+      setDebouncedValue(value)
+    }, delay)
+
+    // useEffect 的清理函数：在下次 effect 执行前调用
+    // 如果 value 在 delay 内又变化了，先清除上一个定时器
+    // 这就实现了"重置计时器"的效果
+    return () => {
+      clearTimeout(timer)
+    }
+
+    // value 或 delay 变化时重新执行这个 effect
+  }, [value, delay])
+
+  return debouncedValue
+}
+
+export default useDebounce
+```
+
+验证理解：
+
+```
+value 变成 "B"
+  → effect 执行，设置 timer A（500ms 后更新 debouncedValue 为 "B"）
+
+value 变成 "BM"（500ms 内）
+  → 清理函数执行，清除 timer A
+  → effect 重新执行，设置 timer B（500ms 后更新 debouncedValue 为 "BM"）
+
+value 变成 "BMW"（500ms 内）
+  → 清理函数执行，清除 timer B
+  → effect 重新执行，设置 timer C（500ms 后更新 debouncedValue 为 "BMW"）
+
+500ms 内没有新变化
+  → timer C 触发，debouncedValue 更新为 "BMW"
+  → useQuery 的 queryKey 变化，发起请求
+```
+
+
+
+### 5. 做搜索过滤 UI
+
+先创建一个独立的搜索过滤组件，不和列表页混在一起：
+
+```bash
+touch src/components/CarFilters.tsx
+```
+
+**第一步：想清楚这个组件需要什么**
+
+过滤组件需要：
+
+- 读取 URL 里当前的过滤条件（初始化输入框的值）
+- 用户修改时更新 URL
+
+它不需要知道列表数据，只负责过滤条件的读写：
+
+```tsx
+import { useSearchParams } from 'react-router-dom'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Button } from '@/components/ui/button'
+```
+
+**第二步：读取当前过滤条件初始化输入框**
+
+```tsx
+import { useSearchParams } from 'react-router-dom'
+
+export default function CarFilters() {
+  const [searchParams, setSearchParams] = useSearchParams()
+
+  // 从 URL 读取当前的过滤条件，作为输入框的初始值
+  // 没有对应参数时用空字符串或 undefined
+  const brand = searchParams.get('brand') ?? ''
+  const minPrice = searchParams.get('minPrice') ?? ''
+  const maxPrice = searchParams.get('maxPrice') ?? ''
+```
+
+**第三步：更新过滤条件**
+
+用户修改过滤条件时，更新 URL 参数。注意要保留已有的参数（比如已有 brand，再加 maxPrice 时不能把 brand 清掉）：
+
+```tsx
+  const updateFilter = (key: string, value: string) => {
+    // 用当前的所有参数构建新的参数对象
+    const current = Object.fromEntries(searchParams.entries())
+
+    if (value) {
+      // 有值：更新这个参数
+      current[key] = value
+    } else {
+      // 空值：删除这个参数（不在 URL 里显示空参数）
+      // 比如用户清空了品牌输入框
+      // updateFilter("brand", "")
+      // → value 是空字符串 → delete current["brand"]
+      // → URL 里 brand 参数消失，不会变成 ?brand=
+      delete current[key]
+    }
+
+    // 每次改过滤条件，把 page 参数从 URL 里删掉
+	// 效果是重置回第一页
+	// 防止出现"第5页但只有2页数据"的情况
+    delete current['page']
+
+    setSearchParams(current)
+  }
+```
+
+>`Object.fromEntries(searchParams.entries())`的用法：
+>
+>```tsx
+>// searchParams 是 URL 参数对象，不是普通对象
+>// 比如 URL 是 ?brand=Toyota&minPrice=50000
+>// searchParams.entries() 返回迭代器：[["brand","Toyota"], ["minPrice","50000"]]
+>// Object.fromEntries 把它转成普通对象
+>const current = Object.fromEntries(searchParams.entries())
+>// current = { brand: "Toyota", minPrice: "50000" }
+>```
+>
+>为什么要转？因为 `searchParams` 不能直接修改，需要先转成普通对象再操作。
+>
+>`delete`是什么？？？
+>
+>`delete` 是 JavaScript **内置运算符**，不是方法，专门用来删除对象的属性：
+>
+>```ts
+>const obj = { a: 1, b: 2, c: 3 }
+>delete obj.b
+>// obj = { a: 1, c: 3 }
+>
+>// 两种写法都行
+>delete obj.b        // 点语法
+>delete obj["b"]     // 方括号语法，适合动态 key
+>```
+
+完整流程举例：
+
+```bash
+当前 URL：?brand=Toyota&minPrice=50000&page=3
+
+用户把品牌改成 Honda
+  → updateFilter("brand", "Honda")
+  → current = { brand: "Toyota", minPrice: "50000", page: "3" }
+  → current["brand"] = "Honda"
+  → delete current["page"]
+  → current = { brand: "Honda", minPrice: "50000" }
+  → setSearchParams(current)
+  → 新 URL：?brand=Honda&minPrice=50000  ← page 消失，回到第一页
+```
+
+
+
+**第四步：清空所有过滤条件**
+
+```tsx
+  const clearFilters = () => {
+    setSearchParams({}) // URL 变成完全干净，没有任何参数
+  }
+```
+
+**第五步：渲染 UI**
+
+```tsx
+import { useSearchParams } from 'react-router-dom'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Button } from '@/components/ui/button'
+
+...
+
+// 派生的 UI 状态
+const hasFilters = brand || minPrice || maxPrice
+
+return (
+    <div className="rounded-lg border bg-white p-4 space-y-4">
+      <h2 className="font-semibold">Filters</h2>
+
+      {/* 品牌搜索 */}
+      <div className="space-y-1">
+        <Label htmlFor="brand">Brand</Label>
+        <Input
+          id="brand"
+          placeholder="e.g. BMW, Toyota"
+          value={brand}
+          onChange={(e) => updateFilter('brand', e.target.value)}
+        />
+      </div>
+
+      {/* 价格区间 */}
+      <div className="space-y-1">
+        <Label>Price Range</Label>
+        <div className="flex gap-2">
+          <Input
+            placeholder="Min"
+            type="number"
+            value={minPrice}
+            onChange={(e) => updateFilter('minPrice', e.target.value)}
+          />
+          <Input
+            placeholder="Max"
+            type="number"
+            value={maxPrice}
+            onChange={(e) => updateFilter('maxPrice', e.target.value)}
+          />
+        </div>
+      </div>
+
+      {/* 清空过滤条件 */}
+      {hasFilters && (
+        <Button
+          variant="outline"
+          className="w-full"
+          onClick={clearFilters}
+        >
+          Clear filters
+        </Button>
+      )}
+    </div>
+  )
+}
+```
+
+注意：<Input/>里使用value而不是defaultValue，**否则，清空过滤后输入框不会清空**
+
+```tsx
+// defaultValue：非受控输入，只设置初始值，之后 React 不管它
+<Input defaultValue={brand} onChange={...} />
+
+// value：受控输入，值始终和变量绑定，变量变了输入框跟着变
+<Input value={brand} onChange={...} />
+```
+
+这样 `clearFilters` 清空 `searchParams` 后，`brand`/`minPrice`/`maxPrice` 都变成空字符串，输入框跟着清空。
+
+### 6. 在 HomePage 里使用过滤条件
+
+现在 `CarFilters` 负责把过滤条件写入 URL，`HomePage` 负责从 URL 读取过滤条件发请求。
+
+打开 `src/pages/HomePage.tsx`，更新：
+
+**第一步：从 URL 读取过滤条件**
+
+```tsx
+import { useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
+import { useQuery } from '@tanstack/react-query'
+import { carsApi } from '@/api'
+import useDebounce from '@/hooks/useDebounce'
+import CarCard from '@/components/CarCard'
+import CarCardSkeleton from '@/components/CarCardSkeleton'
+import CarFilters from '@/components/CarFilters'
+import { Button } from '@/components/ui/button'
+
+// 前端单独维护显示的数量
+const PAGE_SIZE = 10;
+
+export default function HomePage() {
+  const [searchParams, setSearchParams] = useSearchParams()
+
+  // 从 URL 读取当前过滤条件
+  const brand = searchParams.get('brand') ?? ''
+  const minPrice = searchParams.get('minPrice') ?? ''
+  const maxPrice = searchParams.get('maxPrice') ?? ''
+  const page = Number(searchParams.get('page') ?? '1')
+```
+
+**第二步：对品牌搜索加防抖**
+
+品牌是输入框，每次按键都会触发，需要防抖。价格是数字输入框，用户通常输完再改，防抖影响不大但加上也无妨：
+
+```tsx
+  // 加防抖：用户停止输入 500ms 后才触发请求
+  const debouncedBrand = useDebounce(brand, 500);
+  const debouncedMinPrice = useDebounce(minPrice, 800);
+  const debouncedMaxPrice = useDebounce(maxPrice, 800);
+```
+
+**第三步：用防抖后的值作为 queryKey 和请求参数**
+
+```tsx
+  const { data, isLoading, error } = useQuery({
+    // queryKey 用防抖后的 brand，不用原始的 brand
+    // 这样用户打字过程中 queryKey 不变，不触发请求
+    // 停止输入 500ms 后 debouncedBrand 变化，queryKey 变化，才触发请求
+    queryKey: [
+      "cars",
+      {
+        page,
+        pageSize: PAGE_SIZE,
+        brand: debouncedBrand,
+        minPrice: debouncedMinPrice,
+        maxPrice: debouncedMaxPrice,
+      },
+    ],
+    queryFn: () =>
+      carsApi.getPaged({
+        page,
+        pageSize: PAGE_SIZE,
+        brand: debouncedBrand || undefined,
+        minPrice: debouncedMinPrice ? Number(debouncedMinPrice) : undefined,
+        maxPrice: debouncedMaxPrice ? Number(debouncedMaxPrice) : undefined,
+      }),
+  });
+```
+
+**第四步：分页通过 URL 参数控制**
+
+分页不再用 `useState`，改为通过 URL 参数控制，和过滤条件保持一致：
+
+```tsx
+  const handlePageChange = (newPage: number) => {
+    const current = Object.fromEntries(searchParams.entries())
+    setSearchParams({ ...current, page: String(newPage) })
+  }
+```
+
+**第五步：更新 JSX，加入过滤组件**
+
+```tsx
+  if (error) {
+    return (
+      <div className="py-12 text-center text-gray-500">
+        Failed to load cars. Please try again.
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex gap-6">
+      {/* 左侧：过滤条件 */}
+      <aside className="hidden w-64 shrink-0 lg:block">
+        <CarFilters />
+      </aside>
+
+      {/* 右侧：列表 */}
+      <div className="flex-1 space-y-6">
+        <div className="flex items-center justify-between">
+          <h1 className="text-2xl font-bold">Browse Cars</h1>
+          {data && (
+            <p className="text-sm text-gray-500">
+              {data.totalCount} cars found
+            </p>
+          )}
+        </div>
+
+        {/* 车辆卡片网格 */}
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+          {isLoading
+            ? Array.from({ length: pageSize }).map((_, i) => (
+                <CarCardSkeleton key={i} />
+              ))
+            : data?.items.map(car => (
+                <CarCard key={car.id} car={car} />
+              ))
+          }
+        </div>
+
+        {/* 没有数据 */}
+        {!isLoading && data?.items.length === 0 && (
+          <div className="py-12 text-center text-gray-500">
+            No cars found. Try adjusting your filters.
+          </div>
+        )}
+
+        {/* 分页 */}
+        {data && data.totalPages > 1 && (
+          <div className="flex items-center justify-center gap-4">
+            <Button
+              variant="outline"
+              onClick={() => handlePageChange(page - 1)}
+              disabled={page === 1}
+            >
+              Previous
+            </Button>
+            <span className="text-sm text-gray-600">
+              Page {page} of {data.totalPages}
+            </span>
+            <Button
+              variant="outline"
+              onClick={() => handlePageChange(page + 1)}
+              disabled={page === data.totalPages}
+            >
+              Next
+            </Button>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+```
+
+
+
+### 7. 完整测试
+
+```bash
+npm run dev
+```
+
+**测试防抖效果：**
+
+打开浏览器开发者工具 → Network 面板，在品牌输入框快速输入 "BMW"。观察网络请求，应该只有一次请求（停止输入 500ms 后），而不是每个字母一次。
+
+**测试 URL 同步：**
+
+在品牌输入框输入 "BMW"，设置最高价格 200000。观察浏览器地址栏，URL 应该变成：
+
+```
+http://localhost:5173/?brand=BMW&maxPrice=200000
+```
+
+复制这个 URL，开新标签页粘贴打开。过滤条件应该自动恢复——输入框有值，列表已经过滤好了。
+
+**测试分页 + 过滤组合：**
+
+设置过滤条件后翻页，URL 应该同时包含过滤参数和页码参数：
+
+```
+http://localhost:5173/?brand=BMW&page=2
+```
+
+**测试清空过滤：**
+
+点击 "Clear filters"，URL 回到 `/`，列表显示所有车辆。
+
+
+
+### 8. 此时的目录变化
+
+```
+src/
+├── components/
+│   ├── CarFilters.tsx      ← 新增
+│   └── CarCard.tsx         （已有）
+├── hooks/
+│   └── useDebounce.ts      ← 新增
+└── pages/
+    └── HomePage.tsx        ← 已更新
+```
+
+
+
+### 9. Git 提交
+
+```bash
+git add .
+git commit -m "feat: car search filters with URL sync and debounce"
+git push origin feature/browse-pages
+```
+
+
+
+### Step 50 完成状态
+
+```
+✅ 理解搜索条件和 URL 同步的意义（分享链接=分享结果）
+✅ 理解 useSearchParams 双向用法（读取 + 修改）
+✅ 理解 URL 参数全是字符串，数字需要转换
+✅ 理解防抖的原理（重置计时器）
+✅ 理解 useEffect 清理函数（clearTimeout）
+✅ 理解自定义 Hook（用 use 开头，内部可用其他 Hook）
+✅ useDebounce 实现（泛型 + useState + useEffect）
+✅ CarFilters 组件（读写 URL 参数，保留已有参数）
+✅ HomePage 更新（URL 驱动查询，防抖品牌搜索）
+✅ 分页通过 URL 参数控制（和过滤条件统一管理）
+✅ 测试通过（防抖/URL同步/分页+过滤组合/清空）
+✅ Git commit 完成
+```
+
+
+
+## Step 51 · 车辆详情页
+
+### 这一步做什么
+
+用户在列表页点击一辆车，进入详情页。详情页要展示车辆的完整信息、图片、卖家信息，以及根据用户身份显示不同的操作按钮：
+
+```
+未登录用户    → 显示"Sign in to purchase"
+买家         → 显示"Buy Now"和收藏按钮
+车主（卖家）  → 显示"Edit"和"Submit for Review"按钮
+```
+
+这一步引入两个新东西：`useParams`（从 URL 读取车辆 ID）和 `useMutation`（处理修改数据的操作）。
+
+
+
+### 1. useParams 是什么
+
+详情页的 URL 是 `/cars/1`、`/cars/42` 这样的格式，URL 里的数字是车辆 ID。
+
+React Router 提供 `useParams` Hook 读取 URL 里的动态参数：
+
+```tsx
+// 路由配置：{ path: '/cars/:id', element: <CarDetailPage /> }
+// URL：/cars/42
+
+const { id } = useParams()
+// id → "42"（字符串，需要转成数字）
+```
+
+`useParams` 返回的值类型是 `string | undefined`，因为参数可能不存在。使用时需要处理这两种情况：
+
+```tsx
+const { id } = useParams()
+const carId = Number(id)  // 转成数字
+```
+
+
+
+### 2. useMutation 是什么
+
+Step 49 里用 `useQuery` 请求数据（读操作）。`useMutation` 是 TanStack Query 提供的另一个 Hook，专门处理**写操作**——创建、修改、删除。
+
+**为什么不直接在事件处理函数里调用 API？**
+
+直接调用也能工作：
+
+```tsx
+const handleBuy = async () => {
+  setIsLoading(true)
+  try {
+    await ordersApi.create({ carId })
+    // 成功后做什么...
+  } catch (error) {
+    // 处理错误...
+  } finally {
+    setIsLoading(false)
+  }
+}
+```
+
+但 `useMutation` 的好处是：它帮你管理 loading 状态、错误状态、成功回调，不需要自己写这些样板代码。而且它和 TanStack Query 的缓存系统集成——操作成功后可以让相关查询自动刷新。
+
+**useMutation 的用法：**
+
+```tsx
+const mutation = useMutation({
+  // mutationFn：实际执行的操作
+  mutationFn: (carId: number) => ordersApi.create({ carId }),
+
+  // onSuccess：操作成功后的回调
+  onSuccess: () => {
+    // 比如刷新数据、显示成功提示
+  },
+
+  // onError：操作失败后的回调
+  onError: (error) => {
+    // 处理错误
+  },
+})
+
+// 调用：执行操作
+mutation.mutate(carId)
+
+// 状态：
+// mutation.isPending  → 正在执行
+// mutation.isError    → 执行失败
+// mutation.isSuccess  → 执行成功
+```
+
+
+
+### 3. 安装 sonner（Toast 通知）
+
+操作成功或失败时，需要给用户一个提示。用弹窗太重，更常见的做法是右下角弹出一个短暂显示的通知——叫 Toast。
+
+安装 sonner（shadcn 推荐的 Toast 库）：
+
+```bash
+npm install sonner
+```
+
+在 `main.tsx` 里加入 `Toaster` 组件（负责渲染所有 Toast 通知）：
+
+```tsx
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import { RouterProvider } from 'react-router-dom'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { Toaster } from 'sonner'
+import { router } from './router'
+import './index.css'
+
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 1000 * 60,
+      retry: 1,
+    },
+  },
+})
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <QueryClientProvider client={queryClient}>
+      <RouterProvider router={router} />
+      {/* Toaster 放在最外层，所有页面都能用 */}
+      <Toaster position="bottom-right" />
+    </QueryClientProvider>
+  </StrictMode>,
+)
+```
+
+使用方式很简单，在任何地方调用 `toast()` 就会显示通知：
+
+```tsx
+import { toast } from 'sonner'
+
+toast.success('Order placed successfully!')
+toast.error('Something went wrong.')
+```
+
+
+
+### 4. 安装 Dialog 组件
+
+下单前需要一个确认弹窗，防止用户误点。用 shadcn 的 Dialog 组件：
+
+```bash
+npx shadcn@latest add dialog
+```
+
+**Dialog 的工作方式：**
+
+Dialog 是一个受控组件，用 `open` 状态控制显示和隐藏：
+
+```tsx
+const [open, setOpen] = useState(false)
+
+<Dialog open={open} onOpenChange={setOpen}>
+  {/* 触发按钮 */}
+  <DialogTrigger asChild>
+    <Button onClick={() => setOpen(true)}>Buy Now</Button>
+  </DialogTrigger>
+
+  {/* 弹窗内容 */}
+  <DialogContent>
+    <DialogHeader>
+      <DialogTitle>Confirm Purchase</DialogTitle>
+      <DialogDescription>
+        Are you sure you want to buy this car?
+      </DialogDescription>
+    </DialogHeader>
+    <DialogFooter>
+      <Button variant="outline" onClick={() => setOpen(false)}>
+        Cancel
+      </Button>
+      <Button onClick={handleConfirm}>Confirm</Button>
+    </DialogFooter>
+  </DialogContent>
+</Dialog>
+```
+
+
+
+### 5. 实现详情页
+
+打开 `src/pages/CarDetailPage.tsx`，一步一步来。
+
+**第一步：读取 URL 参数，请求数据**
+
+```tsx
+import { useParams } from 'react-router-dom'
+import { useQuery } from '@tanstack/react-query'
+import { carsApi } from '@/api'
+
+export default function CarDetailPage() {
+  const { id } = useParams()
+  const carId = Number(id)
+
+  const { data: car, isLoading, error } = useQuery({
+    queryKey: ['car', carId],
+    queryFn: () => carsApi.getById(carId),
+    // enabled：只有 carId 是有效数字时才发请求
+    // 防止 id 是 undefined 或 NaN 时发出无效请求
+    enabled: !isNaN(carId),
+  })
+
+  if (isLoading) return <div className="p-8">Loading...</div>
+  if (error || !car) return <div className="p-8">Car not found.</div>
+
+  return (
+    <div>
+      <h1>{car.title}</h1>
+      <p>{car.price}</p>
+    </div>
+  )
+}
+```
+
+在路由里把详情页加上。打开 `src/router.tsx`：
+
+```tsx
+import CarDetailPage from '@/pages/CarDetailPage'
+
+// 在 Layout 的公开路由里添加
+{ path: '/cars/:id', element: <CarDetailPage /> },
+```
+
+验证：访问 `/cars/1`（用真实的车辆 ID），应该能看到车辆标题和价格。数据通了，再往下做。
+
+**第二步：显示完整车辆信息**
+
+更新 `CarDetailPage`，展示完整信息：
+
+```tsx
+import { useParams } from 'react-router-dom'
+import { useQuery } from '@tanstack/react-query'
+import { carsApi } from '@/api'
+import { Badge } from '@/components/ui/badge'
+
+export default function CarDetailPage() {
+  const { id } = useParams()
+  const carId = Number(id)
+
+  const { data: car, isLoading, error } = useQuery({
+    queryKey: ['car', carId],
+    queryFn: () => carsApi.getById(carId),
+    enabled: !isNaN(carId),
+  })
+
+  if (isLoading) return <div className="p-8">Loading...</div>
+  if (error || !car) return <div className="p-8">Car not found.</div>
+
+  return (
+    <div className="mx-auto max-w-4xl space-y-6">
+
+      {/* 图片区域 */}
+      {car.images.length > 0 ? (
+        <div className="overflow-hidden rounded-lg">
+          <img
+            src={car.images[0].imageUrl}
+            alt={car.title}
+            className="h-96 w-full object-cover"
+          />
+        </div>
+      ) : (
+        <div className="flex h-96 items-center justify-center
+                        rounded-lg bg-gray-100 text-gray-400">
+          No images available
+        </div>
+      )}
+
+      {/* 基本信息 */}
+      <div className="space-y-2">
+        <div className="flex items-start justify-between">
+          <h1 className="text-2xl font-bold">{car.title}</h1>
+          <Badge variant="secondary">{car.status}</Badge>
+        </div>
+        <p className="text-3xl font-bold text-blue-600">
+          ${car.price.toLocaleString()}
+        </p>
+        <p className="text-gray-500">
+          {car.year} · {car.brand} {car.model} ·{' '}
+          {car.mileage.toLocaleString()} km
+        </p>
+        <p className="text-sm text-gray-500">
+          Seller: {car.sellerUsername}
+        </p>
+      </div>
+
+      {/* 描述 */}
+      {car.description && (
+        <div className="space-y-2">
+          <h2 className="font-semibold">Description</h2>
+          <p className="whitespace-pre-line text-gray-600">
+            {car.description}
+          </p>
+        </div>
+      )}
+
+    </div>
+  )
+}
+```
+
+**第三步：权限判断，显示不同按钮**
+
+不同身份的用户看到不同的操作区域。先从 Zustand 读取当前用户信息，判断身份：
+
+```tsx
+import { useAuthStore } from '@/stores/authStore'
+
+  // 权限判断，显示不同按钮
+  // 在组件里获取当前用户
+  const { user, isAuthenticated } = useAuthStore();
+
+  // 判断当前用户是不是这辆车的车主
+  const isOwner = user?.id === car?.sellerId;
+
+  // 判断是否可以购买：已登录 + 不是车主 + 车辆是 Published 状态
+  const canBuy = isAuthenticated() && !isOwner && car?.status === "Published";
+```
+
+根据这些判断，在详情页底部显示对应的按钮区域：
+
+```tsx
+import { Link } from 'react-router-dom'
+import { Button } from '@/components/ui/button'
+
+// 在 JSX 的合适位置加入操作区域
+  {/* 权限判断，显示不同按钮 */}
+  <div className="border-t pt-4">
+    {!isAuthenticated() && (
+      // 未登录：引导去登录
+      <Button asChild className="w-full">
+        <Link to="/login">Sign in to purchase</Link>
+      </Button>
+    )}
+
+    {isOwner && (
+      // 车主：显示管理操作
+      <div className="flex gap-2">
+        <Button asChild variant="outline" className="flex-1">
+          <Link to={`/cars/${car.id}/edit`}>Edit</Link>
+        </Button>
+        {car.status === "Draft" && (
+          <Button asChild className="flex-1">
+            <Link to={`/cars/${car.id}/submit`}>Submit for Review</Link>
+          </Button>
+        )}
+      </div>
+    )}
+
+    {canBuy && (
+      // 买家：显示购买和收藏操作（下一步实现）
+      <Button className="w-full">Buy Now</Button>
+    )}
+  </div>
+```
+
+**第四步：实现收藏功能**
+
+用 `useMutation` 处理收藏操作：
+
+```tsx
+import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { favoritesApi } from '@/api'
+import { toast } from 'sonner'
+
+// useQueryClient：获取 QueryClient 实例，用于操作缓存
+const queryClient = useQueryClient()
+
+const favoriteMutation = useMutation({
+  mutationFn: () => favoritesApi.add(carId),
+  onSuccess: () => {
+    toast.success('Added to favorites!')
+    // 让收藏列表的缓存失效，下次访问收藏页时会重新请求
+    queryClient.invalidateQueries({ queryKey: ['favorites'] })
+  },
+  onError: (error) => {
+    toast.error(error.message)
+  },
+})
+```
+
+> **`invalidateQueries` 是什么？** 它告诉 TanStack Query："这个 key 对应的缓存数据已经过时了，下次有人用这个 key 查数据时，重新请求。" 收藏成功后，收藏列表数据变了，所以让 `['favorites']` 缓存失效，保证下次访问收藏页时看到最新数据。
+
+把收藏按钮加到买家操作区域：
+
+```tsx
+{canBuy && (
+  <div className="flex gap-2">
+    <Button
+      variant="outline"
+      // 调用mutate()执行更新
+      onClick={() => favoriteMutation.mutate()}
+      disabled={favoriteMutation.isPending}
+    >
+      {favoriteMutation.isPending ? "Saving..." : "♡ Favorite"}
+    </Button>
+    <Button className="flex-1">Buy Now</Button>
+  </div>
+)}
+```
+
+**第五步：实现下单确认弹窗**
+
+```tsx
+import { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { ordersApi } from '@/api'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+
+const navigate = useNavigate()
+const [dialogOpen, setDialogOpen] = useState(false)
+
+const orderMutation = useMutation({
+  mutationFn: () => ordersApi.create({ carId }),
+  onSuccess: () => {
+    setDialogOpen(false)
+    toast.success('Order placed successfully!')
+    // 让车辆详情缓存失效（车辆状态变成 Sold 了）
+    queryClient.invalidateQueries({ queryKey: ['car', carId] })
+    // 让列表缓存失效（这辆车不再出现在列表里）
+    queryClient.invalidateQueries({ queryKey: ['cars'] })
+    navigate('/profile/purchases')
+  },
+  onError: (error) => {
+    setDialogOpen(false)
+    toast.error(error.message)
+  },
+})
+```
+
+在 JSX 里加入 Dialog：
+
+```tsx
+<Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
+  <DialogContent>
+    <DialogHeader>
+      <DialogTitle>Confirm Purchase</DialogTitle>
+      <DialogDescription>
+        You are about to purchase{' '}
+        <span className="font-semibold">{car.title}</span>{' '}
+        for{' '}
+        <span className="font-semibold text-blue-600">
+          ${car.price.toLocaleString()}
+        </span>.
+        This action cannot be undone.
+      </DialogDescription>
+    </DialogHeader>
+    <DialogFooter>
+      <Button
+        variant="outline"
+        onClick={() => setDialogOpen(false)}
+        disabled={orderMutation.isPending}
+      >
+        Cancel
+      </Button>
+      <Button
+        onClick={() => orderMutation.mutate()}
+        disabled={orderMutation.isPending}
+      >
+        {orderMutation.isPending ? 'Processing...' : 'Confirm Purchase'}
+      </Button>
+    </DialogFooter>
+  </DialogContent>
+</Dialog>
+```
+
+**第六步：把所有部分组合成完整组件**
+
+现在把所有 import 和逻辑整理到一起，形成完整的 `CarDetailPage.tsx`：
+
+```tsx
+import { useState } from 'react'
+import { useParams, Link, useNavigate } from 'react-router-dom'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { toast } from 'sonner'
+import { carsApi, favoritesApi, ordersApi } from '@/api'
+import { useAuthStore } from '@/stores/authStore'
+import { Button } from '@/components/ui/button'
+import { Badge } from '@/components/ui/badge'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+
+export default function CarDetailPage() {
+  const { id } = useParams()
+  const carId = Number(id)
+  const navigate = useNavigate()
+  const queryClient = useQueryClient()
+  const { user, isAuthenticated } = useAuthStore()
+  const [dialogOpen, setDialogOpen] = useState(false)
+
+  // 请求车辆详情
+  const { data: car, isLoading, error } = useQuery({
+    queryKey: ['car', carId],
+    queryFn: () => carsApi.getById(carId),
+    enabled: !isNaN(carId),
+  })
+
+  // 收藏 mutation
+  const favoriteMutation = useMutation({
+    mutationFn: () => favoritesApi.add(carId),
+    onSuccess: () => {
+      toast.success('Added to favorites!')
+      queryClient.invalidateQueries({ queryKey: ['favorites'] })
+    },
+    onError: (error) => {
+      toast.error(error.message)
+    },
+  })
+
+  // 下单 mutation
+  const orderMutation = useMutation({
+    mutationFn: () => ordersApi.create({ carId }),
+    onSuccess: () => {
+      setDialogOpen(false)
+      toast.success('Order placed successfully!')
+      queryClient.invalidateQueries({ queryKey: ['car', carId] })
+      queryClient.invalidateQueries({ queryKey: ['cars'] })
+      navigate('/profile/purchases')
+    },
+    onError: (error) => {
+      setDialogOpen(false)
+      toast.error(error.message)
+    },
+  })
+
+  if (isLoading) return <div className="p-8">Loading...</div>
+  if (error || !car) return <div className="p-8">Car not found.</div>
+
+  const isOwner = user?.id === car.sellerId
+  const canBuy = isAuthenticated() && !isOwner && car.status === 'Published'
+
+  return (
+    <div className="mx-auto max-w-4xl space-y-6">
+
+      {/* 图片 */}
+      {car.images.length > 0 ? (
+        <div className="overflow-hidden rounded-lg">
+          <img
+            src={car.images[0].imageUrl}
+            alt={car.title}
+            className="h-96 w-full object-cover"
+          />
+        </div>
+      ) : (
+        <div className="flex h-96 items-center justify-center
+                        rounded-lg bg-gray-100 text-gray-400">
+          No images available
+        </div>
+      )}
+
+      {/* 信息 */}
+      <div className="space-y-2">
+        <div className="flex items-start justify-between">
+          <h1 className="text-2xl font-bold">{car.title}</h1>
+          <Badge variant="secondary">{car.status}</Badge>
+        </div>
+        <p className="text-3xl font-bold text-blue-600">
+          ${car.price.toLocaleString()}
+        </p>
+        <p className="text-gray-500">
+          {car.year} · {car.brand} {car.model} ·{' '}
+          {car.mileage.toLocaleString()} km
+        </p>
+        <p className="text-sm text-gray-500">
+          Seller: {car.sellerUsername}
+        </p>
+      </div>
+
+      {/* 描述 */}
+      {car.description && (
+        <div className="space-y-2">
+          <h2 className="font-semibold">Description</h2>
+          <p className="whitespace-pre-line text-gray-600">
+            {car.description}
+          </p>
+        </div>
+      )}
+
+      {/* 操作按钮 */}
+      <div className="border-t pt-4">
+        {!isAuthenticated() && (
+          <Button asChild className="w-full">
+            <Link to="/login">Sign in to purchase</Link>
+          </Button>
+        )}
+
+        {isOwner && (
+          <div className="flex gap-2">
+            <Button asChild variant="outline" className="flex-1">
+              <Link to={`/cars/${car.id}/edit`}>Edit</Link>
+            </Button>
+            {car.status === 'Draft' && (
+              <Button className="flex-1">Submit for Review</Button>
+            )}
+          </div>
+        )}
+
+        {canBuy && (
+          <div className="flex gap-2">
+            <Button
+              variant="outline"
+              onClick={() => favoriteMutation.mutate()}
+              disabled={favoriteMutation.isPending}
+            >
+              {favoriteMutation.isPending ? 'Saving...' : '♡ Favorite'}
+            </Button>
+            <Button
+              className="flex-1"
+              onClick={() => setDialogOpen(true)}
+            >
+              Buy Now
+            </Button>
+          </div>
+        )}
+      </div>
+
+      {/* 下单确认弹窗 */}
+      <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Confirm Purchase</DialogTitle>
+            <DialogDescription>
+              You are about to purchase{' '}
+              <span className="font-semibold">{car.title}</span>{' '}
+              for{' '}
+              <span className="font-semibold text-blue-600">
+                ${car.price.toLocaleString()}
+              </span>.
+              This action cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setDialogOpen(false)}
+              disabled={orderMutation.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={() => orderMutation.mutate()}
+              disabled={orderMutation.isPending}
+            >
+              {orderMutation.isPending ? 'Processing...' : 'Confirm Purchase'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+    </div>
+  )
+}
+```
+
+
+
+### 6. 完整测试
+
+```bash
+npm run dev
+```
+
+**测试权限渲染：**
+
+未登录访问详情页 → 看到 "Sign in to purchase" 按钮。
+
+用车主账号登录，访问自己的车辆详情 → 看到 "Edit" 和 "Submit for Review" 按钮。
+
+用买家账号登录，访问别人的 Published 车辆 → 看到 "Favorite" 和 "Buy Now" 按钮。
+
+**测试收藏：**
+
+点击 "♡ Favorite" → 按钮短暂显示 "Saving..." → 右下角出现 "Added to favorites!" 通知。
+
+**测试下单：**
+
+点击 "Buy Now" → 弹出确认弹窗 → 点 Confirm → 按钮显示 "Processing..." → 成功后通知出现 → 跳转到 `/profile/purchases`（当前是占位页面）。
+
+**测试 invalidateQueries：**
+
+下单成功后返回详情页，刷新，车辆状态应该变成 "Sold"，按钮消失。
+
+
+
+### 7. 此时的目录变化
+
+```
+src/
+├── pages/
+│   └── CarDetailPage.tsx   ← 已更新（完整实现）
+└── main.tsx                ← 已更新（Toaster）
+```
+
+
+
+### 8. Git 提交
+
+```bash
+git add .
+git commit -m "feat: car detail page with buy and favorite actions"
+git push origin feature/browse-pages
+```
+
+
+
+### Step 51 完成状态
+
+```
+✅ 理解 useParams（读取 URL 动态参数）
+✅ 理解 enabled 选项（条件性发请求）
+✅ 安装 sonner，配置 Toaster
+✅ 理解 useMutation（写操作的状态管理）
+✅ 理解 invalidateQueries（操作后让缓存失效）
+✅ 理解 Dialog 受控组件用法
+✅ 权限判断逻辑（isOwner / canBuy / 未登录）
+✅ 收藏功能（useMutation + toast 通知）
+✅ 下单功能（Dialog 确认 + useMutation）
+✅ 测试通过（权限渲染/收藏/下单/缓存刷新）
+✅ Git commit 完成
+```
+
+
+
+## Step 52 · 完善导航布局
+
+### 这一步做什么
+
+Step 49 做的 `Layout` 组件只有最基础的导航栏，功能缺失：
+
+```
+现在：Logo + 用户名 + Sign out
+缺少：发布车辆链接、个人中心链接、当前页面高亮
+```
+
+这一步把导航栏完善，同时引入 `NavLink`——它和 `Link` 的区别是能感知当前路由，自动给当前页面的链接加高亮样式。
+
+
+
+### 1. NavLink 和 Link 的区别
+
+Step 46 开始一直在用 `Link` 做页面跳转。`Link` 只负责跳转，不关心当前在哪个页面。
+
+`NavLink` 多了一个能力：**知道自己指向的路由是不是当前激活的路由**，并且可以根据这个状态改变样式。
+
+```tsx
+// Link：固定样式，不感知当前路由
+<Link to="/cars" className="text-gray-600">
+  Browse Cars
+</Link>
+
+// NavLink：当前在 /cars 时，className 函数里的 isActive 为 true
+<NavLink
+  to="/cars"
+  className={({ isActive }) =>
+    isActive
+      ? "text-blue-600 font-semibold"   // 当前页面的样式
+      : "text-gray-600 hover:text-gray-900"  // 其他页面的样式
+  }
+>
+  Browse Cars
+</NavLink>
+```
+
+`className` 接收一个函数，函数参数里有 `isActive` 布尔值，根据它返回不同的类名字符串。这比手动判断路由再设置样式简洁得多。
+
+
+
+### 2. 安装下拉菜单组件
+
+用户登录后，点击用户名显示下拉菜单（个人中心、退出登录等）。用 shadcn 的 DropdownMenu 组件：
+
+```bash
+npx shadcn@latest add dropdown-menu
+```
+
+**DropdownMenu 的基本用法：**
+
+```tsx
+<DropdownMenu>
+  {/* 触发元素：点击它显示菜单 */}
+  <DropdownMenuTrigger asChild>
+    <Button variant="ghost">用户名</Button>
+  </DropdownMenuTrigger>
+
+  {/* 菜单内容 */}
+  <DropdownMenuContent align="end">
+    <DropdownMenuItem onClick={handleLogout}>
+      Sign out
+    </DropdownMenuItem>
+  </DropdownMenuContent>
+</DropdownMenu>
+```
+
+`align="end"` 让菜单从右侧对齐弹出，不会超出屏幕右边缘。
+
+
+
+### 3. 完善 Layout 组件
+
+打开 `src/components/Layout.tsx
+
+先想清楚导航栏需要什么
+
+```
+左侧：Logo（点击回首页）+ 主导航链接（Browse Cars）
+右侧：
+  未登录 → Sign in 链接 + Sign up 按钮
+  已登录 → Sell a Car 按钮 + 用户下拉菜单
+             下拉菜单里：My Profile、My Listings、Sign out
+```
+
+定义 NavLink 的样式函数
+
+这个样式逻辑会用到多次，抽成一个变量：
+
+```tsx
+// 导航链接的样式函数
+// isActive 为 true 时：蓝色加粗
+// isActive 为 false 时：灰色，hover 时变深
+const navLinkClass = ({ isActive }: { isActive: boolean }) =>
+  isActive
+    ? 'text-blue-600 font-semibold text-sm'
+    : 'text-gray-600 hover:text-gray-900 text-sm'
+```
+
+实现左侧：替换为`<NavLink/>`标签，并给主导航链接添加 `navLinkClass` 类名
+
+```tsx
+import { NavLink, Outlet, useNavigate } from "react-router-dom";
+
+...
+
+  return (
+    <div className="min-h-screen bg-gray-50">
+      <header className="border-b bg-white">
+        <div className="mx-auto flex max-w-7xl items-center
+                        justify-between px-4 py-4">
+
+          {/* 左侧*/}
+          <div className="flex items-center gap-8">
+              
+            {/* Logo */}
+            <NavLink to="/" className="text-xl font-bold text-blue-600">
+              UUcars
+            </NavLink>
+			
+            {/* 主导航 */}
+            <nav className="flex items-center gap-6">
+              <NavLink to="/" className={navLinkClass} end>
+                Browse Cars
+              </NavLink>
+            </nav>
+          </div>
+
+          {/* 右侧：登录状态 */}
+          <div className="flex items-center gap-3">
+            ...
+          </div>
+
+        </div>
+      </header>
+
+      <main className="mx-auto max-w-7xl px-4 py-8">
+        <Outlet />
+      </main>
+    </div>
+  )
+}
+```
+
+实现右侧：未登录状态
+
+```tsx
+...
+  return (
+    <div className="min-h-screen bg-gray-50">
+      <header className="border-b bg-white">
+        <div className="mx-auto flex max-w-7xl items-center
+                        justify-between px-4 py-4">
+
+          {/* 左侧 */}
+          <div className="flex items-center gap-8">
+           ...
+          </div>
+
+          {/* 右侧*/}
+          <div className="flex items-center gap-3">
+            {isAuthenticated() ? (
+              // 登录状态
+              <>
+                ...
+              </>
+            ) : (
+              // 未登录状态
+              <>
+                {/* 登录 */} 
+                <NavLink
+                  to="/login"
+                  className="text-sm text-gray-600 hover:text-gray-900"
+                >
+                  Sign in
+                </NavLink>
+              	{/* 注册 */}
+                <Button asChild size="sm">
+                  <NavLink to="/register">Sign up</NavLink>
+                </Button>
+              </>
+            )}
+          </div>
+
+        </div>
+      </header>
+      ...
+    </div>
+  )
+}
+```
+
+实现右侧：登录状态 - 使用下拉菜单组件
+
+```tsx
+
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "./ui/dropdown-menu";
+
+...
+
+  return (
+    <div className="min-h-screen bg-gray-50">
+      <header className="border-b bg-white">
+        <div
+          className="mx-auto flex max-w-7xl items-center
+                        justify-between px-4 py-4"
+        >
+          {/* 左侧*/}
+          <div className="flex items-center gap-8">
+           ...
+          </div>
+
+          {/* 右侧 */}
+          <div className="flex items-center gap-3">
+            {isAuthenticated() ? (
+              // 登录状态
+              <>
+                {/* 发布车辆按钮 */}
+                <Button asChild size="sm" variant="outline">
+                  <NavLink to="/cars/new">Sell a Car</NavLink>
+                </Button>
+
+                {/* 用户下拉菜单 */}
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button variant="ghost" size="sm">
+                      {user?.username}
+                    </Button>
+                  </DropdownMenuTrigger>
+
+                  <DropdownMenuContent align="end" className="w-48">
+                     
+                    {/* 用户资料 */} 
+                    <DropdownMenuItem onClick={() => navigate("/profile")}>
+                      My Profile
+                    </DropdownMenuItem>
+                      
+                    {/* 车辆发布列表 */}  
+                    <DropdownMenuItem
+                      onClick={() => navigate("/profile/listings")}
+                    >
+                      My Listings
+                    </DropdownMenuItem>
+                      
+                    {/* 购买列表 */}
+                    <DropdownMenuItem
+                      onClick={() => navigate("/profile/purchases")}
+                    >
+                      My Purchases
+                    </DropdownMenuItem>
+
+                    {/* 分隔线 */}
+                    <DropdownMenuSeparator />
+
+                    {/* Admin 入口：只有 Admin 角色才显示 */}
+                    {user?.role === "Admin" && (
+                      <>
+                        <DropdownMenuItem onClick={() => navigate("/admin")}>
+                          Admin Panel
+                        </DropdownMenuItem>
+                        <DropdownMenuSeparator />
+                      </>
+                    )}
+                      
+					{/* 退出登录 */}
+                    <DropdownMenuItem
+                      onClick={handleLogout}
+                      className="text-red-600"
+                    >
+                      Sign out
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </>
+            ) : (
+              // 未登录状态
+              <>
+               ...
+              </>
+            )}
+          </div>
+        </div>
+      </header>
+     ...
+    </div>
+  );
+}
+
+```
+
+> **`NavLink to="/" end` 里的 `end` 是什么？** 默认情况下，`/` 会匹配所有以 `/` 开头的路由（几乎所有路由），导致 "Browse Cars" 这个链接在任何页面都显示为激活状态。`end` 属性让它只在**完全匹配** `/` 时才激活，访问 `/cars/1` 时就不会激活了。
+
+
+
+### 4. 验证
+
+```bash
+npm run dev
+```
+
+**测试 NavLink 高亮：**
+
+访问首页 `/`，"Browse Cars" 链接应该是蓝色加粗。跳转到其他页面，它变回灰色。
+
+**测试未登录状态：**
+
+清除 localStorage，刷新，导航栏右侧显示 "Sign in" 和 "Sign up"。
+
+**测试已登录状态：**
+
+登录后，导航栏右侧显示 "Sell a Car" 按钮和用户名。点击用户名，下拉菜单出现，有 "My Profile"、"My Listings"、"My Purchases"、"Sign out" 等选项。
+
+**测试 Admin 菜单：**
+
+用 Admin 账号登录（`admin@uucars.com`），下拉菜单里额外显示 "Admin Panel" 选项。
+
+**测试退出登录：**
+
+点击 "Sign out"，跳转到登录页，导航栏恢复未登录状态。
+
+
+
+### 5. 此时的目录变化
+
+```
+src/
+└── components/
+    └── Layout.tsx    ← 已更新（NavLink + 下拉菜单）
+```
+
+
+
+### 6. Git 提交
+
+```bash
+git add .
+git commit -m "feat: complete navigation with NavLink and dropdown menu"
+git push origin feature/browse-pages
+```
+
+这一步完成，`feature/browse-pages` 分支包含了 Step 49、50、51、52 的所有内容，可以合并回 `develop`：
+
+```bash
+git checkout develop
+git merge --no-ff feature/browse-pages \
+    -m "merge: feature/browse-pages into develop"
+git push origin develop
+git branch -D feature/browse-pages
+git push origin --delete feature/browse-pages
+```
+
+
+
+### Step 52 完成状态
+
+```
+✅ 理解 NavLink 和 Link 的区别（感知当前路由）
+✅ 理解 NavLink className 函数（isActive 参数）
+✅ 理解 end 属性（精确匹配 /）
+✅ 安装 DropdownMenu 组件
+✅ 理解 DropdownMenu 基本用法（Trigger/Content/Item）
+✅ Layout 完善（左侧导航 + 右侧登录状态）
+✅ 已登录：Sell a Car + 用户下拉菜单
+✅ 未登录：Sign in + Sign up
+✅ Admin 角色额外显示 Admin Panel 入口
+✅ 测试通过（NavLink高亮/下拉菜单/退出登录/Admin菜单）
+✅ feature/browse-pages 合并回 develop
+```
+
+
+
+## Step 53 · 发布/编辑车辆
+
+### 这一步做什么
+
+卖家需要能发布自己的车辆。发布流程：
+
+```
+填写车辆信息 → 创建草稿
+        ↓
+上传图片
+        ↓
+提交审核
+```
+
+这一步同时做发布和编辑两个页面——两者的表单完全一样，区别只是编辑时需要把已有数据填回表单。这是一个复用表单的好机会。
+
+切出新的分支
+
+```bash
+git checkout develop
+git checkout -b feature/seller-pages
+git push -u origin feature/seller-pages
+```
+
+
+
+### 1. 页面结构
+
+**CreateCarPage（发布新车）：**
+
+- 空表单，提交后创建草稿
+- 创建成功后跳转到编辑页，继续上传图片
+
+**EditCarPage（编辑草稿）：**
+
+- 先请求车辆数据，填回表单
+- 可以修改信息、上传/删除图片
+- 提交审核按钮
+
+两个页面共用同一个表单组件 `CarForm`，区别通过 props 传入。
+
+```tsx
+export default function CreateCarPage() {
+    ...
+    <CarForm ...props/>
+}
+
+export default function EditCarPage() {
+    ...
+    <CarForm ...props/>
+}
+```
+
+
+
+### 2. 创建车辆表单组件
+
+表单组件负责信息填写，不负责创建或更新的 API 调用（那是页面组件的事）：
+
+```bash
+touch src/components/CarForm.tsx
+```
+
+**第一步：定义 Schema 和类型**
+
+```tsx
+import { z } from 'zod'
+
+const carSchema = z.object({
+  title: z
+    .string()
+    .min(1, 'Title is required')
+    .max(100, 'Title must not exceed 100 characters'),
+  brand: z
+    .string()
+    .min(1, 'Brand is required')
+    .max(50, 'Brand must not exceed 50 characters'),
+  model: z
+    .string()
+    .min(1, 'Model is required')
+    .max(50, 'Model must not exceed 50 characters'),
+  year: z
+    .number({error: 'Year is required' })
+    .int()
+    .min(1900, 'Year must be after 1900')
+    .max(new Date().getFullYear() + 1, 'Invalid year'),
+  price: z
+    .number({ error: 'Price is required' })
+    .positive('Price must be greater than 0'),
+  mileage: z
+    .number({ error: 'Mileage is required' })
+    .min(0, 'Mileage cannot be negative'),
+  description: z.string().max(2000).optional(),
+})
+
+export type CarFormValues = z.infer<typeof carSchema>
+```
+
+> **`z.number({ error: '...' })` 是什么？** HTML 的 `<input type="number">` 在用户没有输入时，返回的是空字符串 `""`，不是数字。Zod 默认的 `z.number()` 在收到字符串时会显示 "Expected number, received string" 这样不友好的错误。error` 让你自定义这种情况的错误信息。
+>
+> 但还有一个问题：`<input>` 返回的始终是字符串，即使用户输入了数字。需要在 RHF 的配置里告诉它把这些字段的值转成数字，稍后会处理。
+
+**第二步：定义 Props 类型**
+
+```tsx
+interface CarFormProps {
+  // defaultValues：编辑时传入已有数据，发布时不传（空表单）
+  defaultValues?: CarFormValues
+  // onSubmit：父组件（页面）负责实际的 API 调用
+  onSubmit: (values: CarFormValues) => Promise<void>
+  // isSubmitting：从父组件传入，控制按钮禁用状态
+  isSubmitting: boolean
+  // submitLabel：按钮文字（"Create Draft" 或 "Save Changes"）
+  submitLabel: string
+}
+```
+
+**第三步：实现表单**
+
+```tsx
+import { useForm } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+
+export default function CarForm({
+  defaultValues,
+  onSubmit,
+  isSubmitting,
+  submitLabel,
+}: CarFormProps) {
+    
+  const {
+    register,
+    handleSubmit,
+    formState: { errors },
+  } = useForm<CarFormValues>({
+    resolver: zodResolver(carSchema),
+    defaultValues,
+  })
+
+  return (
+    <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+
+      <div className="space-y-2">
+        <Label htmlFor="title">Title</Label>
+        <Input
+          id="title"
+          placeholder="e.g. 2020 BMW 3 Series - Low Mileage"
+          {...register('title')}
+        />
+        {errors.title && (
+          <p className="text-sm text-red-500">{errors.title.message}</p>
+        )}
+      </div>
+
+      <div className="grid grid-cols-2 gap-4">
+        <div className="space-y-2">
+          <Label htmlFor="brand">Brand</Label>
+          <Input
+            id="brand"
+            placeholder="e.g. BMW"
+            {...register('brand')}
+          />
+          {errors.brand && (
+            <p className="text-sm text-red-500">{errors.brand.message}</p>
+          )}
+        </div>
+
+        <div className="space-y-2">
+          <Label htmlFor="model">Model</Label>
+          <Input
+            id="model"
+            placeholder="e.g. 3 Series"
+            {...register('model')}
+          />
+          {errors.model && (
+            <p className="text-sm text-red-500">{errors.model.message}</p>
+          )}
+        </div>
+      </div>
+
+      <div className="grid grid-cols-3 gap-4">
+        <div className="space-y-2">
+          <Label htmlFor="year">Year</Label>
+          <Input
+            id="year"
+            type="number"
+            placeholder="2020"
+            // valueAsNumber：告诉 RHF 把这个字段的值转成数字
+            // 不加这个，RHF 收到的是字符串，Zod 的 z.number() 会报错
+            {...register('year', { valueAsNumber: true })}
+          />
+          {errors.year && (
+            <p className="text-sm text-red-500">{errors.year.message}</p>
+          )}
+        </div>
+
+        <div className="space-y-2">
+          <Label htmlFor="price">Price ($)</Label>
+          <Input
+            id="price"
+            type="number"
+            placeholder="25000"
+            {...register('price', { valueAsNumber: true })}
+          />
+          {errors.price && (
+            <p className="text-sm text-red-500">{errors.price.message}</p>
+          )}
+        </div>
+
+        <div className="space-y-2">
+          <Label htmlFor="mileage">Mileage (km)</Label>
+          <Input
+            id="mileage"
+            type="number"
+            placeholder="50000"
+            {...register('mileage', { valueAsNumber: true })}
+          />
+          {errors.mileage && (
+            <p className="text-sm text-red-500">{errors.mileage.message}</p>
+          )}
+        </div>
+      </div>
+
+      <div className="space-y-2">
+        <Label htmlFor="description">Description (optional)</Label>
+        <textarea
+          id="description"
+          rows={4}
+          placeholder="Describe the car's condition, features, history..."
+          className="w-full rounded-md border px-3 py-2 text-sm
+                     focus:outline-none focus:ring-2 focus:ring-blue-500"
+          {...register('description')}
+        />
+        {errors.description && (
+          <p className="text-sm text-red-500">{errors.description.message}</p>
+        )}
+      </div>
+
+      <Button type="submit" disabled={isSubmitting}>
+        {isSubmitting ? 'Saving...' : submitLabel}
+      </Button>
+
+    </form>
+  )
+}
+```
+
+### 3. 实现 CreateCarPage
+
+打开 `src/pages/CreateCarPage.tsx`。
+
+这个页面只负责创建草稿，并使用车辆表单组件`CarForm`。
+
+创建成功后跳转到编辑页 （在编辑页实现图片的操作和车辆的修改和提交审核）
+
+```tsx
+import { useNavigate } from 'react-router-dom'
+import { useMutation } from '@tanstack/react-query'
+import { toast } from 'sonner'
+import { carsApi } from '@/api'
+import CarForm from '@/components/CarForm'
+import type { CarFormValues } from '@/components/CarForm'
+
+export default function CreateCarPage() {
+  const navigate = useNavigate()
+
+  const createMutation = useMutation({
+    mutationFn: (values: CarFormValues) => carsApi.create(values),
+    onSuccess: (car) => {
+      toast.success('Draft created!')
+        
+      // 创建成功后跳转到编辑页，继续上传图片
+      navigate(`/cars/${car.id}/edit`)
+    },
+    onError: (error) => {
+      toast.error(error.message)
+    },
+  })
+
+  const handleSubmit = async (values: CarFormValues) => {
+    createMutation.mutate(values)
+  }
+
+  return (
+    <div className="mx-auto max-w-2xl space-y-6">
+      <h1 className="text-2xl font-bold">List Your Car</h1>
+      <CarForm
+        onSubmit={handleSubmit}
+        isSubmitting={createMutation.isPending}
+        submitLabel="Create Draft"
+      />
+    </div>
+  )
+}
+```
+
+
+
+### 4. 图片上传组件
+
+图片上传逻辑比较独立，抽成一个组件：
+
+```bash
+touch src/components/ImageUploader.tsx
+```
+
+**思路**
+
+用户选择文件 → 本地预览 → 调用 API 上传 → 显示上传后的 URL
+
+定义参数类型
+
+```tsx
+import { carsApi } from '@/api'
+import type { CarImage } from '@/types'
+
+interface ImageUploaderProps {
+  carId: number
+  images: CarImage[]   // 已有的图片列表
+}
+
+export default function ImageUploader() {
+  return <div>ImageUploader</div>;
+}
+```
+
+**图片预览实现原理：**
+
+- 使用`URL.createObjectURL(file)` 
+
+用户选择图片文件后，要在上传之前先显示预览，让用户确认选对了。
+
+`URL.createObjectURL(file)` 是浏览器提供的 API，把一个 `File` 对象转成一个**临时的本地 URL**，可以直接放进 `<img src>` 显示：
+
+```tsx
+// file 是用户选择的 File 对象
+const previewUrl = URL.createObjectURL(file)
+// previewUrl 类似 "blob:http://localhost:5173/abc123..."
+// 直接放进 img 标签就能显示图片
+<img src={previewUrl} />
+```
+
+这个 URL 只存在于当前浏览器标签页的内存里，不需要上传到服务器，所以预览速度很快。
+
+使用完之后要释放内存：
+
+```tsx
+// 不用了之后释放
+URL.revokeObjectURL(previewUrl)
+```
+
+**选择文件和预览**
+
+```tsx
+import type { CarImage } from "@/types";
+import { useRef, useState } from "react";
+import { Button } from "./ui/button";
+
+interface ImageUploaderProps {
+  carId: number;
+  images: CarImage[];
+}
+
+export default function ImageUploader({ carId, images }: ImageUploaderProps) {
+  // previewUrl：用户选择文件后的本地预览 URL
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  // selectedFile：用户选择的文件对象，上传时用
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+
+  // useRef 拿到 input 元素的引用，点击按钮时触发文件选择
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    // 释放上一个预览 URL（避免内存泄漏）
+    if (previewUrl) {
+      URL.revokeObjectURL(previewUrl);
+    }
+
+    // 生成本地预览 URL
+    const url = URL.createObjectURL(file);
+    setPreviewUrl(url);
+    setSelectedFile(file);
+  };
+
+  return (
+    <div className="space-y-4">
+      {/* 选择图片 */}
+      <div className="space-y-3">
+        {/* 隐藏的原生文件选择 input */}
+        <input
+          ref={inputRef}
+          type="file"
+          accept="image/jpeg,image/png,image/webp"
+          className="hidden"
+          onChange={handleFileChange}
+        />
+
+        {/* 点击这个按钮触发文件选择 */}
+        <Button
+          type="button"
+          variant="outline"
+          onClick={() => inputRef.current?.click()}
+        >
+          Select Image
+        </Button>
+
+        {/* 选择后显示预览 */}
+        {previewUrl && selectedFile && (
+          <div className="space-y-2">
+            <img
+              src={previewUrl}
+              alt="Preview"
+              className="h-40 w-40 rounded-lg object-cover"
+            />
+            <p className="text-sm text-gray-500">{selectedFile.name}</p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+```
+
+>使用`useRef` hook， 创建一个存储input 元素的容器
+
+> **`useRef` 是什么？** `useRef` 创建一个可以存储任意值的容器，**修改它不会触发组件重新渲染**。最常见的用途是存储 DOM 元素的引用，这样可以用 JavaScript 直接操作这个元素。这里用它拿到 `<input type="file">` 的引用，实现"点击自定义按钮触发文件选择框"的效果——隐藏原生的 input，用好看的 Button 代替，点 Button 时调用 `inputRef.current.click()` 触发文件选择。
+>
+> 
+
+**上传 mutation**
+
+```tsx
+export default function ImageUploader() {
+  ...
+  const queryClient = new QueryClient();
+
+  const uploadMutation = useMutation({
+    mutationFn: (file: File) => carsApi.uploadImage(carId, file),
+    onSuccess: () => {
+      toast.success('Image uploaded!')
+      // 清除预览状态
+      setPreviewUrl(null)
+      setSelectedFile(null)
+      // 让车辆详情缓存失效，图片列表会刷新
+      queryClient.invalidateQueries({ queryKey: ['car', carId] })
+    },
+    onError: (error) => {
+      toast.error(error.message)
+    },
+  })
+
+  return (
+    <div className="space-y-4">
+      {/* 选择图片 */}
+          
+      ...
+
+        {/* 选择后显示预览 */}
+        {previewUrl && selectedFile && (
+          <div className="space-y-2">
+            <img
+              src={previewUrl}
+              alt="Preview"
+              className="h-40 w-40 rounded-lg object-cover"
+            />
+            <p className="text-sm text-gray-500">{selectedFile.name}</p>
+            
+            {/* 点击按钮，实现上传 */} 
+            <Button
+              type="button"
+              size="sm"
+              onClick={() => uploadMutation.mutate(selectedFile)}
+              disabled={uploadMutation.isPending}
+            >
+              {uploadMutation.isPending ? "Uploading..." : "Upload"}
+            </Button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+```
+
+**删除 mutation**
+
+```tsx
+  const deleteMutation = useMutation({
+    mutationFn: (imageId: number) => carsApi.deleteImage(carId, imageId),
+    onSuccess: () => {
+      toast.success('Image deleted.')
+      queryClient.invalidateQueries({ queryKey: ['car', carId] })
+    },
+    onError: (error) => {
+      toast.error(error.message)
+    },
+  })
+```
+
+**补齐 UI**
+
+```tsx
+  return (
+    <div className="space-y-4">
+      <h2 className="font-semibold">Images</h2>
+
+      {/* 已上传的图片列表 */}
+      {images.length > 0 && (
+        <div className="flex flex-wrap gap-3">
+          {images.map(image => (
+            <div key={image.id} className="relative">
+              <img
+                src={image.imageUrl}
+                alt="Car"
+                className="h-24 w-24 rounded-lg object-cover"
+              />
+              {/* 删除按钮 */}
+              <button
+                onClick={() => deleteMutation.mutate(image.id)}
+                disabled={deleteMutation.isPending}
+                className="absolute -right-2 -top-2 flex h-5 w-5
+                           items-center justify-center rounded-full
+                           bg-red-500 text-xs text-white
+                           hover:bg-red-600"
+              >
+                ×
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* 选择图片 */}
+      <div className="space-y-3">
+        ...
+      </div>
+    </div>
+  )
+}
+```
+
+
+
+### 5. 实现 EditCarPage
+
+新建页面
+
+```bash
+touch src/pages/EditCarPage.tsx
+```
+
+编辑页需要先请求车辆数据，把数据填回表单，同时提供图片上传和提交审核功能：
+
+**请求车辆数据**
+
+```tsx
+import { carsApi } from "@/api";
+import { useQuery } from "@tanstack/react-query";
+import { useParams } from "react-router-dom";
+
+export default function EditCarPage() {
+  const { id } = useParams();
+  const carId = Number(id);
+
+  const { data: car, isLoading } = useQuery({
+    queryKey: ["car", carId],
+    queryFn: () => carsApi.getById(carId),
+    enabled: !isNaN(carId),
+  });
+
+  if (isLoading) return <div className="p-8">Loading...</div>;
+  if (!car) return <div className="p-8">Car not found.</div>;
+
+  return <div>EditCarPage</div>;
+}
+
+```
+
+**只有 Draft 状态才能编辑**
+
+```tsx
+...
+import { useParams, useNavigate } from 'react-router-dom'
+import { Button } from "@/components/ui/button";
+
+export default function EditCarPage() {
+ ...
+ const navigate = useNavigate()
+ 
+  // 不是草稿状态，不允许编辑
+  if (car.status !== 'Draft') {
+    return (
+      <div className="mx-auto max-w-2xl p-8 text-center">
+        <p className="text-gray-500">
+          This car cannot be edited in its current status ({car.status}).
+        </p>
+        <Button
+          variant="outline"
+          className="mt-4"
+          onClick={() => navigate('/profile/listings')}
+        >
+          Back to My Listings
+        </Button>
+      </div>
+    )
+  }
+
+  return <div>EditCarPage</div>;
+}
+
+```
+
+**更新 mutation**
+
+```tsx
+...
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
+
+export default function EditCarPage() {
+ ...
+	const queryClient = useQueryClient();
+    const updateMutation = useMutation({
+        mutationFn: (values: CarFormValues) => carsApi.update(carId, values),
+        onSuccess: () => {
+          toast.success('Changes saved!')
+          queryClient.invalidateQueries({ queryKey: ['car', carId] })
+        },
+        onError: (error) => {
+          toast.error(error.message)
+        },
+      })
+    
+    const handleSubmit = async (values: CarFormValues) => {
+    updateMutation.mutate(values)
+  }
+
+  return <div>EditCarPage</div>;
+}
+```
+
+**数据回填; 渲染UI（复用车辆表单组件`CarForm`)**
+
+```tsx
+export default function EditCarPage() {
+
+ ...
+
+ return (
+    <>
+      <div>EditCarPage</div>
+      {/* 车辆信息表单，defaultValues 填入已有数据 */}
+      <CarForm
+        defaultValues={{
+          title: car.title,
+          brand: car.brand,
+          model: car.model,
+          year: car.year,
+          price: car.price,
+          mileage: car.mileage,
+          description: car.description ?? "",
+        }}
+        onSubmit={handleSubmit}
+        isSubmitting={updateMutation.isPending}
+        submitLabel="Save Changes"
+      />
+    </>
+  )
+}
+
+```
+
+添加**提交审核 mutation**
+
+```tsx
+export default function EditCarPage() {
+
+ ...
+ 
+ const submitMutation = useMutation({
+    mutationFn: () => carsApi.submit(carId),
+    onSuccess: () => {
+      toast.success('Submitted for review!')
+      navigate('/profile/listings')
+    },
+    onError: (error) => {
+      toast.error(error.message)
+    },
+  })
+
+ return (
+    <>
+      <div>EditCarPage</div>
+      ...
+    </>
+  )
+}
+```
+
+**渲染完整页面**
+
+```tsx
+import { carsApi } from "@/api";
+import type { CarFormValues } from "@/components/CarForm";
+import CarForm from "@/components/CarForm";
+import ImageUploader from "@/components/ImageUploader";
+import { Button } from "@/components/ui/button";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useNavigate, useParams } from "react-router-dom";
+import { toast } from "sonner";
+
+export default function EditCarPage() {
+  const { id } = useParams();
+  const carId = Number(id);
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+
+  /* ---- 请求车辆数据-用于表单回填 --- */
+  const { data: car, isLoading } = useQuery({
+    queryKey: ["car", carId],
+    queryFn: () => carsApi.getById(carId),
+    enabled: !isNaN(carId),
+  });
+
+  /* ----- 更新 mutation ---- */
+  const updateMutation = useMutation({
+    mutationFn: (values: CarFormValues) => carsApi.update(carId, values),
+    onSuccess: () => {
+      toast.success("Changes saved!");
+      queryClient.invalidateQueries({ queryKey: ["car", carId] });
+    },
+    onError: (error) => {
+      toast.error(error.message);
+    },
+  });
+
+  const handleSubmit = async (values: CarFormValues) => {
+    updateMutation.mutate(values);
+  };
+
+  /* ---- 提交审核 mutation --- */
+  const submitMutation = useMutation({
+    mutationFn: () => carsApi.submit(carId),
+    onSuccess: () => {
+      toast.success("Submitted for review!");
+      navigate("/profile/listings");
+    },
+    onError: (error) => {
+      toast.error(error.message);
+    },
+  });
+
+  if (isLoading) return <div className="p-8">Loading...</div>;
+  if (!car) return <div className="p-8">Car not found.</div>;
+
+  // 不是草稿状态，不允许编辑
+  if (car.status !== "Draft") {
+    return (
+      <div className="mx-auto max-w-2xl p-8 text-center">
+        <p className="text-gray-500">
+          This car cannot be edited in its current status ({car.status}).
+        </p>
+        <Button
+          variant="outline"
+          className="mt-4"
+          onClick={() => navigate("/profile/listings")}
+        >
+          Back to My Listings
+        </Button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mx-auto max-w-2xl space-y-8">
+      <div className="flex items-center justify-between">
+        <h1 className="text-2xl font-bold">Edit Car</h1>
+        {/* 提交审核按钮 */}
+        <Button
+          onClick={() => submitMutation.mutate()}
+          disabled={submitMutation.isPending}
+        >
+          {submitMutation.isPending ? "Submitting..." : "Submit for Review"}
+        </Button>
+      </div>
+
+      {/* 车辆信息表单，defaultValues 填入已有数据 */}
+      <CarForm
+        defaultValues={{
+          title: car.title,
+          brand: car.brand,
+          model: car.model,
+          year: car.year,
+          price: car.price,
+          mileage: car.mileage,
+          description: car.description ?? "",
+        }}
+        onSubmit={handleSubmit}
+        isSubmitting={updateMutation.isPending}
+        submitLabel="Save Changes"
+      />
+
+      {/* 图片上传 */}
+      <ImageUploader carId={carId} images={car.images} />
+    </div>
+  );
+}
+
+```
+
+
+
+### 6. 更新路由
+
+打开 `src/router.tsx`，确认编辑页路由已经在受保护路由里：
+
+```tsx
+import EditCarPage from '@/pages/EditCarPage'
+
+// 在受保护路由的 children 里（已有 CreateCarPage）
+{ path: '/cars/:id/edit', element: <EditCarPage /> },
+```
+
+
+
+### 7. 完整测试
+
+```bash
+npm run dev
+```
+
+**测试发布流程：**
+
+登录后点导航栏 "Sell a Car" → 进入发布页面。
+
+不填内容直接提交 → 看到字段验证错误。
+
+正确填写所有字段，提交 → 看到 "Draft created!" 通知 → 自动跳转到编辑页。
+
+**测试编辑页：**
+
+编辑页表单里已经填好了刚才输入的数据。修改价格，点 "Save Changes" → 看到 "Changes saved!" 通知。
+
+**测试图片上传：**
+
+点 "Select Image" → 选择一张本地图片 → 看到预览 → 点 "Upload" → 看到 "Image uploaded!" 通知 → 图片出现在已上传列表里。
+
+**测试删除图片：**
+
+点图片右上角的 × 按钮 → 图片消失，看到 "Image deleted." 通知。
+
+**测试提交审核：**
+
+点右上角 "Submit for Review" → 看到通知 → 跳转到 `/profile/listings`（当前是占位页）。
+
+**验证状态保护：**
+
+在数据库里把一辆车的状态改成 `PendingReview`，访问它的编辑页，应该看到"This car cannot be edited"提示。
+
+
+
+### 8. 此时的目录变化
+
+```
+src/
+├── components/
+│   ├── CarForm.tsx         ← 新增
+│   └── ImageUploader.tsx   ← 新增
+└── pages/
+    ├── CreateCarPage.tsx   ← 已更新（完整实现）
+    └── EditCarPage.tsx     ← 已更新（完整实现）
+```
+
+
+
+### 9. Git 提交
+
+```bash
+git add .
+git commit -m "feat: create and edit car pages with image upload"
+git push origin feature/seller-pages
+```
+
+
+
+### Step 53 完成状态
+
+```
+✅ 理解表单组件复用（CarForm被Create和Edit共用）
+✅ 理解 valueAsNumber（让RHF把input值转成数字）
+✅ 理解 z.number invalid_type_error（自定义类型错误提示）
+✅ 理解 URL.createObjectURL（本地图片预览）
+✅ 理解 useRef（DOM引用，触发文件选择框）
+✅ 理解 URL.revokeObjectURL（释放内存）
+✅ CarForm 组件（Props类型 + defaultValues + submitLabel）
+✅ ImageUploader 组件（选择/预览/上传/删除）
+✅ CreateCarPage（创建草稿，成功后跳编辑页）
+✅ EditCarPage（加载数据/填回表单/图片管理/提交审核）
+✅ 状态保护（非Draft状态不允许编辑）
+✅ 测试通过（发布/编辑/图片上传/删除/提交审核）
+✅ Git commit 完成
+```
+
+
+
+## Step 54 · 个人中心
+
+### 这一步做什么
+
+个人中心有四个标签页：我的车辆、我的收藏、我买的订单、我卖的订单。
+
+用嵌套路由实现：
+
+```
+/profile           → ProfilePage（外层布局，含标签栏）
+/profile/listings  → MyListingsPage（子路由，在 Outlet 渲染）
+/profile/favorites → MyFavoritesPage
+/profile/purchases → MyPurchasesPage
+/profile/sales     → MySalesPage
+```
+
+切换标签时只有 `Outlet` 里的内容变化，标签栏本身不重新渲染。
+
+
+
+### 1. 嵌套路由实战：ProfilePage
+
+Step 47 讲了 `Outlet` 的概念，这里真正用上。
+
+`ProfilePage` 是外层布局——顶部是标签栏，下方是 `Outlet`（子路由内容渲染在这里）。
+
+**标签栏用 `NavLink` 实现：** 点击标签时跳转子路由，当前激活的标签有高亮样式。这和导航栏的 `NavLink` 完全一样的用法。
+
+先来想清楚标签栏的数据结构，把每个标签定义成一个对象，再用 `.map()` 渲染，避免重复代码：
+
+```tsx
+const tabs = [
+  { to: '/profile/listings',  label: 'My Listings' },
+  { to: '/profile/favorites', label: 'My Favorites' },
+  { to: '/profile/purchases', label: 'My Purchases' },
+  { to: '/profile/sales',     label: 'My Sales' },
+]
+```
+
+打开 `src/pages/ProfilePage.tsx`：
+
+```tsx
+import { NavLink, Outlet } from 'react-router-dom'
+import { useAuthStore } from '@/stores/authStore'
+
+const tabs = [
+  { to: '/profile/listings',  label: 'My Listings' },
+  { to: '/profile/favorites', label: 'My Favorites' },
+  { to: '/profile/purchases', label: 'My Purchases' },
+  { to: '/profile/sales',     label: 'My Sales' },
+]
+
+export default function ProfilePage() {
+  const { user } = useAuthStore()
+
+  return (
+    <div className="space-y-6">
+      {/* 页头 */}
+      <div>
+        <h1 className="text-2xl font-bold">My Profile</h1>
+        <p className="text-gray-500">{user?.email}</p>
+      </div>
+
+      {/* 标签栏 */}
+      <div className="border-b">
+        <nav className="flex gap-1">
+          {tabs.map(tab => (
+            <NavLink
+              key={tab.to}
+              to={tab.to}
+              className={({ isActive }) =>
+                isActive
+                  ? 'border-b-2 border-blue-600 px-4 py-2 text-sm font-semibold text-blue-600'
+                  : 'px-4 py-2 text-sm text-gray-600 hover:text-gray-900'
+              }
+            >
+              {tab.label}
+            </NavLink>
+          ))}
+        </nav>
+      </div>
+
+      {/* 子路由内容渲染在这里 */}
+      {/* 切换标签时，只有这里的内容变化，上方的标签栏不重新渲染 */}
+      <Outlet />
+    </div>
+  )
+}
+```
+
+验证路由配置正确。打开 `src/router.tsx`，确认个人中心的嵌套路由结构：
+
+```tsx
+import ProfilePage from '@/pages/ProfilePage'
+import MyListingsPage from '@/pages/MyListingsPage'
+import MyFavoritesPage from '@/pages/MyFavoritesPage'
+import MyPurchasesPage from '@/pages/MyPurchasesPage'
+import MySalesPage from '@/pages/MySalesPage'
+
+// 在受保护路由的 children 里
+{
+  path: '/profile',
+  element: <ProfilePage />,
+  children: [
+    // index: true 表示访问 /profile 时默认显示这个子路由
+    { index: true, element: <MyListingsPage /> },
+    { path: 'listings', element: <MyListingsPage /> },
+    { path: 'favorites', element: <MyFavoritesPage /> },
+    { path: 'purchases', element: <MyPurchasesPage /> },
+    { path: 'sales', element: <MySalesPage /> },
+  ],
+},
+```
+
+验证效果：
+
+```bash
+npm run dev
+```
+
+登录后访问 `/profile`，应该看到标签栏和默认显示的子路由内容（当前是占位）。点击不同标签，URL 变化，标签高亮切换，上方标签栏不闪烁。
+
+
+
+### 2. 我的车辆列表（MyListingsPage）
+
+卖家需要看到自己所有状态的车辆，并且能执行操作：提交审核、删除。
+
+打开 `src/pages/MyListingsPage.tsx`：
+
+**第一步：请求数据**
+
+```tsx
+import { useQuery} from '@tanstack/react-query'
+
+
+export default function MyListingsPage() {
+  const queryClient = useQueryClient()
+
+  const { data, isLoading } = useQuery({
+    queryKey: ['my-listings'],
+    queryFn: () => carsApi.getMyListings(),
+  })
+
+  if (isLoading) return <div>Loading...</div>
+```
+
+使用Badge显示车辆状态，并设置状态对应的颜色
+
+不同状态用不同颜色，让卖家一眼看清楚每辆车处于哪个阶段
+
+```ts
+ // 根据状态返回 Badge 的 variant
+  const getStatusVariant = (status: string) => {
+    switch (status) {
+      case "Published":
+        return "secondary";
+      case "PendingReview":
+        return "outline";
+      case "Sold":
+        return "destructive";
+      case "Draft":
+      default:
+        return "default";
+    }
+  };
+```
+
+渲染列表
+
+```tsx
+import { carsApi } from "@/api";
+import { Badge } from "@/components/ui/badge";
+import { useQuery } from "@tanstack/react-query";
+import { Link } from "react-router-dom";
+
+export default function MyListingsPage() {
+  /* -- 请求数据 -- */
+...
+
+  // 根据状态返回 Badge 的 variant
+...
+
+  if (isLoading) return <div>Loading...</div>;
+    
+  if (!data?.items.length) {
+    return (
+      <div className="py-12 text-center text-gray-500">
+        You haven't listed any cars yet.{" "}
+        <Link to="/cars/new" className="text-blue-600 hover:underline">
+          List your first car
+        </Link>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      {data.items.map((car) => (
+        <div
+          key={car.id}
+          className="flex items-center justify-between rounded-lg
+                     border bg-white p-4"
+        >
+          {/* 车辆信息 */}
+          <div className="space-y-1">
+            <div className="flex items-center gap-2">
+              <span className="font-medium">{car.title}</span>
+              <Badge variant={getStatusVariant(car.status)}>{car.status}</Badge>
+            </div>
+            <p className="text-sm text-gray-500">
+              ${car.price.toLocaleString()} · {car.year} ·{" "}
+              {car.mileage.toLocaleString()} km
+            </p>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+```
+
+**第二步：操作 mutation**
+
+只有 Draft 状态才有操作:
+
+- Submit for review
+- Delete
+
+```tsx
+
+export default function MyListingsPage() {
+    
+  const queryClient = useQueryClient();
+  /* -- 请求数据 -- */
+ 
+    ...
+
+  /* --- submit Mutation -- */
+  const submitMutation = useMutation({
+    mutationFn: (carId: number) => carsApi.submit(carId),
+    onSuccess: () => {
+      toast.success("Submitted for review!");
+      queryClient.invalidateQueries({ queryKey: ["my-listings"] });
+    },
+    onError: (error) => toast.error(error.message),
+  });
+
+  /* --- delete mutation -- */
+
+  const deleteMutation = useMutation({
+    mutationFn: (carId: number) => carsApi.delete(carId),
+    onSuccess: () => {
+      toast.success("Car deleted.");
+      queryClient.invalidateQueries({ queryKey: ["my-listings"] });
+    },
+    onError: (error) => toast.error(error.message),
+  });
+    
+  return (
+    <div className="space-y-3">
+    ...
+    </div>
+  );
+}
+
+```
+
+添加操作按钮
+
+```tsx
+...
+
+export default function MyListingsPage() {
+ 
+  /* -- 请求数据 -- */
+  ...
+
+  // 根据状态返回 Badge 的 variant
+	...
+
+  /* --- submit Mutation -- */
+  	...
+
+  /* --- delete mutation -- */
+
+	...
+
+  return (
+    <div className="space-y-3">
+      {data.items.map((car) => (
+        <div
+          key={car.id}
+          className="flex items-center justify-between rounded-lg
+                     border bg-white p-4"
+        >
+          {/* 左侧：车辆信息 */}
+
+                  ...
+
+          {/* 右侧：操作按钮（只有 Draft 状态才有操作） */}
+          {car.status === "Draft" && (
+            <div className="flex gap-2">
+              <Button asChild variant="outline" size="sm">
+                <Link to={`/cars/${car.id}/edit`}>Edit</Link>
+              </Button>
+              <Button
+                size="sm"
+                onClick={() => submitMutation.mutate(car.id)}
+                disabled={submitMutation.isPending}
+              >
+                Submit
+              </Button>
+              <Button
+                size="sm"
+                variant="destructive"
+                onClick={() => deleteMutation.mutate(car.id)}
+                disabled={deleteMutation.isPending}
+              >
+                Delete
+              </Button>
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+```
+
+**第三步：更新拦截器**
+
+注意：DELETE 请求返回 `204 No Content`，没有响应体。 响应拦截器把 204 No Content 当成失败了
+
+```tsx
+...
+// =============================================
+// 响应拦截器：统一处理响应和错误
+// =============================================
+apiClient.interceptors.response.use(
+  (response) => {
+    const apiResponse = response.data as ApiResponse<unknown>
+    // 204 没有响应体，response.data 是空的
+    // apiResponse.success 是 undefined → 判断为 false
+    if (!apiResponse.success) {
+      return Promise.reject(new Error(apiResponse.message ?? "Request failed"))
+      // ↑ 走到这里，抛出 "Request failed"
+    }
+
+    return response;
+  },
+  (error) => {
+  ...
+  },
+);
+
+export default apiClient;
+
+```
+
+所以：
+
+- `onSuccess` 永远不会执行 → `invalidateQueries` 不触发 → 列表不更新
+- `onError` 执行 → toast 显示 "Request failed"
+
+因此，修复拦截器：
+
+在拦截器里加 204 判断
+
+```tsx
+apiClient.interceptors.response.use(
+  (response) => {
+    // 204 No Content：没有响应体，直接放行
+    if (response.status === 204) {
+      return response
+    }
+
+    const apiResponse = response.data as ApiResponse<unknown>
+    if (!apiResponse.success) {
+      return Promise.reject(new Error(apiResponse.message ?? "Request failed"))
+    }
+    return response
+  },
+  (error) => {
+    // 失败分支不变
+    ...
+  }
+)
+```
+
+加了这个判断后：
+
+- 204 直接放行 → `onSuccess` 正常执行 → `invalidateQueries` 触发 → 列表更新
+- toast 显示 "Car deleted." ✅
+
+完整UI - 添加页码和格栅显示
+
+```tsx
+import { carsApi } from "@/api";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Link, useSearchParams } from "react-router-dom";
+import { toast } from "sonner";
+
+const PAGE_SIZE = 10;
+
+/* -- Badge variant -- */
+const getStatusVariant = (status: string) => {
+  switch (status) {
+    case "Published":
+      return "secondary";
+    case "PendingReview":
+      return "outline";
+    case "Sold":
+      return "destructive";
+    case "Draft":
+    default:
+      return "default";
+  }
+};
+
+export default function MyListingsPage() {
+  const queryClient = useQueryClient();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const page = Number(searchParams.get("page") ?? "1");
+
+  /* -- 请求数据 -- */
+  const { data, isLoading } = useQuery({
+    queryKey: ["my-listings", { page, pageSize: PAGE_SIZE }],
+    queryFn: () => carsApi.getMyListings({ page, pageSize: PAGE_SIZE }),
+  });
+
+  /* -- Mutations -- */
+  const submitMutation = useMutation({
+    mutationFn: (carId: number) => carsApi.submit(carId),
+    onSuccess: () => {
+      toast.success("Submitted for review!");
+      queryClient.invalidateQueries({ queryKey: ["my-listings"] });
+    },
+    onError: (error) => toast.error(error.message),
+  });
+
+  const deleteMutation = useMutation({
+    mutationFn: (carId: number) => carsApi.delete(carId),
+    onSuccess: () => {
+      toast.success("Car deleted.");
+      queryClient.invalidateQueries({ queryKey: ["my-listings"] });
+    },
+    onError: (error) => toast.error(error.message),
+  });
+
+  const handlePageChange = (newPage: number) => {
+    setSearchParams({ page: String(newPage) });
+  };
+
+  /* -- Loading -- */
+  if (isLoading) {
+    return (
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+        {Array.from({ length: PAGE_SIZE }).map((_, i) => (
+          <div key={i} className="h-48 animate-pulse rounded-lg bg-gray-100" />
+        ))}
+      </div>
+    );
+  }
+
+  /* -- 空状态 -- */
+  if (!data?.items.length) {
+    return (
+      <div className="py-12 text-center text-gray-500">
+        You haven't listed any cars yet.{" "}
+        <Link to="/cars/new" className="text-blue-600 hover:underline">
+          List your first car
+        </Link>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      {/* 顶部：数量统计 */}
+      <p className="text-sm text-gray-500 text-right">
+        {data.totalCount} cars total
+      </p>
+
+      {/* 网格列表 */}
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+        {data.items.map((car) => (
+          <div
+            key={car.id}
+            className="flex flex-col justify-between rounded-lg border bg-white p-4 space-y-3"
+          >
+            {/* 车辆信息 */}
+            <div className="space-y-1">
+              <div className="flex items-start justify-between gap-2">
+                <Link
+                  to={`/cars/${car.id}`}
+                  className="font-medium hover:text-blue-600 hover:underline"
+                >
+                  {car.title}
+                </Link>
+                <Badge
+                  variant={getStatusVariant(car.status)}
+                  className="shrink-0"
+                >
+                  {car.status}
+                </Badge>
+              </div>
+              <p className="text-lg font-bold text-blue-600">
+                ${car.price.toLocaleString()}
+              </p>
+              <p className="text-sm text-gray-500">
+                {car.year} · {car.mileage.toLocaleString()} km
+              </p>
+            </div>
+
+            {/* 操作按钮：只有 Draft 状态才有 */}
+            {car.status === "Draft" && (
+              <div className="flex gap-2 border-t pt-3">
+                <Button asChild variant="outline" size="sm" className="flex-1">
+                  <Link to={`/cars/${car.id}/edit`}>Edit</Link>
+                </Button>
+                <Button
+                  size="sm"
+                  className="flex-1"
+                  onClick={() => submitMutation.mutate(car.id)}
+                  disabled={submitMutation.isPending}
+                >
+                  Submit
+                </Button>
+                <Button
+                  size="sm"
+                  variant="destructive"
+                  onClick={() => deleteMutation.mutate(car.id)}
+                  disabled={deleteMutation.isPending}
+                >
+                  Delete
+                </Button>
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+
+      {/* 分页 */}
+      {data.totalPages > 1 && (
+        <div className="flex items-center justify-center gap-4">
+          <Button
+            variant="outline"
+            onClick={() => handlePageChange(page - 1)}
+            disabled={page === 1}
+          >
+            Previous
+          </Button>
+          <span className="text-sm text-gray-600">
+            Page {page} of {data.totalPages}
+          </span>
+          <Button
+            variant="outline"
+            onClick={() => handlePageChange(page + 1)}
+            disabled={page === data.totalPages}
+          >
+            Next
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+```
+
+
+
+### 3. 我的收藏列表（MyFavoritesPage）
+
+打开 `src/pages/MyFavoritesPage.tsx`：
+
+```tsx
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { Link, useSearchParams } from "react-router-dom";
+import { toast } from "sonner";
+import { favoritesApi } from "@/api";
+import { Button } from "@/components/ui/button";
+
+const PAGE_SIZE = 10;
+
+export default function MyFavoritesPage() {
+  const queryClient = useQueryClient();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const page = Number(searchParams.get("page") ?? "1");
+
+  /* -- 请求数据 -- */
+  const { data, isLoading } = useQuery({
+    queryKey: ["favorites", { page, pageSize: PAGE_SIZE }],
+    queryFn: () => favoritesApi.getMyFavorites(page, PAGE_SIZE),
+  });
+
+  /* -- Mutations -- */
+  const removeMutation = useMutation({
+    mutationFn: (carId: number) => favoritesApi.remove(carId),
+    onSuccess: () => {
+      toast.success("Removed from favorites.");
+      queryClient.invalidateQueries({ queryKey: ["favorites"] });
+    },
+    onError: (error) => toast.error(error.message),
+  });
+
+  const handlePageChange = (newPage: number) => {
+    setSearchParams({ page: String(newPage) });
+  };
+
+  /* -- Loading -- */
+  if (isLoading) {
+    return (
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+        {Array.from({ length: PAGE_SIZE }).map((_, i) => (
+          <div key={i} className="h-36 animate-pulse rounded-lg bg-gray-100" />
+        ))}
+      </div>
+    );
+  }
+
+  /* -- 空状态 -- */
+  if (!data?.items.length) {
+    return (
+      <div className="py-12 text-center text-gray-500">
+        No favorites yet.{" "}
+        <Link to="/" className="text-blue-600 hover:underline">
+          Browse cars
+        </Link>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      <p className="text-sm text-gray-500 text-right">
+        {data.totalCount} favorites
+      </p>
+
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+        {data.items.map((item) => (
+          <div
+            key={item.carId}
+            className="flex flex-col justify-between rounded-lg border bg-white p-4 space-y-3"
+          >
+            <Link
+              to={`/cars/${item.carId}`}
+              className="space-y-1 hover:opacity-80"
+            >
+              <p className="font-medium">
+                {item.car?.title ?? "Car #" + item.carId}
+              </p>
+              {item.car && (
+                <p className="text-sm text-gray-500">
+                  ${item.car.price.toLocaleString()} · {item.car.year}
+                </p>
+              )}
+            </Link>
+            <Button
+              variant="outline"
+              size="sm"
+              className="w-full"
+              onClick={() => removeMutation.mutate(item.carId)}
+              disabled={removeMutation.isPending}
+            >
+              Remove
+            </Button>
+          </div>
+        ))}
+      </div>
+
+      {/* 分页 */}
+      {data.totalPages > 1 && (
+        <div className="flex items-center justify-center gap-4">
+          <Button
+            variant="outline"
+            onClick={() => handlePageChange(page - 1)}
+            disabled={page === 1}
+          >
+            Previous
+          </Button>
+          <span className="text-sm text-gray-600">
+            Page {page} of {data.totalPages}
+          </span>
+          <Button
+            variant="outline"
+            onClick={() => handlePageChange(page + 1)}
+            disabled={page === data.totalPages}
+          >
+            Next
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+```
+
+
+
+### 4. 我的订单：买家视角（MyPurchasesPage）
+
+打开 `src/pages/MyPurchasesPage.tsx`：
+
+```tsx
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useSearchParams } from "react-router-dom";
+import { toast } from "sonner";
+import { ordersApi } from "@/api";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+
+const PAGE_SIZE = 10;
+
+/* -- Badge variant -- */
+const getStatusVariant = (status: string) => {
+  switch (status) {
+    case "Completed":
+      return "outline";
+    case "Cancelled":
+      return "destructive";
+    default:
+      return "default";
+  }
+};
+
+export default function MyPurchasesPage() {
+  const queryClient = useQueryClient();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const page = Number(searchParams.get("page") ?? "1");
+
+  /* -- 请求数据 -- */
+
+  const { data, isLoading } = useQuery({
+    queryKey: ["my-purchases", { page, pageSize: PAGE_SIZE }],
+    queryFn: () => ordersApi.getMyPurchases(page, PAGE_SIZE),
+  });
+
+  /* -- Mutations -- */
+  const cancelMutation = useMutation({
+    mutationFn: (orderId: number) => ordersApi.cancel(orderId),
+    onSuccess: () => {
+      toast.success("Order cancelled.");
+      queryClient.invalidateQueries({ queryKey: ["my-purchases"] });
+    },
+    onError: (error) => toast.error(error.message),
+  });
+
+  const handlePageChange = (newPage: number) => {
+    setSearchParams({ page: String(newPage) });
+  };
+
+  /* -- Loading -- */
+  if (isLoading) {
+    return (
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+        {Array.from({ length: PAGE_SIZE }).map((_, i) => (
+          <div key={i} className="h-36 animate-pulse rounded-lg bg-gray-100" />
+        ))}
+      </div>
+    );
+  }
+
+  /* -- 空状态 -- */
+  if (!data?.items.length) {
+    return (
+      <div className="py-12 text-center text-gray-500">No purchases yet.</div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      <p className="text-sm text-gray-500 text-right">
+        {data.totalCount} orders
+      </p>
+
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+        {data.items.map((order) => (
+          <div
+            key={order.id}
+            className="flex flex-col justify-between rounded-lg border bg-white p-4 space-y-3"
+          >
+            <div className="space-y-1">
+              <div className="flex items-start justify-between gap-2">
+                <span className="font-medium">{order.carTitle}</span>
+                <Badge
+                  variant={getStatusVariant(order.status)}
+                  className="shrink-0"
+                >
+                  {order.status}
+                </Badge>
+              </div>
+              <p className="text-lg font-bold text-blue-600">
+                ${order.price.toLocaleString()}
+              </p>
+              <p className="text-sm text-gray-500">
+                Seller: {order.sellerUsername}
+              </p>
+            </div>
+
+            {order.status === "Pending" && (
+              <Button
+                variant="destructive"
+                size="sm"
+                className="w-full"
+                onClick={() => cancelMutation.mutate(order.id)}
+                disabled={cancelMutation.isPending}
+              >
+                Cancel
+              </Button>
+            )}
+          </div>
+        ))}
+      </div>
+
+      {/* 分页 */}
+      {data.totalPages > 1 && (
+        <div className="flex items-center justify-center gap-4">
+          <Button
+            variant="outline"
+            onClick={() => handlePageChange(page - 1)}
+            disabled={page === 1}
+          >
+            Previous
+          </Button>
+          <span className="text-sm text-gray-600">
+            Page {page} of {data.totalPages}
+          </span>
+          <Button
+            variant="outline"
+            onClick={() => handlePageChange(page + 1)}
+            disabled={page === data.totalPages}
+          >
+            Next
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+```
+
+
+
+### 5. 我的订单：卖家视角（MySalesPage）
+
+打开 `src/pages/MySalesPage.tsx`：
+
+卖家可以确认订单完成（让买家可以评价）：
+
+```tsx
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useSearchParams } from "react-router-dom";
+import { toast } from "sonner";
+import { ordersApi } from "@/api";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+
+const PAGE_SIZE = 10;
+
+/* -- Badge variant -- */
+const getStatusVariant = (status: string) => {
+  switch (status) {
+    case "Completed":
+      return "outline";
+    case "Cancelled":
+      return "destructive";
+    default:
+      return "default";
+  }
+};
+
+export default function MySalesPage() {
+  const queryClient = useQueryClient();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const page = Number(searchParams.get("page") ?? "1");
+
+  /* -- 请求数据 -- */
+  const { data, isLoading } = useQuery({
+    queryKey: ["my-sales", { page, pageSize: PAGE_SIZE }],
+    queryFn: () => ordersApi.getMySales(page, PAGE_SIZE),
+  });
+
+  /* -- Mutations -- */
+  const completeMutation = useMutation({
+    mutationFn: (orderId: number) => ordersApi.complete(orderId),
+    onSuccess: () => {
+      toast.success("Order marked as completed.");
+      queryClient.invalidateQueries({ queryKey: ["my-sales"] });
+    },
+    onError: (error) => toast.error(error.message),
+  });
+
+  const handlePageChange = (newPage: number) => {
+    setSearchParams({ page: String(newPage) });
+  };
+
+  /* -- Loading -- */
+  if (isLoading) {
+    return (
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+        {Array.from({ length: PAGE_SIZE }).map((_, i) => (
+          <div key={i} className="h-36 animate-pulse rounded-lg bg-gray-100" />
+        ))}
+      </div>
+    );
+  }
+
+  /* -- 空状态 -- */
+  if (!data?.items.length) {
+    return <div className="py-12 text-center text-gray-500">No sales yet.</div>;
+  }
+
+  return (
+    <div className="space-y-6">
+      <p className="text-sm text-gray-500 text-right">
+        {data.totalCount} orders
+      </p>
+
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+        {data.items.map((order) => (
+          <div
+            key={order.id}
+            className="flex flex-col justify-between rounded-lg border bg-white p-4 space-y-3"
+          >
+            <div className="space-y-1">
+              <div className="flex items-start justify-between gap-2">
+                <span className="font-medium">{order.carTitle}</span>
+                <Badge
+                  variant={getStatusVariant(order.status)}
+                  className="shrink-0"
+                >
+                  {order.status}
+                </Badge>
+              </div>
+              <p className="text-lg font-bold text-blue-600">
+                ${order.price.toLocaleString()}
+              </p>
+              <p className="text-sm text-gray-500">
+                Buyer: {order.buyerUsername}
+              </p>
+            </div>
+
+            {order.status === "Pending" && (
+              <Button
+                size="sm"
+                className="w-full"
+                onClick={() => completeMutation.mutate(order.id)}
+                disabled={completeMutation.isPending}
+              >
+                Mark as Completed
+              </Button>
+            )}
+          </div>
+        ))}
+      </div>
+
+      {/* 分页 */}
+      {data.totalPages > 1 && (
+        <div className="flex items-center justify-center gap-4">
+          <Button
+            variant="outline"
+            onClick={() => handlePageChange(page - 1)}
+            disabled={page === 1}
+          >
+            Previous
+          </Button>
+          <span className="text-sm text-gray-600">
+            Page {page} of {data.totalPages}
+          </span>
+          <Button
+            variant="outline"
+            onClick={() => handlePageChange(page + 1)}
+            disabled={page === data.totalPages}
+          >
+            Next
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+```
+
+
+
+### 6. 完整测试
+
+```bash
+npm run dev
+```
+
+**测试嵌套路由切换：**
+
+登录后访问 `/profile`，看到标签栏和默认的 My Listings 内容。点击不同标签，URL 变化，内容区域切换，标签栏不闪烁不重新渲染。
+
+**测试 My Listings：**
+
+有草稿状态的车辆时，看到 Edit、Submit、Delete 三个按钮。点 Submit，车辆状态变成 PendingReview，按钮消失。点 Delete，车辆从列表消失。
+
+**测试 My Favorites：**
+
+之前收藏的车辆出现在列表里。点 Remove，车辆从列表消失，收藏页缓存刷新。
+
+**测试 My Purchases：**
+
+之前下单的订单出现在列表里。Pending 状态的订单有 Cancel 按钮，点击取消后订单状态变化，按钮消失。
+
+**测试 My Sales：**
+
+用卖家账号登录，在 My Sales 里看到买家的订单。点 "Mark as Completed"，状态变成 Completed，按钮消失。
+
+
+
+### 7. 此时的目录变化
+
+```
+src/
+└── pages/
+    ├── ProfilePage.tsx     ← 已更新（完整实现）
+    ├── MyListingsPage.tsx  ← 已更新（完整实现）
+    ├── MyFavoritesPage.tsx ← 已更新（完整实现）
+    ├── MyPurchasesPage.tsx ← 已更新（完整实现）
+    └── MySalesPage.tsx     ← 已更新（完整实现）
+```
+
+
+
+### 8. Git 提交
+
+```bash
+git add .
+git commit -m "feat: profile page with listings, favorites, orders"
+git push origin feature/seller-pages
+```
+
+合并回 `develop`：
+
+```bash
+git checkout develop
+git merge --no-ff feature/seller-pages \
+    -m "merge: feature/seller-pages into develop"
+git push origin develop
+git branch -D feature/seller-pages
+git push origin --delete feature/seller-pages
+```
+
+
+
+### Step 54 完成状态
+
+```
+✅ 理解嵌套路由实战（标签页对应子路由，Outlet渲染内容）
+✅ 理解 index: true（访问父路由时的默认子路由）
+✅ ProfilePage（标签栏 + Outlet，NavLink高亮）
+✅ MyListingsPage（车辆列表 + 状态Badge + 操作按钮）
+✅ MyFavoritesPage（收藏列表 + 取消收藏）
+✅ MyPurchasesPage（买家订单 + 取消操作）
+✅ MySalesPage（卖家订单 + 确认完成）
+✅ 测试通过（标签切换/车辆操作/收藏/订单操作）
+✅ feature/seller-pages 合并回 develop
+```
+
+
+
+## Step 55 · Admin 面板 + 错误页面
+
+### 这一步做什么
+
+完成最后两个功能模块：
+
+Admin 面板（待审核列表 + 审核通过/拒绝/删除）
+404页面
+通用错误处理（已有 toast，够用）
+
+
+
+### 1. admin角色的功能
+
+先切出新的分支
+
+```bash
+git checkout develop
+git checkout -b feature/admin-and-polish
+git push -u origin feature/admin-and-polish
+```
+
+admin角色功能用于对发表车辆的审核删除等操作，**admin不能实现**：
+
+- ~~sell a car~~
+- ~~Buy now~~
+- ~~用户信息下拉菜单 My Profile/My Listings/My Purchases~~
+
+这些功能是 user 角色的功能。
+
+因此先对之前完成的功能做一些角色限制相关的修改。
+
+**更新1：`Layout.tsx` — 导航栏的 Sell a Car 按钮 和下拉菜单**
+
+Admin 也不应该看到 Sell a Car，下拉菜单按角色显示不同的内容
+
+```tsx
+export default function Layout() {
+  const { user, isAuthenticated, logout } = useAuthStore();
+  const navigate = useNavigate();
+
+  // 判断是不是admin
+  const isAdmin = user?.role === "Admin";
+
+	...
+
+  return (
+    <div className="min-h-screen bg-gray-100">
+      <header className="border-b bg-white">
+        <div
+          className="mx-auto flex max-w-7xl items-center
+                        justify-between px-4 py-4"
+        >
+          {/* 左侧*/}
+            
+         	...
+            
+          {/* 右侧 */}
+          <div className="flex items-center gap-3">
+            {isAuthenticated() ? (
+              // 登录状态
+              <>
+                {/* 普通用户 发布车辆按钮  */}
+                {!isAdmin && (
+                  <Button asChild size="sm" variant="outline">
+                    <NavLink to="/cars/new">Sell a Car</NavLink>
+                  </Button>
+                )}
+
+                {/* 用户下拉菜单 */}
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button variant="ghost" size="sm">
+                      {user?.username}
+                    </Button>
+                  </DropdownMenuTrigger>
+
+                  <DropdownMenuContent align="end" className="w-48">
+                    {isAdmin ? (
+                      // role="admin"
+                      <>
+                        <DropdownMenuItem onClick={() => navigate("/admin")}>
+                          Admin Panel
+                        </DropdownMenuItem>
+                      </>
+                    ) : (
+                      // role="user"
+                      <>
+                        {/* 用户资料 */}
+                        <DropdownMenuItem onClick={() => navigate("/profile")}>
+                          My Profile
+                        </DropdownMenuItem>
+
+                        {/* 车辆发布列表 */}
+                        <DropdownMenuItem
+                          onClick={() => navigate("/profile/listings")}
+                        >
+                          My Listings
+                        </DropdownMenuItem>
+
+                        {/* 购买列表 */}
+                        <DropdownMenuItem
+                          onClick={() => navigate("/profile/purchases")}
+                        >
+                          My Purchases
+                        </DropdownMenuItem>
+                      </>
+                    )}
+
+                    {/* 分隔线 */}
+                    <DropdownMenuSeparator />
+
+                    {/* 退出登录 */}
+                    <DropdownMenuItem
+                      onClick={handleLogout}
+                      className="text-red-600"
+                    >
+                      Sign out
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </>
+            ) : (
+              // 未登录状态
+              <>
+                
+             	...
+                
+              </>
+            )}
+          </div>
+        </div>
+      </header>
+
+      <main className="mx-auto max-w-7xl px-4 py-8">
+        <Outlet />
+      </main>
+    </div>
+  );
+}
+
+```
+
+**更新2：`CarDetailPage.tsx` — Buy Now 排除 Admin**
+
+```tsx
+ /* -------------- 权限判断 -------------- */
+
+  // 判断当前用户是不是admin
+  const isAdmin = user?.role === "Admin";
+  // 判断当前用户是不是这辆车的车主
+  const isOwner = user?.id === car?.sellerId;
+  // 判断是否可以购买：已登录 + 不是admin + 不是车主  + 车辆是 Published 状态
+  const canBuy =
+    isAuthenticated() && !isAdmin && !isOwner && car?.status === "Published";
+```
+
+**更新3：登录成功后跳转的问题**
+
+登录的来源页面：登录页或者homePage里的car 详情页。因此登录成功后，页面跳转也分：
+
+- 从登录页登录：
+
+    - 管理员角色：跳转到管理页面 `'/admin'`
+    - 用户角色：跳转到首页 `'/'`
+
+- 从详情页登录：跳转到来源页， 使用 `useLocation`动态获取
+
+    `useLocation`返回当前路由的信息，其中state 是路由跳转时附带的格外数据，类型默认是unknown。 
+
+    比如从详情页跳转到登录页时， 会传递这样的state:
+
+    ```tsx
+    navigate('/login', {
+      state: { from: { pathname: '/cars/123' } }
+    })
+    ```
+
+    点击跳转时携带来源页信息
+
+    ```tsx
+    // 带上当前页面路径作为 state
+    <Link to="/login" state={{ from: { pathname: location.pathname } }}>
+      Sign in to purchase
+    </Link>
+    ```
+
+    获取跳转来源的路径
+
+    ```tsx
+    import {  useLocation } from 'react-router-dom'
+    
+    const location = useLocation()
+    // 有来源页就跳回去，没有的话 Admin 跳管理页、普通用户跳首页
+    
+    // 定义location state数据类型
+    interface LocationState {
+      from?: { pathname: string }
+    }
+    
+    // 先把 state 断言成明确的类型
+    const state = location.state as LocationState | null
+    
+    // 再取值
+    const from = state?.from?.pathname // null 时直接返回 undefined，不报错
+    ```
+
+    `from` 的类型是 `string | undefined`
+
+完整的更新
+
+ `CarDetailPage`详情页里"Sign in to purchase"的跳转到登录页时附带 `state`
+
+```tsx
+import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
+...
+
+export default function CarDetailPage() {
+  ...
+  // 页面路由信息
+  const location = useLocation();
+
+  /* ------------- 请求车辆详情 ------------- */
+
+  	...
+  
+  /* -------------- 权限判断 -------------- */
+	...
+
+  return (
+    <div className="mx-auto max-w-4xl space-y-6">
+      {/* 图片区域 */}
+          
+	...
+
+      {/* 基本信息 */}
+          
+    ...
+
+      {/* 操作按钮:权限判断，显示不同按钮   */}
+      <div className="border-t pt-4">
+        {!isAuthenticated() && (
+          // 未登录：引导去登录
+          <Button asChild className="w-full">
+            <Link
+              to="/login"
+              // 带上当前页面路径作为 state
+              state={{ from: { pathname: location.pathname } }}
+            >
+              Sign in to purchase
+            </Link>
+          </Button>
+        )}
+
+        {isOwner && (
+          // 车主：显示管理操作
+          ...
+        )}
+          
+		...
+          
+    </div>
+  );
+}
+
+```
+
+`LoginPage` 登录页里根据来源页和role匹配不同的跳转页面
+
+```tsx
+import { Link, useLocation, useNavigate } from "react-router-dom";
+
+...
+
+// 定义location state数据类型
+interface LocationState {
+  from?: { pathname: string };
+}
+
+export default function LoginPage() {
+
+  ...
+  
+  // 路由来源
+  const loction = useLocation();
+  // 获取路由跳转来源页路径信息
+  const state = loction.state as LocationState | null;
+  const from = state?.from?.pathname;
+
+  const onSubmit = async (data: LoginForm) => {
+    setServerError(null);
+    try {
+      const result = await authApi.login(data);
+      setAuth(result.user, result.token);
+
+      // 跳转
+      // 有来源页就跳回去，没有的话 Admin 跳管理页、普通用户跳首页
+      if (from) {
+        navigate(from, { replace: true });
+      } else if (result.user.role === "Admin") {
+        navigate("/admin", { replace: true });
+      } else {
+        navigate("/", { replace: true });
+      }
+    } catch (error) {
+    	...
+    }
+  };
+  return (
+    ...
+  );
+}
+
+```
+
+
+
+### 2. AdminRoute 
+
+Step 47 里已经实现了 `ProtectedRoute`， 现在要实现 `AdminRoute`，它的逻辑很简单：
+
+- 未登录 → 跳登录页
+- 登录了，但不是admin → 跳首页
+- admin登录 → 跳AdminPage页
+
+```tsx
+export default function AdminRoute() {
+  const { user, isAuthenticated } = useAuthStore()
+
+  // 未登录 → 跳登录页
+  if (!isAuthenticated()) {
+    return <Navigate to="/login" replace />
+  }
+
+  // 已登录但不是 Admin → 跳首页 （用户已经登录，然后再地址栏手动访问 `/admin`的话）
+  if (user?.role !== "Admin") {
+    return <Navigate to="/" replace />
+  }
+
+  return <Outlet />
+}
+```
+
+Admin 页面的路由配置
+
+```tsx
+import AdminPage from '@/pages/AdminPage'
+
+// AdminRoute 的 children 里
+{
+  element: <AdminRoute />,
+  children: [
+    {
+      path: '/admin',
+      element: <AdminPage />
+    },
+  ],
+},
+```
+
+
+
+### 3. Admin 面板布局（AdminPage）
+
+Admin 面板和个人中心的结构一样——外层布局 + 标签栏 + `Outlet`。
+
+打开 `src/pages/AdminPage.tsx`：
+
+```tsx
+import { NavLink, Outlet } from 'react-router-dom'
+
+const tabs = [
+  { to: '/admin/pending', label: 'Pending Review' },
+]
+
+export default function AdminPage() {
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-2xl font-bold">Admin Panel</h1>
+        <p className="text-gray-500">Manage car listings and users</p>
+      </div>
+
+      {/* 标签栏 */}
+      <div className="border-b">
+        <nav className="flex gap-1">
+          {tabs.map(tab => (
+            <NavLink
+              key={tab.to}
+              to={tab.to}
+              className={({ isActive }) =>
+                isActive
+                  ? 'border-b-2 border-blue-600 px-4 py-2 text-sm font-semibold text-blue-600'
+                  : 'px-4 py-2 text-sm text-gray-600 hover:text-gray-900'
+              }
+            >
+              {tab.label}
+            </NavLink>
+          ))}
+        </nav>
+      </div>
+
+      <Outlet />
+    </div>
+  )
+}
+```
+
+更新路由，确认 Admin 的嵌套结构正确。打开 `src/router.tsx`：
+
+```tsx
+import AdminPage from '@/pages/AdminPage'
+import AdminPendingPage from '@/pages/AdminPendingPage'
+
+// AdminRoute 的 children 里
+{
+  element: <AdminRoute />,
+  children: [
+    {
+      path: '/admin',
+      element: <AdminPage />,
+      children: [
+        { index: true, element: <AdminPendingPage /> },
+        { path: 'pending', element: <AdminPendingPage /> },
+      ],
+    },
+  ],
+},
+```
+
+### 
+
+### 4. 安装 Table 组件
+
+待审核列表用表格展示，更清晰：
+
+```bash
+npx shadcn@latest add table
+```
+
+**Table 的基本结构：**
+
+shadcn 的 Table 和 HTML 的 `<table>` 结构对应，只是加了样式：
+
+```tsx
+<Table>
+  <TableHeader>
+    <TableRow>
+      <TableHead>列标题</TableHead>
+    </TableRow>
+  </TableHeader>
+  <TableBody>
+    <TableRow>
+      <TableCell>数据</TableCell>
+    </TableRow>
+  </TableBody>
+</Table>
+```
+
+
+
+### 5. 待审核车辆列表（AdminPendingPage）
+
+打开 `src/pages/AdminPendingPage.tsx`：
+
+**第一步：请求数据 + 定义操作**
+
+```tsx
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
+import { adminApi } from "@/api";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+
+export default function AdminPendingPage() {
+  const queryClient = useQueryClient();
+
+  const { data, isLoading } = useQuery({
+    queryKey: ["admin-pending"],
+    queryFn: () => adminApi.getPendingCars(),
+  })
+
+  if (isLoading) return <div>Loading...</div>;
+
+  if (!data?.items.length) {
+    return (
+      <div className="py-12 text-center text-gray-500">
+        No cars pending review. All caught up!
+      </div>
+    );
+  }
+  return (
+    <Table>
+      <TableHeader>
+        <TableRow>
+          <TableHead>Title</TableHead>
+          <TableHead>Seller</TableHead>
+          <TableHead>Price</TableHead>
+          <TableHead>Year</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {data.items.map((car) => (
+          <TableRow key={car.id}>
+            <TableCell className="font-medium">{car.title}</TableCell>
+            <TableCell>{car.sellerUsername}</TableCell>
+            <TableCell>${car.price.toLocaleString()}</TableCell>
+            <TableCell>{car.year}</TableCell>
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
+  );
+}
+
+```
+
+**第二步：**定义操作
+
+```tsx
+...
+import { Button } from "@/components/ui/button";
+
+export default function AdminPendingPage() {
+  const queryClient = useQueryClient();
+
+  /* -------------- 请求数据 -------------- */
+  ...
+
+  /* --------- approveMutation -------- */
+  const approveMutation = useMutation({
+    mutationFn: (carId: number) => adminApi.approve(carId),
+    onSuccess: () => {
+      toast.success("Car approved and published!");
+      queryClient.invalidateQueries({ queryKey: ["admin-pending"] });
+      // 公开列表也需要刷新，新车上架了
+      queryClient.invalidateQueries({ queryKey: ["cars"] });
+    },
+    onError: (error) => toast.error(error.message),
+  });
+
+  /* --------- rejectMutation --------- */
+  const rejectMutation = useMutation({
+    mutationFn: (carId: number) => adminApi.reject(carId),
+    onSuccess: () => {
+      toast.success("Car rejected, returned to seller.");
+      queryClient.invalidateQueries({ queryKey: ["admin-pending"] });
+    },
+    onError: (error) => toast.error(error.message),
+  });
+    
+  /* --------- deleteMutation --------- */
+  const deleteMutation = useMutation({
+    mutationFn: (carId: number) => adminApi.deleteCar(carId),
+    onSuccess: () => {
+      toast.success("Car deleted.");
+      queryClient.invalidateQueries({ queryKey: ["admin-pending"] });
+    },
+    onError: (error) => toast.error(error.message),
+  });
+
+  if (isLoading) return <div>Loading...</div>;
+
+  if (!data?.items.length) {
+    return (
+      <div className="py-12 text-center text-gray-500">
+        No cars pending review. All caught up!
+      </div>
+    );
+  }
+  return (
+    <Table>
+      <TableHeader>
+        <TableRow>
+          <TableHead>Title</TableHead>
+          <TableHead>Seller</TableHead>
+          <TableHead>Price</TableHead>
+          <TableHead>Year</TableHead>
+          <TableHead className="text-right">Actions</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {data.items.map((car) => (
+          <TableRow key={car.id}>
+            <TableCell className="font-medium">{car.title}</TableCell>
+            <TableCell>{car.sellerUsername}</TableCell>
+            <TableCell>${car.price.toLocaleString()}</TableCell>
+            <TableCell>{car.year}</TableCell>
+            <TableCell>
+              <div className="flex justify-end gap-2">
+                <Button
+                  size="sm"
+                  onClick={() => approveMutation.mutate(car.id)}
+                  disabled={
+                    approveMutation.isPending ||
+                    rejectMutation.isPending ||
+                    deleteMutation.isPending
+                  }
+                >
+                  Approve
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => rejectMutation.mutate(car.id)}
+                  disabled={
+                    approveMutation.isPending ||
+                    rejectMutation.isPending ||
+                    deleteMutation.isPending
+                  }
+                >
+                  Reject
+                </Button>
+                <Button
+                  size="sm"
+                  variant="destructive"
+                  onClick={() => deleteMutation.mutate(car.id)}
+                  disabled={
+                    approveMutation.isPending ||
+                    rejectMutation.isPending ||
+                    deleteMutation.isPending
+                  }
+                >
+                  Delete
+                </Button>
+              </div>
+            </TableCell>
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
+  );
+}
+
+```
+
+> **为什么三个 mutation 都检查彼此的 `isPending`？** 防止 Admin 在一个操作还没完成时，又对同一辆车触发另一个操作。比如审核通过的请求还在飞，又点了删除，就会产生冲突。三个按钮共享禁用状态，任何一个操作进行中，其他按钮都禁用。
+
+
+
+### 6. 错误页面
+
+#### 6.1 404 页面
+
+打开 `src/pages/NotFoundPage.tsx`：
+
+```tsx
+import { Link } from 'react-router-dom'
+import { Button } from '@/components/ui/button'
+
+export default function NotFoundPage() {
+  return (
+    <div className="flex min-h-screen flex-col items-center
+                    justify-center gap-4 text-center">
+      <h1 className="text-6xl font-bold text-gray-200">404</h1>
+      <h2 className="text-2xl font-semibold">Page Not Found</h2>
+      <p className="text-gray-500">
+        The page you're looking for doesn't exist.
+      </p>
+      <Button asChild>
+        <Link to="/">Back to Home</Link>
+      </Button>
+    </div>
+  )
+}
+```
+
+#### 6.2 未授权页面
+
+非 Admin 访问 Admin 路由时跳转到 `/`，已经够用。不需要额外的 403 页面。
+
+#### 6.3 TanStack Query 的全局错误处理
+
+目前的错误处理是：每个 `useMutation` 单独的 `onError` 里调用 `toast.error()`。这对于这个项目来说已经足够了。
+
+但 `useQuery` 的错误目前只在组件里显示一段文字，还没有统一处理。给 `QueryClient` 加一个全局的 query 错误回调，让请求失败时自动显示 toast：
+
+打开 `src/main.tsx`，更新 `QueryClient` 配置：
+
+```tsx
+import { toast } from 'sonner'
+
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 1000 * 60,
+      retry: 1,
+    },
+  },
+  // 全局错误处理：所有 useQuery 失败时自动显示 toast
+  // 不需要在每个组件里单独处理 query 错误
+  queryCache: new QueryCache({
+    onError: (error) => {
+      toast.error(error.message)
+    },
+  }),
+})
+```
+
+补上 import：
+
+```tsx
+import { QueryClient, QueryClientProvider, QueryCache } from '@tanstack/react-query'
+```
+
+
+
+### 7. 完整测试
+
+```bash
+npm run dev
+```
+
+**测试 Admin 面板：**
+
+用普通用户账号访问 `/admin`，应该跳转到 `/404`，看到 404 页面。
+
+用 Admin 账号（`admin@uucars.com`）登录，导航栏下拉菜单里有 "Admin Panel" 入口。
+
+进入 Admin 面板，看到待审核的车辆列表（数据库里需要有 PendingReview 状态的车辆）。
+
+**测试审核通过：**
+
+点 "Approve"，车辆从待审核列表消失，toast 显示成功。访问首页，被审核通过的车辆出现在列表里。
+
+**测试审核拒绝：**
+
+点 "Reject"，车辆从待审核列表消失。卖家在 My Listings 里看到这辆车状态变回 Draft，可以重新编辑提交。
+
+**测试删除违规车辆：**
+
+点 "Delete"，车辆从列表消失，数据库里状态变为 Deleted。
+
+**测试 404 页面：**
+
+访问 `http://localhost:5173/any-random-path`，应该显示 404 页面。
+
+**测试全局 query 错误：**
+
+临时停掉后端，刷新首页，应该看到右下角弹出错误 toast，而不是空白页面。
+
+
+
+### 8. 此时的目录变化
+
+```
+src/
+├── pages/
+│   ├── AdminPage.tsx         ← 已更新（完整实现）
+│   ├── AdminPendingPage.tsx  ← 已更新（完整实现）
+│   └── NotFoundPage.tsx      ← 已更新（完整实现）
+└── main.tsx                  ← 已更新（QueryCache全局错误）
+```
+
+
+
+### 9. Git 提交 + 合并 + 里程碑 tag
+
+```bash
+git add .
+git commit -m "feat: admin panel + 404 page + global error handling"
+git push origin feature/admin-and-polish
+
+# 合并回 develop
+git checkout develop
+git merge --no-ff feature/admin-and-polish \
+    -m "merge: feature/admin-and-polish into develop"
+git push origin develop
+git branch -D feature/admin-and-polish
+git push origin --delete feature/admin-and-polish
+
+# 前端核心页面全部完成，合并到 main 打里程碑 tag
+git checkout main
+git merge --no-ff develop \
+    -m "release: v2.0-frontend - all core pages complete"
+git tag -a v2.0-frontend \
+    -m "V2 frontend: auth + car listing + detail + profile + admin"
+git push origin main
+git push origin v2.0-frontend
+git checkout develop
+```
+
+
+
+### Step 55 完成状态
+
+```
+✅ 切出 feature/admin-and-polish 分支
+✅ AdminPage（嵌套路由布局 + 标签栏）
+✅ 安装 Table 组件，理解其结构
+✅ AdminPendingPage（待审核列表 + 审核通过/拒绝/删除）
+✅ 三个操作按钮共享禁用状态（防止并发操作冲突）
+✅ 404 页面
+✅ QueryCache 全局错误处理（useQuery 失败自动 toast）
+✅ 测试通过（权限拦截/审核通过/拒绝/删除/404/全局错误）
+✅ feature/admin-and-polish 合并回 develop
+✅ v2.0-frontend 里程碑 tag 打完
+```
