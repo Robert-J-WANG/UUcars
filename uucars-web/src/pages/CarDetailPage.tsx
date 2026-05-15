@@ -1,4 +1,4 @@
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { carsApi, favoritesApi, ordersApi } from "@/api";
 import { Badge } from "@/components/ui/badge";
@@ -25,6 +25,8 @@ export default function CarDetailPage() {
   // 控制下单对话框
   const [dialogOpen, setDialogOpen] = useState(false);
   const navigate = useNavigate();
+  // 页面路由信息
+  const location = useLocation();
 
   /* ------------- 请求车辆详情 ------------- */
   const {
@@ -73,10 +75,13 @@ export default function CarDetailPage() {
 
   /* -------------- 权限判断 -------------- */
 
+  // 判断当前用户是不是admin
+  const isAdmin = user?.role === "Admin";
   // 判断当前用户是不是这辆车的车主
   const isOwner = user?.id === car?.sellerId;
-  // 判断是否可以购买：已登录 + 不是车主 + 车辆是 Published 状态
-  const canBuy = isAuthenticated() && !isOwner && car?.status === "Published";
+  // 判断是否可以购买：已登录 + 不是admin + 不是车主  + 车辆是 Published 状态
+  const canBuy =
+    isAuthenticated() && !isAdmin && !isOwner && car?.status === "Published";
 
   return (
     <div className="mx-auto max-w-4xl space-y-6">
@@ -127,7 +132,13 @@ export default function CarDetailPage() {
         {!isAuthenticated() && (
           // 未登录：引导去登录
           <Button asChild className="w-full">
-            <Link to="/login">Sign in to purchase</Link>
+            <Link
+              to="/login"
+              // 带上当前页面路径作为 state
+              state={{ from: { pathname: location.pathname } }}
+            >
+              Sign in to purchase
+            </Link>
           </Button>
         )}
 

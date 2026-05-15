@@ -1,9 +1,13 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { RouterProvider } from "react-router-dom";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import {
+  QueryCache,
+  QueryClient,
+  QueryClientProvider,
+} from "@tanstack/react-query";
 import { router } from "./router";
-import { Toaster } from "sonner";
+import { toast, Toaster } from "sonner";
 import "./index.css";
 
 // 创建 QueryClient 实例
@@ -20,6 +24,13 @@ const queryClient = new QueryClient({
       retry: 1,
     },
   },
+  // 全局错误处理：所有 useQuery 失败时自动显示 toast
+  // 不需要在每个组件里单独处理 query 错误
+  queryCache: new QueryCache({
+    onError: (error) => {
+      toast.error(error.message);
+    },
+  }),
 });
 
 createRoot(document.getElementById("root")!).render(

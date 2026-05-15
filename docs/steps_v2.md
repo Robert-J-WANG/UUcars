@@ -7051,8 +7051,7 @@ function DashboardLayout() {
 
 现在来实现它：
 
-```bash
-touch src/components/ProtectedRoute.tsx
+```tsx
 // src/components/ProtectedRoute.tsx
 import { Navigate, Outlet } from 'react-router-dom'
 import { useAuthStore } from '@/stores/authStore'
@@ -7077,8 +7076,7 @@ export default function ProtectedRoute() {
 
 现在把 `router.tsx` 更新，加入受保护路由。暂时只加一个占位页面测试效果：
 
-```bash
-touch src/pages/CreateCarPage.tsx
+```tsx
 // src/pages/CreateCarPage.tsx（占位）
 export default function CreateCarPage() {
   return <div className="p-8">发布车辆（占位）</div>
@@ -8243,14 +8241,6 @@ git push origin --delete feature/auth-pages
 
 
 
-好，先核查 Step 49 的内容。
-
-
-
-## 
-
-
-
 ## Step 49 · 首页：车辆列表
 
 ### 这一步做什么
@@ -8681,19 +8671,6 @@ import HomePage from '@/pages/HomePage'
 
 列表里每一项都是一张车辆卡片，把它抽成独立的组件，列表页只管布局和数据，卡片只管显示单辆车的信息。
 
-```bash
-touch src/components/CarCard.tsx
-import { Link } from 'react-router-dom'
-import type { Car } from '@/types'
-import {
-  Card,
-  CardContent,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
-import { Badge } from '@/components/ui/badge'
-```
-
 > **`Badge` 组件还没安装，先装上：**
 >
 > ```bash
@@ -8703,6 +8680,17 @@ import { Badge } from '@/components/ui/badge'
 继续写 `CarCard`：
 
 ```tsx
+// src/components/CarCard.tsx
+import { Link } from 'react-router-dom'
+import type { Car } from '@/types'
+import {
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card'
+import { Badge } from '@/components/ui/badge'
+
 interface CarCardProps {
   car: Car
 }
@@ -8758,8 +8746,8 @@ npx shadcn@latest add skeleton
 
 创建车辆卡片的骨架屏：
 
-```bash
-touch src/components/CarCardSkeleton.tsx
+```tsx
+// src/components/CarCardSkeleton.tsx
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 
@@ -9075,7 +9063,7 @@ React 允许你把可复用的逻辑封装成**自定义 Hook**。自定义 Hook
 用 `useState` 存防抖后的值，用 `useEffect` 管理定时器：
 
 ```ts
-touch src/hooks/useDebounce.ts
+// src/hooks/useDebounce.ts
 import { useState, useEffect } from 'react'
 
 // 泛型 T：让这个 Hook 能处理任意类型的值
@@ -11771,7 +11759,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 
 export default function MyListingsPage() {
-  /* -------------- 请求数据 -------------- */
+  /* -- 请求数据 -- */
 ...
 
   // 根据状态返回 Badge 的 variant
@@ -11828,11 +11816,11 @@ export default function MyListingsPage() {
 export default function MyListingsPage() {
     
   const queryClient = useQueryClient();
-  /* -------------- 请求数据 -------------- */
+  /* -- 请求数据 -- */
  
     ...
 
-  /* --------- submit Mutation -------- */
+  /* --- submit Mutation -- */
   const submitMutation = useMutation({
     mutationFn: (carId: number) => carsApi.submit(carId),
     onSuccess: () => {
@@ -11842,7 +11830,7 @@ export default function MyListingsPage() {
     onError: (error) => toast.error(error.message),
   });
 
-  /* --------- delete mutation -------- */
+  /* --- delete mutation -- */
 
   const deleteMutation = useMutation({
     mutationFn: (carId: number) => carsApi.delete(carId),
@@ -11869,16 +11857,16 @@ export default function MyListingsPage() {
 
 export default function MyListingsPage() {
  
-  /* -------------- 请求数据 -------------- */
+  /* -- 请求数据 -- */
   ...
 
   // 根据状态返回 Badge 的 variant
 	...
 
-  /* --------- submit Mutation -------- */
+  /* --- submit Mutation -- */
   	...
 
-  /* --------- delete mutation -------- */
+  /* --- delete mutation -- */
 
 	...
 
@@ -12002,7 +11990,7 @@ import { toast } from "sonner";
 
 const PAGE_SIZE = 10;
 
-/* -------------- Badge variant -------------- */
+/* -- Badge variant -- */
 const getStatusVariant = (status: string) => {
   switch (status) {
     case "Published":
@@ -12022,13 +12010,13 @@ export default function MyListingsPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const page = Number(searchParams.get("page") ?? "1");
 
-  /* -------------- 请求数据 -------------- */
+  /* -- 请求数据 -- */
   const { data, isLoading } = useQuery({
     queryKey: ["my-listings", { page, pageSize: PAGE_SIZE }],
     queryFn: () => carsApi.getMyListings({ page, pageSize: PAGE_SIZE }),
   });
 
-  /* -------------- Mutations -------------- */
+  /* -- Mutations -- */
   const submitMutation = useMutation({
     mutationFn: (carId: number) => carsApi.submit(carId),
     onSuccess: () => {
@@ -12051,7 +12039,7 @@ export default function MyListingsPage() {
     setSearchParams({ page: String(newPage) });
   };
 
-  /* -------------- Loading -------------- */
+  /* -- Loading -- */
   if (isLoading) {
     return (
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
@@ -12062,7 +12050,7 @@ export default function MyListingsPage() {
     );
   }
 
-  /* -------------- 空状态 -------------- */
+  /* -- 空状态 -- */
   if (!data?.items.length) {
     return (
       <div className="py-12 text-center text-gray-500">
@@ -12188,13 +12176,13 @@ export default function MyFavoritesPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const page = Number(searchParams.get("page") ?? "1");
 
-  /* -------------- 请求数据 -------------- */
+  /* -- 请求数据 -- */
   const { data, isLoading } = useQuery({
     queryKey: ["favorites", { page, pageSize: PAGE_SIZE }],
     queryFn: () => favoritesApi.getMyFavorites(page, PAGE_SIZE),
   });
 
-  /* -------------- Mutations -------------- */
+  /* -- Mutations -- */
   const removeMutation = useMutation({
     mutationFn: (carId: number) => favoritesApi.remove(carId),
     onSuccess: () => {
@@ -12208,7 +12196,7 @@ export default function MyFavoritesPage() {
     setSearchParams({ page: String(newPage) });
   };
 
-  /* -------------- Loading -------------- */
+  /* -- Loading -- */
   if (isLoading) {
     return (
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
@@ -12219,7 +12207,7 @@ export default function MyFavoritesPage() {
     );
   }
 
-  /* -------------- 空状态 -------------- */
+  /* -- 空状态 -- */
   if (!data?.items.length) {
     return (
       <div className="py-12 text-center text-gray-500">
@@ -12313,7 +12301,7 @@ import { Button } from "@/components/ui/button";
 
 const PAGE_SIZE = 10;
 
-/* -------------- Badge variant -------------- */
+/* -- Badge variant -- */
 const getStatusVariant = (status: string) => {
   switch (status) {
     case "Completed":
@@ -12330,14 +12318,14 @@ export default function MyPurchasesPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const page = Number(searchParams.get("page") ?? "1");
 
-  /* -------------- 请求数据 -------------- */
+  /* -- 请求数据 -- */
 
   const { data, isLoading } = useQuery({
     queryKey: ["my-purchases", { page, pageSize: PAGE_SIZE }],
     queryFn: () => ordersApi.getMyPurchases(page, PAGE_SIZE),
   });
 
-  /* -------------- Mutations -------------- */
+  /* -- Mutations -- */
   const cancelMutation = useMutation({
     mutationFn: (orderId: number) => ordersApi.cancel(orderId),
     onSuccess: () => {
@@ -12351,7 +12339,7 @@ export default function MyPurchasesPage() {
     setSearchParams({ page: String(newPage) });
   };
 
-  /* -------------- Loading -------------- */
+  /* -- Loading -- */
   if (isLoading) {
     return (
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
@@ -12362,7 +12350,7 @@ export default function MyPurchasesPage() {
     );
   }
 
-  /* -------------- 空状态 -------------- */
+  /* -- 空状态 -- */
   if (!data?.items.length) {
     return (
       <div className="py-12 text-center text-gray-500">No purchases yet.</div>
@@ -12460,7 +12448,7 @@ import { Button } from "@/components/ui/button";
 
 const PAGE_SIZE = 10;
 
-/* -------------- Badge variant -------------- */
+/* -- Badge variant -- */
 const getStatusVariant = (status: string) => {
   switch (status) {
     case "Completed":
@@ -12477,13 +12465,13 @@ export default function MySalesPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const page = Number(searchParams.get("page") ?? "1");
 
-  /* -------------- 请求数据 -------------- */
+  /* -- 请求数据 -- */
   const { data, isLoading } = useQuery({
     queryKey: ["my-sales", { page, pageSize: PAGE_SIZE }],
     queryFn: () => ordersApi.getMySales(page, PAGE_SIZE),
   });
 
-  /* -------------- Mutations -------------- */
+  /* -- Mutations -- */
   const completeMutation = useMutation({
     mutationFn: (orderId: number) => ordersApi.complete(orderId),
     onSuccess: () => {
@@ -12497,7 +12485,7 @@ export default function MySalesPage() {
     setSearchParams({ page: String(newPage) });
   };
 
-  /* -------------- Loading -------------- */
+  /* -- Loading -- */
   if (isLoading) {
     return (
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
@@ -12508,7 +12496,7 @@ export default function MySalesPage() {
     );
   }
 
-  /* -------------- 空状态 -------------- */
+  /* -- 空状态 -- */
   if (!data?.items.length) {
     return <div className="py-12 text-center text-gray-500">No sales yet.</div>;
   }
@@ -12662,4 +12650,804 @@ git push origin --delete feature/seller-pages
 ✅ MySalesPage（卖家订单 + 确认完成）
 ✅ 测试通过（标签切换/车辆操作/收藏/订单操作）
 ✅ feature/seller-pages 合并回 develop
+```
+
+
+
+## Step 55 · Admin 面板 + 错误页面
+
+### 这一步做什么
+
+完成最后两个功能模块：
+
+Admin 面板（待审核列表 + 审核通过/拒绝/删除）
+404页面
+通用错误处理（已有 toast，够用）
+
+
+
+### 1. admin角色的功能
+
+先切出新的分支
+
+```bash
+git checkout develop
+git checkout -b feature/admin-and-polish
+git push -u origin feature/admin-and-polish
+```
+
+admin角色功能用于对发表车辆的审核删除等操作，**admin不能实现**：
+
+- ~~sell a car~~
+- ~~Buy now~~
+- ~~用户信息下拉菜单 My Profile/My Listings/My Purchases~~
+
+这些功能是 user 角色的功能。
+
+因此先对之前完成的功能做一些角色限制相关的修改。
+
+**更新1：`Layout.tsx` — 导航栏的 Sell a Car 按钮 和下拉菜单**
+
+Admin 也不应该看到 Sell a Car，下拉菜单按角色显示不同的内容
+
+```tsx
+export default function Layout() {
+  const { user, isAuthenticated, logout } = useAuthStore();
+  const navigate = useNavigate();
+
+  // 判断是不是admin
+  const isAdmin = user?.role === "Admin";
+
+	...
+
+  return (
+    <div className="min-h-screen bg-gray-100">
+      <header className="border-b bg-white">
+        <div
+          className="mx-auto flex max-w-7xl items-center
+                        justify-between px-4 py-4"
+        >
+          {/* 左侧*/}
+            
+         	...
+            
+          {/* 右侧 */}
+          <div className="flex items-center gap-3">
+            {isAuthenticated() ? (
+              // 登录状态
+              <>
+                {/* 普通用户 发布车辆按钮  */}
+                {!isAdmin && (
+                  <Button asChild size="sm" variant="outline">
+                    <NavLink to="/cars/new">Sell a Car</NavLink>
+                  </Button>
+                )}
+
+                {/* 用户下拉菜单 */}
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button variant="ghost" size="sm">
+                      {user?.username}
+                    </Button>
+                  </DropdownMenuTrigger>
+
+                  <DropdownMenuContent align="end" className="w-48">
+                    {isAdmin ? (
+                      // role="admin"
+                      <>
+                        <DropdownMenuItem onClick={() => navigate("/admin")}>
+                          Admin Panel
+                        </DropdownMenuItem>
+                      </>
+                    ) : (
+                      // role="user"
+                      <>
+                        {/* 用户资料 */}
+                        <DropdownMenuItem onClick={() => navigate("/profile")}>
+                          My Profile
+                        </DropdownMenuItem>
+
+                        {/* 车辆发布列表 */}
+                        <DropdownMenuItem
+                          onClick={() => navigate("/profile/listings")}
+                        >
+                          My Listings
+                        </DropdownMenuItem>
+
+                        {/* 购买列表 */}
+                        <DropdownMenuItem
+                          onClick={() => navigate("/profile/purchases")}
+                        >
+                          My Purchases
+                        </DropdownMenuItem>
+                      </>
+                    )}
+
+                    {/* 分隔线 */}
+                    <DropdownMenuSeparator />
+
+                    {/* 退出登录 */}
+                    <DropdownMenuItem
+                      onClick={handleLogout}
+                      className="text-red-600"
+                    >
+                      Sign out
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </>
+            ) : (
+              // 未登录状态
+              <>
+                
+             	...
+                
+              </>
+            )}
+          </div>
+        </div>
+      </header>
+
+      <main className="mx-auto max-w-7xl px-4 py-8">
+        <Outlet />
+      </main>
+    </div>
+  );
+}
+
+```
+
+**更新2：`CarDetailPage.tsx` — Buy Now 排除 Admin**
+
+```tsx
+ /* -------------- 权限判断 -------------- */
+
+  // 判断当前用户是不是admin
+  const isAdmin = user?.role === "Admin";
+  // 判断当前用户是不是这辆车的车主
+  const isOwner = user?.id === car?.sellerId;
+  // 判断是否可以购买：已登录 + 不是admin + 不是车主  + 车辆是 Published 状态
+  const canBuy =
+    isAuthenticated() && !isAdmin && !isOwner && car?.status === "Published";
+```
+
+**更新3：登录成功后跳转的问题**
+
+登录的来源页面：登录页或者homePage里的car 详情页。因此登录成功后，页面跳转也分：
+
+- 从登录页登录：
+
+    - 管理员角色：跳转到管理页面 `'/admin'`
+    - 用户角色：跳转到首页 `'/'`
+
+- 从详情页登录：跳转到来源页， 使用 `useLocation`动态获取
+
+    `useLocation`返回当前路由的信息，其中state 是路由跳转时附带的格外数据，类型默认是unknown。 
+
+    比如从详情页跳转到登录页时， 会传递这样的state:
+
+    ```tsx
+    navigate('/login', {
+      state: { from: { pathname: '/cars/123' } }
+    })
+    ```
+
+    点击跳转时携带来源页信息
+
+    ```tsx
+    // 带上当前页面路径作为 state
+    <Link to="/login" state={{ from: { pathname: location.pathname } }}>
+      Sign in to purchase
+    </Link>
+    ```
+
+    获取跳转来源的路径
+
+    ```tsx
+    import {  useLocation } from 'react-router-dom'
+    
+    const location = useLocation()
+    // 有来源页就跳回去，没有的话 Admin 跳管理页、普通用户跳首页
+    
+    // 定义location state数据类型
+    interface LocationState {
+      from?: { pathname: string }
+    }
+    
+    // 先把 state 断言成明确的类型
+    const state = location.state as LocationState | null
+    
+    // 再取值
+    const from = state?.from?.pathname // null 时直接返回 undefined，不报错
+    ```
+
+    `from` 的类型是 `string | undefined`
+
+完整的更新
+
+ `CarDetailPage`详情页里"Sign in to purchase"的跳转到登录页时附带 `state`
+
+```tsx
+import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
+...
+
+export default function CarDetailPage() {
+  ...
+  // 页面路由信息
+  const location = useLocation();
+
+  /* ------------- 请求车辆详情 ------------- */
+
+  	...
+  
+  /* -------------- 权限判断 -------------- */
+	...
+
+  return (
+    <div className="mx-auto max-w-4xl space-y-6">
+      {/* 图片区域 */}
+          
+	...
+
+      {/* 基本信息 */}
+          
+    ...
+
+      {/* 操作按钮:权限判断，显示不同按钮   */}
+      <div className="border-t pt-4">
+        {!isAuthenticated() && (
+          // 未登录：引导去登录
+          <Button asChild className="w-full">
+            <Link
+              to="/login"
+              // 带上当前页面路径作为 state
+              state={{ from: { pathname: location.pathname } }}
+            >
+              Sign in to purchase
+            </Link>
+          </Button>
+        )}
+
+        {isOwner && (
+          // 车主：显示管理操作
+          ...
+        )}
+          
+		...
+          
+    </div>
+  );
+}
+
+```
+
+`LoginPage` 登录页里根据来源页和role匹配不同的跳转页面
+
+```tsx
+import { Link, useLocation, useNavigate } from "react-router-dom";
+
+...
+
+// 定义location state数据类型
+interface LocationState {
+  from?: { pathname: string };
+}
+
+export default function LoginPage() {
+
+  ...
+  
+  // 路由来源
+  const loction = useLocation();
+  // 获取路由跳转来源页路径信息
+  const state = loction.state as LocationState | null;
+  const from = state?.from?.pathname;
+
+  const onSubmit = async (data: LoginForm) => {
+    setServerError(null);
+    try {
+      const result = await authApi.login(data);
+      setAuth(result.user, result.token);
+
+      // 跳转
+      // 有来源页就跳回去，没有的话 Admin 跳管理页、普通用户跳首页
+      if (from) {
+        navigate(from, { replace: true });
+      } else if (result.user.role === "Admin") {
+        navigate("/admin", { replace: true });
+      } else {
+        navigate("/", { replace: true });
+      }
+    } catch (error) {
+    	...
+    }
+  };
+  return (
+    ...
+  );
+}
+
+```
+
+
+
+### 2. AdminRoute 
+
+Step 47 里已经实现了 `ProtectedRoute`， 现在要实现 `AdminRoute`，它的逻辑很简单：
+
+- 未登录 → 跳登录页
+- 登录了，但不是admin → 跳首页
+- admin登录 → 跳AdminPage页
+
+```tsx
+export default function AdminRoute() {
+  const { user, isAuthenticated } = useAuthStore()
+
+  // 未登录 → 跳登录页
+  if (!isAuthenticated()) {
+    return <Navigate to="/login" replace />
+  }
+
+  // 已登录但不是 Admin → 跳首页 （用户已经登录，然后再地址栏手动访问 `/admin`的话）
+  if (user?.role !== "Admin") {
+    return <Navigate to="/" replace />
+  }
+
+  return <Outlet />
+}
+```
+
+Admin 页面的路由配置
+
+```tsx
+import AdminPage from '@/pages/AdminPage'
+
+// AdminRoute 的 children 里
+{
+  element: <AdminRoute />,
+  children: [
+    {
+      path: '/admin',
+      element: <AdminPage />
+    },
+  ],
+},
+```
+
+
+
+### 3. Admin 面板布局（AdminPage）
+
+Admin 面板和个人中心的结构一样——外层布局 + 标签栏 + `Outlet`。
+
+打开 `src/pages/AdminPage.tsx`：
+
+```tsx
+import { NavLink, Outlet } from 'react-router-dom'
+
+const tabs = [
+  { to: '/admin/pending', label: 'Pending Review' },
+]
+
+export default function AdminPage() {
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-2xl font-bold">Admin Panel</h1>
+        <p className="text-gray-500">Manage car listings and users</p>
+      </div>
+
+      {/* 标签栏 */}
+      <div className="border-b">
+        <nav className="flex gap-1">
+          {tabs.map(tab => (
+            <NavLink
+              key={tab.to}
+              to={tab.to}
+              className={({ isActive }) =>
+                isActive
+                  ? 'border-b-2 border-blue-600 px-4 py-2 text-sm font-semibold text-blue-600'
+                  : 'px-4 py-2 text-sm text-gray-600 hover:text-gray-900'
+              }
+            >
+              {tab.label}
+            </NavLink>
+          ))}
+        </nav>
+      </div>
+
+      <Outlet />
+    </div>
+  )
+}
+```
+
+更新路由，确认 Admin 的嵌套结构正确。打开 `src/router.tsx`：
+
+```tsx
+import AdminPage from '@/pages/AdminPage'
+import AdminPendingPage from '@/pages/AdminPendingPage'
+
+// AdminRoute 的 children 里
+{
+  element: <AdminRoute />,
+  children: [
+    {
+      path: '/admin',
+      element: <AdminPage />,
+      children: [
+        { index: true, element: <AdminPendingPage /> },
+        { path: 'pending', element: <AdminPendingPage /> },
+      ],
+    },
+  ],
+},
+```
+
+### 
+
+### 4. 安装 Table 组件
+
+待审核列表用表格展示，更清晰：
+
+```bash
+npx shadcn@latest add table
+```
+
+**Table 的基本结构：**
+
+shadcn 的 Table 和 HTML 的 `<table>` 结构对应，只是加了样式：
+
+```tsx
+<Table>
+  <TableHeader>
+    <TableRow>
+      <TableHead>列标题</TableHead>
+    </TableRow>
+  </TableHeader>
+  <TableBody>
+    <TableRow>
+      <TableCell>数据</TableCell>
+    </TableRow>
+  </TableBody>
+</Table>
+```
+
+
+
+### 5. 待审核车辆列表（AdminPendingPage）
+
+打开 `src/pages/AdminPendingPage.tsx`：
+
+**第一步：请求数据 + 定义操作**
+
+```tsx
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
+import { adminApi } from "@/api";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+
+export default function AdminPendingPage() {
+  const queryClient = useQueryClient();
+
+  const { data, isLoading } = useQuery({
+    queryKey: ["admin-pending"],
+    queryFn: () => adminApi.getPendingCars(),
+  })
+
+  if (isLoading) return <div>Loading...</div>;
+
+  if (!data?.items.length) {
+    return (
+      <div className="py-12 text-center text-gray-500">
+        No cars pending review. All caught up!
+      </div>
+    );
+  }
+  return (
+    <Table>
+      <TableHeader>
+        <TableRow>
+          <TableHead>Title</TableHead>
+          <TableHead>Seller</TableHead>
+          <TableHead>Price</TableHead>
+          <TableHead>Year</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {data.items.map((car) => (
+          <TableRow key={car.id}>
+            <TableCell className="font-medium">{car.title}</TableCell>
+            <TableCell>{car.sellerUsername}</TableCell>
+            <TableCell>${car.price.toLocaleString()}</TableCell>
+            <TableCell>{car.year}</TableCell>
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
+  );
+}
+
+```
+
+**第二步：**定义操作
+
+```tsx
+...
+import { Button } from "@/components/ui/button";
+
+export default function AdminPendingPage() {
+  const queryClient = useQueryClient();
+
+  /* -------------- 请求数据 -------------- */
+  ...
+
+  /* --------- approveMutation -------- */
+  const approveMutation = useMutation({
+    mutationFn: (carId: number) => adminApi.approve(carId),
+    onSuccess: () => {
+      toast.success("Car approved and published!");
+      queryClient.invalidateQueries({ queryKey: ["admin-pending"] });
+      // 公开列表也需要刷新，新车上架了
+      queryClient.invalidateQueries({ queryKey: ["cars"] });
+    },
+    onError: (error) => toast.error(error.message),
+  });
+
+  /* --------- rejectMutation --------- */
+  const rejectMutation = useMutation({
+    mutationFn: (carId: number) => adminApi.reject(carId),
+    onSuccess: () => {
+      toast.success("Car rejected, returned to seller.");
+      queryClient.invalidateQueries({ queryKey: ["admin-pending"] });
+    },
+    onError: (error) => toast.error(error.message),
+  });
+    
+  /* --------- deleteMutation --------- */
+  const deleteMutation = useMutation({
+    mutationFn: (carId: number) => adminApi.deleteCar(carId),
+    onSuccess: () => {
+      toast.success("Car deleted.");
+      queryClient.invalidateQueries({ queryKey: ["admin-pending"] });
+    },
+    onError: (error) => toast.error(error.message),
+  });
+
+  if (isLoading) return <div>Loading...</div>;
+
+  if (!data?.items.length) {
+    return (
+      <div className="py-12 text-center text-gray-500">
+        No cars pending review. All caught up!
+      </div>
+    );
+  }
+  return (
+    <Table>
+      <TableHeader>
+        <TableRow>
+          <TableHead>Title</TableHead>
+          <TableHead>Seller</TableHead>
+          <TableHead>Price</TableHead>
+          <TableHead>Year</TableHead>
+          <TableHead className="text-right">Actions</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {data.items.map((car) => (
+          <TableRow key={car.id}>
+            <TableCell className="font-medium">{car.title}</TableCell>
+            <TableCell>{car.sellerUsername}</TableCell>
+            <TableCell>${car.price.toLocaleString()}</TableCell>
+            <TableCell>{car.year}</TableCell>
+            <TableCell>
+              <div className="flex justify-end gap-2">
+                <Button
+                  size="sm"
+                  onClick={() => approveMutation.mutate(car.id)}
+                  disabled={
+                    approveMutation.isPending ||
+                    rejectMutation.isPending ||
+                    deleteMutation.isPending
+                  }
+                >
+                  Approve
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => rejectMutation.mutate(car.id)}
+                  disabled={
+                    approveMutation.isPending ||
+                    rejectMutation.isPending ||
+                    deleteMutation.isPending
+                  }
+                >
+                  Reject
+                </Button>
+                <Button
+                  size="sm"
+                  variant="destructive"
+                  onClick={() => deleteMutation.mutate(car.id)}
+                  disabled={
+                    approveMutation.isPending ||
+                    rejectMutation.isPending ||
+                    deleteMutation.isPending
+                  }
+                >
+                  Delete
+                </Button>
+              </div>
+            </TableCell>
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
+  );
+}
+
+```
+
+> **为什么三个 mutation 都检查彼此的 `isPending`？** 防止 Admin 在一个操作还没完成时，又对同一辆车触发另一个操作。比如审核通过的请求还在飞，又点了删除，就会产生冲突。三个按钮共享禁用状态，任何一个操作进行中，其他按钮都禁用。
+
+
+
+### 6. 错误页面
+
+#### 6.1 404 页面
+
+打开 `src/pages/NotFoundPage.tsx`：
+
+```tsx
+import { Link } from 'react-router-dom'
+import { Button } from '@/components/ui/button'
+
+export default function NotFoundPage() {
+  return (
+    <div className="flex min-h-screen flex-col items-center
+                    justify-center gap-4 text-center">
+      <h1 className="text-6xl font-bold text-gray-200">404</h1>
+      <h2 className="text-2xl font-semibold">Page Not Found</h2>
+      <p className="text-gray-500">
+        The page you're looking for doesn't exist.
+      </p>
+      <Button asChild>
+        <Link to="/">Back to Home</Link>
+      </Button>
+    </div>
+  )
+}
+```
+
+#### 6.2 未授权页面
+
+非 Admin 访问 Admin 路由时跳转到 `/`，已经够用。不需要额外的 403 页面。
+
+#### 6.3 TanStack Query 的全局错误处理
+
+目前的错误处理是：每个 `useMutation` 单独的 `onError` 里调用 `toast.error()`。这对于这个项目来说已经足够了。
+
+但 `useQuery` 的错误目前只在组件里显示一段文字，还没有统一处理。给 `QueryClient` 加一个全局的 query 错误回调，让请求失败时自动显示 toast：
+
+打开 `src/main.tsx`，更新 `QueryClient` 配置：
+
+```tsx
+import { toast } from 'sonner'
+
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 1000 * 60,
+      retry: 1,
+    },
+  },
+  // 全局错误处理：所有 useQuery 失败时自动显示 toast
+  // 不需要在每个组件里单独处理 query 错误
+  queryCache: new QueryCache({
+    onError: (error) => {
+      toast.error(error.message)
+    },
+  }),
+})
+```
+
+补上 import：
+
+```tsx
+import { QueryClient, QueryClientProvider, QueryCache } from '@tanstack/react-query'
+```
+
+
+
+### 7. 完整测试
+
+```bash
+npm run dev
+```
+
+**测试 Admin 面板：**
+
+用普通用户账号访问 `/admin`，应该跳转到 `/404`，看到 404 页面。
+
+用 Admin 账号（`admin@uucars.com`）登录，导航栏下拉菜单里有 "Admin Panel" 入口。
+
+进入 Admin 面板，看到待审核的车辆列表（数据库里需要有 PendingReview 状态的车辆）。
+
+**测试审核通过：**
+
+点 "Approve"，车辆从待审核列表消失，toast 显示成功。访问首页，被审核通过的车辆出现在列表里。
+
+**测试审核拒绝：**
+
+点 "Reject"，车辆从待审核列表消失。卖家在 My Listings 里看到这辆车状态变回 Draft，可以重新编辑提交。
+
+**测试删除违规车辆：**
+
+点 "Delete"，车辆从列表消失，数据库里状态变为 Deleted。
+
+**测试 404 页面：**
+
+访问 `http://localhost:5173/any-random-path`，应该显示 404 页面。
+
+**测试全局 query 错误：**
+
+临时停掉后端，刷新首页，应该看到右下角弹出错误 toast，而不是空白页面。
+
+
+
+### 8. 此时的目录变化
+
+```
+src/
+├── pages/
+│   ├── AdminPage.tsx         ← 已更新（完整实现）
+│   ├── AdminPendingPage.tsx  ← 已更新（完整实现）
+│   └── NotFoundPage.tsx      ← 已更新（完整实现）
+└── main.tsx                  ← 已更新（QueryCache全局错误）
+```
+
+
+
+### 9. Git 提交 + 合并 + 里程碑 tag
+
+```bash
+git add .
+git commit -m "feat: admin panel + 404 page + global error handling"
+git push origin feature/admin-and-polish
+
+# 合并回 develop
+git checkout develop
+git merge --no-ff feature/admin-and-polish \
+    -m "merge: feature/admin-and-polish into develop"
+git push origin develop
+git branch -D feature/admin-and-polish
+git push origin --delete feature/admin-and-polish
+
+# 前端核心页面全部完成，合并到 main 打里程碑 tag
+git checkout main
+git merge --no-ff develop \
+    -m "release: v2.0-frontend - all core pages complete"
+git tag -a v2.0-frontend \
+    -m "V2 frontend: auth + car listing + detail + profile + admin"
+git push origin main
+git push origin v2.0-frontend
+git checkout develop
+```
+
+
+
+### Step 55 完成状态
+
+```
+✅ 切出 feature/admin-and-polish 分支
+✅ AdminPage（嵌套路由布局 + 标签栏）
+✅ 安装 Table 组件，理解其结构
+✅ AdminPendingPage（待审核列表 + 审核通过/拒绝/删除）
+✅ 三个操作按钮共享禁用状态（防止并发操作冲突）
+✅ 404 页面
+✅ QueryCache 全局错误处理（useQuery 失败自动 toast）
+✅ 测试通过（权限拦截/审核通过/拒绝/删除/404/全局错误）
+✅ feature/admin-and-polish 合并回 develop
+✅ v2.0-frontend 里程碑 tag 打完
 ```
