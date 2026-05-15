@@ -13,6 +13,9 @@ export default function Layout() {
   const { user, isAuthenticated, logout } = useAuthStore();
   const navigate = useNavigate();
 
+  // 判断是不是admin
+  const isAdmin = user?.role === "Admin";
+
   /* ------------ 导航链接的样式函数 ----------- */
   // isActive 为 true 时：蓝色加粗
   // isActive 为 false 时：灰色，hover 时变深
@@ -52,10 +55,12 @@ export default function Layout() {
             {isAuthenticated() ? (
               // 登录状态
               <>
-                {/* 发布车辆按钮 */}
-                <Button asChild size="sm" variant="outline">
-                  <NavLink to="/cars/new">Sell a Car</NavLink>
-                </Button>
+                {/* 普通用户 发布车辆按钮  */}
+                {!isAdmin && (
+                  <Button asChild size="sm" variant="outline">
+                    <NavLink to="/cars/new">Sell a Car</NavLink>
+                  </Button>
+                )}
 
                 {/* 用户下拉菜单 */}
                 <DropdownMenu>
@@ -66,37 +71,39 @@ export default function Layout() {
                   </DropdownMenuTrigger>
 
                   <DropdownMenuContent align="end" className="w-48">
-                    {/* 用户资料 */}
-                    <DropdownMenuItem onClick={() => navigate("/profile")}>
-                      My Profile
-                    </DropdownMenuItem>
-
-                    {/* 车辆发布列表 */}
-                    <DropdownMenuItem
-                      onClick={() => navigate("/profile/listings")}
-                    >
-                      My Listings
-                    </DropdownMenuItem>
-
-                    {/* 购买列表 */}
-                    <DropdownMenuItem
-                      onClick={() => navigate("/profile/purchases")}
-                    >
-                      My Purchases
-                    </DropdownMenuItem>
-
-                    {/* 分隔线 */}
-                    <DropdownMenuSeparator />
-
-                    {/* Admin 入口：只有 Admin 角色才显示 */}
-                    {user?.role === "Admin" && (
+                    {isAdmin ? (
+                      // role="admin"
                       <>
                         <DropdownMenuItem onClick={() => navigate("/admin")}>
                           Admin Panel
                         </DropdownMenuItem>
-                        <DropdownMenuSeparator />
+                      </>
+                    ) : (
+                      // role="user"
+                      <>
+                        {/* 用户资料 */}
+                        <DropdownMenuItem onClick={() => navigate("/profile")}>
+                          My Profile
+                        </DropdownMenuItem>
+
+                        {/* 车辆发布列表 */}
+                        <DropdownMenuItem
+                          onClick={() => navigate("/profile/listings")}
+                        >
+                          My Listings
+                        </DropdownMenuItem>
+
+                        {/* 购买列表 */}
+                        <DropdownMenuItem
+                          onClick={() => navigate("/profile/purchases")}
+                        >
+                          My Purchases
+                        </DropdownMenuItem>
                       </>
                     )}
+
+                    {/* 分隔线 */}
+                    <DropdownMenuSeparator />
 
                     {/* 退出登录 */}
                     <DropdownMenuItem

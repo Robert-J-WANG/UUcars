@@ -2,7 +2,7 @@ import { useState } from "react";
 import { z } from "zod";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 import { authApi } from "@/api";
 import { useAuthStore } from "@/stores/authStore";
 
@@ -25,9 +25,16 @@ const loginSchema = z.object({
 // 从 Schema 推导类型
 type LoginForm = z.infer<typeof loginSchema>;
 
+// 定义location state数据类型
+interface LocationState {
+  from?: { pathname: string };
+}
+
 export default function LoginPage() {
   // 路由跳转
   const navigate = useNavigate();
+  // 路由来源
+  const loction = useLocation();
   const { setAuth } = useAuthStore();
   // const [isLoading, setIsLoading] = useState<boolean>(false);
   // 服务端错误信息（密码错误、邮箱未验证等）
@@ -41,6 +48,10 @@ export default function LoginPage() {
   } = useForm<LoginForm>({
     resolver: zodResolver(loginSchema),
   });
+
+  // 获取路由跳转来源页路径信息
+  const state = loction.state as LocationState | null;
+  const from = state?.from?.pathname;
 
   // onSubmit 只在 RHF 验证通过后才会被调用
   // data 是表单所有字段的值，类型是 LoginForm
@@ -56,8 +67,15 @@ export default function LoginPage() {
       // setAuth 内部会同时写入 localStorage
       setAuth(result.user, result.token);
 
-      // 跳转首页
-      navigate("/");
+      // 跳转
+      // 有来源页就跳回去，没有的话 Admin 跳管理页、普通用户跳首页
+      if (from) {
+        navigate(from, { replace: true });
+      } else if (result.user.role === "Admin") {
+        navigate("/admin", { replace: true });
+      } else {
+        navigate("/", { replace: true });
+      }
     } catch (error) {
       // Axios 拦截器已经把错误提取成 Error 对象
       // 直接读 message 显示给用户
