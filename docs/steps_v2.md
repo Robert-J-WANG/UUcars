@@ -12800,7 +12800,7 @@ export default function Layout() {
 **更新2：`CarDetailPage.tsx` — Buy Now 排除 Admin**
 
 ```tsx
- /* -------------- 权限判断 -------------- */
+ /* -- 权限判断 -- */
 
   // 判断当前用户是不是admin
   const isAdmin = user?.role === "Admin";
@@ -12876,11 +12876,11 @@ export default function CarDetailPage() {
   // 页面路由信息
   const location = useLocation();
 
-  /* ------------- 请求车辆详情 ------------- */
+  /* - 请求车辆详情 - */
 
   	...
   
-  /* -------------- 权限判断 -------------- */
+  /* -- 权限判断 -- */
 	...
 
   return (
@@ -13179,10 +13179,10 @@ import { Button } from "@/components/ui/button";
 export default function AdminPendingPage() {
   const queryClient = useQueryClient();
 
-  /* -------------- 请求数据 -------------- */
+  /* -- 请求数据 -- */
   ...
 
-  /* --------- approveMutation -------- */
+  /* --- approveMutation -- */
   const approveMutation = useMutation({
     mutationFn: (carId: number) => adminApi.approve(carId),
     onSuccess: () => {
@@ -13194,7 +13194,7 @@ export default function AdminPendingPage() {
     onError: (error) => toast.error(error.message),
   });
 
-  /* --------- rejectMutation --------- */
+  /* --- rejectMutation --- */
   const rejectMutation = useMutation({
     mutationFn: (carId: number) => adminApi.reject(carId),
     onSuccess: () => {
@@ -13204,7 +13204,7 @@ export default function AdminPendingPage() {
     onError: (error) => toast.error(error.message),
   });
     
-  /* --------- deleteMutation --------- */
+  /* --- deleteMutation --- */
   const deleteMutation = useMutation({
     mutationFn: (carId: number) => adminApi.deleteCar(carId),
     onSuccess: () => {
@@ -13450,4 +13450,640 @@ git checkout develop
 ✅ 测试通过（权限拦截/审核通过/拒绝/删除/404/全局错误）
 ✅ feature/admin-and-polish 合并回 develop
 ✅ v2.0-frontend 里程碑 tag 打完
+```
+
+
+
+手册读完了。内容整体是正确的，有几处需要核查和修正：
+
+1. **Step 4（前端部署）里的 git 操作有问题**：`.env.production` 和 `staticwebapp.config.json` 应该在 feature 分支上提交，不应该直接在 develop 上操作，不符合之前建立的分支策略。
+2. **Static Web Apps 的 workflow 文件**：Azure 会自动在仓库里创建一个 `.github/workflows/azure-static-web-apps-xxx.yml`，这个文件需要手动调整 `app_location` 路径，手册里没有提到这一步。
+3. **手册的顺序**：先配置前端环境变量（.env.production）再部署 Static Web Apps 是正确的，但实际上前端 URL 在 Static Web Apps 创建之前是不知道的，所以 CORS 和 EmailSettings 的更新必须在前端部署之后，这个顺序手册里是对的。
+4. **GitHub Secrets 手册里只列了 3 个**（CLIENT_ID、TENANT_ID、SUBSCRIPTION_ID），但这三个就够了，OIDC 不需要 Client Secret，这是正确的。
+
+现在生成步骤笔记。
+
+
+
+## Step 56 · Azure 云部署
+
+### 这一步做什么
+
+把整个项目部署到真实的生产环境，实现完整的 CI/CD 自动化流程。
+
+部署完成后，每次 `git push origin main`，系统会自动完成：
+
+```
+单元测试 → 构建 Docker 镜像 → 推送到 ghcr.io
+→ 通知 Azure Container Apps 拉取新镜像更新后端
+→ 构建 React 前端 → 部署到 Azure Static Web Apps
+```
+
+### 为什么选 Azure 这套方案
+
+| 服务                            | 作用                                  | 费用     |
+| - | - | -- |
+| Azure Container Apps            | 后端 API 容器化托管，无流量时缩容到零 | ~$0/月   |
+| Azure SQL Database (Free Offer) | 生产数据库，无流量时自动暂停          | 完全免费 |
+| Azure Static Web Apps           | 前端静态托管，全球 CDN，自动 HTTPS    | 完全免费 |
+
+> **冷启动说明：** Container Apps 缩容到零后首次请求约需 10-30 秒，SQL Serverless 自动暂停后首次连接约需 20 秒唤醒。这是成本优化的设计决策，portfolio 项目完全可以接受，面试时可以主动解释。
+
+
+
+### 1. 切出部署分支
+
+```bash
+git checkout develop
+git checkout -b feature/azure-deployment
+git push -u origin feature/azure-deployment
+```
+
+
+
+### 2. 创建 Azure 账号与资源组
+
+**注册账号：**
+
+访问 [portal.azure.com](https://portal.azure.com/) 注册，需要信用卡验证身份，新账号获得 $200 免费额度。
+
+**创建资源组：**
+
+资源组是一个"文件夹"，把所有 Azure 资源（数据库、容器、静态网站）放在一起统一管理，删项目时直接删资源组就能清理所有资源。
+
+Portal 左侧导航点 `Resource groups` → `+ Create`：
+
+```
+Resource group name:  uucars-rg
+Region:               Australia East   ← 离新西兰最近
+```
+
+点 `Review + create` → `Create`。
+
+
+
+### 3. 创建 Azure SQL Serverless 数据库
+
+**为什么用 Serverless 版本：** 普通 Azure SQL 需要持续运行，约 $15/月起。Serverless 版本无流量时自动暂停，只收存储费，Free Offer 套餐每月 100,000 vCore 秒 + 32GB 存储完全免费。
+
+**操作步骤：**
+
+Portal 搜索 `Azure SQL Database` → `+ Create`，选择 **`SQL database (free offer)`**。
+
+> ⚠️ 必须选 `free offer` 版本，选错会产生费用。
+
+填写基本信息：
+
+```
+Resource Group:  uucars-rg
+Database name:   uucarsdb
+```
+
+Server 选 `Create new`：
+
+```
+Server name:        uucars-sql-server   （全球唯一）
+Location:           Australia East
+Authentication:     SQL authentication
+Admin login:        uucarsadmin
+Password:           自定义强密码（保存好，后面需要）
+```
+
+`Review + create` 确认配置里显示 `Serverless` 和 `Free` 后点 `Create`，等待约 2-3 分钟。
+
+**获取连接字符串：**
+
+进入数据库页面 → 左侧 `Connection strings` → 选 `ADO.NET (SQL authentication)` 标签，复制并替换密码：
+
+```
+Server=tcp:uucars-sql-server.database.windows.net,1433;
+Initial Catalog=uucarsdb;
+Persist Security Info=False;
+User ID=uucarsadmin;
+Password=你的实际密码;
+MultipleActiveResultSets=False;
+Encrypt=True;
+TrustServerCertificate=False;
+Connection Timeout=30;
+```
+
+> 注意：密码直接填写，不加引号。
+
+**本地连接数据库跑 Migration（可选）：**
+
+如果需要从本地连接云数据库（比如手动跑 Migration），进入 SQL Server → `Networking` → 添加本机 IP 地址。项目里已配置应用启动时自动执行 Migration，这步可跳过。
+
+
+
+### 4. 创建 Azure Container Apps（后端）
+
+**为什么用 Container Apps 而不是 App Service：**
+
+App Service F1 免费层不支持 Docker 容器；
+
+B1 支持但要 $13/月。
+
+Container Apps 支持 Docker、可缩容到零、费用接近 $0，是最优选择。
+
+**准备 GitHub Personal Access Token：**
+
+Container Apps 需要从 ghcr.io 拉取私有镜像，需要 GitHub Token 认证：
+
+访问 `github.com/settings/tokens` → `Generate new token (classic)`：
+
+```
+Note:        azure-container-apps-pull
+Expiration:  No expiration（或 1 year）
+Scope:       只勾选 read:packages
+```
+
+生成后**立即复制保存**，只显示一次。
+
+**创建 Container App：**
+
+Portal 搜索 `Container Apps` → `+ Create` → `Container App`：
+
+Basics 页面：
+
+```
+Resource group:             uucars-rg
+Container app name:         uucars-api
+Region:                     Australia East
+Container Apps environment: 自动生成（保持默认）
+```
+
+Container 页面：
+
+- `Use quickstart image`：**不勾选**
+- Image source：选 `Docker Hub or other registries`
+- Image type：选 `Private`
+
+```
+Registry login server:  ghcr.io
+Registry user name:     你的GitHub用户名（必须小写）
+Registry password:      上一步的 PAT Token
+Image and tag:          你的github用户名小写/uucars-api:latest
+```
+
+> ⚠️ 用户名必须小写，ghcr.io 对大小写敏感。
+
+环境变量（在 Container 页面下方逐一添加）：
+
+```
+ConnectionStrings__DefaultConnection  = （完整连接字符串）
+JwtSettings__Secret                   = 你的JWT密钥（至少32字符）
+JwtSettings__Issuer                   = UUcars
+JwtSettings__Audience                 = UUcarsUsers
+JwtSettings__ExpiresInMinutes         = 60
+EmailSettings__ApiKey                 = Resend API Key
+EmailSettings__FromEmail              = 发件邮箱
+EmailSettings__FromName               = UUcars
+EmailSettings__BaseUrl                = http://localhost:5173（前端部署后再改）
+StorageSettings__AccessKeyId          = R2 Access Key ID
+StorageSettings__SecretAccessKey      = R2 Secret Access Key
+StorageSettings__AccountId            = R2 Account ID
+StorageSettings__BucketName           = 存储桶名称
+StorageSettings__PublicUrl            = R2 公开访问 URL
+Cors__AllowedOrigins__0               = http://localhost:5173（前端部署后再改）
+ASPNETCORE_ENVIRONMENT                = Production
+```
+
+> **为什么用双下划线？** ASP.NET Core 会自动将环境变量里的 `__` 转换成 JSON 配置里的 `.`（层级分隔符），这是框架约定。`ConnectionStrings__DefaultConnection` 等价于 appsettings.json 里的 `ConnectionStrings.DefaultConnection`。
+
+Ingress 页面（必须配置，否则外网访问不到）：
+
+```
+Ingress:          ✅ 勾选
+Ingress traffic:  Accepting traffic from anywhere
+Ingress type:     HTTP
+Target port:      8080   ← 与 Dockerfile 里的 EXPOSE 8080 一致
+```
+
+`Review + create` → `Create`，等待约 3-5 分钟。
+
+**验证后端是否正常：**
+
+Overview 页面找到 `Application URL`，浏览器访问：
+
+```
+https://uucars-api.australiaeast.azurecontainerapps.io/cars
+```
+
+返回 JSON（即使是空列表）即表示成功。如果启动失败，去 `Monitoring` → `Log stream` 查看实时日志，找 `Exception` 关键字排查。
+
+
+
+### 5. 准备前端生产配置（提交到 feature 分支）
+
+前端部署前需要两个文件提交到 Git：
+
+**5.1 创建生产环境变量文件**
+
+在前端项目根目录（`uucars-web/`）创建 `.env.production`：
+
+```
+VITE_API_BASE_URL=https://uucars-api.australiaeast.azurecontainerapps.io
+```
+
+> `.env.production` 存储的是公开的 URL，不是密钥，可以安全提交到 Git。确认 `.gitignore` 里只忽略 `.env`，不忽略 `.env.production`。
+
+**5.2 创建 SPA 路由回退配置**
+
+在前端项目根目录创建 `staticwebapp.config.json`：
+
+```json
+{
+  "navigationFallback": {
+    "rewrite": "/index.html",
+    "exclude": ["/assets/*", "/*.{css,js,ico,png,jpg,svg}"]
+  }
+}
+```
+
+为什么需要这个文件：React Router 的路由是在客户端由 JavaScript 处理的，服务器上实际只有 `index.html` 一个文件。当用户直接访问 `/verify-email?token=xxx` 或刷新页面时，Azure 服务器找不到对应文件就会返回 404。这个配置告诉 Azure：所有未找到的路径都返回 `index.html`，让 React Router 来处理。
+
+**5.3 提交到 feature 分支**
+
+```bash
+git add uucars-web/.env.production uucars-web/staticwebapp.config.json
+git commit -m "feat: add production env config and SPA routing fallback"
+git push origin feature/azure-deployment
+```
+
+
+
+### 6. 部署前端到 Azure Static Web Apps
+
+**创建 Static Web App：**
+
+Portal 搜索 `Static Web Apps` → `+ Create`：
+
+```
+Resource Group:  uucars-rg
+Name:            uucars-web
+Plan type:       Free
+Source:          GitHub
+```
+
+点 `Sign in with GitHub` 授权后：
+
+```
+Organization:  你的GitHub用户名
+Repository:    UUcars
+Branch:        main
+```
+
+Build Details（Azure 会自动检测，但要确认）：
+
+```
+Build Presets:   React (detected)
+App location:    /uucars-web    ← 前端代码在仓库里的路径
+Output location: dist           ← Vite 构建输出目录是 dist，不是 build！
+```
+
+> ⚠️ Output location 必须填 `dist`，Vite 项目的构建产物在 `dist` 目录，不是 CRA 的 `build` 目录。
+
+`Review + create` → `Create`。
+
+**Azure 会自动在仓库里创建一个 workflow 文件**，路径类似 `.github/workflows/azure-static-web-apps-xxx.yml`，同时触发首次构建。
+
+**检查并修正自动生成的 workflow 文件：**
+
+Azure 自动生成的 workflow 有时 `app_location` 路径不准确，需要确认。去 GitHub 仓库找到这个文件，确认以下字段：
+
+```yaml
+app_location: "/uucars-web"      # 前端代码目录，相对于仓库根目录
+output_location: "dist"          # Vite 构建输出目录
+api_location: ""                 # 没有后端 API，留空
+```
+
+如果有误，直接在 GitHub 上编辑保存即可触发重新构建。
+
+**获取前端公网地址：**
+
+Static Web Apps Overview 页面，复制 `URL`，格式类似：
+
+```
+https://black-coast-04ba93800.7.azurestaticapps.net
+```
+
+
+
+### 7. 更新后端 CORS 和邮件配置
+
+前端地址拿到后，更新 Container App 里的两个环境变量，否则前端无法调用后端 API。
+
+Container App → `Application` → `Containers` → `Environment variables` 标签，找到并修改：
+
+```
+Cors__AllowedOrigins__0  →  https://black-coast-04ba93800.7.azurestaticapps.net
+EmailSettings__BaseUrl   →  https://black-coast-04ba93800.7.azurestaticapps.net
+```
+
+修改后点底部 **`Save as a new revision`**，Container App 自动重启应用新配置。
+
+
+
+### 8. 配置 GitHub Actions 自动部署后端
+
+目前 CI/CD 只会构建镜像推送到 ghcr.io，但 Container App 不会自动拉取新镜像。这一步配置完成后，push 到 main 就会自动完成全套部署。
+
+**8.1 创建 App Registration（Service Principal）**
+
+Portal 搜索 `Microsoft Entra ID` → 左侧 `App registrations` → `New registration`：
+
+```
+Name:          uucars-github-actions
+Account types: Single tenant only（默认）
+```
+
+点 `Register`，记录以下两个值：
+
+```
+Application (client) ID:  xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+Directory (tenant) ID:    xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+```
+
+**8.2 配置 Federated Credential（OIDC）**
+
+OIDC 是 GitHub Actions 连接 Azure 的推荐方式，不需要 Client Secret，更安全。
+
+进入刚创建的 App → `Certificates & secrets` → `Federated credentials` 标签 → `+ Add credential`：
+
+选 `GitHub Actions deploying Azure resources`，填写：
+
+```
+Organization:        你的GitHub用户名（区分大小写）
+Repository:          UUcars（区分大小写）
+Entity type:         Branch
+GitHub branch name:  main
+Name:                github-actions-main
+```
+
+点 `Add`。
+
+**8.3 分配权限**
+
+Portal 搜索 `Resource groups` → 点击 `uucars-rg` → 左侧 `Access control (IAM)` → `+ Add` → `Add role assignment`：
+
+搜索并选 `Container Apps Contributor` → `Next` → `+ Select members` → 搜索 `uucars-github-actions` 选中 → `Review + assign`。
+
+**8.4 添加 GitHub Secrets**
+
+访问 `github.com/你的用户名/UUcars/settings/secrets/actions`，添加 3 个 Secret：
+
+```
+AZURE_CLIENT_ID        =  App Registration 的 Application (client) ID
+AZURE_TENANT_ID        =  App Registration 的 Directory (tenant) ID
+AZURE_SUBSCRIPTION_ID  =  Azure 订阅 ID（Portal 首页搜索 Subscriptions 可找到）
+```
+
+> ⚠️ 每个值手动输入，不要复制粘贴，避免带入不可见字符。Tenant ID 必须是纯 GUID 格式：`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`。认证失败时最先检查 Tenant ID 是否正确。
+
+**8.5 更新 CI/CD Workflow**
+
+打开 `.github/workflows/ci.yml`，在原有的 `build-and-push` job 后面新增 `deploy` job：
+
+```yaml
+name: CI/CD
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/uucars-api
+
+jobs:
+  # Job 1：单元测试（所有分支都跑）
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "9.0.x"
+      - run: dotnet restore
+      - run: dotnet build --no-restore
+      - run: dotnet test --no-build --filter "FullyQualifiedName!~Integration"
+
+  # Job 2：构建并推送 Docker 镜像（只在 main 分支）
+  build-and-push:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Job 3：部署到 Azure Container Apps（Job 2 成功后执行）
+  deploy:
+    name: Deploy to Azure Container Apps
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      id-token: write    # OIDC 认证必须声明此权限，缺少会导致认证失败
+      contents: read
+    steps:
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy to Container Apps
+        uses: azure/container-apps-deploy-action@v1
+        with:
+          resourceGroup: uucars-rg
+          containerAppName: uucars-api
+          imageToDeploy: ghcr.io/${{ github.repository_owner }}/uucars-api:latest
+```
+
+> **关键点：** 使用 OIDC 方式登录不需要 `client-secret`，只需要三个 ID。`permissions: id-token: write` 缺少会导致 OIDC 认证失败，这是最常见的配置错误之一。
+
+**8.6 提交并触发完整 CI/CD**
+
+```bash
+git add .github/workflows/ci.yml
+git commit -m "feat: add Azure Container Apps auto deploy job"
+git push origin feature/azure-deployment
+```
+
+
+
+### 9. 合并分支并触发完整部署
+
+feature 分支上的所有改动都准备好后，合并回 develop，再合并到 main 触发完整的自动化部署：
+
+```bash
+git checkout develop
+git merge --no-ff feature/azure-deployment -m "merge: feature/azure-deployment into develop"
+git push origin develop
+git branch -D feature/azure-deployment
+git push origin --delete feature/azure-deployment
+
+git checkout main
+git merge --no-ff develop -m "release: v2.0 complete - Azure cloud deployment"
+git push origin main   # ← 这一步触发全套自动化部署
+git checkout develop
+```
+
+push 到 main 后，去 GitHub Actions 页面观察三个 job 依次执行：
+
+```
+✅ Unit Tests
+✅ Build & Push Docker Image
+✅ Deploy to Azure Container Apps
+✅ Azure Static Web Apps CI/CD（Azure 自动生成的 workflow）
+```
+
+
+
+### 10. 验证与测试
+
+**验证后端 API：**
+
+```bash
+curl https://uucars-api.australiaeast.azurecontainerapps.io/cars
+# 期望返回：{"success":true,"data":{"items":[],"totalCount":0,...}}
+```
+
+**验证前端：**
+
+访问 Static Web Apps 的 URL，测试完整流程：注册 → 收到验证邮件 → 点链接验证 → 登录 → 发布车辆 → 搜索浏览。
+
+**验证路由回退：**
+
+直接在浏览器地址栏访问 `https://你的前端地址/cars/1`（不经过首页点击），应该正常加载，不返回 404。
+
+
+
+### 11. 常见问题排查
+
+**API 返回 404：** 检查 Controller 的 `[Route]` 路由路径；查看 Container App → `Monitoring` → `Log stream`，确认日志有 `Application started` 和 `Now listening on: http://[::]:8080`。
+
+**前端显示请求失败：** 检查 Container App 环境变量 `Cors__AllowedOrigins__0` 是否设为前端完整 URL（含 `https://`）。
+
+**邮件链接点击后 404：** 检查 `staticwebapp.config.json` 是否已提交并推送到 main 分支。
+
+**GitHub Actions 报 "Tenant not found"：** 在 GitHub Secrets 中重新手动输入 `AZURE_TENANT_ID`，不要复制粘贴，避免带入不可见字符。
+
+**前端 VITE_API_BASE_URL 为 undefined：** 确认 `.env.production` 已提交到 Git，`.gitignore` 里没有忽略它。
+
+**Container App 部署成功但 API 不工作：** 查看 Log stream 找 `Exception` 关键字，通常是数据库连接字符串配置错误或 Migration 失败。
+
+
+
+### 12. 日常工作流（部署后）
+
+```bash
+# 1. 切出功能分支开发
+git checkout -b feature/your-feature
+
+# 2. 开发提交
+git commit -m "feat: ..."
+
+# 3. 合并回 develop（不触发部署）
+git checkout develop
+git merge --no-ff feature/your-feature -m "merge: ..."
+git push origin develop
+git branch -D feature/your-feature
+
+# 4. 里程碑时合并到 main → 自动触发全套部署
+git checkout main
+git merge --no-ff develop -m "release: ..."
+git push origin main   # ← 触发完整 CI/CD
+git checkout develop
+```
+
+
+
+### Step 56 完成状态
+
+```
+✅ Azure 账号 + 资源组建立
+✅ Azure SQL Database Serverless（Free Offer）
+✅ Azure Container Apps 部署后端（Docker 容器）
+✅ .env.production 提交（前端生产 API 地址）
+✅ staticwebapp.config.json 提交（SPA 路由回退）
+✅ Azure Static Web Apps 部署前端
+✅ CORS 和邮件配置更新为前端真实地址
+✅ App Registration + OIDC Federated Credential 配置
+✅ Container Apps Contributor 权限分配
+✅ GitHub Secrets 添加（3 个 Azure ID）
+✅ CI/CD workflow 新增 deploy job（3个 job 串联）
+✅ push 到 main 触发完整自动化部署验证通过
+✅ feature/azure-deployment 合并回 develop → main
+```
+
+
+
+### 完整架构图
+
+```
+开发者本地
+    │
+    ├── git push origin main
+    │
+    ▼
+GitHub Repository
+    │
+    ├── GitHub Actions CI/CD Workflow (.github/workflows/ci.yml)
+    │   ├── Job 1: 单元测试（所有分支）
+    │   ├── Job 2: 构建 Docker 镜像 → ghcr.io（仅 main）
+    │   └── Job 3: 通知 Azure Container Apps 更新（仅 main）
+    │
+    └── Azure Static Web Apps Workflow（Azure 自动生成）
+        └── 构建 React → 部署到 Static Web Apps（仅 main）
+
+                    │                           │
+                    ▼                           ▼
+         Azure Container Apps          Azure Static Web Apps
+         (后端 ASP.NET Core API)       (前端 React + Vite)
+              │
+              ▼
+         Azure SQL Database
+         (Serverless，自动暂停)
+              │
+              ▼
+         Cloudflare R2
+         (图片等静态资源)
+```
+
+
+
+### 打里程碑 tag
+
+```bash
+git tag -a v2.0 -m "UUcars V2 - Full stack Azure cloud deployment with CI/CD"
+git push origin v2.0
 ```
