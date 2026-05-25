@@ -1,11 +1,12 @@
 import { NavLink, Outlet } from "react-router-dom";
 import { useAuthStore } from "@/stores/authStore";
+import { ListFilter, Heart, ShoppingBag, TrendingUp } from "lucide-react";
 
 const tabs = [
-  { to: "/profile/listings", label: "My Listings" },
-  { to: "/profile/favorites", label: "My Favorites" },
-  { to: "/profile/purchases", label: "My Purchases" },
-  { to: "/profile/sales", label: "My Sales" },
+  { to: "/profile/listings", label: "My Listings", icon: ListFilter },
+  { to: "/profile/favorites", label: "Saved Cars", icon: Heart },
+  { to: "/profile/purchases", label: "My Purchases", icon: ShoppingBag },
+  { to: "/profile/sales", label: "My Sales", icon: TrendingUp },
 ];
 
 export default function ProfilePage() {
@@ -14,32 +15,60 @@ export default function ProfilePage() {
   return (
     <div className="space-y-6">
       {/* 页头 */}
-      <div>
-        <h1 className="text-2xl font-bold">My Profile</h1>
-        <p className="text-gray-500">{user?.email}</p>
+      <div className="flex items-center gap-4">
+        <div
+          className="flex h-14 w-14 items-center justify-center rounded-2xl text-xl font-bold text-white"
+          style={{ backgroundColor: "var(--color-primary)" }}
+        >
+          {user?.username?.charAt(0).toUpperCase()}
+        </div>
+        <div>
+          <h1
+            className="text-2xl"
+            style={{
+              color: "var(--color-text-primary)",
+              fontFamily: "'DM Serif Display', serif",
+            }}
+          >
+            {user?.username}
+          </h1>
+          <p className="text-sm" style={{ color: "var(--color-text-muted)" }}>
+            {user?.email}
+          </p>
+        </div>
       </div>
 
       {/* 标签栏 */}
-      <div className="border-b">
+      <div className="border-b" style={{ borderColor: "var(--color-border)" }}>
         <nav className="flex gap-1">
-          {tabs.map((tab) => (
-            <NavLink
-              key={tab.to}
-              to={tab.to}
-              className={({ isActive }) =>
-                isActive
-                  ? "border-b-2 border-blue-600 px-4 py-2 text-sm font-semibold text-blue-600"
-                  : "px-4 py-2 text-sm text-gray-600 hover:text-gray-900"
-              }
-            >
-              {tab.label}
-            </NavLink>
-          ))}
+          {tabs.map((tab) => {
+            const Icon = tab.icon;
+            return (
+              <NavLink
+                key={tab.to}
+                to={tab.to}
+                className={({ isActive }) =>
+                  isActive
+                    ? "flex items-center gap-1.5 border-b-2 px-4 py-2.5 text-sm font-semibold"
+                    : "flex items-center gap-1.5 px-4 py-2.5 text-sm transition-colors"
+                }
+                style={({ isActive }) => ({
+                  color: isActive
+                    ? "var(--color-primary)"
+                    : "var(--color-text-secondary)",
+                  borderColor: isActive
+                    ? "var(--color-primary)"
+                    : "transparent",
+                })}
+              >
+                <Icon className="h-3.5 w-3.5" />
+                {tab.label}
+              </NavLink>
+            );
+          })}
         </nav>
       </div>
 
-      {/* 子路由内容渲染在这里 */}
-      {/* 切换标签时，只有这里的内容变化，上方的标签栏不重新渲染 */}
       <Outlet />
     </div>
   );

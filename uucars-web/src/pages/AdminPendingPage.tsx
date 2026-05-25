@@ -1,128 +1,146 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { adminApi } from "@/api";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
 import { Button } from "@/components/ui/button";
+import EmptyState from "@/components/EmptyState";
+import { CheckCircle, ExternalLink } from "lucide-react";
+import { Link } from "react-router-dom";
 
 export default function AdminPendingPage() {
   const queryClient = useQueryClient();
 
-  /* -------------- 请求数据 -------------- */
   const { data, isLoading } = useQuery({
     queryKey: ["admin-pending"],
     queryFn: () => adminApi.getPendingCars(),
   });
 
-  /* --------- approveMutation -------- */
   const approveMutation = useMutation({
     mutationFn: (carId: number) => adminApi.approve(carId),
     onSuccess: () => {
       toast.success("Car approved and published!");
       queryClient.invalidateQueries({ queryKey: ["admin-pending"] });
-      // 公开列表也需要刷新，新车上架了
       queryClient.invalidateQueries({ queryKey: ["cars"] });
     },
     onError: (error) => toast.error(error.message),
   });
 
-  /* --------- rejectMutation --------- */
   const rejectMutation = useMutation({
     mutationFn: (carId: number) => adminApi.reject(carId),
     onSuccess: () => {
-      toast.success("Car rejected, returned to seller.");
+      toast.success("Car returned to seller for revision.");
       queryClient.invalidateQueries({ queryKey: ["admin-pending"] });
     },
     onError: (error) => toast.error(error.message),
   });
 
-  /* --------- deleteMutation --------- */
   const deleteMutation = useMutation({
     mutationFn: (carId: number) => adminApi.deleteCar(carId),
     onSuccess: () => {
-      toast.success("Car deleted.");
+      toast.success("Car removed.");
       queryClient.invalidateQueries({ queryKey: ["admin-pending"] });
     },
     onError: (error) => toast.error(error.message),
   });
 
-  /* -------------- 数据加载 -------------- */
-  if (isLoading) return <div>Loading...</div>;
-
-  /* --------------- 空状态 -------------- */
-  if (!data?.items.length) {
+  if (isLoading) {
     return (
-      <div className="py-12 text-center text-gray-500">
-        No cars pending review. All caught up!
+      <div className="space-y-3">
+        {Array.from({ length: 5 }).map((_, i) => (
+          <div
+            key={i}
+            className="h-20 animate-pulse rounded-[var(--radius-lg)]"
+            style={{ backgroundColor: "var(--color-border)" }}
+          />
+        ))}
       </div>
     );
   }
+
+  if (!data?.items.length) {
+    return (
+      <EmptyState
+        icon={<CheckCircle className="h-8 w-8" />}
+        title="All caught up!"
+        description="No cars are waiting for review right now."
+      />
+    );
+  }
+
   return (
-    <Table>
-      <TableHeader>
-        <TableRow>
-          <TableHead>Title</TableHead>
-          <TableHead>Seller</TableHead>
-          <TableHead>Price</TableHead>
-          <TableHead>Year</TableHead>
-          <TableHead className="text-right">Actions</TableHead>
-        </TableRow>
-      </TableHeader>
-      <TableBody>
+    <div className="space-y-4">
+      <p className="text-sm" style={{ color: "var(--color-text-muted)" }}>
+        {data.totalCount} car{data.totalCount !== 1 ? "s" : ""} awaiting review
+      </p>
+
+      <div className="space-y-3">
         {data.items.map((car) => (
-          <TableRow key={car.id}>
-            <TableCell className="font-medium">{car.title}</TableCell>
-            <TableCell>{car.sellerUsername}</TableCell>
-            <TableCell>${car.price.toLocaleString()}</TableCell>
-            <TableCell>{car.year}</TableCell>
-            <TableCell>
-              <div className="flex justify-end gap-2">
-                <Button
-                  size="sm"
-                  onClick={() => approveMutation.mutate(car.id)}
-                  disabled={
-                    approveMutation.isPending ||
-                    rejectMutation.isPending ||
-                    deleteMutation.isPending
-                  }
+          <div
+            key={car.id}
+            className="flex flex-col gap-3 rounded-[var(--radius-lg)] border p-4 sm:flex-row sm:items-center sm:justify-between"
+            style={{
+              backgroundColor: "var(--color-surface)",
+              borderColor: "var(--color-border)",
+              boxShadow: "var(--shadow-card)",
+            }}
+          >
+            <div className="space-y-1 flex-1 min-w-0">
+              <div className="flex items-center gap-2">
+                <Link
+                  to={`/cars/${car.id}`}
+                  className="font-medium text-sm hover:text-[var(--color-primary)] transition-colors flex items-center gap-1"
+                  style={{ color: "var(--color-text-primary)" }}
                 >
-                  Approve
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() => rejectMutation.mutate(car.id)}
-                  disabled={
-                    approveMutation.isPending ||
-                    rejectMutation.isPending ||
-                    deleteMutation.isPending
-                  }
-                >
-                  Reject
-                </Button>
-                <Button
-                  size="sm"
-                  variant="destructive"
-                  onClick={() => deleteMutation.mutate(car.id)}
-                  disabled={
-                    approveMutation.isPending ||
-                    rejectMutation.isPending ||
-                    deleteMutation.isPending
-                  }
-                >
-                  Delete
-                </Button>
+                  {car.title}
+                  <ExternalLink className="h-3 w-3 opacity-50" />
+                </Link>
               </div>
-            </TableCell>
-          </TableRow>
+              <p
+                className="text-xs"
+                style={{ color: "var(--color-text-muted)" }}
+              >
+                {car.brand} {car.model} · {car.year} ·{" "}
+                {car.mileage.toLocaleString()} km ·{" "}
+                <span style={{ color: "var(--color-accent)", fontWeight: 600 }}>
+                  ${car.price.toLocaleString()}
+                </span>{" "}
+                · Seller:{" "}
+                <span style={{ color: "var(--color-text-secondary)" }}>
+                  {car.sellerUsername}
+                </span>
+              </p>
+            </div>
+
+            <div className="flex gap-2 shrink-0">
+              <Button
+                size="sm"
+                onClick={() => approveMutation.mutate(car.id)}
+                disabled={approveMutation.isPending}
+                className="gap-1.5"
+              >
+                <CheckCircle className="h-3.5 w-3.5" />
+                Approve
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => rejectMutation.mutate(car.id)}
+                disabled={rejectMutation.isPending}
+              >
+                Reject
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="text-[var(--color-danger)] hover:bg-[var(--color-danger-light)] hover:text-[var(--color-danger)]"
+                onClick={() => deleteMutation.mutate(car.id)}
+                disabled={deleteMutation.isPending}
+              >
+                Remove
+              </Button>
+            </div>
+          </div>
         ))}
-      </TableBody>
-    </Table>
+      </div>
+    </div>
   );
 }

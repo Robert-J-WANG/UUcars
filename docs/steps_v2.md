@@ -14087,3 +14087,3163 @@ GitHub Repository
 git tag -a v2.0 -m "UUcars V2 - Full stack Azure cloud deployment with CI/CD"
 git push origin v2.0
 ```
+
+
+
+## Step 56b · 前端 UI 重构与设计系统建立
+
+### 这一步做什么
+
+V2 完成后的界面用的是 shadcn/ui 默认的 Slate 配色 + Tailwind 原始工具类拼凑的布局。每个页面 都能用，但缺乏设计语言——没有品牌感，没有视觉层次，组件之间的风格不统一。
+
+这一步的目标是：**在不改变任何功能逻辑的前提下，建立完整的设计系统，让 UUcars 从"能用" 变成"好看"。**
+
+具体做四件事：
+
+1. 建立设计 token——颜色、字体、间距写进 `tailwind.config.ts` 和 `index.css`，一处定义全局生效
+2. 改造高频共享组件——覆盖 80% 的页面面积
+    - CarCard
+    - CarDetails
+    - MyListings
+3. 重做首页——Hero 区 + 搜索入口 + 车辆列表视觉升级
+4. 所有空状态和加载状态
+
+
+
+### 1. 设计方向决策
+
+- 主色：近黑色 （`#1c1c1e`）——高对比度，编辑感强
+- 辅色：红色（`#c0392b`）——价格、CTA 按钮的点睛色
+- 字体：`DM Sans`（正文，现代无衬线）+ `DM Serif Display`（大标题，有质感的衬线字体）
+- 背景：`#FAFAF8`（带一点暖色调的白，比纯白更有温度）
+- 卡片：白色 + 精确的阴影层级，不是默认的 `shadow-md`
+
+
+
+### 2. 准备工作
+
+新建分支
+
+```bash
+git checkout develop
+git checkout -b feature/ui-polish
+git push -u origin feature/ui-polish
+```
+
+安装需要的字体和依赖：
+
+```bash
+# Google Fonts 通过 CSS @import 引入，不需要 npm 包
+# lucide-react 图标库（shadcn/ui 已经依赖了，确认已安装）
+npm list lucide-react
+```
+
+
+
+### 3. 更新后端接口模型
+
+现在的后端接口，返回的车辆模型没有包含图片
+
+现在的数据模型设计
+
+```
+Cars 表        — 车辆核心信息
+CarImages 表   — 图片单独一张表，通过 CarId 关联
+```
+
+这个设计完全正确，一辆车多张图片，分开存储，标准做法。
+
+接口设计
+
+```
+CarResponse（列表用）
+CarDetailResponse（详情用）
+```
+
+列表不需要返回完整的多张图片列表，那会带来大量不必要的数据传输。 
+
+但是，漏掉了一个关键需求：**列表页的卡片需要显示封面图**。
+
+正确的设计应该在 `CarResponse` 里包含 `CoverImageUrl`
+
+```
+CarResponse（列表用）：
+  id, title, brand, price, mileage, status...
+  coverImageUrl    ← 只要第一张图的 URL，不是整个数组
+
+CarDetailResponse（详情用）：
+  ...CarResponse 的所有字段
+  images: CarImage[]   ← 完整图片列表，支持轮播
+```
+
+因此，我们对之前的 `CarResponse`模型和相关的地方做完整的更新
+
+#### 3.1 修改后端 `CarResponse.cs`
+
+**文件路径：** `UUcars.API/DTOs/Responses/CarResponse.cs`
+
+在 `UpdatedAt` 字段后面加一行：
+
+```csharp
+public class CarResponse
+{
+    public int Id { get; set; }
+    public string Title { get; set; } = string.Empty;
+    public string Brand { get; set; } = string.Empty;
+    public string Model { get; set; } = string.Empty;
+    public int Year { get; set; }
+    public decimal Price { get; set; }
+    public int Mileage { get; set; }
+    public string? Description { get; set; }
+    public string Status { get; set; } = string.Empty;
+    public int SellerId { get; set; }
+    public string SellerUsername { get; set; } = string.Empty;
+    public DateTime CreatedAt { get; set; }
+    public DateTime UpdatedAt { get; set; }
+    public string? CoverImageUrl { get; set; }   // ← 新增这一行
+}
+```
+
+#### 3.2 修改后端 `CarService.cs` — `MapToResponse`
+
+**文件路径：** `UUcars.API/Services/CarService.cs`
+
+找到 `MapToResponse` 方法，在 `UpdatedAt` 赋值后加一行：
+
+```csharp
+internal static CarResponse MapToResponse(Car car) => new()
+{
+    Id = car.Id,
+    Title = car.Title,
+    Brand = car.Brand,
+    Model = car.Model,
+    Year = car.Year,
+    Price = car.Price,
+    Mileage = car.Mileage,
+    Description = car.Description,
+    Status = car.Status.ToString(),
+    SellerId = car.SellerId,
+    SellerUsername = car.Seller?.Username ?? string.Empty,
+    CreatedAt = car.CreatedAt,
+    UpdatedAt = car.UpdatedAt,
+    CoverImageUrl = car.Images                      // ← 新增这三行
+        .OrderBy(i => i.SortOrder)
+        .FirstOrDefault()?.ImageUrl
+};
+```
+
+#### 3.3 修改后端 `EfCarRepository.cs` — 两个查询方法各加一行 Include
+
+**文件路径：** `UUcars.API/Repositories/EfCarRepository.cs`
+
+#####  `GetPagedAsync` 方法
+
+找到这段代码：
+
+```csharp
+var query = _context.Cars
+    .Include(c => c.Seller)
+    .Where(c => c.Status == status);
+```
+
+改为：
+
+```csharp
+var query = _context.Cars
+    .Include(c => c.Seller)
+    .Include(c => c.Images)      // ← 新增这一行
+    .Where(c => c.Status == status);
+```
+
+##### `GetBySellerAsync` 方法
+
+找到这段代码：
+
+```csharp
+var query = _context.Cars
+    .Include(c => c.Seller)
+    .Where(c => c.SellerId == sellerId)
+```
+
+改为：
+
+```csharp
+var query = _context.Cars
+    .Include(c => c.Seller)
+    .Include(c => c.Images)      // ← 新增这一行
+    .Where(c => c.SellerId == sellerId)
+```
+
+#### 3.4 修改前端 `src/types/index.ts`
+
+**文件路径：** `src/types/car.ts`
+
+找到 `Car` 接口，在 `updatedAt` 后面加一行：
+
+```typescript
+export interface Car {
+  id: number
+  title: string
+  brand: string
+  model: string
+  year: number
+  price: number
+  mileage: number
+  description: string | null
+  status: CarStatus
+  sellerId: number
+  sellerUsername: string
+  createdAt: string
+  updatedAt: string
+  coverImageUrl?: string        // ← 新增这一行
+}
+
+// CarDetail 不需要动，它 extends Car，自动继承新字段
+export interface CarDetail extends Car {
+  images: CarImage[]
+}
+```
+
+#### 3.5 修改前端 `src/components/CarCard.tsx`
+
+**文件路径：** `src/components/CarCard.tsx`
+
+详细完整的修改见后面页面重构的步骤
+
+#### 3.6 后端验证
+
+```bash
+cd UUcars.API
+dotnet build        # 确认编译通过，无报错
+dotnet test         # 确认所有测试通过，无需改测试
+dotnet run          # 启动后访问 GET /cars，确认响应里有 coverImageUrl 字段
+```
+
+#### 3.7 改动总结
+
+```
+后端（3处，均为1-2行）：
+  UUcars.API/DTOs/Responses/CarResponse.cs        加 CoverImageUrl 字段
+  UUcars.API/Services/CarService.cs               MapToResponse 取封面图 URL
+  UUcars.API/Repositories/EfCarRepository.cs      GetPagedAsync + GetBySellerAsync 各加一行 Include
+
+前端（2处）：
+  src/types/index.ts                              Car 接口加 coverImageUrl 可选字段
+  src/components/CarCard.tsx                      完整替换，支持图片和占位两种状态
+
+不需要改动：
+  所有单元测试（Car 实体 Images 默认值是空集合，不是 null）
+  所有集成测试
+  任何 Controller、其他 Service、其他前端页面
+  数据库 Migration（只改 DTO，不改表结构）
+```
+
+
+
+### 4. 设计 Token 建立
+
+#### 4.1 更新 `src/index.css`
+
+这是整个设计系统的根基。把颜色、字体、间距都定义在这里。
+
+> **为什么用 CSS 变量而不是直接写 Tailwind 类名？**
+>
+> CSS 变量（`--color-primary`）是全局的，shadcn/ui 的组件内部也读取这些变量。只改变量值， 所有用到这个颜色的组件都跟着变。如果直接用 Tailwind 类名（`bg-blue-600`）， 要改颜色就得全局搜索替换，非常麻烦。
+
+```css
+/* src/index.css */
+@import "tailwindcss";
+
+/* ─── 字体引入 ─────────────────────────────── */
+@import url("https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=DM+Serif+Display:ital@0;1&display=swap");
+
+/* ─── CSS 变量：设计 Token ──────────────────── */
+/* Option B — Charcoal & Crimson                */
+/* 近黑色主色 + 深红强调色 + 暖白背景           */
+:root {
+  /* 主色调：炭黑 */
+  --color-primary: #1c1c1e;
+  --color-primary-hover: #2c2c2e;
+  --color-primary-light: #f0f0ef;
+  --color-primary-muted: #6e6e73;
+
+  /* 强调色：深红 */
+  --color-accent: #c0392b;
+  --color-accent-hover: #a93226;
+  --color-accent-light: #fdf0ef;
+
+  /* 中性色 */
+  --color-bg: #f8f8f8;
+  --color-surface: #ffffff;
+  --color-border: #e4e4e4;
+  --color-border-strong: #d0d0d0;
+
+  /* 文字色 */
+  --color-text-primary: #1c1c1e;
+  --color-text-secondary: #636366;
+  --color-text-muted: #aeaeb2;
+  --color-text-inverse: #ffffff;
+
+  /* 语义色（保持不变，语义色不跟随品牌色变化） */
+  --color-success: #16a34a;
+  --color-success-light: #dcfce7;
+  --color-danger: #dc2626;
+  --color-danger-light: #fee2e2;
+  --color-warning: #d97706;
+  --color-warning-light: #fef3c7;
+
+  /* 阴影层级（调整为炭黑色调） */
+  --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+  --shadow-md:
+    0 4px 12px -2px rgb(0 0 0 / 0.1), 0 2px 4px -1px rgb(0 0 0 / 0.06);
+  --shadow-lg:
+    0 12px 32px -4px rgb(0 0 0 / 0.14), 0 4px 8px -2px rgb(0 0 0 / 0.08);
+  --shadow-card:
+    0 2px 8px -1px rgb(0 0 0 / 0.07), 0 1px 2px 0 rgb(0 0 0 / 0.04);
+
+  /* 圆角（保持不变） */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 20px;
+
+  /* ─── shadcn/ui 变量覆盖 ─────────────────── */
+  /* 主色改为炭黑，强调色改为深红                */
+  --background: 0 0% 97%;
+  --foreground: 0 0% 11%;
+  --card: 0 0% 100%;
+  --card-foreground: 0 0% 11%;
+  --primary: 0 0% 11%; /* 炭黑 #1c1c1e */
+  --primary-foreground: 0 0% 100%;
+  --secondary: 0 0% 95%;
+  --secondary-foreground: 0 0% 11%;
+  --muted: 0 0% 95%;
+  --muted-foreground: 0 0% 39%;
+  --accent: 5 63% 46%; /* 深红 #c0392b */
+  --accent-foreground: 0 0% 100%;
+  --destructive: 0 72% 51%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 0 0% 89%;
+  --input: 0 0% 89%;
+  --ring: 0 0% 11%; /* 焦点环用炭黑 */
+  --radius: 0.625rem;
+}
+
+/* ─── 基础样式 ──────────────────────────────── */
+* {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  background-color: var(--color-bg);
+  color: var(--color-text-primary);
+  font-family: "DM Sans", system-ui, sans-serif;
+  font-size: 15px;
+  line-height: 1.6;
+}
+
+/* 大标题用衬线字体 */
+h1,
+.display-font {
+  font-family: "DM Serif Display", Georgia, serif;
+  letter-spacing: -0.02em;
+}
+
+h2,
+h3 {
+  font-family: "DM Sans", system-ui, sans-serif;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+/* 链接默认样式 */
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+/* 滚动条美化（Webkit） */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-border-strong);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-text-muted);
+}
+
+/* ─── 工具类扩展 ─────────────────────────────── */
+/* 卡片悬停动画 */
+.card-hover {
+  transition:
+    transform 0.2s ease,
+    box-shadow 0.2s ease;
+}
+.card-hover:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-lg);
+}
+
+/* 文字渐变（价格等强调内容）
+   Charcoal 方案用炭黑到深灰的渐变，不用彩色 */
+.text-gradient {
+  background: linear-gradient(
+    135deg,
+    var(--color-primary) 0%,
+    var(--color-primary-muted) 100%
+  );
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* 价格专用：深红强调色渐变 */
+.text-gradient-accent {
+  background: linear-gradient(
+    135deg,
+    var(--color-accent) 0%,
+    var(--color-accent-hover) 100%
+  );
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* 精细的焦点环样式（无障碍） */
+.focus-ring:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* 页面进入动画 */
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fade-in-up {
+  animation: fadeInUp 0.4s ease forwards;
+}
+
+/* 骨架屏动画 */
+@keyframes shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+.skeleton-shimmer {
+  background: linear-gradient(
+    90deg,
+    var(--color-border) 25%,
+    #ebebeb 50%,
+    var(--color-border) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.8s infinite;
+}
+
+/* Layout 撑满屏幕高度，footer 自动沉底 */
+.layout-root {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+.layout-main {
+  flex: 1;
+}
+
+```
+
+#### 4.2 更新 shadcn/ui 的按钮组件样式
+
+shadcn 生成的组件代码就在项目里，可以直接修改。
+
+打开 `src/components/ui/button.tsx`， 找到 `buttonVariants` 的定义，替换：
+
+```tsx
+// src/components/ui/button.tsx
+import * as React from "react"
+import { Slot } from "@radix-ui/react-slot"
+import { cva, type VariantProps } from "class-variance-authority"
+import { cn } from "@/lib/utils"
+
+const buttonVariants = cva(
+  // 基础样式：字体、过渡、焦点
+  "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-[var(--radius-md)] text-sm font-medium transition-all duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-primary)] focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-40 [&_svg]:pointer-events-none [&_svg:not([class*='size-'])]:size-4 shrink-0",
+  {
+    variants: {
+      variant: {
+        // 主按钮
+        default:
+          "bg-[var(--color-primary)] text-white shadow-sm hover:bg-[var(--color-primary-hover)] active:scale-[0.98]",
+        // 强调按钮：用于最重要的 CTA
+        accent:
+          "bg-[var(--color-accent)] text-white shadow-sm hover:bg-[var(--color-accent-hover)] active:scale-[0.98]",
+        // 危险操作
+        destructive:
+          "bg-[var(--color-danger)] text-white shadow-sm hover:bg-red-700 active:scale-[0.98]",
+        // 次要按钮：边框样式
+        outline:
+          "border border-[var(--color-border-strong)] bg-white text-[var(--color-text-primary)] shadow-[var(--shadow-sm)] hover:bg-[var(--color-bg)] hover:border-[var(--color-primary)] active:scale-[0.98]",
+        // 幽灵按钮：无背景
+        ghost:
+          "text-[var(--color-text-secondary)] hover:bg-[var(--color-primary-light)] hover:text-[var(--color-primary)]",
+        // 链接按钮
+        link:
+          "text-[var(--color-primary)] underline-offset-4 hover:underline p-0 h-auto",
+      },
+      size: {
+        default: "h-10 px-5 py-2",
+        sm:      "h-8 rounded-[var(--radius-sm)] px-3 text-xs",
+        lg:      "h-12 rounded-[var(--radius-lg)] px-8 text-base",
+        icon:    "size-9",
+      },
+    },
+    defaultVariants: {
+      variant: "default",
+      size: "default",
+    },
+  }
+)
+
+export interface ButtonProps
+  extends React.ButtonHTMLAttributes<HTMLButtonElement>,
+    VariantProps<typeof buttonVariants> {
+  asChild?: boolean
+}
+
+const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
+  ({ className, variant, size, asChild = false, ...props }, ref) => {
+    const Comp = asChild ? Slot : "button"
+    return (
+      <Comp
+        className={cn(buttonVariants({ variant, size, className }))}
+        ref={ref}
+        {...props}
+      />
+    )
+  }
+)
+Button.displayName = "Button"
+
+export { Button, buttonVariants }
+```
+
+#### 4.3 更新 Input 组件
+
+```tsx
+// src/components/ui/input.tsx
+import * as React from "react"
+import { cn } from "@/lib/utils"
+
+function Input({ className, type, ...props }: React.ComponentProps<"input">) {
+  return (
+    <input
+      type={type}
+      data-slot="input"
+      className={cn(
+        // 基础：背景、边框、圆角
+        "flex h-10 w-full rounded-[var(--radius-md)] border border-[var(--color-border-strong)] bg-white px-3.5 py-2",
+        // 文字
+        "text-sm text-[var(--color-text-primary)] placeholder:text-[var(--color-text-muted)]",
+        // 交互：焦点边框变为主色
+        "transition-colors duration-150",
+        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-primary)] focus-visible:ring-offset-0 focus-visible:border-[var(--color-primary)]",
+        // 禁用
+        "disabled:cursor-not-allowed disabled:opacity-50 disabled:bg-[var(--color-bg)]",
+        // 文件上传
+        "file:border-0 file:bg-transparent file:text-sm file:font-medium",
+        className
+      )}
+      {...props}
+    />
+  )
+}
+
+export { Input }
+```
+
+#### 4.4 更新 Card 组件
+
+```tsx
+// src/components/ui/card.tsx
+import * as React from "react"
+import { cn } from "@/lib/utils"
+
+function Card({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      data-slot="card"
+      className={cn(
+        "rounded-[var(--radius-lg)] border border-[var(--color-border)] bg-[var(--color-surface)]",
+        "shadow-[var(--shadow-card)]",
+        className
+      )}
+      {...props}
+    />
+  )
+}
+
+function CardHeader({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      data-slot="card-header"
+      className={cn("flex flex-col gap-1.5 p-5 pb-3", className)}
+      {...props}
+    />
+  )
+}
+
+function CardTitle({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      data-slot="card-title"
+      className={cn("text-base font-semibold leading-snug text-[var(--color-text-primary)]", className)}
+      {...props}
+    />
+  )
+}
+
+function CardDescription({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      data-slot="card-description"
+      className={cn("text-sm text-[var(--color-text-secondary)]", className)}
+      {...props}
+    />
+  )
+}
+
+function CardContent({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      data-slot="card-content"
+      className={cn("p-5 pt-0", className)}
+      {...props}
+    />
+  )
+}
+
+function CardFooter({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      data-slot="card-footer"
+      className={cn("flex items-center p-5 pt-0", className)}
+      {...props}
+    />
+  )
+}
+
+export { Card, CardHeader, CardFooter, CardTitle, CardDescription, CardContent }
+```
+
+#### 4.5 更新 Badge 组件
+
+```tsx
+// src/components/ui/badge.tsx
+import * as React from "react"
+import { cva, type VariantProps } from "class-variance-authority"
+import { cn } from "@/lib/utils"
+
+const badgeVariants = cva(
+  "inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-medium transition-colors",
+  {
+    variants: {
+      variant: {
+        default:
+          "border-transparent bg-[var(--color-primary)] text-white",
+        secondary:
+          "border-transparent bg-[var(--color-primary-light)] text-[var(--color-primary)] border-[var(--color-primary-light)]",
+        accent:
+          "border-transparent bg-[var(--color-accent-light)] text-[var(--color-accent-hover)]",
+        outline:
+          "border-[var(--color-border-strong)] text-[var(--color-text-secondary)] bg-transparent",
+        success:
+          "border-transparent bg-[var(--color-success-light)] text-[var(--color-success)]",
+        destructive:
+          "border-transparent bg-[var(--color-danger-light)] text-[var(--color-danger)]",
+        warning:
+          "border-transparent bg-[var(--color-warning-light)] text-[var(--color-warning)]",
+      },
+    },
+    defaultVariants: {
+      variant: "default",
+    },
+  }
+)
+
+export interface BadgeProps
+  extends React.HTMLAttributes<HTMLDivElement>,
+    VariantProps<typeof badgeVariants> {}
+
+function Badge({ className, variant, ...props }: BadgeProps) {
+  return (
+    <div className={cn(badgeVariants({ variant }), className)} {...props} />
+  )
+}
+
+export { Badge, badgeVariants }
+```
+
+
+
+### 5. 共享组件改造
+
+#### 5.1 布局页重做
+
+这是出现频率最高的组件
+
+- 改造导航栏
+- 新增footer
+
+```tsx
+// src/components/Layout.tsx
+import { useState } from "react";
+import { NavLink, Outlet, useNavigate } from "react-router-dom";
+import {
+  Menu,
+  X,
+  CarFront,
+  User,
+  LogOut,
+  LayoutDashboard,
+  ShoppingBag,
+  Heart,
+  PlusCircle,
+  ListFilter,
+} from "lucide-react";
+import { useAuthStore } from "@/stores/authStore";
+import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+  DropdownMenuLabel,
+} from "@/components/ui/dropdown-menu";
+import { cn } from "@/lib/utils";
+
+const navLinkClass = ({ isActive }: { isActive: boolean }) =>
+  cn(
+    "text-sm font-medium transition-colors duration-150 relative pb-0.5",
+    "after:absolute after:bottom-0 after:left-0 after:h-0.5 after:w-full after:rounded-full",
+    "after:transition-transform after:duration-200 after:origin-left",
+    isActive
+      ? "text-[var(--color-primary)] after:bg-[var(--color-primary)] after:scale-x-100"
+      : "text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] after:scale-x-0 hover:after:scale-x-100 after:bg-[var(--color-border-strong)]",
+  );
+
+export default function Layout() {
+  const { user, isAuthenticated, logout } = useAuthStore();
+  const navigate = useNavigate();
+  const [mobileOpen, setMobileOpen] = useState(false);
+  const isAdmin = user?.role === "Admin";
+
+  const handleLogout = () => {
+    logout();
+    navigate("");
+    setMobileOpen(false);
+  };
+
+  return (
+    // ✅ flex-col + min-h-screen 让 footer 沉底
+    <div className="layout-root">
+      {/* ── 导航栏 ── */}
+      {/*sticky + z-50 确保下拉菜单浮在页面内容之上 */}
+      <header
+        className="sticky top-0 z-50 border-b"
+        style={{
+          backgroundColor: "var(--color-surface)",
+          borderColor: "var(--color-border-strong)",
+          boxShadow: "var(--shadow-sm)",
+        }}
+      >
+        <div className="mx-auto flex h-16 max-w-7xl items-center justify-between px-4 sm:px-6">
+          {/* 左侧：Logo + 主导航 */}
+          <div className="flex items-center gap-8">
+            <NavLink to="/" className="flex items-center gap-2 group">
+              <div
+                className="flex h-8 w-8 items-center justify-center rounded-lg transition-opacity group-hover:opacity-90"
+                style={{ backgroundColor: "var(--color-accent)" }}
+              >
+                <CarFront className="h-4 w-4 text-white" />
+              </div>
+              <span
+                className="text-lg font-bold tracking-tight"
+                style={{
+                  color: "var(--color-accent)",
+                  fontFamily: "'DM Serif Display', serif",
+                }}
+              >
+                UUcars
+              </span>
+            </NavLink>
+
+            {/* 桌面端导航 */}
+            <nav className="hidden items-center gap-6 md:flex">
+              <NavLink to="/" className={navLinkClass} end>
+                Browse Cars
+              </NavLink>
+              {isAuthenticated() && !isAdmin && (
+                <NavLink to="/profile/listings" className={navLinkClass}>
+                  My Listings
+                </NavLink>
+              )}
+              {isAdmin && (
+                <NavLink to="/admin" className={navLinkClass}>
+                  Admin Panel
+                </NavLink>
+              )}
+            </nav>
+          </div>
+
+          {/* 右侧 */}
+          <div className="flex items-center gap-3">
+            {isAuthenticated() ? (
+              <>
+                {/* 普通用户：Sell a Car 按钮 */}
+                {!isAdmin && (
+                  <Button
+                    variant="accent"
+                    size="sm"
+                    className="hidden sm:inline-flex gap-1.5"
+                    onClick={() => navigate("/cars/new")}
+                  >
+                    <PlusCircle className="h-3.5 w-3.5" />
+                    Sell a Car
+                  </Button>
+                )}
+
+                {/* 用户下拉菜单 */}
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    
+                    <button
+                      className="flex h-9 w-9 items-center justify-center rounded-full text-sm font-semibold text-white transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-primary)] focus-visible:ring-offset-2"
+                      style={{ backgroundColor: "var(--color-primary)" }}
+                      aria-label="User menu"
+                    >
+                      {user?.username?.charAt(0).toUpperCase()}
+                    </button>
+                  </DropdownMenuTrigger>
+
+                  {/* z-[100] 确保在 sticky header 之上 */}
+                  <DropdownMenuContent
+                    align="end"
+                    className="z-[100] w-52 rounded-[var(--radius-lg)] border p-1.5"
+                    style={{
+                      borderColor: "var(--color-border)",
+                      boxShadow: "var(--shadow-lg)",
+                      backgroundColor: "var(--color-surface)",
+                    }}
+                  >
+                    <DropdownMenuLabel className="px-2 py-1.5">
+                      <p
+                        className="text-sm font-semibold"
+                        style={{ color: "var(--color-text-primary)" }}
+                      >
+                        {user?.username}
+                      </p>
+                      <p
+                        className="truncate text-xs"
+                        style={{ color: "var(--color-text-muted)" }}
+                      >
+                        {user?.email}
+                      </p>
+                    </DropdownMenuLabel>
+                    <DropdownMenuSeparator
+                      style={{ backgroundColor: "var(--color-border)" }}
+                    />
+
+                    {isAdmin ? (
+                      // Admin 菜单
+                      <DropdownMenuItem
+                        onClick={() => navigate("/admin")}
+                        className="flex cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] px-2 py-1.5 text-sm"
+                      >
+                        <LayoutDashboard
+                          className="h-4 w-4"
+                          style={{ color: "var(--color-text-muted)" }}
+                        />
+                        Admin Panel
+                      </DropdownMenuItem>
+                    ) : (
+                      // 普通用户菜单
+                      <>
+                        <DropdownMenuItem
+                          onClick={() => navigate("/profile")}
+                          className="flex cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] px-2 py-1.5 text-sm"
+                        >
+                          <User
+                            className="h-4 w-4"
+                            style={{ color: "var(--color-text-muted)" }}
+                          />
+                          My Profile
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onClick={() => navigate("/profile/listings")}
+                          className="flex cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] px-2 py-1.5 text-sm"
+                        >
+                          <ListFilter
+                            className="h-4 w-4"
+                            style={{ color: "var(--color-text-muted)" }}
+                          />
+                          My Listings
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onClick={() => navigate("/profile/purchases")}
+                          className="flex cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] px-2 py-1.5 text-sm"
+                        >
+                          <ShoppingBag
+                            className="h-4 w-4"
+                            style={{ color: "var(--color-text-muted)" }}
+                          />
+                          My Purchases
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onClick={() => navigate("/profile/favorites")}
+                          className="flex cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] px-2 py-1.5 text-sm"
+                        >
+                          <Heart
+                            className="h-4 w-4"
+                            style={{ color: "var(--color-text-muted)" }}
+                          />
+                          Saved Cars
+                        </DropdownMenuItem>
+                      </>
+                    )}
+
+                    <DropdownMenuSeparator
+                      style={{ backgroundColor: "var(--color-border)" }}
+                    />
+                    <DropdownMenuItem
+                      onClick={handleLogout}
+                      className="flex cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] px-2 py-1.5 text-sm"
+                      style={{ color: "var(--color-danger)" }}
+                    >
+                      <LogOut className="h-4 w-4" />
+                      Sign out
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </>
+            ) : (
+              <>
+                <NavLink
+                  to="/login"
+                  className="text-sm font-medium"
+                  style={{ color: "var(--color-text-secondary)" }}
+                >
+                  Sign in
+                </NavLink>
+                <Button asChild size="sm">
+                  <NavLink to="/register" style={{ color: "white" }}>
+                    Get started
+                  </NavLink>
+                </Button>
+              </>
+            )}
+
+            {/* 移动端汉堡 */}
+            <button
+              className="flex h-9 w-9 items-center justify-center rounded-lg transition-colors md:hidden"
+              style={{ color: "var(--color-text-secondary)" }}
+              onClick={() => setMobileOpen(!mobileOpen)}
+              aria-label="Toggle menu"
+            >
+              {mobileOpen ? (
+                <X className="h-5 w-5" />
+              ) : (
+                <Menu className="h-5 w-5" />
+              )}
+            </button>
+          </div>
+        </div>
+
+        {/* 移动端展开菜单 */}
+        {mobileOpen && (
+          <div
+            className="border-t px-4 py-3 md:hidden"
+            style={{
+              backgroundColor: "var(--color-surface)",
+              borderColor: "var(--color-border)",
+            }}
+          >
+            <div className="space-y-1">
+              <MobileNavLink to="/" onClick={() => setMobileOpen(false)} end>
+                Browse Cars
+              </MobileNavLink>
+              {isAuthenticated() ? (
+                <>
+                  {!isAdmin && (
+                    <>
+                      <MobileNavLink
+                        to="/cars/new"
+                        onClick={() => setMobileOpen(false)}
+                      >
+                        Sell a Car
+                      </MobileNavLink>
+                      <MobileNavLink
+                        to="/profile"
+                        onClick={() => setMobileOpen(false)}
+                      >
+                        My Profile
+                      </MobileNavLink>
+                    </>
+                  )}
+                  {isAdmin && (
+                    <MobileNavLink
+                      to="/admin"
+                      onClick={() => setMobileOpen(false)}
+                    >
+                      Admin Panel
+                    </MobileNavLink>
+                  )}
+                  <button
+                    onClick={handleLogout}
+                    className="flex w-full items-center rounded-lg px-3 py-2.5 text-sm font-medium transition-colors"
+                    style={{ color: "var(--color-danger)" }}
+                  >
+                    Sign out
+                  </button>
+                </>
+              ) : (
+                <>
+                  <MobileNavLink
+                    to="/login"
+                    onClick={() => setMobileOpen(false)}
+                  >
+                    Sign in
+                  </MobileNavLink>
+                  <MobileNavLink
+                    to="/register"
+                    onClick={() => setMobileOpen(false)}
+                  >
+                    Get started
+                  </MobileNavLink>
+                </>
+              )}
+            </div>
+          </div>
+        )}
+      </header>
+
+      {/* layout-main = flex-1，撑开高度 */}
+      <main className="layout-main mx-auto w-full max-w-7xl px-4 py-8 sm:px-6">
+        <Outlet />
+      </main>
+
+      {/* Footer 永远在底部 */}
+      <footer
+        className="border-t py-8"
+        style={{
+          borderColor: "var(--color-border)",
+          backgroundColor: "var(--color-surface)",
+        }}
+      >
+        <div className="mx-auto flex max-w-7xl flex-col items-center justify-between gap-4 px-4 sm:flex-row sm:px-6">
+          <div className="flex items-center gap-2">
+            <CarFront
+              className="h-4 w-4"
+              style={{ color: "var(--color-accent)" }}
+            />
+            <span
+              className="text-sm font-bold"
+              style={{
+                color: "var(--color-accent)",
+                fontFamily: "'DM Serif Display', serif",
+              }}
+            >
+              UUcars
+            </span>
+          </div>
+          <p className="text-xs" style={{ color: "var(--color-text-muted)" }}>
+            © {new Date().getFullYear()} UUcars · The trusted marketplace for
+            Kiwi car buyers and sellers.
+          </p>
+        </div>
+      </footer>
+    </div>
+  );
+}
+
+function MobileNavLink({
+  to,
+  onClick,
+  children,
+  end,
+}: {
+  to: string;
+  onClick: () => void;
+  children: React.ReactNode;
+  end?: boolean;
+}) {
+  return (
+    <NavLink
+      to={to}
+      end={end}
+      onClick={onClick}
+      className={({ isActive }) =>
+        cn(
+          "flex items-center rounded-lg px-3 py-2.5 text-sm font-medium transition-colors",
+          isActive
+            ? "bg-[var(--color-primary-light)] text-[var(--color-primary)]"
+            : "text-[var(--color-text-secondary)] hover:bg-[var(--color-bg)] hover:text-[var(--color-text-primary)]",
+        )
+      }
+    >
+      {children}
+    </NavLink>
+  );
+}
+
+```
+
+#### 5.2 车辆卡片重做
+
+车辆卡片是整个平台出现最多的元素，改好之后首页的视觉密度和信息层次会有质的提升。
+
+- 显示封面图片，图片固定宽高比，防止变形
+- 卡片设定最大尺寸
+
+```tsx
+// src/components/CarCard.tsx
+import { Link } from "react-router-dom";
+import { Gauge, Calendar, Car as CarIcon } from "lucide-react";
+import type { Car } from "@/types";
+import { Badge } from "@/components/ui/badge";
+import { cn } from "@/lib/utils";
+
+interface CarCardProps {
+  car: Car;
+}
+
+// 计算距今多久（用于显示发布时间）
+function getRelativeTime(dateStr: string): string {
+  const diff = Date.now() - new Date(dateStr).getTime();
+  const days = Math.floor(diff / 86400000);
+  return `${days}d ago`;
+}
+
+export default function CarCard({ car }: CarCardProps) {
+  return (
+    <Link
+      to={`/cars/${car.id}`}
+      className="block group w-full max-w-sm mx-auto"
+    >
+      <article
+        className={cn(
+          "rounded-[var(--radius-lg)] border overflow-hidden",
+          "bg-[var(--color-surface)]",
+          "shadow-[var(--shadow-card)] card-hover",
+        )}
+        style={{ borderColor: "var(--color-border)" }}
+      >
+        {/* 图片区域：aspect-[4/3] 固定比例，宽度变化时高度等比缩放 */}
+        <div className="relative aspect-[4/3] overflow-hidden">
+          {car.coverImageUrl ? (
+            // 有图片：直接显示，object-cover 保证不变形
+            <img
+              src={car.coverImageUrl}
+              alt={car.title}
+              className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
+            />
+          ) : (
+            // 无图片：lucide Car 图标做占位
+            <div
+              className="flex h-full w-full items-center justify-center"
+              style={{ backgroundColor: "var(--color-border)" }}
+            >
+              <CarIcon
+                className="h-16 w-16 opacity-20"
+                style={{ color: "var(--color-text-muted)" }}
+              />
+            </div>
+          )}
+        </div>
+
+        {/* 信息区 */}
+        <div className="p-4">
+          {/* 品牌 + 年份 */}
+          <div className="mb-2 flex items-center justify-between">
+            <Badge variant="accent" className="text-xs">
+              {car.brand}
+            </Badge>
+            <span
+              className="flex items-center gap-1 text-xs"
+              style={{ color: "var(--color-text-muted)" }}
+            >
+              <Calendar className="h-3 w-3" />
+              {car.year}
+            </span>
+          </div>
+
+          {/* 标题 */}
+          <h3
+            className={cn(
+              "mb-3 line-clamp-2 text-sm font-semibold leading-snug",
+              "transition-colors duration-150 group-hover:text-[var(--color-primary)]",
+              "text-nowrap overflow-hidden text-ellipsis",
+            )}
+            style={{ color: "var(--color-text-primary)" }}
+          >
+            {car.title}
+          </h3>
+
+          {/* 价格 */}
+          <div className="mb-3">
+            <span
+              className="text-xl font-bold text-gradient-accent"
+              style={{
+                // color: "var(--color-primary)",
+                fontFamily: "'DM Serif Display', serif",
+              }}
+            >
+              ${car.price.toLocaleString()}
+            </span>
+          </div>
+
+          {/* 里程 + 发布时间 */}
+          <div className="flex items-center justify-between">
+            <span
+              className="flex items-center gap-1 text-xs"
+              style={{ color: "var(--color-text-secondary)" }}
+            >
+              <Gauge className="h-3 w-3" />
+              {car.mileage.toLocaleString()} km
+            </span>
+            {/* 发布时间：替换原来的 MileageBadge */}
+            {car.createdAt && (
+              <span
+                className="text-xs"
+                style={{ color: "var(--color-text-muted)" }}
+              >
+                {getRelativeTime(car.createdAt)}
+              </span>
+            )}
+          </div>
+        </div>
+      </article>
+    </Link>
+  );
+}
+
+```
+
+#### 5.3 骨架屏重做
+
+和carCard的尺寸保持一致
+
+```tsx
+// src/components/CarCardSkeleton.tsx
+export default function CarCardSkeleton() {
+  return (
+    // max-w-sm mx-auto：与 CarCard 的 Link 外层保持一致，卡片不无限拉伸
+    <div
+      className="w-full max-w-sm mx-auto rounded-[var(--radius-lg)] border overflow-hidden"
+      style={{
+        backgroundColor: "var(--color-surface)",
+        borderColor: "var(--color-border)",
+        boxShadow: "var(--shadow-card)",
+      }}
+      aria-hidden="true"
+    >
+      {/* 图片占位：aspect-[4/3] 与 CarCard 图片区完全对齐，宽度变化时等比缩放 */}
+      <div
+        className="aspect-[4/3] skeleton-shimmer"
+        style={{ backgroundColor: "var(--color-border)" }}
+      />
+
+      {/* 内容占位 */}
+      <div className="p-4 space-y-3">
+        <div className="flex items-center justify-between">
+          <div
+            className="h-5 w-16 rounded-full skeleton-shimmer"
+            style={{ backgroundColor: "var(--color-border)" }}
+          />
+          <div
+            className="h-4 w-10 rounded skeleton-shimmer"
+            style={{ backgroundColor: "var(--color-border)" }}
+          />
+        </div>
+        <div
+          className="h-4 w-full rounded skeleton-shimmer"
+          style={{ backgroundColor: "var(--color-border)" }}
+        />
+        <div
+          className="h-4 w-3/4 rounded skeleton-shimmer"
+          style={{ backgroundColor: "var(--color-border)" }}
+        />
+        <div
+          className="h-7 w-28 rounded skeleton-shimmer"
+          style={{ backgroundColor: "var(--color-border)" }}
+        />
+        <div className="flex items-center justify-between">
+          <div
+            className="h-4 w-24 rounded skeleton-shimmer"
+            style={{ backgroundColor: "var(--color-border)" }}
+          />
+          <div
+            className="h-5 w-16 rounded-full skeleton-shimmer"
+            style={{ backgroundColor: "var(--color-border)" }}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+```
+
+#### 5.4 新建通用空状态组件
+
+建一个统一的空状态组件，所有列表页复用。
+
+```tsx
+// src/components/EmptyState.tsx
+import { cn } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
+
+interface EmptyStateProps {
+  /** 图标（lucide-react 的 SVG 组件） */
+  icon?: React.ReactNode;
+  title: string;
+  description?: string;
+  /** 操作按钮文字 */
+  actionLabel?: string;
+  /** 操作按钮点击回调 */
+  onAction?: () => void;
+  className?: string;
+}
+
+export default function EmptyState({
+  icon,
+  title,
+  description,
+  actionLabel,
+  onAction,
+  className,
+}: EmptyStateProps) {
+  return (
+    <div
+      className={cn(
+        "flex flex-col items-center justify-center rounded-[var(--radius-xl)]",
+        "border-2 border-dashed px-6 py-16 text-center",
+        className,
+      )}
+      style={{ borderColor: "var(--color-border-strong)" }}
+    >
+      {/* 图标容器 */}
+      {icon && (
+        <div
+          className="mb-4 flex h-16 w-16 items-center justify-center rounded-2xl"
+          style={{ backgroundColor: "var(--color-primary-light)" }}
+        >
+          <div style={{ color: "var(--color-primary)" }}>{icon}</div>
+        </div>
+      )}
+
+      {/* 标题 */}
+      <h3
+        className="mb-2 text-base font-semibold"
+        style={{ color: "var(--color-text-primary)" }}
+      >
+        {title}
+      </h3>
+
+      {/* 描述 */}
+      {description && (
+        <p
+          className="mb-6 max-w-xs text-sm leading-relaxed"
+          style={{ color: "var(--color-text-secondary)" }}
+        >
+          {description}
+        </p>
+      )}
+
+      {/* 操作按钮 */}
+      {actionLabel && onAction && (
+        <Button onClick={onAction} size="sm">
+          {actionLabel}
+        </Button>
+      )}
+    </div>
+  );
+}
+
+```
+
+使用示例（在 `HomePage.tsx` 里替换原来的空状态）：
+
+```tsx
+import { Car } from 'lucide-react'
+import EmptyState from '@/components/EmptyState'
+
+// 原来的：
+// <div className="py-12 text-center text-gray-500">No cars available.</div>
+
+// 替换为：
+{!isLoading && data?.items.length === 0 && (
+  <EmptyState
+    icon={<Car className="h-8 w-8" />}
+    title="No cars listed yet"
+    description="Be the first to list your car. It only takes a few minutes."
+    actionLabel="List your car"
+    onAction={() => navigate('/cars/new')}
+  />
+)}
+```
+
+
+
+### 6. 组件重构
+
+#### 6.1 重构首页
+
+重做后分三个区块：HeroBanner 区、轮播图、SellerBanner区、车辆过滤和车辆列表。
+
+```tsx
+// src/pages/HomePage.tsx
+import { useQuery } from "@tanstack/react-query";
+import { carsApi } from "@/api";
+import CarCard from "@/components/CarCard";
+import CarCardSkeleton from "@/components/CarCardSkeleton";
+import { Button } from "@/components/ui/button";
+import { useSearchParams } from "react-router-dom";
+import CarFilters from "@/components/CarFilters";
+import useDebounce from "@/hooks/useDebounce";
+import { Car } from "lucide-react";
+import EmptyState from "@/components/EmptyState";
+import HeroBanner from "@/components/HeroBanner";
+import LatestCarousel from "@/components/LatestCarousel";
+import SellerBanner from "@/components/SellerBanner";
+
+const PAGE_SIZE = 6;
+
+export default function HomePage() {
+  const [searchParams, setSearchParams] = useSearchParams();
+
+  const brand = searchParams.get("brand") ?? "";
+  const minPrice = searchParams.get("minPrice") ?? "";
+  const maxPrice = searchParams.get("maxPrice") ?? "";
+  const page = Number(searchParams.get("page") ?? "1");
+
+  const debouncedBrand = useDebounce(brand, 500);
+  const debouncedMinPrice = useDebounce(minPrice, 800);
+  const debouncedMaxPrice = useDebounce(maxPrice, 800);
+
+  const { data, isLoading, error } = useQuery({
+    queryKey: [
+      "cars",
+      {
+        page,
+        pageSize: PAGE_SIZE,
+        brand: debouncedBrand,
+        minPrice: debouncedMinPrice,
+        maxPrice: debouncedMaxPrice,
+      },
+    ],
+    queryFn: () =>
+      carsApi.getPaged({
+        page,
+        pageSize: PAGE_SIZE,
+        brand: debouncedBrand || undefined,
+        minPrice: debouncedMinPrice ? Number(debouncedMinPrice) : undefined,
+        maxPrice: debouncedMaxPrice ? Number(debouncedMaxPrice) : undefined,
+      }),
+  });
+
+  const handlePageChange = (newPage: number) => {
+    const current = Object.fromEntries(searchParams.entries());
+    setSearchParams({ ...current, page: String(newPage) });
+  };
+
+  const isHomepage = !brand && !minPrice && !maxPrice && page === 1;
+
+  if (error) {
+    return (
+      <div
+        className="py-12 text-center"
+        style={{ color: "var(--color-text-muted)" }}
+      >
+        Failed to load cars. Please try again.
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-8">
+      {/* Hero + 轮播（首页状态显示） */}
+      {isHomepage && <HeroBanner />}
+      {isHomepage && <LatestCarousel />}
+      {isHomepage && <SellerBanner />}
+
+      {/* 车辆列表区域（单栏，filter 移至顶部） */}
+      <div className="space-y-5">
+        {/* 标题 + 统计 */}
+        <div className="flex items-center justify-between">
+          <h1
+            className="text-lg"
+            style={{
+              color: "var(--color-text-primary)",
+            }}
+          >
+            {isHomepage ? "All Listings" : "Browse Cars"}
+          </h1>
+          {data && (
+            <p className="text-sm" style={{ color: "var(--color-text-muted)" }}>
+              {data.totalCount.toLocaleString()} cars found
+            </p>
+          )}
+        </div>
+
+        {/* Filters：横向排列在列表上方 */}
+        <CarFilters />
+
+        {/* 车辆卡片网格
+            justify-items-center：配合 CarCard 的 max-w-sm，让卡片在格子里居中
+            而不是被拉伸到格子满宽                                              */}
+        <div className="grid grid-cols-1 gap-6 sm:grid-cols-2 xl:grid-cols-3 justify-items-center max-w-3xl xl:max-w-none mx-auto w-full">
+          {isLoading
+            ? Array.from({ length: PAGE_SIZE }).map((_, i) => (
+                <CarCardSkeleton key={i} />
+              ))
+            : data?.items.map((car) => <CarCard key={car.id} car={car} />)}
+        </div>
+
+        {/* 空状态 */}
+        {!isLoading && data?.items.length === 0 && (
+          <EmptyState
+            icon={<Car className="h-8 w-8" />}
+            title="No cars found"
+            description="Try adjusting your filters."
+            actionLabel="Clear filters"
+            onAction={() => setSearchParams({})}
+          />
+        )}
+
+        {/* 分页 */}
+        {data && data.totalPages > 1 && (
+          <div className="flex items-center justify-center gap-3">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => handlePageChange(page - 1)}
+              disabled={page === 1}
+            >
+              ← Previous
+            </Button>
+            <span
+              className="text-sm"
+              style={{ color: "var(--color-text-secondary)" }}
+            >
+              {page} / {data.totalPages}
+            </span>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => handlePageChange(page + 1)}
+              disabled={page === data.totalPages}
+            >
+              Next →
+            </Button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+```
+
+##### 新增HeroBanner组件
+
+职责：品牌定位 + 搜索框 + 热门品牌标签
+背景：用户提供的图片 + 主题色蒙层压在上面，文字在最顶层
+
+```TSX
+// src/components/HeroBanner.tsx
+
+import { useState } from "react";
+import { useSearchParams } from "react-router-dom";
+import { Search, X } from "lucide-react";
+import { Button } from "@/components/ui/button";
+// 背景图：放在 src/assets/hero-bg.jpg
+// 替换成你自己的图片文件名即可，支持 .jpg / .png / .webp
+import heroBg from "@/assets/hero-bg.jpg";
+
+const POPULAR_BRANDS = [
+  "Toyota",
+  "Honda",
+  "BMW",
+  "Mercedes",
+  "Mazda",
+  "Nissan",
+  "Ford",
+  "Subaru",
+];
+
+export default function HeroBanner() {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [input, setInput] = useState("");
+
+  const currentBrand = searchParams.get("brand") ?? "";
+
+  const handleSearch = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!input.trim()) return;
+    const current = Object.fromEntries(searchParams.entries());
+    delete current["page"];
+    setSearchParams({ ...current, brand: input.trim() });
+    setInput("");
+  };
+
+  const handleBrandTag = (brand: string) => {
+    const current = Object.fromEntries(searchParams.entries());
+    delete current["page"];
+    if (current["brand"] === brand) {
+      delete current["brand"];
+    } else {
+      current["brand"] = brand;
+    }
+    setSearchParams(current);
+  };
+
+  return (
+    <div className="relative -mx-4 overflow-hidden sm:mx-0 sm:rounded-2xl ">
+      {/* ── 第一层：背景图片 ── */}
+      <img
+        src={heroBg}
+        alt=""
+        aria-hidden="true"
+        className="absolute inset-0 h-full w-full object-cover"
+        // object-position 控制图片焦点，根据图片内容调整
+        // 比如人物在右侧就用 "right center"
+        style={{ objectPosition: "center center" }}
+      />
+
+      {/* ── 第二层：蒙层 ──
+          用原来的渐变背景色作为蒙层，opacity 控制透明度
+          opacity 越高图片越暗/越被遮住；越低图片越清晰
+          这里设 0.72，让图片隐约可见但文字对比度仍然足够  */}
+      <div
+        className="absolute inset-0"
+        style={{
+          background:
+            "linear-gradient(135deg, var(--color-primary) 0%,  var(--color-primary-light) 100%)",
+          opacity: 0.5,
+        }}
+      />
+
+      {/* ── 第四层：内容（文字 / 搜索框 / 标签） ── */}
+      <div className="relative px-4 py-14 text-[var(--color-text-inverse)]">
+        <div className="mx-auto max-w-2xl text-center">
+          {/* 小标签 */}
+          <div
+            className="mb-4 inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium"
+            style={{
+              borderColor: "rgba(255,255,255,0.25)",
+              backgroundColor: "rgba(255,255,255,0.12)",
+              color: "rgba(255,255,255,0.9)",
+            }}
+          >
+            <span>↗</span>
+            New Zealand's trusted car marketplace
+          </div>
+
+          {/* 主标题 */}
+          <h1
+            className="mb-3 text-3xl leading-tight sm:text-4xl"
+            style={{
+              fontFamily: "'DM Serif Display', serif",
+              letterSpacing: "-0.02em",
+            }}
+          >
+            Find Your Perfect Car
+            <br className="hidden sm:block" />
+            <em
+              className="not-italic "
+              style={{ color: "var(--color-accent-hover)" }}
+            >
+              in New Zealand
+            </em>
+          </h1>
+
+          <p
+            className="mb-8 text-base sm:text-lg"
+            style={{ color: "rgba(255,255,255,0.85)" }}
+          >
+            Browse quality pre-owned vehicles from trusted sellers across NZ.
+            Simple, secure, and transparent.
+          </p>
+
+          {/* 搜索框 */}
+          <form onSubmit={handleSearch} className="mx-auto max-w-xl">
+            <div
+              className="flex overflow-hidden rounded-[var(--radius-xl)] p-1.5"
+              style={{
+                backgroundColor: "rgba(255,255,255,0.95)",
+                boxShadow: "0 8px 32px rgba(15, 76, 117, 0.35)",
+              }}
+            >
+              <div className="flex flex-1 items-center gap-2 px-3">
+                <Search
+                  className="h-4 w-4 shrink-0"
+                  style={{ color: "var(--color-text-muted)" }}
+                />
+                <input
+                  type="text"
+                  placeholder="Search by brand, model..."
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  className="flex-1 bg-transparent text-sm outline-none placeholder:opacity-60"
+                  style={{ color: "var(--color-text-primary)" }}
+                />
+                {input && (
+                  <button
+                    type="button"
+                    onClick={() => setInput("")}
+                    className="shrink-0 opacity-40 hover:opacity-70 transition-opacity"
+                  >
+                    <X
+                      className="h-3.5 w-3.5"
+                      style={{ color: "var(--color-text-muted)" }}
+                    />
+                  </button>
+                )}
+              </div>
+              <Button
+                type="submit"
+                size="sm"
+                className="shrink-0 rounded-[var(--radius-lg)]"
+              >
+                Search
+              </Button>
+            </div>
+          </form>
+
+          {/* 热门品牌标签 */}
+          <div className="mt-5 flex flex-wrap justify-center gap-2">
+            {POPULAR_BRANDS.map((brand) => {
+              const isActive = currentBrand === brand;
+              return (
+                <button
+                  key={brand}
+                  onClick={() => handleBrandTag(brand)}
+                  className="rounded-full px-3 py-1 text-xs font-medium transition-all duration-150 hover:scale-105"
+                  style={{
+                    backgroundColor: isActive
+                      ? "rgba(255,255,255,0.92)"
+                      : "rgba(255,255,255,0.15)",
+                    color: isActive
+                      ? "var(--color-primary)"
+                      : "rgba(255,255,255,0.9)",
+                    border: "1px solid rgba(255,255,255,0.2)",
+                    fontWeight: isActive ? 600 : 500,
+                  }}
+                >
+                  {brand}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+```
+
+##### 新增轮播图组件
+
+```tsx
+// src/components/CarCardHorizontal.tsx
+import { Link } from "react-router-dom";
+import { Gauge, Calendar, Car as CarIcon } from "lucide-react";
+import type { Car } from "@/types";
+import { Badge } from "@/components/ui/badge";
+import { cn } from "@/lib/utils";
+
+interface CarCardHorizontalProps {
+  car: Car;
+}
+
+// 与 CarCard 保持一致的相对时间函数
+function getRelativeTime(dateStr: string): string {
+  const diff = Date.now() - new Date(dateStr).getTime();
+  const days = Math.floor(diff / 86400000);
+  return `${days}d ago`;
+}
+
+export default function CarCardHorizontal({ car }: CarCardHorizontalProps) {
+  return (
+    <Link to={`/cars/${car.id}`} className="block group">
+      <article
+        className={cn(
+          "flex rounded-[var(--radius-lg)] border overflow-hidden",
+          "bg-[var(--color-surface)] shadow-[var(--shadow-card)] card-hover",
+          "h-72",
+        )}
+        style={{ borderColor: "var(--color-border)" }}
+      >
+        {/* 左侧图片区域
+            h-full 撑满卡片高度，aspect-[4/3] 由高度反推宽度
+            与 CarCard 保持相同比例                            */}
+        <div className="relative shrink-0 h-full aspect-[4/3] overflow-hidden">
+          {car.coverImageUrl ? (
+            // 有图片：显示真实图片
+            <img
+              src={car.coverImageUrl}
+              alt={car.title}
+              className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
+            />
+          ) : (
+            // 无图片：与 CarCard 一致的占位样式
+            <div
+              className="flex h-full w-full items-center justify-center"
+              style={{ backgroundColor: "var(--color-border)" }}
+            >
+              <CarIcon
+                className="h-10 w-10 opacity-20"
+                style={{ color: "var(--color-text-muted)" }}
+              />
+            </div>
+          )}
+        </div>
+
+        {/* 右侧文字区域 */}
+        <div className="flex min-w-0 flex-1 flex-col justify-between p-3">
+          {/* 上：品牌 + 年份 */}
+          <div>
+            <div className="mb-1.5 flex items-center justify-between">
+              <Badge variant="accent" className="text-xs ">
+                {car.brand}
+              </Badge>
+              <span
+                className="flex items-center gap-1 text-xs"
+                style={{ color: "var(--color-text-muted)" }}
+              >
+                <Calendar className="h-3 w-3" />
+                {car.year}
+              </span>
+            </div>
+            <h3
+              className={cn(
+                "line-clamp-2 text-sm font-semibold leading-snug",
+                "transition-colors duration-150 group-hover:text-[var(--color-primary)]",
+              )}
+              style={{ color: "var(--color-text-primary)" }}
+            >
+              {car.title}
+            </h3>
+          </div>
+
+          {/* 下：价格 + 里程 + 发布时间 */}
+          <div>
+            <span
+              className="block text-lg font-bold"
+              style={{
+                color: "var(--color-accent)",
+                fontFamily: "'DM Serif Display', serif",
+              }}
+            >
+              ${car.price.toLocaleString()}
+            </span>
+            <div className="mt-1 flex items-center justify-between">
+              <span
+                className="flex items-center gap-1 text-xs"
+                style={{ color: "var(--color-text-secondary)" }}
+              >
+                <Gauge className="h-3 w-3" />
+                {car.mileage.toLocaleString()} km
+              </span>
+              {car.createdAt && (
+                <span
+                  className="text-xs"
+                  style={{ color: "var(--color-text-muted)" }}
+                >
+                  {getRelativeTime(car.createdAt)}
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+      </article>
+    </Link>
+  );
+}
+
+```
+
+##### 新增 *SellerBanner* 组件
+
+```tsx
+// src/components/SellerBanner.tsx
+import { Link } from "react-router-dom";
+import { ArrowRight, BadgeCheck, Clock } from "lucide-react";
+// 静态图片：放在 src/assets/seller-banner.jpg
+// Vite 构建时会自动压缩并加上 hash（如 seller-banner.a3f2c1.jpg）
+import sellerImg from "@/assets/seller-banner.jpg";
+
+export default function SellerBanner() {
+  return (
+    <div
+      className="overflow-hidden rounded-[var(--radius-xl)] flex flex-col sm:flex-row"
+      style={{
+        border: "1px solid var(--color-border)",
+        backgroundColor: "var(--color-accent-light)",
+      }}
+    >
+      {/* ── 左侧：图片 ──
+          固定高度，图片用 object-cover 填满，不变形
+          sm 以下隐藏图片，只显示文字（小屏空间有限）     */}
+      <div className="hidden sm:block sm:w-[42%] shrink-0">
+        <img
+          src={sellerImg}
+          alt="Sell your car"
+          className="h-full w-full object-cover"
+          // 高度撑满右侧内容区，由右侧 padding 决定
+          style={{ minHeight: "200px" }}
+        />
+      </div>
+
+      {/* ── 右侧：说明文字 + CTA ── */}
+      <div className="flex flex-col justify-center gap-8 px-8 py-8">
+        <div>
+          <h2
+            className="text-2xl font-bold mb-2"
+            style={{
+              color: "var(--color-text-primary)",
+              fontFamily: "'DM Serif Display', serif",
+            }}
+          >
+            Sell your car. Free, forever.
+          </h2>
+          <p
+            className="text-sm leading-relaxed"
+            style={{ color: "var(--color-text-secondary)" }}
+          >
+            List your car in minutes and reach thousands of buyers. No waiting,
+            no fees, no expiry — your listing stays live until it sells.
+          </p>
+        </div>
+
+        {/* 两个亮点 */}
+        <div className="flex flex-wrap gap-10">
+          {[
+            { icon: BadgeCheck, text: "No success fees" },
+            { icon: Clock, text: "Live until sold" },
+          ].map(({ icon: Icon, text }) => (
+            <span
+              key={text}
+              className="flex items-center gap-1.5 text-sm font-medium"
+              style={{ color: "var(--color-text-secondary)" }}
+            >
+              <Icon
+                className="h-4 w-4"
+                style={{ color: "var(--color-success)" }}
+              />
+              {text}
+            </span>
+          ))}
+        </div>
+
+        {/* CTA 按钮 */}
+
+        <div>
+          <Link
+            to="/cars/new"
+            className="inline-flex items-center gap-2 rounded-full px-6 py-2.5 text-sm font-semibold transition-all duration-150 hover:gap-3 bg-[var(--color-accent)] hover:bg-[var(--color-accent-hover)]"
+            style={{
+              // backgroundColor: "var(--color-accent)",
+              color: "var(--color-text-inverse)",
+            }}
+          >
+            List my car now
+            <ArrowRight className="h-4 w-4" />
+          </Link>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+```
+
+##### 重构车辆过滤器组件
+
+```tsx
+// src/components/CarFilters.tsx
+import { useSearchParams } from "react-router-dom";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Button } from "@/components/ui/button";
+import { X } from "lucide-react";
+
+function CarFilters() {
+  const [searchParams, setSearchParams] = useSearchParams();
+
+  const brand = searchParams.get("brand") ?? "";
+  const minPrice = searchParams.get("minPrice") ?? "";
+  const maxPrice = searchParams.get("maxPrice") ?? "";
+
+  const updateFilter = (key: string, value: string) => {
+    const current = Object.fromEntries(searchParams.entries());
+    if (value) {
+      current[key] = value;
+    } else {
+      delete current[key];
+    }
+    delete current["page"];
+    setSearchParams(current);
+  };
+
+  const clearFilters = () => setSearchParams({});
+
+  const hasFilters = brand || minPrice || maxPrice;
+
+  return (
+    // 横向布局：所有过滤项一行排列，小屏时自动换行
+    <div
+      className="flex flex-wrap items-end gap-4 rounded-[var(--radius-lg)] border p-4 pb-8 mb-8"
+      style={{
+        borderColor: "var(--color-border)",
+        backgroundColor: "var(--color-surface)",
+      }}
+    >
+      {/* 品牌搜索 */}
+      <div className="flex flex-col gap-1 min-w-[160px] flex-1">
+        <Label
+          htmlFor="brand"
+          className="text-xs"
+          style={{ color: "var(--color-text-secondary)" }}
+        >
+          Brand
+        </Label>
+        <Input
+          id="brand"
+          placeholder="e.g. BMW, Toyota"
+          value={brand}
+          onChange={(e) => updateFilter("brand", e.target.value)}
+        />
+      </div>
+
+      {/* 最低价格 */}
+      <div className="flex flex-col gap-1 min-w-[100px] flex-1">
+        <Label
+          htmlFor="minPrice"
+          className="text-xs"
+          style={{ color: "var(--color-text-secondary)" }}
+        >
+          Min Price
+        </Label>
+        <Input
+          id="minPrice"
+          placeholder="Min"
+          type="number"
+          value={minPrice}
+          onChange={(e) => updateFilter("minPrice", e.target.value)}
+        />
+      </div>
+
+      {/* 最高价格 */}
+      <div className="flex flex-col gap-1 min-w-[100px] flex-1">
+        <Label
+          htmlFor="maxPrice"
+          className="text-xs"
+          style={{ color: "var(--color-text-secondary)" }}
+        >
+          Max Price
+        </Label>
+        <Input
+          id="maxPrice"
+          placeholder="Max"
+          type="number"
+          value={maxPrice}
+          onChange={(e) => updateFilter("maxPrice", e.target.value)}
+        />
+      </div>
+
+      {/* 清除按钮：只在有过滤条件时显示，与输入框底部对齐 */}
+      {hasFilters && (
+        <Button
+          variant="outline"
+          onClick={clearFilters}
+          className="flex items-center gap-1.5 self-end"
+          style={{ color: "var(--color-text-secondary)" }}
+        >
+          <X className="h-3.5 w-3.5" />
+          Clear
+        </Button>
+      )}
+    </div>
+  );
+}
+
+export default CarFilters;
+
+```
+
+#### 6.2 重构车辆详情页
+
+##### 封装独立的图片画廊组件
+
+主图 + 缩略图 + 左右切换
+
+```tsx
+// src/components/ImageGallery.tsx
+
+import { useState } from "react";
+import { ChevronLeft, ChevronRight, Car as CarIcon } from "lucide-react";
+
+interface CarImage {
+  id: number;
+  imageUrl: string;
+}
+
+interface ImageGalleryProps {
+  images: CarImage[];
+  title: string;
+  brand: string;
+}
+
+export default function ImageGallery({ images, title }: ImageGalleryProps) {
+  const [activeIndex, setActiveIndex] = useState(0);
+
+  const prev = () =>
+    setActiveIndex((i) => (i - 1 + images.length) % images.length);
+  const next = () => setActiveIndex((i) => (i + 1) % images.length);
+
+  const hasImages = images && images.length > 0;
+  const hasMultiple = hasImages && images.length > 1;
+
+  return (
+    <div className="space-y-3">
+      {/* ── 主图区域 ── */}
+      <div
+        className="relative overflow-hidden"
+        style={{
+          aspectRatio: "4 / 3",
+          borderRadius: "var(--radius-xl)",
+          border: "1px solid var(--color-border)",
+          backgroundColor: "var(--color-bg)",
+        }}
+      >
+        {hasImages ? (
+          <>
+            <img
+              key={activeIndex} // key 变化时触发重新渲染，产生淡入效果
+              src={images[activeIndex].imageUrl}
+              alt={`${title} - photo ${activeIndex + 1}`}
+              className="h-full w-full object-cover transition-opacity duration-300"
+            />
+
+            {/* 左右箭头（多图时才显示） */}
+            {hasMultiple && (
+              <>
+                <button
+                  onClick={prev}
+                  aria-label="Previous photo"
+                  className="absolute left-3 top-1/2 -translate-y-1/2 flex h-9 w-9 items-center justify-center rounded-full transition-all hover:scale-105"
+                  style={{
+                    backgroundColor: "var(--color-text-muted)",
+                    boxShadow: "var(--shadow-md)",
+                    color: "var(--color-text-inverse)",
+                    fontSize: "20px",
+                  }}
+                >
+                  <ChevronLeft className="h-5 w-5" />
+                </button>
+                <button
+                  onClick={next}
+                  aria-label="Next photo"
+                  className="absolute right-3 top-1/2 -translate-y-1/2 flex h-9 w-9 items-center justify-center rounded-full transition-all hover:scale-105"
+                  style={{
+                    backgroundColor: "var(--color-text-muted)",
+                    boxShadow: "var(--shadow-md)",
+                    color: "var(--color-text-inverse)",
+                  }}
+                >
+                  <ChevronRight className="h-5 w-5" />
+                </button>
+
+                {/* 右下角计数器 */}
+                <div
+                  className="absolute bottom-3 right-3 rounded-full px-2.5 py-1 text-xs font-medium"
+                  style={{
+                    backgroundColor: "var(--color-text-muted)",
+                    color: "var(--color-text-inverse)",
+                    backdropFilter: "blur(4px)",
+                  }}
+                >
+                  {activeIndex + 1} / {images.length}
+                </div>
+              </>
+            )}
+          </>
+        ) : (
+          // 无图占位
+          <div className="flex h-full flex-col items-center justify-center gap-3">
+            <CarIcon
+              className="h-16 w-16 opacity-20"
+              style={{ color: "var(--color-text-muted)" }}
+            />
+            <p className="text-sm" style={{ color: "var(--color-text-muted)" }}>
+              No photos available
+            </p>
+          </div>
+        )}
+      </div>
+
+      {/* ── 缩略图行（多图时显示） ── */}
+      {hasMultiple && (
+        <div className="flex gap-2 overflow-x-auto pb-1">
+          {images.map((img, i) => (
+            <button
+              key={img.id}
+              onClick={() => setActiveIndex(i)}
+              aria-label={`View photo ${i + 1}`}
+              className="shrink-0 overflow-hidden transition-all duration-150"
+              style={{
+                width: 72,
+                height: 54,
+                borderRadius: "var(--radius-md)",
+                // 选中高亮，未选中降低透明度
+                border:
+                  i === activeIndex
+                    ? "2px solid var(--color-primary)"
+                    : "2px solid var(--color-border)",
+                opacity: i === activeIndex ? 1 : 0.55,
+              }}
+            >
+              <img
+                src={img.imageUrl}
+                alt={`Thumbnail ${i + 1}`}
+                className="h-full w-full object-cover"
+              />
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+```
+
+##### 重构车辆详情页
+
+```tsx
+// src/pages/CarDetailPage.tsx
+import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { carsApi, favoritesApi, ordersApi } from "@/api";
+import { useAuthStore } from "@/stores/authStore";
+import { Button } from "@/components/ui/button";
+import { toast } from "sonner";
+import { useState } from "react";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import ImageGallery from "@/components/ImageGallery";
+
+export default function CarDetailPage() {
+  const { id } = useParams();
+  const carId = Number(id);
+  const { user, isAuthenticated } = useAuthStore();
+  const queryClient = useQueryClient();
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const navigate = useNavigate();
+  const location = useLocation();
+
+  /* ── 请求车辆详情 ── */
+  const {
+    data: car,
+    isLoading,
+    error,
+  } = useQuery({
+    queryKey: ["car", carId],
+    queryFn: () => carsApi.getById(carId),
+    enabled: !isNaN(carId),
+  });
+
+  /* ── 收藏 mutation ── */
+  const favoriteMutation = useMutation({
+    mutationFn: () => favoritesApi.add(carId),
+    onSuccess: () => {
+      toast.success("Added to favorites!");
+      queryClient.invalidateQueries({ queryKey: ["favorites"] });
+    },
+    onError: (error) => toast.error(error.message),
+  });
+
+  /* ── 下单 mutation ── */
+  const orderMutation = useMutation({
+    mutationFn: () => ordersApi.create({ carId }),
+    onSuccess: () => {
+      setDialogOpen(false);
+      toast.success("Order placed successfully!");
+      queryClient.invalidateQueries({ queryKey: ["car", carId] });
+      queryClient.invalidateQueries({ queryKey: ["cars"] });
+      navigate("/profile/purchases");
+    },
+    onError: (error) => {
+      setDialogOpen(false);
+      toast.error(error.message);
+    },
+  });
+
+  if (isLoading) return <div className="p-8">Loading...</div>;
+  if (error || !car) return <div className="p-8">Car not found.</div>;
+
+  /* ── 权限判断 ── */
+  const isAdmin = user?.role === "Admin";
+  const isOwner = user?.id === car?.sellerId;
+  const canBuy =
+    isAuthenticated() && !isAdmin && !isOwner && car?.status === "Published";
+
+  const specs = [
+    { label: "Year", value: car.year },
+    { label: "Brand", value: car.brand },
+    { label: "Model", value: car.model },
+    { label: "Mileage", value: `${car.mileage.toLocaleString()} km` },
+  ];
+
+  return (
+    <div className="mx-auto max-w-6xl">
+      <div className="flex flex-col gap-8 lg:flex-row lg:items-start">
+        {/* ══════════════════════════════════════
+            左栏：图片画廊（55%）
+            只负责展示图片，所有交互逻辑在 ImageGallery 内部
+        ══════════════════════════════════════ */}
+        <div className="flex-none lg:w-[55%]">
+          <ImageGallery
+            images={car.images ?? []}
+            title={car.title}
+            brand={car.brand}
+          />
+        </div>
+
+        {/* ══════════════════════════════════════
+            右栏：车辆信息 + 操作按钮（sticky）
+            包含：标题/价格/状态、规格、描述、卖家、操作
+        ══════════════════════════════════════ */}
+        <div className="flex-1 lg:sticky lg:top-24">
+          <div
+            className="rounded-[var(--radius-xl)] border p-6 space-y-5"
+            style={{
+              backgroundColor: "var(--color-surface)",
+              borderColor: "var(--color-border)",
+              boxShadow: "var(--shadow-md)",
+            }}
+          >
+            {/* ── 标题 + 状态 + 价格 ── */}
+            <div>
+              <div className="mb-1 flex items-start justify-between gap-3">
+                <h1
+                  className="text-xl "
+                  style={{
+                    color: "var(--color-text-primary)",
+                  }}
+                >
+                  {car.title}
+                </h1>
+                <span
+                  className="shrink-0 inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium"
+                  style={{
+                    backgroundColor:
+                      car.status === "Published"
+                        ? "var(--color-success-light)"
+                        : "var(--color-warning-light)",
+                    color:
+                      car.status === "Published"
+                        ? "var(--color-success)"
+                        : "var(--color-warning)",
+                  }}
+                >
+                  {car.status}
+                </span>
+              </div>
+              <p
+                className="text-lg font-bold"
+                style={{
+                  color: "var(--color-accent)",
+                  fontFamily: "'DM Serif Display', serif",
+                }}
+              >
+                ${car.price.toLocaleString()}
+              </p>
+            </div>
+
+            {/* ── 规格（原来在左栏底部，移到右栏） ── */}
+            <div
+              className="grid grid-cols-2 gap-3 rounded-[var(--radius-lg)] p-4"
+              style={{
+                backgroundColor: "var(--color-bg)",
+                border: "1px solid var(--color-border)",
+              }}
+            >
+              {specs.map((item) => (
+                <div key={item.label}>
+                  <p
+                    className="text-xs uppercase tracking-wide"
+                    style={{ color: "var(--color-text-muted)" }}
+                  >
+                    {item.label}
+                  </p>
+                  <p
+                    className="mt-0.5 text-sm font-semibold"
+                    style={{ color: "var(--color-text-primary)" }}
+                  >
+                    {item.value}
+                  </p>
+                </div>
+              ))}
+            </div>
+
+            {/* ── 描述（原来在左栏底部，移到右栏） ── */}
+            {car.description && (
+              <div
+                className="rounded-[var(--radius-lg)] p-4"
+                style={{
+                  backgroundColor: "var(--color-bg)",
+                  border: "1px solid var(--color-border)",
+                }}
+              >
+                <p
+                  className="mb-1.5 text-xs font-semibold uppercase tracking-wide"
+                  style={{ color: "var(--color-text-muted)" }}
+                >
+                  Description
+                </p>
+                <p
+                  className="whitespace-pre-line text-sm leading-relaxed"
+                  style={{ color: "var(--color-text-secondary)" }}
+                >
+                  {car.description}
+                </p>
+              </div>
+            )}
+
+            {/* ── 卖家信息 ── */}
+            <div
+              className="rounded-[var(--radius-md)] p-3"
+              style={{
+                backgroundColor: "var(--color-bg)",
+                border: "1px solid var(--color-border)",
+              }}
+            >
+              <p
+                className="mb-0.5 text-xs uppercase tracking-wide"
+                style={{ color: "var(--color-text-muted)" }}
+              >
+                Listed by
+              </p>
+              <p
+                className="font-semibold text-sm"
+                style={{ color: "var(--color-text-primary)" }}
+              >
+                {car.sellerUsername}
+              </p>
+            </div>
+
+            {/* ── 操作按钮 ── */}
+            <div
+              className="space-y-2 border-t pt-4"
+              style={{
+                borderColor: "var(--color-border)",
+                color: "var(--color-text-inverse)",
+              }}
+            >
+              {!isAuthenticated() && (
+                <Button asChild className="w-full" variant="default" size="lg">
+                  <Link
+                    to="/login"
+                    state={{ from: { pathname: location.pathname } }}
+                  >
+                    Sign in to purchase
+                  </Link>
+                </Button>
+              )}
+
+              {isOwner && (
+                <>
+                  <Button asChild className="w-full">
+                    <Link to={`/cars/${car.id}/edit`}>Edit Listing</Link>
+                  </Button>
+                  {car.status === "Draft" && (
+                    <Button variant="outline" className="w-full">
+                      Submit for Review
+                    </Button>
+                  )}
+                </>
+              )}
+
+              {canBuy && (
+                <div className="flex flex-col gap-6">
+                  <Button
+                    variant="outline"
+                    className="w-full gap-2"
+                    onClick={() => favoriteMutation.mutate()}
+                    disabled={favoriteMutation.isPending}
+                  >
+                    {favoriteMutation.isPending ? "♡ Saving..." : "♡ Save Car"}
+                  </Button>
+                  <Button
+                    className="w-full"
+                    onClick={() => setDialogOpen(true)}
+                  >
+                    Buy Now
+                  </Button>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* ── 下单确认弹窗 ── */}
+      <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
+        <DialogContent
+          style={{
+            background: "var(--color-surface)",
+          }}
+        >
+          <DialogHeader>
+            <DialogTitle>Confirm Purchase</DialogTitle>
+            <DialogDescription>
+              You are about to purchase{" "}
+              <span className="font-semibold">{car.title}</span> for{" "}
+              <span
+                className="font-semibold"
+                style={{ color: "var(--color-accent)" }}
+              >
+                ${car.price.toLocaleString()}
+              </span>
+              . This action cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setDialogOpen(false)}
+              disabled={orderMutation.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={() => orderMutation.mutate()}
+              disabled={orderMutation.isPending}
+            >
+              {orderMutation.isPending ? "Processing..." : "Confirm Purchase"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
+```
+
+#### 6.3 重构用户信息页面
+
+##### ProfilePage
+
+```tsx
+import { NavLink, Outlet } from "react-router-dom";
+import { useAuthStore } from "@/stores/authStore";
+import { ListFilter, Heart, ShoppingBag, TrendingUp } from "lucide-react";
+
+const tabs = [
+  { to: "/profile/listings", label: "My Listings", icon: ListFilter },
+  { to: "/profile/favorites", label: "Saved Cars", icon: Heart },
+  { to: "/profile/purchases", label: "My Purchases", icon: ShoppingBag },
+  { to: "/profile/sales", label: "My Sales", icon: TrendingUp },
+];
+
+export default function ProfilePage() {
+  const { user } = useAuthStore();
+
+  return (
+    <div className="space-y-6">
+      {/* 页头 */}
+      <div className="flex items-center gap-4">
+        <div
+          className="flex h-14 w-14 items-center justify-center rounded-2xl text-xl font-bold text-white"
+          style={{ backgroundColor: "var(--color-primary)" }}
+        >
+          {user?.username?.charAt(0).toUpperCase()}
+        </div>
+        <div>
+          <h1
+            className="text-2xl"
+            style={{
+              color: "var(--color-text-primary)",
+              fontFamily: "'DM Serif Display', serif",
+            }}
+          >
+            {user?.username}
+          </h1>
+          <p className="text-sm" style={{ color: "var(--color-text-muted)" }}>
+            {user?.email}
+          </p>
+        </div>
+      </div>
+
+      {/* 标签栏 */}
+      <div className="border-b" style={{ borderColor: "var(--color-border)" }}>
+        <nav className="flex gap-1">
+          {tabs.map((tab) => {
+            const Icon = tab.icon;
+            return (
+              <NavLink
+                key={tab.to}
+                to={tab.to}
+                className={({ isActive }) =>
+                  isActive
+                    ? "flex items-center gap-1.5 border-b-2 px-4 py-2.5 text-sm font-semibold"
+                    : "flex items-center gap-1.5 px-4 py-2.5 text-sm transition-colors"
+                }
+                style={({ isActive }) => ({
+                  color: isActive
+                    ? "var(--color-primary)"
+                    : "var(--color-text-secondary)",
+                  borderColor: isActive
+                    ? "var(--color-primary)"
+                    : "transparent",
+                })}
+              >
+                <Icon className="h-3.5 w-3.5" />
+                {tab.label}
+              </NavLink>
+            );
+          })}
+        </nav>
+      </div>
+
+      <Outlet />
+    </div>
+  );
+}
+
+```
+
+##### MyListings
+
+```tsx
+// src/pages/MyListingsPage.tsx — 完整替换
+
+import { carsApi } from "@/api";
+import { Button } from "@/components/ui/button";
+import EmptyState from "@/components/EmptyState";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Car, PlusCircle } from "lucide-react";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import { toast } from "sonner";
+import CarCardSkeleton from "@/components/CarCardSkeleton";
+import ListingCard from "@/components/ListingCard";
+
+const PAGE_SIZE = 10;
+
+export default function MyListingsPage() {
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const page = Number(searchParams.get("page") ?? "1");
+
+  const { data, isLoading } = useQuery({
+    queryKey: ["my-listings", { page, pageSize: PAGE_SIZE }],
+    queryFn: () => carsApi.getMyListings({ page, pageSize: PAGE_SIZE }),
+  });
+
+  const submitMutation = useMutation({
+    mutationFn: (carId: number) => carsApi.submit(carId),
+    onSuccess: () => {
+      toast.success("Submitted for review!");
+      queryClient.invalidateQueries({ queryKey: ["my-listings"] });
+    },
+    onError: (error) => toast.error(error.message),
+  });
+
+  const deleteMutation = useMutation({
+    mutationFn: (carId: number) => carsApi.delete(carId),
+    onSuccess: () => {
+      toast.success("Car deleted.");
+      queryClient.invalidateQueries({ queryKey: ["my-listings"] });
+    },
+    onError: (error) => toast.error(error.message),
+  });
+
+  if (isLoading) {
+    return (
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+        {Array.from({ length: 6 }).map((_, i) => (
+          <CarCardSkeleton key={i} />
+        ))}
+      </div>
+    );
+  }
+
+  if (!data?.items.length) {
+    return (
+      <EmptyState
+        icon={<Car className="h-8 w-8" />}
+        title="No listings yet"
+        description="List your first car and reach thousands of buyers across New Zealand."
+        actionLabel="List a car"
+        onAction={() => navigate("/cars/new")}
+      />
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      {/* 顶部统计 + 新建按钮 */}
+      <div className="flex items-center justify-between">
+        <p className="text-sm" style={{ color: "var(--color-text-muted)" }}>
+          {data.totalCount} listing{data.totalCount !== 1 ? "s" : ""}
+        </p>
+        <Button
+          size="sm"
+          onClick={() => navigate("/cars/new")}
+          className="gap-1.5"
+        >
+          <PlusCircle className="h-3.5 w-3.5" />
+          New Listing
+        </Button>
+      </div>
+
+      {/* ✅ 卡片网格：统一高度 */}
+      <div className="grid grid-cols-1 gap-8 sm:grid-cols-2 xl:grid-cols-3 justify-items-center max-w-3xl xl:max-w-none mx-auto w-full">
+        {data.items.map((car) => (
+          <ListingCard
+            key={car.id}
+            car={car}
+            onSubmit={submitMutation.mutate}
+            onDelete={deleteMutation.mutate}
+            isSubmitting={submitMutation.isPending}
+            isDeleting={deleteMutation.isPending}
+          />
+        ))}
+      </div>
+
+      {/* 分页 */}
+      {data.totalPages > 1 && (
+        <div className="flex items-center justify-center gap-3">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setSearchParams({ page: String(page - 1) })}
+            disabled={page === 1}
+          >
+            ← Prev
+          </Button>
+          <span
+            className="text-sm"
+            style={{ color: "var(--color-text-secondary)" }}
+          >
+            {page} / {data.totalPages}
+          </span>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setSearchParams({ page: String(page + 1) })}
+            disabled={page === data.totalPages}
+          >
+            Next →
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+```
+
+封装的 `ListingCard`组件
+
+```tsx
+import type { Car } from "@/types";
+import { Button } from "./ui/button";
+import { Link } from "react-router-dom";
+
+interface ListingCardProps {
+  car: Car;
+  onSubmit: (id: number) => void;
+  onDelete: (id: number) => void;
+
+  isSubmitting?: boolean;
+  isDeleting?: boolean;
+}
+
+// ✅ 统一状态样式配置，彻底解决换行问题
+const STATUS_CONFIG: Record<
+  string,
+  { label: string; color: string; bg: string }
+> = {
+  Published: {
+    label: "Published",
+    color: "var(--color-success)",
+    bg: "var(--color-success-light)",
+  },
+  PendingReview: {
+    label: "Pending",
+    color: "var(--color-warning)",
+    bg: "var(--color-warning-light)",
+  },
+  // ✅ 重点：PendingReview label 改为 'Pending'，避免两个英文单词换行
+  Draft: {
+    label: "Draft",
+    color: "var(--color-text-secondary)",
+    bg: "var(--color-bg)",
+  },
+  Sold: {
+    label: "Sold",
+    color: "var(--color-danger)",
+    bg: "var(--color-danger-light)",
+  },
+  Deleted: {
+    label: "Deleted",
+    color: "var(--color-text-muted)",
+    bg: "var(--color-border)",
+  },
+};
+
+function StatusBadge({ status }: { status: string }) {
+  const cfg = STATUS_CONFIG[status] ?? STATUS_CONFIG.Draft;
+  return (
+    <span
+      // ✅ whitespace-nowrap + shrink-0 双重保证不换行
+      className="inline-flex shrink-0 items-center whitespace-nowrap rounded-full px-2 py-0.5 text-xs font-medium"
+      style={{ color: cfg.color, backgroundColor: cfg.bg }}
+    >
+      {cfg.label}
+    </span>
+  );
+}
+
+export default function ListingCard({
+  car,
+  onSubmit,
+  onDelete,
+  isSubmitting,
+  isDeleting,
+}: ListingCardProps) {
+  return (
+    <div
+      // ✅ flex flex-col 让内容撑满，按钮区 mt-auto 沉底
+      // min-h 保证无按钮的卡片和有按钮的卡片视觉高度接近
+      className="block group w-full max-w-sm mx-auto p-4 border overflow-hidden
+         card-hover"
+      style={{
+        backgroundColor: "var(--color-surface)",
+        borderColor: "var(--color-border)",
+        boxShadow: "var(--shadow-card)",
+        minHeight: "176px",
+        borderRadius: "var(--radius-lg)",
+      }}
+    >
+      {/* 车辆信息区 */}
+      <div className="flex-1 space-y-2">
+        {/* 标题行：标题 + 状态，状态 shrink-0 不压缩 */}
+        <div className="flex items-start justify-between gap-2">
+          <Link
+            to={`/cars/${car.id}`}
+            className="line-clamp-2 flex-1 text-sm font-medium leading-snug transition-colors"
+            style={{ color: "var(--color-text-primary)" }}
+          >
+            {car.title}
+          </Link>
+          {/* ✅ StatusBadge 内部已有 shrink-0 + whitespace-nowrap */}
+          <StatusBadge status={car.status} />
+        </div>
+
+        <p
+          className="text-lg font-bold"
+          style={{
+            color: "var(--color-primary)",
+            fontFamily: "'DM Serif Display', serif",
+          }}
+        >
+          ${car.price.toLocaleString()}
+        </p>
+        <p className="text-xs" style={{ color: "var(--color-text-muted)" }}>
+          {car.year} · {car.mileage.toLocaleString()} km
+        </p>
+      </div>
+
+      {/* ✅ 操作区：mt-auto 沉到底部，始终占位保持高度统一 */}
+      <div
+        className="mt-4 border-t pt-3"
+        style={{ borderColor: "var(--color-border)" }}
+      >
+        {car.status === "Draft" ? (
+          // Draft：Edit + Submit + Delete
+          <div className="flex gap-2">
+            <Button asChild variant="outline" size="sm" className="flex-1">
+              <Link to={`/cars/${car.id}/edit`}>Edit</Link>
+            </Button>
+            <Button
+              size="sm"
+              className="flex-1"
+              onClick={() => onSubmit(car.id)}
+              disabled={isSubmitting}
+            >
+              Submit
+            </Button>
+            <Button
+              size="sm"
+              variant="destructive"
+              className="w-8 px-0"
+              onClick={() => onDelete(car.id)}
+              disabled={isDeleting}
+              aria-label="Delete"
+            >
+              ✕
+            </Button>
+          </div>
+        ) : (
+          // 非 Draft：显示 View 按钮（禁用的操作按钮区域，保持高度一致）
+          <Button
+            asChild
+            variant="ghost"
+            size="sm"
+            className="w-full text-xs"
+            style={{ color: "var(--color-text-muted)" }}
+          >
+            <Link to={`/cars/${car.id}`}>View listing →</Link>
+          </Button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+```
+
+##### MyPurchase 
+
+...
+
+##### MySales
+
+...
+
+##### SavedCars
+
+...
+
+#### 重构管理员面板
+
+##### AdminPage
+
+...
+
+##### AdminPendingPage
+
+...
+
+### 7. 认证页面重构
+
+#### 7.1 登录页
+
+...
+
+#### 7.2 注册页
+
+...
+
+
+
+### 8. 验证与收尾
+
+#### 8.1 检查清单
+
+运行 `npm run dev`，逐页检查：
+
+**导航栏**
+
+- [ ] Logo 图标 + 字体正确显示
+- [ ] 主导航 NavLink 激活样式（底部横线动画）
+- [ ] 未登录：右侧显示 Sign in + Get started 按钮
+- [ ] 已登录：右侧显示 Sell a Car 按钮 + 头像字母圆圈
+- [ ] 头像下拉菜单：所有菜单项正常跳转
+- [ ] 移动端：汉堡菜单展开/收起
+- [ ] Footer：品牌信息正确
+
+**首页**
+
+- [ ] Hero 区：渐变背景 + 背景图片 + 红色标题强调
+- [ ] 搜索栏：圆角卡片样式，输入框无边框样式
+- [ ] 热门品牌标签正常显示
+- [ ] 车辆卡片：图片区域 / 无图时品牌字母占位
+- [ ] 骨架屏：shimmer 动画效果
+- [ ] 卡片进入动画：staggered fade-in-up（依次延迟出现）
+- [ ] 空状态：图标 + 标题 + 描述 + 按钮
+- [ ] 分页：数字页码按钮
+
+**认证页**
+
+- [ ] 背景渐变光晕
+- [ ] 表单卡片阴影层次感
+- [ ] 错误提示颜色和样式
+- [ ] 加载中的 spinner 动画
+
+#### 8.2 响应式检查
+
+用 Chrome DevTools 分别检查：
+
+- iPhone SE（375px）：导航栏收起，汉堡菜单
+- iPad（768px）：两列卡片
+- 桌面（1280px）：三列卡片，完整导航
+
+#### 8.3 类型修复
+
+如果 `CarCard.tsx` 里用到了 `car.images`，需要确认 `Car` 类型定义（`src/types/index.ts`） 里有 `images?: CarImage[]` 字段。如果详情接口返回图片但列表接口不返回， 在 `CarCard` 里要做 optional chaining 保护：
+
+```tsx
+// 安全地访问图片
+{car.images && car.images.length > 0 ? (
+  <img src={car.images[0].imageUrl} ... />
+) : (
+  // 占位
+)}
+```
+
+静态资源图片放置在 src/assets 里， 使用时导入使用
+
+```tsx
+
+import { Button } from "@/components/ui/button";
+...
+
+export default function HeroBanner() {
+  ...
+
+  return (
+    <div className="relative -mx-4 overflow-hidden sm:mx-0 sm:rounded-2xl ">
+      <img
+        src={heroBg}
+        alt=""
+        aria-hidden="true"
+        className="absolute inset-0 h-full w-full object-cover"
+        style={{ objectPosition: "center center" }}
+      />
+
+    ...
+    </div>
+  );
+}
+
+```
+
+
+
+### 9. 后续其他页面的统一原则
+
+Step 56b 建立了设计语言，后续做其他页面改造时只需要遵守以下原则，不需要再单独创建新的颜色或组件：
+
+- **颜色** 
+
+    全部使用 CSS 变量（`var(--color-*)`），不写 Tailwind 的 `text-blue-600` 这类硬编码颜色。
+
+- **间距**
+
+    内边距优先用 `p-4`/`p-5`/`p-6`，组件间距用 `gap-4`/`gap-5`，区块间距用 `space-y-8`/`space-y-10`。
+
+- **空状态** 
+
+    所有空列表使用 `<EmptyState />` 组件，不写"No data"文字。
+
+- **错误提示** 
+
+    行内错误用 `var(--color-danger)` + `var(--color-danger-light)` 组合。
+
+- **加载状态**
+
+    列表用 `<CarCardSkeleton />`，其他元素用 `skeleton-shimmer` class。
+
+- **字体**
+
+    大标题（h1、Hero 区）加 `fontFamily: "'DM Serif Display', serif"`，正文和按钮不需要设置（已在 body 默认）。
+
+
+
+### Git 提交
+
+```bash
+git add .
+git commit -m "feat: UI polish - design system, components, homepage, color scheme"
+git push origin feature/ui-polish
+
+# 合并回 develop
+git checkout develop
+git pull origin develop          # 先拉一下，确保本地是最新的
+git merge --no-ff feature/ui-polish -m "merge: feature/ui-polish into develop"
+git push origin develop
+
+# 删除 feature 分支
+git branch -d feature/ui-polish
+git push origin --delete feature/ui-polish
+
+# 合并到 main，触发 CI/CD 构建镜像
+git checkout main
+git pull origin main
+git merge --no-ff develop -m "release: UI polish complete"
+git push origin main
+
+# 可选：打 tag 标记里程碑
+git tag -a v2.1 -m "UI polish complete - Charcoal & Crimson design system"
+git push origin v2.1
+```
+
+
+
+### Step 56b 完成状态
+
+```
+✅ 设计 token 建立（颜色/字体/阴影/圆角，CSS 变量全局生效）
+✅ 字体引入（DM Sans 正文 + DM Serif Display 标题）
+✅ shadcn/ui 组件重新定制（Button/Input/Card/Badge）
+✅ 导航栏重做（NavLink 底线动画/头像圆圈/移动端菜单/Footer）
+✅ 车辆卡片重做（图片区/品牌徽章/价格字体/里程徽章/悬停动画）
+✅ 骨架屏重做（shimmer 动画对齐真实卡片结构）
+✅ 通用空状态组件（图标/标题/描述/操作按钮）
+✅ 首页重做（Hero 区/搜索栏/品牌快捷入口/卡片进入动画/数字分页）
+✅ 登录页样式升级（背景光晕/表单卡片/加载 spinner）
+✅ 响应式检查通过（移动/平板/桌面）
+✅ Git commit 完成
+```
+
+
+

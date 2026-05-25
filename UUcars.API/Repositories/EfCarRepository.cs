@@ -46,39 +46,25 @@ public class EfCarRepository : ICarRepository
         // 后续每一个 Where 都是在已有的查询基础上追加条件，
         // 最终 EF Core 会把所有条件合并成一条 SQL 语句
         var query = _context.Cars
-            .Include(c => c.Seller)
+            .Include(c => c.Seller).Include(c => c.Images)
             .Where(c => c.Status == status);
 
         // 品牌过滤：只有传了 Brand 才追加这个条件
         // string.IsNullOrWhiteSpace：同时处理 null、空字符串、纯空格的情况
         if (!string.IsNullOrWhiteSpace(request.Brand))
-        {
             // Contains + ToLower：大小写不敏感的模糊匹配
             // 比如搜 "bmw" 能匹配 "BMW"、"Bmw"
             // EF Core 会把这个翻译成 SQL 的 LIKE '%bmw%'（在 SQL Server 里不区分大小写）
             query = query.Where(c => c.Brand.Contains(request.Brand.ToLower()));
-        }
 
         // 价格区间：MinPrice 和 MaxPrice 各自独立，可以只传其中一个
-        if (request.MinPrice.HasValue)
-        {
-            query = query.Where(c => c.Price >= request.MinPrice.Value);
-        }
+        if (request.MinPrice.HasValue) query = query.Where(c => c.Price >= request.MinPrice.Value);
 
-        if (request.MaxPrice.HasValue)
-        {
-            query = query.Where(c => c.Price <= request.MaxPrice.Value);
-        }
+        if (request.MaxPrice.HasValue) query = query.Where(c => c.Price <= request.MaxPrice.Value);
 
-        if (request.MinYear.HasValue)
-        {
-            query = query.Where(c => c.Year >= request.MinYear.Value);
-        }
+        if (request.MinYear.HasValue) query = query.Where(c => c.Year >= request.MinYear.Value);
 
-        if (request.MaxYear.HasValue)
-        {
-            query = query.Where(c => c.Year <= request.MaxYear.Value);
-        }
+        if (request.MaxYear.HasValue) query = query.Where(c => c.Year <= request.MaxYear.Value);
 
 
         // 到这里 query 还是 IQueryable，所有 Where 条件都还没有执行 SQL
@@ -107,36 +93,22 @@ public class EfCarRepository : ICarRepository
         CancellationToken cancellationToken = default)
     {
         var query = _context.Cars
-            .Include(c => c.Seller)
+            .Include(c => c.Seller).Include(c => c.Images)
             .Where(c => c.SellerId == sellerId);
         // 注意：这里没有过滤 Status，返回卖家所有状态的车辆
         // 但排除逻辑删除的车辆——卖家也不需要看到已删除的车
         // 如果将来需要显示已删除的车，可以单独加一个接口
 
         if (!string.IsNullOrWhiteSpace(request.Brand))
-        {
             query = query.Where(c => c.Brand.Contains(request.Brand.ToLower()));
-        }
 
-        if (request.MinPrice.HasValue)
-        {
-            query = query.Where(c => c.Price >= request.MinPrice.Value);
-        }
+        if (request.MinPrice.HasValue) query = query.Where(c => c.Price >= request.MinPrice.Value);
 
-        if (request.MaxPrice.HasValue)
-        {
-            query = query.Where(c => c.Price <= request.MaxPrice.Value);
-        }
+        if (request.MaxPrice.HasValue) query = query.Where(c => c.Price <= request.MaxPrice.Value);
 
-        if (request.MinYear.HasValue)
-        {
-            query = query.Where(c => c.Year >= request.MinYear.Value);
-        }
+        if (request.MinYear.HasValue) query = query.Where(c => c.Year >= request.MinYear.Value);
 
-        if (request.MaxYear.HasValue)
-        {
-            query = query.Where(c => c.Year <= request.MaxYear.Value);
-        }
+        if (request.MaxYear.HasValue) query = query.Where(c => c.Year <= request.MaxYear.Value);
 
         // 去掉逻辑删除的车（卖家视角也不需要看到已删除的车）
         query = query.Where(c => c.Status != CarStatus.Deleted);

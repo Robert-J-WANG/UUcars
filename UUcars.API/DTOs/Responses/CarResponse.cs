@@ -15,4 +15,6 @@ public class CarResponse
     public string SellerUsername { get; set; } = string.Empty;
     public DateTime CreatedAt { get; set; }
     public DateTime UpdatedAt { get; set; }
+
+    public string? CoverImageUrl { get; set; } // ← 新增这一行
 }
