@@ -28,6 +28,7 @@ export interface Car {
   sellerUsername: string;
   createdAt: string;
   updatedAt: string;
+  coverImageUrl?: string;
 }
 
 // 对应后端 CarDetailResponse（含图片列表）

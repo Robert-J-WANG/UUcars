@@ -1,4 +1,3 @@
-using System.ComponentModel.DataAnnotations;
 using UUcars.API.DTOs;
 using UUcars.API.DTOs.Requests;
 using UUcars.API.DTOs.Responses;
@@ -12,13 +11,16 @@ namespace UUcars.API.Services;
 
 public class CarService
 {
-    private readonly ICarRepository _carRepository;
     private readonly ICarImageRepository _carImageRepository;
-    // 构造函数新增 IStorageService
-    private readonly IStorageService _storageService;
+    private readonly ICarRepository _carRepository;
+
     private readonly ILogger<CarService> _logger;
 
-    public CarService(ICarRepository carRepository, ICarImageRepository carImageRepository,IStorageService storageService ,ILogger<CarService> logger)
+    // 构造函数新增 IStorageService
+    private readonly IStorageService _storageService;
+
+    public CarService(ICarRepository carRepository, ICarImageRepository carImageRepository,
+        IStorageService storageService, ILogger<CarService> logger)
     {
         _carRepository = carRepository;
         _carImageRepository = carImageRepository;
@@ -164,7 +166,7 @@ public class CarService
         // 只有 Draft 状态才能添加图片
         if (car.Status != CarStatus.Draft)
             throw new CarStatusException(car.Id, car.Status, CarStatus.Draft);
-        
+
         // 验证文件
         var (isValid, error) = FileValidator.Validate(request.File);
         if (!isValid)
@@ -218,7 +220,7 @@ public class CarService
         var image = await _carImageRepository.GetByIdAsync(imageId, cancellationToken);
         if (image == null || image.CarId != carId)
             throw new CarImageNotFoundException(imageId);
-        
+
         // 从 URL 里提取文件名（格式：{PublicUrl}/cars/{guid}.jpg）
         // 只需要 "cars/{guid}.jpg" 这部分来删除 R2 里的文件
         var uri = new Uri(image.ImageUrl);
@@ -282,8 +284,8 @@ public class CarService
             return MapToDetailResponse(car);
 
         // 车主可以查看自己发布的车辆（Draft / PendingReview 等）
-        
-        if (currentUserId.HasValue && car.SellerId == currentUserId.Value&& car.Status != CarStatus.Deleted)
+
+        if (currentUserId.HasValue && car.SellerId == currentUserId.Value && car.Status != CarStatus.Deleted)
             return MapToDetailResponse(car);
 
         // 既不是 Published，也没有对应权限，对外表现为"不存在"
@@ -293,56 +295,66 @@ public class CarService
     // 实体 → DTO 的映射方法
     // 注意 SellerUsername 暂时用空字符串——创建时 EF Core 不会自动加载导航属性
     // 后续详情接口会用 Include 加载完整的 Seller 信息
-    internal static CarResponse MapToResponse(Car car) => new()
+    internal static CarResponse MapToResponse(Car car)
     {
-        Id = car.Id,
-        Title = car.Title,
-        Brand = car.Brand,
-        Model = car.Model,
-        Year = car.Year,
-        Price = car.Price,
-        Mileage = car.Mileage,
-        Description = car.Description,
-        Status = car.Status.ToString(),
-        SellerId = car.SellerId,
-        SellerUsername = car.Seller?.Username ?? string.Empty,
-        CreatedAt = car.CreatedAt,
-        UpdatedAt = car.UpdatedAt
-    };
+        return new CarResponse
+        {
+            Id = car.Id,
+            Title = car.Title,
+            Brand = car.Brand,
+            Model = car.Model,
+            Year = car.Year,
+            Price = car.Price,
+            Mileage = car.Mileage,
+            Description = car.Description,
+            Status = car.Status.ToString(),
+            SellerId = car.SellerId,
+            SellerUsername = car.Seller?.Username ?? string.Empty,
+            CreatedAt = car.CreatedAt,
+            UpdatedAt = car.UpdatedAt,
+            CoverImageUrl = car.Images.OrderBy(i => i.SortOrder).FirstOrDefault()?.ImageUrl
+        };
+    }
 
-    internal static CarImageResponse MapToImageResponse(CarImage image) => new()
+    internal static CarImageResponse MapToImageResponse(CarImage image)
     {
-        Id = image.Id,
-        ImageUrl = image.ImageUrl,
-        SortOrder = image.SortOrder,
-        CarId = image.CarId
-    };
+        return new CarImageResponse
+        {
+            Id = image.Id,
+            ImageUrl = image.ImageUrl,
+            SortOrder = image.SortOrder,
+            CarId = image.CarId
+        };
+    }
 
-// 详情实体 → DTO 的映射（包含图片列表）
-    private static CarDetailResponse MapToDetailResponse(Car car) => new()
+    // 详情实体 → DTO 的映射（包含图片列表）
+    private static CarDetailResponse MapToDetailResponse(Car car)
     {
-        Id = car.Id,
-        Title = car.Title,
-        Brand = car.Brand,
-        Model = car.Model,
-        Year = car.Year,
-        Price = car.Price,
-        Mileage = car.Mileage,
-        Description = car.Description,
-        Status = car.Status.ToString(),
-        SellerId = car.SellerId,
-        SellerUsername = car.Seller?.Username ?? string.Empty,
-        Images = car.Images
-            .OrderBy(i => i.SortOrder)  // 按 SortOrder 排序，确保图片顺序正确
-            .Select(i => new CarImageResponse
-            {
-                Id = i.Id,
-                ImageUrl = i.ImageUrl,
-                SortOrder = i.SortOrder,
-                CarId = i.CarId
-            })
-            .ToList(),
-        CreatedAt = car.CreatedAt,
-        UpdatedAt = car.UpdatedAt
-    };
+        return new CarDetailResponse
+        {
+            Id = car.Id,
+            Title = car.Title,
+            Brand = car.Brand,
+            Model = car.Model,
+            Year = car.Year,
+            Price = car.Price,
+            Mileage = car.Mileage,
+            Description = car.Description,
+            Status = car.Status.ToString(),
+            SellerId = car.SellerId,
+            SellerUsername = car.Seller?.Username ?? string.Empty,
+            Images = car.Images
+                .OrderBy(i => i.SortOrder) // 按 SortOrder 排序，确保图片顺序正确
+                .Select(i => new CarImageResponse
+                {
+                    Id = i.Id,
+                    ImageUrl = i.ImageUrl,
+                    SortOrder = i.SortOrder,
+                    CarId = i.CarId
+                })
+                .ToList(),
+            CreatedAt = car.CreatedAt,
+            UpdatedAt = car.UpdatedAt
+        };
+    }
 }

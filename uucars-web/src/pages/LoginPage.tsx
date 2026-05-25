@@ -8,14 +8,7 @@ import { useAuthStore } from "@/stores/authStore";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
+import { Car } from "lucide-react";
 
 // 定义验证规则
 const loginSchema = z.object({
@@ -85,76 +78,185 @@ export default function LoginPage() {
     }
   };
   return (
-    <div className="flex min-h-screen items-center justify-center bg-gray-50">
-      <Card className="w-full max-w-md">
-        <CardHeader className="space-y-1">
-          <CardTitle className="text-2xl font-bold">Sign in</CardTitle>
-          <CardDescription>
-            Enter your email and password to sign in
-          </CardDescription>
-        </CardHeader>
+    <div
+      className="flex min-h-screen items-center justify-center px-4 py-12"
+      style={{ backgroundColor: "var(--color-bg)" }}
+    >
+      {/* 背景装饰 */}
+      <div
+        className="pointer-events-none fixed inset-0 opacity-30"
+        style={{
+          background:
+            "radial-gradient(ellipse 80% 60% at 50% -10%, var(--color-primary-light), transparent)",
+        }}
+      />
 
-        <CardContent>
-          {/* 把 onSubmit 传给 handleSubmit */}
-          <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+      <div className="relative w-full max-w-sm animate-fade-in-up">
+        {/* Logo */}
+        <div className="mb-8 text-center">
+          <Link to={"/"} className="mb-3 inline-flex items-center gap-2">
+            <div
+              className="flex h-9 w-9 items-center justify-center rounded-xl"
+              style={{ backgroundColor: "var(--color-accent)" }}
+            >
+              <Car className="h-5 w-5 text-white" />
+            </div>
+            <span
+              className="text-xl font-bold"
+              style={{
+                color: "var(--color-accent)",
+                fontFamily: "'DM Serif Display', serif",
+              }}
+            >
+              UUcars
+            </span>
+          </Link>
+          <h1
+            className="text-2xl"
+            style={{
+              color: "var(--color-text-primary)",
+              fontFamily: "'DM Serif Display', serif",
+            }}
+          >
+            Welcome back
+          </h1>
+          <p
+            className="mt-1 text-sm"
+            style={{ color: "var(--color-text-secondary)" }}
+          >
+            Sign in to your account
+          </p>
+        </div>
+
+        {/* 表单卡片 */}
+        <div
+          className="rounded-[var(--radius-xl)] border p-7"
+          style={{
+            backgroundColor: "var(--color-surface)",
+            borderColor: "var(--color-border)",
+            boxShadow: "var(--shadow-lg)",
+          }}
+        >
+          <form onSubmit={handleSubmit(onSubmit)} className="space-y-5">
+            {/* 服务端错误 */}
             {serverError && (
-              <div className="rounded-md bg-red-50 p-3 text-sm text-red-600">
+              <div
+                className="rounded-[var(--radius-md)] px-4 py-3 text-sm"
+                style={{
+                  backgroundColor: "var(--color-danger-light)",
+                  color: "var(--color-danger)",
+                  border: "1px solid",
+                  borderColor:
+                    "color-mix(in srgb, var(--color-danger) 20%, transparent)",
+                }}
+              >
                 {serverError}
               </div>
             )}
 
-            <div className="space-y-2">
-              <Label htmlFor="email">Email</Label>
-              {/* register('email') 展开传给 input，RHF 开始追踪这个字段 */}
+            <div className="space-y-1.5">
+              <label
+                htmlFor="email"
+                className="text-sm font-medium"
+                style={{ color: "var(--color-text-primary)" }}
+              >
+                Email
+              </label>
               <Input
                 id="email"
                 type="email"
                 placeholder="you@example.com"
+                autoComplete="email"
                 {...register("email")}
               />
               {errors.email && (
-                <p className="text-sm text-red-500">{errors.email.message}</p>
+                <p className="text-xs" style={{ color: "var(--color-danger)" }}>
+                  {errors.email.message}
+                </p>
               )}
             </div>
 
-            <div className="space-y-2">
-              <Label htmlFor="password">Password</Label>
-
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between">
+                <label
+                  htmlFor="password"
+                  className="text-sm font-medium"
+                  style={{ color: "var(--color-text-primary)" }}
+                >
+                  Password
+                </label>
+                <Link
+                  to="/forgot-password"
+                  className="text-xs transition-colors hover:underline"
+                  style={{ color: "var(--color-primary)" }}
+                >
+                  Forgot password?
+                </Link>
+              </div>
               <Input
                 id="password"
                 type="password"
                 placeholder="••••••••"
+                autoComplete="current-password"
                 {...register("password")}
               />
               {errors.password && (
-                <p className="text-sm text-red-500">
+                <p className="text-xs" style={{ color: "var(--color-danger)" }}>
                   {errors.password.message}
                 </p>
               )}
             </div>
 
-            <div className="flex justify-end">
-              <Link
-                to="/forgot-password"
-                className="text-sm text-blue-600 hover:underline"
-              >
-                Forgot password?
-              </Link>
-            </div>
-
-            <Button type="submit" className="w-full" disabled={isSubmitting}>
-              {isSubmitting ? "Signing in..." : "Sign in"}
+            <Button
+              type="submit"
+              className="w-full"
+              size="lg"
+              disabled={isSubmitting}
+            >
+              {isSubmitting ? (
+                <span className="flex items-center gap-2">
+                  <svg
+                    className="h-4 w-4 animate-spin"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                  >
+                    <circle
+                      className="opacity-25"
+                      cx="12"
+                      cy="12"
+                      r="10"
+                      stroke="currentColor"
+                      strokeWidth="4"
+                    />
+                    <path
+                      className="opacity-75"
+                      fill="currentColor"
+                      d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
+                    />
+                  </svg>
+                  Signing in...
+                </span>
+              ) : (
+                "Sign in"
+              )}
             </Button>
-
-            <p className="text-center text-sm text-gray-600">
-              Don't have an account?{" "}
-              <Link to="/register" className="text-blue-600 hover:underline">
-                Sign up
-              </Link>
-            </p>
           </form>
-        </CardContent>
-      </Card>
+        </div>
+
+        <p
+          className="mt-5 text-center text-sm"
+          style={{ color: "var(--color-text-secondary)" }}
+        >
+          Don't have an account?{" "}
+          <Link
+            to="/register"
+            className="font-medium transition-colors hover:underline"
+            style={{ color: "var(--color-accent)" }}
+          >
+            Create one free
+          </Link>
+        </p>
+      </div>
     </div>
   );
 }
