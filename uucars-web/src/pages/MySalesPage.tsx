@@ -1,36 +1,58 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useSearchParams } from "react-router-dom";
+import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import { ordersApi } from "@/api";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import EmptyState from "@/components/EmptyState";
+import { TrendingUp } from "lucide-react";
 
 const PAGE_SIZE = 10;
 
-/* -------------- Badge variant -------------- */
-const getStatusVariant = (status: string) => {
-  switch (status) {
-    case "Completed":
-      return "outline";
-    case "Cancelled":
-      return "destructive";
-    default:
-      return "default";
-  }
+const ORDER_STATUS: Record<
+  string,
+  { color: string; bg: string; label: string }
+> = {
+  Pending: {
+    color: "var(--color-warning)",
+    bg: "var(--color-warning-light)",
+    label: "Pending",
+  },
+  Completed: {
+    color: "var(--color-success)",
+    bg: "var(--color-success-light)",
+    label: "Completed",
+  },
+  Cancelled: {
+    color: "var(--color-text-muted)",
+    bg: "var(--color-border)",
+    label: "Cancelled",
+  },
 };
 
+function OrderStatusBadge({ status }: { status: string }) {
+  const cfg = ORDER_STATUS[status] ?? ORDER_STATUS.Pending;
+  return (
+    <span
+      className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium"
+      style={{ color: cfg.color, backgroundColor: cfg.bg }}
+    >
+      {cfg.label}
+    </span>
+  );
+}
+
 export default function MySalesPage() {
+  const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
   const page = Number(searchParams.get("page") ?? "1");
 
-  /* -------------- 请求数据 -------------- */
   const { data, isLoading } = useQuery({
     queryKey: ["my-sales", { page, pageSize: PAGE_SIZE }],
     queryFn: () => ordersApi.getMySales(page, PAGE_SIZE),
   });
 
-  /* -------------- Mutations -------------- */
   const completeMutation = useMutation({
     mutationFn: (orderId: number) => ordersApi.complete(orderId),
     onSuccess: () => {
@@ -40,52 +62,71 @@ export default function MySalesPage() {
     onError: (error) => toast.error(error.message),
   });
 
-  const handlePageChange = (newPage: number) => {
-    setSearchParams({ page: String(newPage) });
-  };
-
-  /* -------------- Loading -------------- */
   if (isLoading) {
     return (
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
-        {Array.from({ length: PAGE_SIZE }).map((_, i) => (
-          <div key={i} className="h-36 animate-pulse rounded-lg bg-gray-100" />
+      <div className="space-y-3">
+        {Array.from({ length: 4 }).map((_, i) => (
+          <div
+            key={i}
+            className="h-24 animate-pulse rounded-[var(--radius-lg)]"
+            style={{ backgroundColor: "var(--color-border)" }}
+          />
         ))}
       </div>
     );
   }
 
-  /* -------------- 空状态 -------------- */
   if (!data?.items.length) {
-    return <div className="py-12 text-center text-gray-500">No sales yet.</div>;
+    return (
+      <EmptyState
+        icon={<TrendingUp className="h-8 w-8" />}
+        title="No sales yet"
+        description="When buyers purchase your cars, the orders will appear here."
+        actionLabel="My listings"
+        onAction={() => navigate("/profile/listings")}
+      />
+    );
   }
 
   return (
     <div className="space-y-6">
-      <p className="text-sm text-gray-500 text-right">
-        {data.totalCount} orders
+      <p className="text-sm" style={{ color: "var(--color-text-muted)" }}>
+        {data.totalCount} sale{data.totalCount !== 1 ? "s" : ""}
       </p>
 
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+      <div className="space-y-3">
         {data.items.map((order) => (
           <div
             key={order.id}
-            className="flex flex-col justify-between rounded-lg border bg-white p-4 space-y-3"
+            className="flex items-center justify-between rounded-[var(--radius-lg)] border p-4"
+            style={{
+              backgroundColor: "var(--color-surface)",
+              borderColor: "var(--color-border)",
+              boxShadow: "var(--shadow-card)",
+            }}
           >
-            <div className="space-y-1">
-              <div className="flex items-start justify-between gap-2">
-                <span className="font-medium">{order.carTitle}</span>
-                <Badge
-                  variant={getStatusVariant(order.status)}
-                  className="shrink-0"
+            <div className="space-y-1 flex-1 min-w-0 pr-4">
+              <div className="flex items-center gap-2">
+                <p
+                  className="font-medium text-sm truncate"
+                  style={{ color: "var(--color-text-primary)" }}
                 >
-                  {order.status}
-                </Badge>
+                  {order.carTitle}
+                </p>
+                <OrderStatusBadge status={order.status} />
               </div>
-              <p className="text-lg font-bold text-blue-600">
+              <p
+                className="text-lg font-bold"
+                style={{
+                  color: "var(--color-accent)",
+                }}
+              >
                 ${order.price.toLocaleString()}
               </p>
-              <p className="text-sm text-gray-500">
+              <p
+                className="text-xs"
+                style={{ color: "var(--color-text-muted)" }}
+              >
                 Buyer: {order.buyerUsername}
               </p>
             </div>
@@ -93,36 +134,40 @@ export default function MySalesPage() {
             {order.status === "Pending" && (
               <Button
                 size="sm"
-                className="w-full"
                 onClick={() => completeMutation.mutate(order.id)}
                 disabled={completeMutation.isPending}
+                className="shrink-0"
               >
-                Mark as Completed
+                Mark Complete
               </Button>
             )}
           </div>
         ))}
       </div>
 
-      {/* 分页 */}
       {data.totalPages > 1 && (
-        <div className="flex items-center justify-center gap-4">
+        <div className="flex items-center justify-center gap-3">
           <Button
             variant="outline"
-            onClick={() => handlePageChange(page - 1)}
+            size="sm"
+            onClick={() => setSearchParams({ page: String(page - 1) })}
             disabled={page === 1}
           >
-            Previous
+            ← Prev
           </Button>
-          <span className="text-sm text-gray-600">
-            Page {page} of {data.totalPages}
+          <span
+            className="text-sm"
+            style={{ color: "var(--color-text-secondary)" }}
+          >
+            {page} / {data.totalPages}
           </span>
           <Button
             variant="outline"
-            onClick={() => handlePageChange(page + 1)}
+            size="sm"
+            onClick={() => setSearchParams({ page: String(page + 1) })}
             disabled={page === data.totalPages}
           >
-            Next
+            Next →
           </Button>
         </div>
       )}

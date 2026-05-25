@@ -1,3 +1,4 @@
+// src/pages/HomePage.tsx
 import { useQuery } from "@tanstack/react-query";
 import { carsApi } from "@/api";
 import CarCard from "@/components/CarCard";
@@ -6,33 +7,27 @@ import { Button } from "@/components/ui/button";
 import { useSearchParams } from "react-router-dom";
 import CarFilters from "@/components/CarFilters";
 import useDebounce from "@/hooks/useDebounce";
+import { Car } from "lucide-react";
+import EmptyState from "@/components/EmptyState";
+import HeroBanner from "@/components/HeroBanner";
+import LatestCarousel from "@/components/LatestCarousel";
+import SellerBanner from "@/components/SellerBanner";
 
-// 配置每页显示的数量
-// 前端单独维护显示的数量
-const PAGE_SIZE = 10;
+const PAGE_SIZE = 6;
 
 export default function HomePage() {
   const [searchParams, setSearchParams] = useSearchParams();
-  //  const [page, setPage] = useState(1);
-  // 从 URL 读取当前过滤条件
+
   const brand = searchParams.get("brand") ?? "";
   const minPrice = searchParams.get("minPrice") ?? "";
   const maxPrice = searchParams.get("maxPrice") ?? "";
   const page = Number(searchParams.get("page") ?? "1");
 
-  // 品牌加防抖：用户停止输入 500ms 后才触发请求
   const debouncedBrand = useDebounce(brand, 500);
   const debouncedMinPrice = useDebounce(minPrice, 800);
   const debouncedMaxPrice = useDebounce(maxPrice, 800);
 
-  // 用防抖后的值作为 queryKey 和请求参数
   const { data, isLoading, error } = useQuery({
-    // queryKey: ["cars", { page, pageSize: PAGE_SIZE }],
-    // queryFn: () => carsApi.getPaged({ page, pageSize: PAGE_SIZE }),
-
-    // queryKey 用防抖后的 brand，不用原始的 brand
-    // 这样用户打字过程中 queryKey 不变，不触发请求
-    // 停止输入 500ms 后 debouncedBrand 变化，queryKey 变化，才触发请求
     queryKey: [
       "cars",
       {
@@ -53,40 +48,57 @@ export default function HomePage() {
       }),
   });
 
-  // 分页通过 URL 参数控制
   const handlePageChange = (newPage: number) => {
     const current = Object.fromEntries(searchParams.entries());
     setSearchParams({ ...current, page: String(newPage) });
   };
 
+  const isHomepage = !brand && !minPrice && !maxPrice && page === 1;
+
   if (error) {
     return (
-      <div className="py-12 text-center text-gray-500">
+      <div
+        className="py-12 text-center"
+        style={{ color: "var(--color-text-muted)" }}
+      >
         Failed to load cars. Please try again.
       </div>
     );
   }
 
   return (
-    <div className="flex gap-6">
-      {/* 左侧：过滤条件 */}
-      <aside className="hidden w-64 shrink-0 lg:block">
-        <CarFilters />
-      </aside>
+    <div className="space-y-8">
+      {/* Hero + 轮播（首页状态显示） */}
+      {isHomepage && <HeroBanner />}
+      {isHomepage && <LatestCarousel />}
+      {isHomepage && <SellerBanner />}
 
-      {/* 右侧：列表 */}
-      <div className="flex-1 space-y-6">
+      {/* 车辆列表区域（单栏，filter 移至顶部） */}
+      <div className="space-y-5">
+        {/* 标题 + 统计 */}
         <div className="flex items-center justify-between">
-          <h1 className="text-2xl font-bold">Browse Cars</h1>
+          <h1
+            className="text-lg"
+            style={{
+              color: "var(--color-text-primary)",
+            }}
+          >
+            {isHomepage ? "All Listings" : "Browse Cars"}
+          </h1>
           {data && (
-            <p className="text-sm text-gray-500">
-              {data.totalCount} cars found
+            <p className="text-sm" style={{ color: "var(--color-text-muted)" }}>
+              {data.totalCount.toLocaleString()} cars found
             </p>
           )}
         </div>
 
-        {/* 车辆卡片网格 */}
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+        {/* Filters：横向排列在列表上方 */}
+        <CarFilters />
+
+        {/* 车辆卡片网格
+            justify-items-center：配合 CarCard 的 max-w-sm，让卡片在格子里居中
+            而不是被拉伸到格子满宽                                              */}
+        <div className="grid grid-cols-1 gap-6 sm:grid-cols-2 xl:grid-cols-3 justify-items-center max-w-3xl xl:max-w-none mx-auto w-full">
           {isLoading
             ? Array.from({ length: PAGE_SIZE }).map((_, i) => (
                 <CarCardSkeleton key={i} />
@@ -94,32 +106,41 @@ export default function HomePage() {
             : data?.items.map((car) => <CarCard key={car.id} car={car} />)}
         </div>
 
-        {/* 没有数据 */}
+        {/* 空状态 */}
         {!isLoading && data?.items.length === 0 && (
-          <div className="py-12 text-center text-gray-500">
-            No cars found. Try adjusting your filters.
-          </div>
+          <EmptyState
+            icon={<Car className="h-8 w-8" />}
+            title="No cars found"
+            description="Try adjusting your filters."
+            actionLabel="Clear filters"
+            onAction={() => setSearchParams({})}
+          />
         )}
 
         {/* 分页 */}
         {data && data.totalPages > 1 && (
-          <div className="flex items-center justify-center gap-4">
+          <div className="flex items-center justify-center gap-3">
             <Button
               variant="outline"
+              size="sm"
               onClick={() => handlePageChange(page - 1)}
               disabled={page === 1}
             >
-              Previous
+              ← Previous
             </Button>
-            <span className="text-sm text-gray-600">
-              Page {page} of {data.totalPages}
+            <span
+              className="text-sm"
+              style={{ color: "var(--color-text-secondary)" }}
+            >
+              {page} / {data.totalPages}
             </span>
             <Button
               variant="outline"
+              size="sm"
               onClick={() => handlePageChange(page + 1)}
               disabled={page === data.totalPages}
             >
-              Next
+              Next →
             </Button>
           </div>
         )}
