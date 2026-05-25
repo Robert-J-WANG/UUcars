@@ -75,8 +75,19 @@ public class UserService
         // 如果反过来——邮件发出去了但数据库写入失败，
         // 用户点链接时服务端找不到这个 Token，验证永远失败
         // 如果邮件发送失败，用户可以通过"重新发送"功能补救
-        await _emailService.SendEmailVerificationAsync(created.Email, created.EmailConfirmationToken!,
-            cancellationToken);
+        try
+        {
+            await _emailService.SendEmailVerificationAsync(
+                created.Email,
+                created.EmailConfirmationToken!,
+                cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            // 邮件发送失败不阻断注册流程
+            // 用户已成功写入数据库，可以通过"重新发送验证邮件"功能补救
+            _logger.LogWarning(ex, "Failed to send verification email to {Email}", created.Email);
+        }
 
         _logger.LogInformation("New user registered: {Email}", created.Email);
 
