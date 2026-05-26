@@ -516,6 +516,13 @@ dotnet test
 git add .
 git commit -m "perf: add car indexes + AsNoTracking + select projection for list queries"
 git push origin feature/v3-query-optimization
+
+# 合并回 develop
+git checkout develop
+git merge --no-ff feature/v3-query-optimization -m "merge: feature/v3-query-optimization into develop"
+git push origin develop
+git branch -d feature/v3-query-optimization
+git push origin --delete feature/v3-query-optimization
 ```
 
 
