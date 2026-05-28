@@ -44,8 +44,9 @@ public class EfFavoriteRepository : IFavoriteRepository
         CancellationToken cancellationToken = default)
     {
         var query = _context.Favorites
-            .Include(f => f.Car)
-            .ThenInclude(c => c.Seller)  // 加载车辆的同时也加载车辆的卖家
+            .AsNoTracking() // ✅ 只读，关闭变更追踪
+            //.Include(f => f.Car)
+            //.ThenInclude(c => c.Seller)  // 加载车辆的同时也加载车辆的卖家
             .Where(f => f.UserId == userId);
 
         var totalCount = await query.CountAsync(cancellationToken);
@@ -54,6 +55,36 @@ public class EfFavoriteRepository : IFavoriteRepository
             .OrderByDescending(f => f.CreatedAt)
             .Skip((page - 1) * pageSize)
             .Take(pageSize)
+            // ✅ 投影：Favorite 里的 Car 排除 Description，只取封面图
+            .Select(f => new Favorite
+            {
+                UserId = f.UserId,
+                CarId = f.CarId,
+                CreatedAt = f.CreatedAt,
+                Car = new Car
+                {
+                    Id = f.Car.Id,
+                    Title = f.Car.Title,
+                    Brand = f.Car.Brand,
+                    Model = f.Car.Model,
+                    Year = f.Car.Year,
+                    Price = f.Car.Price,
+                    Mileage = f.Car.Mileage,
+                    Status = f.Car.Status,
+                    SellerId = f.Car.SellerId,
+                    CreatedAt = f.Car.CreatedAt,
+                    UpdatedAt = f.Car.UpdatedAt,
+                    Seller = new User
+                    {
+                        Id = f.Car.Seller.Id,
+                        Username = f.Car.Seller.Username
+                    },
+                    Images = f.Car.Images
+                        .OrderBy(i => i.SortOrder)
+                        .Take(1)
+                        .ToList()
+                }
+            })
             .ToListAsync(cancellationToken);
 
         return (favorites, totalCount);

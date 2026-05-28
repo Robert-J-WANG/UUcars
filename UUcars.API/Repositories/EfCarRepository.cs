@@ -114,7 +114,8 @@ public class EfCarRepository : ICarRepository
     {
         var query = _context.Cars
             .AsNoTracking() // ✅ 只读查询，关闭变更追踪
-            .Include(c => c.Seller).Include(c => c.Images)
+            //.Include(c => c.Seller)  // 使用投影select
+            //.Include(c => c.Images)
             .Where(c => c.SellerId == sellerId);
         // 注意：这里没有过滤 Status，返回卖家所有状态的车辆
         // 但排除逻辑删除的车辆——卖家也不需要看到已删除的车
@@ -143,6 +144,30 @@ public class EfCarRepository : ICarRepository
             .OrderByDescending(c => c.CreatedAt)
             .Skip((page - 1) * pageSize)
             .Take(pageSize)
+            // 使用投影，只取需要的字段
+            .Select(c => new Car
+            {
+                Id = c.Id,
+                Title = c.Title,
+                Brand = c.Brand,
+                Model = c.Model,
+                Year = c.Year,
+                Price = c.Price,
+                Mileage = c.Mileage,
+                Status = c.Status,
+                SellerId = c.SellerId,
+                CreatedAt = c.CreatedAt,
+                UpdatedAt = c.UpdatedAt,
+                Seller = new User
+                {
+                    Id = c.Seller.Id,
+                    Username = c.Seller.Username
+                },
+                Images = c.Images
+                    .OrderBy(i => i.SortOrder)
+                    .Take(1)
+                    .ToList()
+            })
             .ToListAsync(cancellationToken);
 
         return (cars, totalCount);
