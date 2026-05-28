@@ -442,6 +442,299 @@ public async Task<(List<Car> Cars, int TotalCount)> GetPagedAsync(
 }
 ```
 
+完整更新后的 `GetPagedAsync`：
+
+```ts
+// UUcars.API/Repositories/EfCarRepository.cs
+
+// GetBySellerAsync：加 AsNoTracking + Select 投影 
+public async Task<(List<Car> Cars, int TotalCount)> GetBySellerAsync(
+    int sellerId,
+    CarQueryRequest request,
+    CancellationToken cancellationToken = default)
+{
+    var query = _context.Cars
+        .AsNoTracking() // ✅ 只读查询，关闭变更追踪
+        //.Include(c => c.Seller)  // 使用投影select
+        //.Include(c => c.Images)
+        .Where(c => c.SellerId == sellerId);
+    // 注意：这里没有过滤 Status，返回卖家所有状态的车辆
+    // 但排除逻辑删除的车辆——卖家也不需要看到已删除的车
+    // 如果将来需要显示已删除的车，可以单独加一个接口
+
+    if (!string.IsNullOrWhiteSpace(request.Brand))
+        query = query.Where(c => c.Brand.Contains(request.Brand.ToLower()));
+
+    if (request.MinPrice.HasValue) query = query.Where(c => c.Price >= request.MinPrice.Value);
+
+    if (request.MaxPrice.HasValue) query = query.Where(c => c.Price <= request.MaxPrice.Value);
+
+    if (request.MinYear.HasValue) query = query.Where(c => c.Year >= request.MinYear.Value);
+
+    if (request.MaxYear.HasValue) query = query.Where(c => c.Year <= request.MaxYear.Value);
+
+    // 去掉逻辑删除的车（卖家视角也不需要看到已删除的车）
+    query = query.Where(c => c.Status != CarStatus.Deleted);
+
+    var totalCount = await query.CountAsync(cancellationToken);
+
+    var page = request.Page;
+    var pageSize = Math.Min(50, request.PageSize);
+
+    var cars = await query
+        .OrderByDescending(c => c.CreatedAt)
+        .Skip((page - 1) * pageSize)
+        .Take(pageSize)
+        // 使用投影，只取需要的字段
+        .Select(c => new Car
+        {
+            Id = c.Id,
+            Title = c.Title,
+            Brand = c.Brand,
+            Model = c.Model,
+            Year = c.Year,
+            Price = c.Price,
+            Mileage = c.Mileage,
+            Status = c.Status,
+            SellerId = c.SellerId,
+            CreatedAt = c.CreatedAt,
+            UpdatedAt = c.UpdatedAt,
+            Seller = new User
+            {
+                Id = c.Seller.Id,
+                Username = c.Seller.Username
+            },
+            Images = c.Images
+                .OrderBy(i => i.SortOrder)
+                .Take(1)
+                .ToList()
+        })
+        .ToListAsync(cancellationToken);
+
+    return (cars, totalCount);
+}
+
+
+```
+
+注意：EfCarRepository里的其他方法不需要加AsNoTracking和投影
+
+```c#
+// ── GetByIdAsync：保持原样，不改 
+// 原因：查出来之后要修改状态，必须保留 EF Core 变更追踪
+// 不加 AsNoTracking，不加投影
+
+// ── GetDetailByIdAsync：保持原样，不改 
+// 原因：详情页展示用，需要加载完整 Images 列表
+// 虽然是只读，但加 AsNoTracking 后如果收藏/下单操作里间接读到这个 Car 对象，会有追踪丢失的隐患
+// 保持现状，清晰优于微小的性能收益
+```
+
+#### 8.3 其他repository的优化
+
+##### **对于favorite （`EfFavoriteRepository.cs`）来说：**
+
+`GetByUserAsync` 是收藏列表，纯只读展示，加 `AsNoTracking`。
+
+**投影的问题：** `GetByUserAsync` 返回的是 `List<Favorite>`，Favorite 实体本身字段很少（UserId、CarId、CreatedAt），主要内容在导航属性 `Car` 和 `Car.Seller` 里。
+
+这里加投影收益不大（Favorite 自身没有大字段），但可以把 Car 里的 `Description` 排除掉，保持和 `GetPagedAsync` 一致的原则：
+
+```c#
+// UUcars.API/Repositories/EfFavoriteRepository.cs
+
+public async Task<(List<Favorite> Favorites, int TotalCount)> GetByUserAsync(
+    int userId,
+    int page,
+    int pageSize,
+    CancellationToken cancellationToken = default)
+{
+    var query = _context.Favorites
+        .AsNoTracking()                          // ✅ 只读，关闭变更追踪
+        .Where(f => f.UserId == userId);
+
+    var totalCount = await query.CountAsync(cancellationToken);
+
+    var favorites = await query
+        .OrderByDescending(f => f.CreatedAt)
+        .Skip((page - 1) * pageSize)
+        .Take(pageSize)
+        // ✅ 投影：Favorite 里的 Car 排除 Description，只取封面图
+        .Select(f => new Favorite
+        {
+            UserId    = f.UserId,
+            CarId     = f.CarId,
+            CreatedAt = f.CreatedAt,
+            Car = new Car
+            {
+                Id        = f.Car.Id,
+                Title     = f.Car.Title,
+                Brand     = f.Car.Brand,
+                Model     = f.Car.Model,
+                Year      = f.Car.Year,
+                Price     = f.Car.Price,
+                Mileage   = f.Car.Mileage,
+                Status    = f.Car.Status,
+                SellerId  = f.Car.SellerId,
+                CreatedAt = f.Car.CreatedAt,
+                UpdatedAt = f.Car.UpdatedAt,
+                Seller = new User
+                {
+                    Id       = f.Car.Seller.Id,
+                    Username = f.Car.Seller.Username,
+                },
+                Images = f.Car.Images
+                            .OrderBy(i => i.SortOrder)
+                            .Take(1)
+                            .ToList(),
+            },
+        })
+        .ToListAsync(cancellationToken);
+
+    return (favorites, totalCount);
+}
+
+// ── GetAsync（按联合主键查单条收藏）：保持原样 ────────────────────────────
+// 原因：用于判断是否已收藏，结果不做展示，不需要投影
+// AddAsync / DeleteAsync：写操作，不加 AsNoTracking
+```
+
+##### **对于order（`EfOrderRepository.cs`）来说：**
+
+`GetByBuyerAsync` 和 `GetBySellerAsync` 都是列表查询，加 `AsNoTracking` + 投影。
+
+Order 实体本身没有大字段（Price 是 decimal，不大），但导航属性 Car 里有 `Description`，投影时排除掉：
+
+```c#
+// UUcars.API/Repositories/EfOrderRepository.cs
+
+public async Task<(List<Order> Orders, int TotalCount)> GetByBuyerAsync(
+    int buyerId,
+    int page,
+    int pageSize,
+    CancellationToken cancellationToken = default)
+{
+    var query = _context.Orders
+        .AsNoTracking()                          // ✅ 只读
+        .Where(o => o.BuyerId == buyerId);
+
+    var totalCount = await query.CountAsync(cancellationToken);
+
+    var orders = await query
+        .OrderByDescending(o => o.CreatedAt)
+        .Skip((page - 1) * pageSize)
+        .Take(pageSize)
+        .Select(o => new Order                   // ✅ 投影
+        {
+            Id        = o.Id,
+            CarId     = o.CarId,
+            BuyerId   = o.BuyerId,
+            SellerId  = o.SellerId,
+            Price     = o.Price,
+            Status    = o.Status,
+            CreatedAt = o.CreatedAt,
+            UpdatedAt = o.UpdatedAt,
+            // Car：只取列表展示需要的字段（不含 Description）
+            Car = new Car
+            {
+                Id    = o.Car.Id,
+                Title = o.Car.Title,
+                Brand = o.Car.Brand,
+                Year  = o.Car.Year,
+                Images = o.Car.Images
+                            .OrderBy(i => i.SortOrder)
+                            .Take(1)
+                            .ToList(),
+            },
+            // 买家查"我买的"，关心卖家是谁
+            Seller = new User
+            {
+                Id       = o.Seller.Id,
+                Username = o.Seller.Username,
+            },
+            // Buyer 不需要（就是自己）
+        })
+        .ToListAsync(cancellationToken);
+
+    return (orders, totalCount);
+}
+
+public async Task<(List<Order> Orders, int TotalCount)> GetBySellerAsync(
+    int sellerId,
+    int page,
+    int pageSize,
+    CancellationToken cancellationToken = default)
+{
+    var query = _context.Orders
+        .AsNoTracking()                          // ✅ 只读
+        .Where(o => o.SellerId == sellerId);
+
+    var totalCount = await query.CountAsync(cancellationToken);
+
+    var orders = await query
+        .OrderByDescending(o => o.CreatedAt)
+        .Skip((page - 1) * pageSize)
+        .Take(pageSize)
+        .Select(o => new Order                   // ✅ 投影
+        {
+            Id        = o.Id,
+            CarId     = o.CarId,
+            BuyerId   = o.BuyerId,
+            SellerId  = o.SellerId,
+            Price     = o.Price,
+            Status    = o.Status,
+            CreatedAt = o.CreatedAt,
+            UpdatedAt = o.UpdatedAt,
+            Car = new Car
+            {
+                Id    = o.Car.Id,
+                Title = o.Car.Title,
+                Brand = o.Car.Brand,
+                Year  = o.Car.Year,
+                Images = o.Car.Images
+                            .OrderBy(i => i.SortOrder)
+                            .Take(1)
+                            .ToList(),
+            },
+            // 卖家查"我卖的"，关心买家是谁
+            Buyer = new User
+            {
+                Id       = o.Buyer.Id,
+                Username = o.Buyer.Username,
+            },
+            // Seller 不需要（就是自己）
+        })
+        .ToListAsync(cancellationToken);
+
+    return (orders, totalCount);
+}
+
+// ── GetByIdAsync（按 ID 查单条订单）：保持原样 ────────────────────────────
+// 原因：CancelAsync 查出来之后要修改状态，需要变更追踪
+// 不加 AsNoTracking，不加投影
+```
+
+#### 8.4 所有方法(读取数据）决策汇总
+
+```
+方法                        AsNoTracking  投影    原因
+──────────────────────────────────────────────────────────────
+Car
+  GetPagedAsync             ✅ 已加       ✅ 已加  只读列表
+  GetBySellerAsync          ✅ 已加       ✅ 已加  只读列表
+  GetByIdAsync              ❌            ❌       写前查询，需要追踪
+  GetDetailByIdAsync        ❌            ❌       详情展示，保持清晰
+
+Favorite
+  GetByUserAsync            ✅ 已加       ✅ 已加  只读列表
+  GetAsync（单条）           ❌            ❌       判断存在，结果不展示
+
+Order
+  GetByBuyerAsync           ✅ 已加       ✅ 已加  只读列表
+  GetBySellerAsync          ✅ 已加       ✅ 已加  只读列表
+  GetByIdAsync              ❌            ❌       写前查询（取消订单）
+```
+
 
 
 ### 9. 验证优化效果
