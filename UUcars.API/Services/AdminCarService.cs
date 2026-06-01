@@ -4,18 +4,22 @@ using UUcars.API.DTOs.Responses;
 using UUcars.API.Entities.Enums;
 using UUcars.API.Exceptions;
 using UUcars.API.Repositories;
+using UUcars.API.Services.Cache;
 
 namespace UUcars.API.Services;
 
 public class AdminCarService
 {
+    private readonly ICacheService _cache; // ✅ 新增
     private readonly ICarRepository _carRepository;
     private readonly ILogger<AdminCarService> _logger;
 
-    public AdminCarService(ICarRepository carRepository, ILogger<AdminCarService> logger)
+
+    public AdminCarService(ICarRepository carRepository, ILogger<AdminCarService> logger, ICacheService cache)
     {
         _carRepository = carRepository;
         _logger = logger;
+        _cache = cache;
     }
 
     public async Task<CarResponse> ApproveAsync(
@@ -37,6 +41,11 @@ public class AdminCarService
         car.UpdatedAt = DateTime.UtcNow;
 
         var updated = await _carRepository.UpdateAsync(car, cancellationToken);
+
+        // ✅ 车辆上架 → 公开列表变了 → 清掉公开列表的所有缓存
+        // 用前缀删除：一次清掉所有分页（page1/page2/page3...）
+        await _cache.RemoveByPrefixAsync(CacheKeys.PublishedCarsPrefix, cancellationToken);
+        await _cache.RemoveByPrefixAsync(CacheKeys.PendingCarsPrefix, cancellationToken);
 
         _logger.LogInformation("Car {CarId} approved by admin, now Published", carId);
 
@@ -62,11 +71,16 @@ public class AdminCarService
 
         var updated = await _carRepository.UpdateAsync(car, cancellationToken);
 
+        // ✅ 车辆退回 → 待审核列表变了 → 清待审核列表缓存
+        await _cache.RemoveByPrefixAsync(CacheKeys.PendingCarsPrefix, cancellationToken);
+
         _logger.LogInformation("Car {CarId} rejected by admin, returned to Draft", carId);
 
         return CarService.MapToResponse(updated);
     }
 
+
+    // ✅ 待审核车辆列表：加缓存
     public async Task<PagedResponse<CarResponse>> GetPendingCarsAsync(
         CarQueryRequest query,
         CancellationToken cancellationToken = default)
@@ -75,16 +89,20 @@ public class AdminCarService
         var pageSize = query.PageSize < 1 ? 20 : query.PageSize;
         pageSize = Math.Min(pageSize, 50);
 
-        // 直接复用 ICarRepository 的 GetPagedAsync，传入 PendingReview 状态
-        // 不需要新增 Repository 方法，这正是把 status 作为参数设计的价值
-        var (cars, totalCount) = await _carRepository.GetPagedAsync(
-            CarStatus.PendingReview,
-            query,
-            cancellationToken);
+        // 构建缓存 Key（包含所有过滤参数，不同参数对应不同缓存）
+        var cacheKey = CacheKeys.PendingCars(page, pageSize);
 
-        var items = cars.Select(CarService.MapToResponse).ToList();
+        // GetOrSetAsync：有缓存直接返回；没有则查数据库并缓存结果
 
-        return PagedResponse<CarResponse>.Create(items, totalCount, page, pageSize);
+        return await _cache.GetOrSetAsync(cacheKey,
+            async () =>
+            {
+                var (cars, totalCount) = await _carRepository.GetPagedAsync(
+                    CarStatus.PendingReview,
+                    query, cancellationToken);
+                var items = cars.Select(CarService.MapToResponse).ToList();
+                return PagedResponse<CarResponse>.Create(items, totalCount, page, pageSize);
+            }, TimeSpan.FromSeconds(30), cancellationToken);
     }
 
     public async Task AdminDeleteAsync(
@@ -101,11 +119,21 @@ public class AdminCarService
         if (car.Status == CarStatus.Deleted)
             throw new CarStatusException(car.Id, car.Status, CarStatus.Published);
 
+        var previousStatus = car.Status; // ✅ 记录删除前的状态
         car.Status = CarStatus.Deleted;
         car.UpdatedAt = DateTime.UtcNow;
 
         await _carRepository.UpdateAsync(car, cancellationToken);
 
-        _logger.LogInformation("Car {CarId} forcefully deleted by admin", carId);
+        // ✅ 根据删除前的状态，清对应的缓存
+        if (previousStatus == CarStatus.Published)
+            await _cache.RemoveByPrefixAsync(CacheKeys.PublishedCarsPrefix, cancellationToken);
+
+        if (previousStatus == CarStatus.PendingReview)
+            await _cache.RemoveByPrefixAsync(CacheKeys.PendingCarsPrefix, cancellationToken);
+
+        _logger.LogInformation(
+            "Car {CarId} forcefully deleted by admin (was {Status}), cache invalidated",
+            carId, previousStatus);
     }
 }

@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using Scalar.AspNetCore;
 using Serilog;
+using StackExchange.Redis;
 using UUcars.API.Auth;
 using UUcars.API.Data;
 using UUcars.API.Entities;
@@ -9,6 +10,7 @@ using UUcars.API.Extensions;
 using UUcars.API.Middleware;
 using UUcars.API.Repositories;
 using UUcars.API.Services;
+using UUcars.API.Services.Cache;
 using UUcars.API.Services.Email;
 using UUcars.API.Services.Storage;
 
@@ -75,6 +77,28 @@ try
 
     // 存储服务
     builder.Services.AddStorageService(builder.Configuration);
+
+    // ── Redis Cache服务 ──
+
+    // Redis 连接（IConnectionMultiplexer 是线程安全的，注册为 Singleton）
+    // Singleton：整个应用生命周期只创建一次连接，所有请求共享
+    // 不用 Scoped 的原因：Redis 连接是昂贵的资源，每次请求创建一个连接会耗尽连接池
+    var redisConnectionString = builder.Configuration
+        .GetConnectionString("Redis") ?? "localhost:6379";
+
+    builder.Services.AddSingleton<IConnectionMultiplexer>(
+        ConnectionMultiplexer.Connect(redisConnectionString));
+
+    // IDistributedCache 的 Redis 实现
+    builder.Services.AddStackExchangeRedisCache(options =>
+    {
+        options.Configuration = redisConnectionString;
+        // Key 前缀：区分不同应用共用同一个 Redis 实例时的 Key 冲突
+        options.InstanceName = "uucars:";
+    });
+
+    // 缓存服务（Singleton，因为它依赖 Singleton 的 IConnectionMultiplexer）
+    builder.Services.AddSingleton<ICacheService, RedisCacheService>();
 
     // 用户模块
     // AddScoped：每次 HTTP 请求创建一个新实例，请求结束后销毁

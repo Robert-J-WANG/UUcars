@@ -17,7 +17,22 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-
+  
+  
+  # ✅ 新增：Redis 缓存服务
+  redis:
+    image: redis:7-alpine         # alpine 版本更小，生产够用
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data          # 数据持久化（可选，开发时可以不要）
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  
+  
   # API 容器
   api:
     build:
@@ -28,6 +43,8 @@ services:
     environment:
       # 连接字符串：指向 sqlserver 容器（docker-compose 网络里用服务名访问）
       ConnectionStrings__DefaultConnection: "Server=sqlserver,1433;Database=UUcarsDB;User Id=sa;Password=${DB_PASSWORD};TrustServerCertificate=True"
+      # ✅ 新增 Redis 连接字符串
+      ConnectionStrings__Redis: "redis:6379"
       # JWT 配置
       JwtSettings__Secret: "${JWT_SECRET}"
       JwtSettings__Issuer: "UUcars"
@@ -38,8 +55,13 @@ services:
     depends_on:
       sqlserver:
         condition: service_healthy    # 等 SQL Server 健康检查通过再启动
+      # ✅ 新增：等 Redis 健康检查通过再启动 API
+      redis:
+        condition: service_healthy
+    
     restart: unless-stopped          # 除非手动停止，否则崩溃后自动重启
 
 # 数据卷：持久化数据库文件
 volumes:
   sqlserver_data:
+  redis_data:      # ✅ 新增
