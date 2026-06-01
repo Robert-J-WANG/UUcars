@@ -1843,7 +1843,7 @@ EXIT
 
 ### 11. 编译和测试
 
-**单元测试里的 CarService 怎么处理 ICacheService？** 
+#### 单元测试里的 CarService 怎么处理 ICacheService？ 
 
 测试里用的是 Fake Repository，但现在 CarService 多了 `ICacheService` 依赖。需要给测试提供一个 fake 的 ICacheService——最简单的方式是用 `NSubstitute` 或直接实现一个 `FakeCacheService`（直接执行 factory，不做任何缓存）。
 
@@ -1912,6 +1912,40 @@ private static OrderService CreateService(
     }
 ```
 
+#### 集成测试如何处理Redis？
+
+集成测试不应该依赖真实的 Redis，原因和替换 `IEmailService` 一样：测试环境不保证 Redis 可用，而且缓存会在测试之间互相干扰。
+
+因此使用 `FakeCacheService`替换
+
+打开 `UUcars.Tests/Integration/SqlServerTestFactory.cs`，在 `ConfigureWebHost` 里补充：
+
+```c#
+protected override void ConfigureWebHost(IWebHostBuilder builder)
+{
+    builder.ConfigureServices(services =>
+    {
+        // 替换 DbContext
+        var descriptor = services.SingleOrDefault(d => d.ServiceType == typeof(DbContextOptions<AppDbContext>));
+        if (descriptor != null) services.Remove(descriptor);
+        services.AddDbContext<AppDbContext>(options =>
+            options.UseSqlServer(_sqlContainer.GetConnectionString()));
+
+        // 替换 IEmailService
+        var emailDescriptor = services.SingleOrDefault(d => d.ServiceType == typeof(IEmailService));
+        if (emailDescriptor != null) services.Remove(emailDescriptor);
+        services.AddSingleton<IEmailService>(FakeEmail);
+
+        // ✅ 替换 ICacheService，集成测试不依赖真实 Redis
+        var cacheDescriptor = services.SingleOrDefault(d => d.ServiceType == typeof(ICacheService));
+        if (cacheDescriptor != null) services.Remove(cacheDescriptor);
+        services.AddSingleton<ICacheService, FakeCacheService>();
+    });
+
+    builder.UseEnvironment("Testing");
+}
+```
+
 再跑一遍：
 
 ```bash
@@ -1921,7 +1955,55 @@ dotnet test
 
 
 
-### 12. Git 提交
+### 12. 生产环境 Redis 部署（Upstash）
+
+Azure部署时， 可以用 Azure Cache for Redis， 但作为学习项目，使用独立第三方提供的redis更合理
+
+#### 12.1 选 Upstash的Redis
+
+|          | Upstash                                         | Azure Cache for Redis   |
+| -------- | ----------------------------------------------- | ----------------------- |
+| 费用     | 免费套餐（10,000 requests/天）                  | 最低 $16/月（Basic C0） |
+| 架构     | 独立托管服务，和 Azure Cache for Redis 完全一致 | 独立托管服务            |
+| 迁移成本 | 只需换连接字符串，代码零改动                    | -                       |
+| 适用场景 | 学习/练手项目                                   | 生产级项目              |
+
+学习阶段用 Upstash，后期迁移到 Azure Cache for Redis 只需要换连接字符串。
+
+**不要用 Redis sidecar 方案**：Container App 重启时缓存数据全部丢失，多实例之间缓存不共享，完全不是生产模式。
+
+#### 12.2 创建 Upstash 数据库
+
+1. 去 [upstash.com](https://upstash.com) 注册账号
+2. 创建新数据库，Region 选离 Azure 服务器最近的
+3. 进入数据库控制台 → **Connect** → 选 **.NET / StackExchange.Redis**
+4. 拿到连接字符串，格式类似：
+
+```
+exact-dove 111625.upstash.io:6379,password=gQAAAAAAAAbQJAAIgcDJmMmY0MmE2Njk1NGQ0ZTY5OWRhMjVhZDZiYTc2ZGEwOQ,ssl=True,abortConnect=False
+```
+
+#### 12.3 配置到 Azure Container Apps
+
+Azure Portal → Container Apps → `uucars-api` → **Environment variables** → 添加：
+
+```
+ConnectionStrings__Redis = exact-dove111625.upstash.io:6379,password=gQAAAAAAAAbQJAAIgcDJmMmY0MmE2Njk1NGQ0ZTY5OWRhMjVhZDZiYTc2ZGEwOQ,ssl=True,abortConnect=False
+```
+
+**不需要改 CI/CD 文件**，部署流程不变，Azure 启动时自动读取环境变量。
+
+#### 12.4 本地开发 vs 生产环境
+
+|                                  | 连接的 Redis                         |
+| -------------------------------- | ------------------------------------ |
+| 本地开发（docker-compose）       | `redis:6379`（本地容器）             |
+| 集成测试                         | `FakeCacheService`（不连任何 Redis） |
+| 生产环境（Azure Container Apps） | Upstash（Azure 环境变量配置）        |
+
+
+
+### 13. Git 提交
 
 ```bash
 git add .
@@ -1955,5 +2037,6 @@ git push origin --delete feature/v3-redis-cache
 ✅ FakeCacheService（单元测试透明执行，不依赖 Redis）
 ✅ dotnet build + dotnet test 全部通过
 ✅ 本地验证：Cache HIT/MISS 日志正确，redis-cli 能看到缓存 Key
+✅ Azure部署Upstash Redis
 ✅ Git commit + 合并回 develop 完成
 ```
