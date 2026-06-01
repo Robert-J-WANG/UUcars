@@ -7,7 +7,9 @@ using Testcontainers.MsSql;
 using UUcars.API.Data;
 using UUcars.API.Entities;
 using UUcars.API.Entities.Enums;
+using UUcars.API.Services.Cache;
 using UUcars.API.Services.Email;
+using UUcars.Tests.Fakes;
 using UUcars.Tests.Services;
 
 namespace UUcars.Tests.Integration;
@@ -64,6 +66,12 @@ public class SqlServerTestFactory : WebApplicationFactory<Program>, IAsyncLifeti
 
             // Singleton：整个测试共享同一个实例，token 才能被正确读取
             services.AddSingleton<IEmailService>(FakeEmail);
+
+            // ✅ 替换 ICacheService，集成测试不依赖真实 Redis
+            var cacheDescriptor = services.SingleOrDefault(d => d.ServiceType == typeof(ICacheService));
+            if (cacheDescriptor != null)
+                services.Remove(cacheDescriptor);
+            services.AddSingleton<ICacheService, FakeCacheService>();
         });
 
         // 使用测试环境，避免加载生产配置
