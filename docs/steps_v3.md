@@ -834,3 +834,1126 @@ git push origin --delete feature/v3-query-optimization
 ✅ Git commit 完成
 ```
 
+
+
+## Step 58 · 缓存层：从 IMemoryCache 到 Redis
+
+### 这一步做什么
+
+Step 57 用索引解决了"查询本身慢"的问题。这一步解决另一个问题：**重复查询**。
+
+`GET /cars`（公开车辆列表）是整个平台访问最频繁的接口。每次有用户打开首页，就发一次数据库查询。如果同时有 50 个用户在浏览，数据库就收到 50 个几乎完全相同的查询——而这 50 个查询的结果，在这一秒内是完全一样的（车辆列表不会每秒都变）。
+
+这 50 次查询里，有 49 次是在做无意义的重复工作。
+
+**缓存的本质：** 把第一次查询的结果存起来，后续相同的请求直接返回存储的结果，不再查数据库。
+
+
+
+### 1. 切出分支
+
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b feature/v3-redis-cache
+git push -u origin feature/v3-redis-cache
+```
+
+
+
+### 2. 缓存的核心概念
+
+#### 2.1 Cache-Aside 模式（旁路缓存）
+
+这是最通用的缓存模式，也是我们要用的：
+
+```
+读操作：
+  1. 先查缓存
+  2. 缓存命中 → 直接返回，结束
+  3. 缓存未命中 → 查数据库 → 把结果写入缓存 → 返回
+
+写操作（数据变化时）：
+  1. 更新数据库
+  2. 删除相关缓存（让下次读重新从数据库加载最新数据）
+```
+
+为什么写操作是"删除缓存"而不是"更新缓存"？因为更新缓存需要重新计算缓存值，而此时可能有多个并发写操作，容易产生数据不一致。删除更简单，也更安全——下次读时自然会重建。
+
+#### 2.2 TTL（Time To Live，生存时间）
+
+缓存不能永久存在，否则数据库更新后缓存里永远是旧数据。TTL 决定缓存多久自动过期。
+
+**TTL 设计原则：数据变化越频繁，TTL 越短。**
+
+```
+车辆公开列表（变化频率：小时级）  → TTL 60 秒
+管理员待审核列表（变化频率：分钟级）→ TTL 30 秒
+用户信息（变化频率：天级）        → TTL 5 分钟
+```
+
+TTL 不是越长越好——太长会导致用户看到过期数据；也不是越短越好——太短缓存命中率低，等于没缓存。
+
+#### 2.3 缓存 Key 设计
+
+缓存 Key 是字符串，必须能唯一标识一次查询的所有参数。
+
+```
+// 错误：不同参数用同一个 Key
+key = "cars:published"
+
+// 正确：参数组合进 Key
+key = "cars:published:page:1:size:20"
+key = "cars:published:brand:BMW:page:1:size:20"
+key = "cars:published:minPrice:10000:maxPrice:50000:page:2:size:20"
+```
+
+Key 命名规范：用冒号分隔层级，从粗到细：
+
+```
+{业务域}:{实体}:{过滤维度}:{过滤值}:...
+```
+
+#### 2.4 IMemoryCache vs Redis，选哪个
+
+|            | IMemoryCache     | Redis            |
+| ---- | ---- | ---- |
+| 存储位置   | 应用进程内存     | 独立进程/服务器  |
+| 进程重启   | 缓存丢失         | 缓存保留         |
+| 多实例部署 | 每个实例各自一份 | 所有实例共享     |
+| 配置复杂度 | 极简（内置）     | 需要安装和配置   |
+| 适合场景   | 单实例，开发测试 | 生产环境，多实例 |
+
+现在 Azure 上只有一个容器实例，用 `IMemoryCache` 也够用。
+
+但 V3 的目标是生产级，而且 Azure Container Apps 在流量变化时会自动扩缩容（可能变成多实例）。**选 Redis**，一步到位。
+
+先在本地用 Docker 跑 Redis，Azure 上用 Azure Cache for Redis（Basic tier，开发测试够用）。
+
+
+
+### 3. 安装 Redis 并更新 Docker Compose
+
+#### 3.1 本地：给 docker-compose 加 Redis 容器
+
+打开项目根目录的 `docker-compose.yml`，在 `services` 里加入 Redis：
+
+```yaml
+services:
+  # SQL Server（原有）
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "${DB_PASSWORD}"
+      MSSQL_PID: Developer
+    ports:
+      - "1433:1433"
+    volumes:
+      - sqlserver_data:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P ${DB_PASSWORD} -Q 'SELECT 1' -C"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ✅ 新增：Redis 缓存服务
+  redis:
+    image: redis:7-alpine         # alpine 版本更小，生产够用
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data          # 数据持久化（可选，开发时可以不要）
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # API（原有，更新 depends_on）
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      ConnectionStrings__DefaultConnection: "Server=sqlserver,1433;Database=UUcarsDB;User Id=sa;Password=${DB_PASSWORD};TrustServerCertificate=True"
+      # ✅ 新增 Redis 连接字符串
+      ConnectionStrings__Redis: "redis:6379"
+      JwtSettings__Secret: "${JWT_SECRET}"
+      JwtSettings__Issuer: "UUcars"
+      JwtSettings__Audience: "UUcarsUsers"
+      JwtSettings__ExpiresInMinutes: "60"
+      ASPNETCORE_ENVIRONMENT: Production
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+      # ✅ 新增：等 Redis 健康检查通过再启动 API
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  sqlserver_data:
+  redis_data:      # ✅ 新增
+```
+
+#### 3.2 安装 NuGet 包
+
+```bash
+cd UUcars.API
+dotnet add package StackExchange.Redis --version 2.8.16
+dotnet add package Microsoft.Extensions.Caching.StackExchangeRedis --version 9.0.0
+cd ..
+```
+
+两个包的分工：
+
+- `StackExchange.Redis`：Redis 的 .NET 驱动，提供底层连接和命令
+- `Microsoft.Extensions.Caching.StackExchangeRedis`：把 Redis 接入 ASP.NET Core 的 `IDistributedCache` 接口
+
+
+
+### 4. 配置 Redis 连接
+
+#### 4.1 更新 `appsettings.json`
+
+在 `ConnectionStrings` 里加 Redis：
+
+```json
+{
+  "ConnectionStrings": {
+    "DefaultConnection": "Server=localhost,1433;Database=UUcarsDB;User Id=sa;Password=PLACEHOLDER;TrustServerCertificate=True",
+    "Redis": "localhost:6379"
+  },
+  "JwtSettings": {
+    "Secret": "PLACEHOLDER_OVERRIDE_WITH_USER_SECRETS",
+    "ExpiresInMinutes": 60,
+    "Issuer": "UUcars",
+    "Audience": "UUcarsUsers"
+  },
+  "Serilog": { ... }
+}
+```
+
+#### 4.2 User Secrets 里不需要额外配置
+
+本地 Redis 不设密码（开发环境），连接字符串 `localhost:6379` 直接进 `appsettings.json` 即可，不是敏感信息。
+
+
+
+### 5. 设计缓存抽象层
+
+**为什么要抽象层，而不是直接用 `IDistributedCache`？**
+
+`IDistributedCache` 是 ASP.NET Core 内置的分布式缓存接口，API 比较底层：
+
+```csharp
+// IDistributedCache 的原始用法——繁琐
+byte[]? cachedBytes = await _cache.GetAsync(key);
+if (cachedBytes != null)
+{
+    var result = JsonSerializer.Deserialize<T>(cachedBytes);
+    return result;
+}
+var data = await queryDatabase();
+var bytes = JsonSerializer.SerializeToUtf8Bytes(data);
+await _cache.SetAsync(key, bytes, new DistributedCacheEntryOptions
+{
+    AbsoluteExpirationRelativeToNow = TimeSpan.FromSeconds(60)
+});
+return data;
+```
+
+每次用缓存都要写这一坨。抽象成一个 `ICacheService`，调用方只需要：
+
+```csharp
+// 抽象后的用法——简洁
+var result = await _cache.GetOrSetAsync(
+    key: "cars:published:page:1",
+    factory: () => queryDatabase(),
+    ttl: TimeSpan.FromSeconds(60)
+);
+```
+
+#### 5.1 定义接口
+
+新建 `UUcars.API/Services/ICacheService.cs`：
+
+```csharp
+namespace UUcars.API.Services;
+
+public interface ICacheService
+{
+    // 核心方法：有缓存直接返回，没有则执行 factory 并缓存结果
+    // factory：一个异步函数，当缓存未命中时调用，返回要缓存的数据
+    Task<T> GetOrSetAsync<T>(
+        string key,
+        Func<Task<T>> factory, 
+        TimeSpan ttl,
+        CancellationToken cancellationToken = default);
+
+    // 主动删除缓存（数据变更时调用）
+    Task RemoveAsync(string key, CancellationToken cancellationToken = default);
+
+    // 按前缀批量删除（一个列表可能有很多分页缓存，一次性清掉）
+    Task RemoveByPrefixAsync(string prefix, CancellationToken cancellationToken = default);
+}
+```
+
+>`Func<Task<T>> factory `:
+>
+>- 无参数，返回值类型是 Task<T> 的C# 委托类型, `Task<T>` 是异步操作的包装，`await` 之后拿到的是 `T`。
+>- 我们自定义的一个callback函数，用来让调用方（比如carService) 来自己决定逻辑来获取缓存数据或者操作缓存数据
+>- "数据从哪来"由调用方决定，缓存服务不关心， 从而实现解耦
+>- 叫 `factory` 是一个**命名惯例**——在设计模式里"工厂"表示"负责生产某个东西的函数"，这里的语义是"负责生产缓存数据的函数"，所以约定叫 `factory`。
+
+
+
+#### 5.2 实现 RedisCacheService
+
+##### 需要使用到一些接口
+
+- `IDistributedCache`
+
+    ASP.NET Core 内置的分布式缓存抽象接口，定义了处理缓存的一些方法：
+
+    ```c#
+    // 接口定义（框架内部，不是我们写的）
+    public interface IDistributedCache
+    {
+        byte[]?      Get(string key);
+        Task<byte[]?> GetAsync(string key, CancellationToken token = default);
+    
+        void         Set(string key, byte[] value, DistributedCacheEntryOptions options);
+        Task         SetAsync(string key, byte[] value,
+                              DistributedCacheEntryOptions options,
+                              CancellationToken token = default);
+    
+        void         Refresh(string key);
+        Task         RefreshAsync(string key, CancellationToken token = default);
+    
+        void         Remove(string key);
+        Task         RemoveAsync(string key, CancellationToken token = default);
+    }
+    ```
+
+    注意：它操作的是 `byte[]`（字节数组），不是字符串或对象。所以存取数据都要手动序列化/反序列化。
+
+    **框架还提供了扩展方法 `GetStringAsync` / `SetStringAsync`，内部自动做 `byte[]` ↔ `string` 转换。**
+
+- `IConnectionMultiplexer`
+
+    StackExchange.Redis 的原生客户端， 它能执行任意 Redis 命令：
+
+    ```c#
+    var server = _redis.GetServer(_redis.GetEndPoints().First());
+    var keys   = server.Keys(pattern: "uucars:cars:published:*");
+    var db     = _redis.GetDatabase();
+    await db.KeyDeleteAsync(keys.ToArray());
+    ```
+
+    我们需要**按前缀批量删除**caches, 所以就使用到IConnectionMultiplexer接口
+
+##### 完整的 ICacheService 实现逻辑
+
+新建 `UUcars.API/Services/RedisCacheService.cs`：
+
+```csharp
+using System.Text.Json;
+using Microsoft.Extensions.Caching.Distributed;
+using StackExchange.Redis;
+
+namespace UUcars.API.Services;
+
+public class RedisCacheService : ICacheService
+{
+    private readonly IDistributedCache _cache; // 高层接口：Get/Set/Remove
+    private readonly IConnectionMultiplexer _redis; // 底层原生：批量删除
+    private readonly ILogger<RedisCacheService> _logger;
+
+    // JSON 序列化选项：属性名用 camelCase，和前端保持一致
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+    };
+
+    public RedisCacheService(
+        IDistributedCache cache,
+        IConnectionMultiplexer redis,
+        ILogger<RedisCacheService> logger)
+    {
+        _cache = cache;
+        _redis = redis;
+        _logger = logger;
+    }
+
+    public async Task<T> GetOrSetAsync<T>(
+    string key,
+    Func<Task<T>> factory,
+    TimeSpan ttl,
+    CancellationToken cancellationToken = default)
+    {
+        // ── 第一步：尝试从 Redis 读取 ─────────────────────────────────────
+        try
+        {
+            var cached = await _cache.GetStringAsync(key, cancellationToken);
+            //                        ↑
+            //            IDistributedCache 的扩展方法
+            //            内部：GetAsync(key) 返回 byte[]，再转成 string
+
+            if (cached is not null)
+            {
+                // 命中：把 JSON 字符串反序列化成 T 对象，直接返回
+                // 不查数据库，不调用 factory
+                _logger.LogDebug("Cache HIT: {Key}", key);
+                return JsonSerializer.Deserialize<T>(cached, JsonOptions)!;
+            }
+        }
+        catch (Exception ex)
+        {
+            // Redis 连不上：不抛异常，继续往下走（降级到查数据库）
+            // 这是关键的容错设计：缓存挂了，系统仍然可用
+            _logger.LogWarning(ex, "Cache GET failed for key: {Key}", key);
+        }
+
+        // ── 第二步：缓存未命中，调用 factory 查数据库 ─────────────────────
+        // factory 就是调用方传进来的那个 lambda
+        // 只有走到这里才会执行，缓存命中时 factory 根本不会被调用
+        _logger.LogDebug("Cache MISS: {Key}", key);
+        var data = await factory();
+        //                 ↑
+        //         执行调用方传入的函数
+        //         例：async () => await _carRepository.GetPagedAsync(...)
+
+        // ── 第三步：把结果写入 Redis ──────────────────────────────────────
+        try
+        {
+            var serialized = JsonSerializer.Serialize(data, JsonOptions);
+            //  把 T 对象序列化成 JSON 字符串
+
+            await _cache.SetStringAsync(
+                key,
+                serialized,
+                new DistributedCacheEntryOptions
+                {
+                    AbsoluteExpirationRelativeToNow = ttl
+                    // AbsoluteExpiration：从现在起 ttl 时间后过期
+                    // 还有 SlidingExpiration：每次访问后重置过期时间
+                    // 我们用 Absolute，更可预测
+                },
+                cancellationToken);
+            // 写缓存失败不影响返回结果
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Cache SET failed for key: {Key}", key);
+        }
+
+        return data;  // 返回从数据库查到的数据
+    }
+
+    public async Task RemoveAsync(string key, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            await _cache.RemoveAsync(key, cancellationToken);
+            _logger.LogDebug("Cache REMOVED: {Key}", key);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Cache REMOVE failed for key: {Key}", key);
+        }
+    }
+
+    public async Task RemoveByPrefixAsync(
+    string prefix,
+    CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            // IDistributedCache 没有按前缀删除的功能
+            // 必须用 IConnectionMultiplexer 的原生 API
+
+            // GetServer：获取 Redis 服务器实例（用于执行管理命令）
+            var server = _redis.GetServer(_redis.GetEndPoints().First());
+
+            // Keys()：执行 Redis 的 SCAN 命令（生产安全，不用 KEYS）
+            // pattern 要加上 InstanceName 前缀，因为 Redis 里实际的 Key 带前缀
+            var keys = server.Keys(pattern: $"uucars:{prefix}*").ToArray();
+            //                                ↑
+            //                         和 InstanceName 保持一致
+
+            if (keys.Length == 0) return;
+
+            // KeyDeleteAsync：批量删除，一次网络往返删多个 Key
+            var db = _redis.GetDatabase();
+            await db.KeyDeleteAsync(keys);
+
+            _logger.LogDebug(
+                "Cache REMOVED {Count} keys with prefix: {Prefix}",
+                keys.Length, prefix);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "Cache REMOVE_BY_PREFIX failed for prefix: {Prefix}", prefix);
+        }
+    }
+}
+```
+
+> **降级策略是什么？** 注意两个 `catch` 块——Redis 连不上或者出错时，不抛异常，只记录 Warning，然后继续正常流程（直接查数据库）。这叫**降级（Graceful Degradation）**：缓存挂了，系统仍然可用，只是性能变差。如果缓存异常直接抛给用户，用户看到 500 错误，那就是缓存把整个系统搞垮了，不可接受。
+
+
+
+### 6. 注册依赖到 Program.cs
+
+打开 `UUcars.API/Program.cs`，在服务注册区域加入：
+
+```csharp
+// 顶部 using
+using StackExchange.Redis;
+using UUcars.API.Services;
+
+// ── 服务注册 ──
+
+// Redis 连接（IConnectionMultiplexer 是线程安全的，注册为 Singleton）
+// Singleton：整个应用生命周期只创建一次连接，所有请求共享
+// 不用 Scoped 的原因：Redis 连接是昂贵的资源，每次请求创建一个连接会耗尽连接池
+var redisConnectionString = builder.Configuration
+    .GetConnectionString("Redis") ?? "localhost:6379";
+
+builder.Services.AddSingleton<IConnectionMultiplexer>(
+    ConnectionMultiplexer.Connect(redisConnectionString));
+
+// IDistributedCache 的 Redis 实现
+builder.Services.AddStackExchangeRedisCache(options =>
+{
+    options.Configuration = redisConnectionString;
+    // Key 前缀：区分不同应用共用同一个 Redis 实例时的 Key 冲突
+    options.InstanceName = "uucars:";
+});
+
+// 缓存服务（Singleton，因为它依赖 Singleton 的 IConnectionMultiplexer）
+builder.Services.AddSingleton<ICacheService, RedisCacheService>();
+```
+
+
+
+### 7. 定义缓存 Key 常量
+
+缓存 Key 分散在代码各处很容易出错（拼写错误导致缓存无法命中或无法删除）。集中管理：
+
+新建 `UUcars.API/Services/CacheKeys.cs`：
+
+```csharp
+namespace UUcars.API.Services;
+
+// 所有缓存 Key 的集中定义
+// 好处：
+//   1. IDE 自动补全，不会拼错
+//   2. 修改 Key 格式时只改一处
+//   3. RemoveByPrefix 用的前缀和 GetOrSet 用的 Key 保证一致
+public static class CacheKeys
+{
+    // 公开车辆列表（带过滤参数）
+    // 参数变化 → Key 变化 → 各自独立缓存
+    public static string PublishedCars(
+        int page, int pageSize,
+        string? brand, decimal? minPrice, decimal? maxPrice,
+        int? minYear, int? maxYear)
+        => $"cars:published:p{page}:s{pageSize}" +
+           $":brand{brand ?? ""}:min{minPrice}:max{maxPrice}" +
+           $":miny{minYear}:maxy{maxYear}";
+
+    // 公开车辆列表的前缀（用于批量删除：车辆审核通过时清掉所有分页缓存）
+    public const string PublishedCarsPrefix = "cars:published:";
+
+    // 待审核车辆列表（Admin 用）
+    public static string PendingCars(int page, int pageSize)
+        => $"cars:pending:p{page}:s{pageSize}";
+
+    public const string PendingCarsPrefix = "cars:pending:";
+}
+```
+
+
+
+### 8. Service里操作缓存
+
+#### 8.1 添加缓存
+
+只对**公开列表**和**待审核列表**加缓存，原因：
+
+- 公开列表：访问量最大，数据变化频率低（只有 Admin 审核时才变）
+- 待审核列表：Admin 频繁刷新，数据库压力大
+- 卖家列表（`GetMyListings`）：每个卖家的数据不同，缓存收益小，先不加
+
+添加缓存的操作如下：
+
+| Service         | 方法                  | 缓存Key             | TTL  |      |
+| --------------- | --------------------- | ------------------- | ---- | ---- |
+| CarService      | GetPublishedCarsAsync | PublishedCarsPrefix | 60s  |      |
+| AdminCarService | GetPendingCarsAsync   | PendingCarsPrefix   | 30s  |      |
+
+打开 `UUcars.API/Services/CarService.cs`，注入 `ICacheService` 并在对应方法里使用：
+
+```csharp
+public class CarService
+{
+    private readonly ICarRepository _carRepository;
+    private readonly ICarImageRepository _carImageRepository;
+    private readonly ICacheService _cache;              // ✅ 新增
+    private readonly ILogger<CarService> _logger;
+
+    public CarService(
+        ICarRepository carRepository,
+        ICarImageRepository carImageRepository,
+        ICacheService cache,                           // ✅ 新增
+        ILogger<CarService> logger)
+    {
+        _carRepository = carRepository;
+        _carImageRepository = carImageRepository;
+        _cache = cache;                                // ✅ 新增
+        _logger = logger;
+    }
+
+    // ✅ 公开车辆列表：加缓存
+    public async Task<PagedResponse<CarResponse>> GetPublishedCarsAsync(
+        CarQueryRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        var page     = request.Page < 1 ? 1 : request.Page;
+        var pageSize = Math.Min(request.PageSize < 1 ? 20 : request.PageSize, 50);
+
+        // 构建缓存 Key（包含所有过滤参数，不同参数对应不同缓存）
+        var cacheKey = CacheKeys.PublishedCars(
+            page, pageSize,
+            request.Brand,
+            request.MinPrice, request.MaxPrice,
+            request.MinYear,  request.MaxYear);
+
+        // GetOrSetAsync：有缓存直接返回；没有则查数据库并缓存结果
+        return await _cache.GetOrSetAsync(
+            key:     cacheKey,
+            factory: async () =>
+            {
+                // 这个 lambda 只在缓存未命中时执行
+                var (cars, totalCount) = await _carRepository.GetPagedAsync(
+                    CarStatus.Published, request, cancellationToken);
+                var items = cars.Select(MapToResponse).ToList();
+                return PagedResponse<CarResponse>.Create(items, totalCount, page, pageSize);
+            },
+            ttl: TimeSpan.FromSeconds(60),   // 公开列表缓存 60 秒
+            cancellationToken: cancellationToken);
+    }
+
+    // 其他方法不变...
+}
+```
+
+打开 `UUcars.API/Services/AdminCarService.cs`，注入 `ICacheService` 并在对应方法里使用：
+
+```c#
+public class AdminCarService
+{
+    private readonly ICacheService _cache; // ✅ 新增
+    private readonly ICarRepository _carRepository;
+    private readonly ILogger<AdminCarService> _logger;
+
+    public AdminCarService(ICarRepository carRepository, ILogger<AdminCarService> logger, ICacheService cache)
+    {
+        _carRepository = carRepository;
+        _logger = logger;
+        _cache = cache;
+    }	
+
+	...
+
+    // ✅ 待审核车辆列表：加缓存
+    public async Task<PagedResponse<CarResponse>> GetPendingCarsAsync(
+        CarQueryRequest query,
+        CancellationToken cancellationToken = default)
+    {
+        var page = query.Page < 1 ? 1 : query.Page;
+        var pageSize = query.PageSize < 1 ? 20 : query.PageSize;
+        pageSize = Math.Min(pageSize, 50);
+
+        // 构建缓存 Key（包含所有过滤参数，不同参数对应不同缓存）
+        var cacheKey = CacheKeys.PendingCars(page, pageSize);
+
+        // GetOrSetAsync：有缓存直接返回；没有则查数据库并缓存结果
+
+        return await _cache.GetOrSetAsync(cacheKey,
+            async () =>
+            {
+                var (cars, totalCount) = await _carRepository.GetPagedAsync(
+                    CarStatus.PendingReview,
+                    query, cancellationToken);
+                var items = cars.Select(CarService.MapToResponse).ToList();
+                return PagedResponse<CarResponse>.Create(items, totalCount, page, pageSize);
+            }, TimeSpan.FromSeconds(30), cancellationToken);
+    }
+    ...
+}
+```
+
+#### 8.2 清除缓存
+
+当车辆的状态改变，并影响公开列表的数据的操作，需要清除缓存
+
+清除缓存的操作如下：
+
+| Service           | 方法                   | 清除的Key                                   | 原因                                             |
+| ----------------- | ---------------------- | ------------------------------------------- | ------------------------------------------------ |
+| AdminCarService   | ApproveAsync           | PublishedCarsPrefix + PendingCarsPrefix | 车辆从待审核进入公开列表，两个列表同时变化       |
+|    | RejectAsync            | PendingCarsPrefix                         | 车辆退回Draft，只影响待审核列表                  |
+|  | AdminDeleteAsync     | PublishedCarsPrefix + PendingCarsPrefix | 车辆可能处于任何状态被删除，两个列表都可能受影响 |
+| CarService      | SubmitForReviewAsync | PendingCarsPrefix                         | 车辆进入待审核列表，缓存数据已过时          |
+| OrderService    | CreateAsync          | PublishedCarsPrefix                       | 车辆变Sold从公开列表消失，缓存数据已过时         |
+|     | CancelAsync          | PublishedCarsPrefix                       | 车辆恢复Published重回公开列表，缓存数据已过时    |
+
+ AdminCarService里清缓存：
+
+```csharp
+public class AdminCarService
+{
+   ...
+       
+    public async Task<CarResponse> ApproveAsync(
+        int carId,
+        CancellationToken cancellationToken = default)
+    {
+        var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+        if (car == null)
+            throw new CarNotFoundException(carId);
+
+        if (car.Status != CarStatus.PendingReview)
+            throw new CarStatusException(car.Id, car.Status, CarStatus.PendingReview);
+
+        car.Status = CarStatus.Published;
+        car.UpdatedAt = DateTime.UtcNow;
+
+        var updated = await _carRepository.UpdateAsync(car, cancellationToken);
+
+        // ✅ 车辆上架 → 公开列表变了 → 清掉公开列表的所有缓存
+        // 用前缀删除：一次清掉所有分页（page1/page2/page3...）
+        await _cache.RemoveByPrefixAsync(CacheKeys.PublishedCarsPrefix, cancellationToken);
+        await _cache.RemoveByPrefixAsync(CacheKeys.PendingCarsPrefix, cancellationToken);
+
+        _logger.LogInformation("Car {CarId} approved by admin, now Published", carId);
+
+        return CarService.MapToResponse(updated);
+    }
+
+    public async Task<CarResponse> RejectAsync(
+        int carId,
+        CancellationToken cancellationToken = default)
+    {
+        var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+        if (car == null)
+            throw new CarNotFoundException(carId);
+
+        if (car.Status != CarStatus.PendingReview)
+            throw new CarStatusException(car.Id, car.Status, CarStatus.PendingReview);
+
+        car.Status = CarStatus.Draft;
+        car.UpdatedAt = DateTime.UtcNow;
+
+        var updated = await _carRepository.UpdateAsync(car, cancellationToken);
+
+        // ✅ 车辆退回 → 待审核列表变了 → 清待审核列表缓存
+        await _cache.RemoveByPrefixAsync(CacheKeys.PendingCarsPrefix, cancellationToken);
+
+        _logger.LogInformation("Car {CarId} rejected by admin, returned to Draft", carId);
+
+        return CarService.MapToResponse(updated);
+    }
+
+	...
+        
+    public async Task AdminDeleteAsync(
+        int carId,
+        CancellationToken cancellationToken = default)
+    {
+        var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+        if (car == null)
+            throw new CarNotFoundException(carId);
+
+        if (car.Status == CarStatus.Deleted)
+            throw new CarStatusException(car.Id, car.Status, CarStatus.Published);
+
+        var previousStatus = car.Status; // ✅ 记录删除前的状态
+        car.Status = CarStatus.Deleted;
+        car.UpdatedAt = DateTime.UtcNow;
+
+        await _carRepository.UpdateAsync(car, cancellationToken);
+
+        // ✅ 根据删除前的状态，清对应的缓存
+        if (previousStatus == CarStatus.Published)
+            await _cache.RemoveByPrefixAsync(CacheKeys.PublishedCarsPrefix, cancellationToken);
+
+        if (previousStatus == CarStatus.PendingReview)
+            await _cache.RemoveByPrefixAsync(CacheKeys.PendingCarsPrefix, cancellationToken);
+
+        _logger.LogInformation(
+            "Car {CarId} forcefully deleted by admin (was {Status}), cache invalidated",
+            carId, previousStatus);
+    }
+}
+```
+
+ CarService里清缓存：
+
+```c#
+public class CarService
+{
+...
+
+	public async Task<CarResponse> SubmitForReviewAsync(
+        int carId,
+        int currentUserId,
+        CancellationToken cancellationToken = default)
+    {
+        var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+        if (car == null)
+            throw new CarNotFoundException(carId);
+
+        if (car.SellerId != currentUserId)
+            throw new ForbiddenException();
+
+        if (car.Status != CarStatus.Draft)
+            throw new CarStatusException(car.Id, car.Status, CarStatus.PendingReview);
+
+        car.Status = CarStatus.PendingReview;
+        car.UpdatedAt = DateTime.UtcNow;
+
+        var updated = await _carRepository.UpdateAsync(car, cancellationToken);
+        
+        //清除待审核车辆列表缓存
+        await _cache.RemoveByPrefixAsync(CacheKeys.PendingCarsPrefix, cancellationToken);
+
+        _logger.LogInformation("Car {CarId} submitted for review by seller {SellerId}",
+            car.Id, currentUserId);
+
+        return MapToResponse(updated);
+    }
+    // 其他方法不变...
+}
+```
+
+ OrderService里清缓存：
+
+```c#
+public class OrderService
+{
+  	...
+
+    public async Task<OrderResponse> CreateAsync(
+        int buyerId,
+        OrderCreateRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        var car = await _carRepository.GetByIdAsync(request.CarId, cancellationToken);
+        if (car == null)
+            throw new CarNotFoundException(request.CarId);
+
+        if (car.Status != CarStatus.Published)
+            throw new CarNotAvailableException(request.CarId);
+
+        if (car.SellerId == buyerId)
+            throw new CannotOrderOwnCarException();
+
+        var order = new Order
+        {
+            CarId = car.Id,
+            BuyerId = buyerId,
+            SellerId = car.SellerId, 
+            Price = car.Price, 
+            Status = OrderStatus.Pending,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        // 更新车辆状态为 Sold
+        car.Status = CarStatus.Sold;
+        car.UpdatedAt = DateTime.UtcNow;
+        _context.Orders.Add(order);
+        _context.Cars.Update(car);
+        await _context.SaveChangesAsync(cancellationToken);
+
+        // ✅ 车辆变 Sold，从公开列表消失，清缓存
+        await _cache.RemoveByPrefixAsync(CacheKeys.PublishedCarsPrefix, cancellationToken);
+
+        _logger.LogInformation(
+            "Order {OrderId} created: buyer {BuyerId} purchased car {CarId} from seller {SellerId}",
+            order.Id, buyerId, car.Id, car.SellerId);
+
+        var created = await _orderRepository.GetByIdAsync(order.Id, cancellationToken);
+        return MapToResponse(created!);
+    }
+    
+
+    public async Task<OrderResponse> CancelAsync(
+        int orderId,
+        int currentUserId,
+        CancellationToken cancellationToken = default)
+    {
+        var order = await _orderRepository.GetByIdAsync(orderId, cancellationToken);
+
+        if (order == null)
+            throw new OrderNotFoundException(orderId);
+
+        if (order.BuyerId != currentUserId)
+            throw new ForbiddenException();
+
+        if (order.Status != OrderStatus.Pending)
+            throw new OrderStatusException(orderId, order.Status, OrderStatus.Pending);
+
+        order.Status = OrderStatus.Cancelled;
+        order.UpdatedAt = DateTime.UtcNow;
+
+        // 恢复车辆状态为 Published
+        var car = await _carRepository.GetByIdAsync(order.CarId, cancellationToken);
+        if (car != null)
+        {
+            car.Status = CarStatus.Published;
+            car.UpdatedAt = DateTime.UtcNow;
+        }
+        _context.Orders.Update(order);
+        if (car != null)
+            _context.Cars.Update(car);
+        await _context.SaveChangesAsync(cancellationToken);
+
+        // ✅ 车辆恢复 Published，重回公开列表，清缓存
+        await _cache.RemoveByPrefixAsync(CacheKeys.PublishedCarsPrefix, cancellationToken);
+
+        _logger.LogInformation(
+            "Order {OrderId} cancelled by buyer {BuyerId}, car {CarId} restored to Published",
+            orderId, currentUserId, order.CarId);
+
+        return MapToResponse(order);
+    }
+
+	...
+}
+```
+
+
+
+### 9. 更新 Program.cs 里 AdminCarService 的注册
+
+`AdminCarService` 现在多了一个依赖，DI 需要知道：
+
+```csharp
+// Admin 模块
+builder.Services.AddScoped<AdminCarService>();
+// ICacheService 已经注册为 Singleton，DI 会自动注入，不需要额外改动
+```
+
+同时，`CarService` 也多了一个依赖：
+
+```csharp
+// 车辆模块
+builder.Services.AddScoped<ICarRepository, EfCarRepository>();
+builder.Services.AddScoped<ICarImageRepository, EfCarImageRepository>();
+builder.Services.AddScoped<CarService>();
+// ICacheService 已注册，DI 自动处理
+```
+
+
+
+### 10. 启动 Redis 并验证
+
+#### 10.1 启动本地 Redis（如果没在 Docker Compose 里）
+
+```bash
+# 单独启动 Redis 容器（开发时用这个，不需要跑整个 compose）
+docker run -d --name uucars-redis -p 6379:6379 redis:7-alpine
+
+# 确认 Redis 正在运行
+docker ps | grep redis
+
+# 确认 Redis 能正常响应
+docker exec uucars-redis redis-cli ping
+# 应该输出：PONG
+```
+
+#### 10.2 启动 API 并测试缓存
+
+```bash
+cd UUcars.API
+dotnet run
+```
+
+**第一次请求（缓存未命中）：**
+
+```bash
+curl http://localhost:5085/cars
+```
+
+查看控制台日志，应该看到：
+
+```
+[Debug] Cache MISS: cars:published:p1:s20:brand:min:max:miny:maxy
+[Info]  Executed DbCommand ... SELECT ...
+```
+
+**第二次相同请求（缓存命中）：**
+
+```bash
+curl http://localhost:5085/cars
+```
+
+控制台日志：
+
+```
+[Debug] Cache HIT: cars:published:p1:s20:brand:min:max:miny:maxy
+```
+
+没有 SQL 查询日志，说明缓存生效了，数据库完全没有被访问。
+
+**验证缓存数据：**
+
+```bash
+# 进入 Redis 容器，查看缓存里存了什么
+docker exec -it uucars-redis redis-cli
+
+# 列出所有 Key（生产环境不要用，这里只是验证）
+KEYS *
+
+# 应该看到类似：
+# 1) "uucars:cars:published:p1:s20:brand:min:max:miny:maxy"
+
+# 查看这个 Key 的剩余 TTL（单位：秒）
+TTL "uucars:cars:published:p1:s20:brand:min:max:miny:maxy"
+# 应该是 0-60 之间的数字
+
+# 退出 redis-cli
+EXIT
+```
+
+
+
+### 11. 编译和测试
+
+**单元测试里的 CarService 怎么处理 ICacheService？** 
+
+测试里用的是 Fake Repository，但现在 CarService 多了 `ICacheService` 依赖。需要给测试提供一个 fake 的 ICacheService——最简单的方式是用 `NSubstitute` 或直接实现一个 `FakeCacheService`（直接执行 factory，不做任何缓存）。
+
+
+ 打开 `UUcars.Tests/Fakes/`，新建 `FakeCacheService.cs`：
+
+```csharp
+// UUcars.Tests/Fakes/FakeCacheService.cs
+using UUcars.API.Services;
+
+namespace UUcars.Tests.Fakes;
+
+// 测试用的 CacheService：直接执行 factory，不做任何缓存
+// 保证单元测试不依赖 Redis，行为和真实 CacheService 一致（逻辑透明）
+public class FakeCacheService : ICacheService
+{
+    public async Task<T> GetOrSetAsync<T>(
+        string key,
+        Func<Task<T>> factory,
+        TimeSpan ttl,
+        CancellationToken cancellationToken = default)
+    {
+        // 直接执行 factory，不缓存
+        return await factory();
+    }
+
+    public Task RemoveAsync(string key, CancellationToken cancellationToken = default)
+        => Task.CompletedTask;
+
+    public Task RemoveByPrefixAsync(string prefix, CancellationToken cancellationToken = default)
+        => Task.CompletedTask;
+}
+```
+
+然后在 `CarServiceTests.cs` 里的 `CreateService` 方法里传入 `FakeCacheService`：
+
+```csharp
+private static CarService CreateService(
+    FakeCarRepository carRepo,
+    FakeCarImageRepository? imageRepo = null)
+{
+    return new CarService(
+        carRepo,
+        imageRepo ?? new FakeCarImageRepository(),
+        new FakeCacheService(),          // ✅ 新增
+        NullLogger<CarService>.Instance
+    );
+}
+```
+
+同样，`OrderService` 的测试也需要传入 `FakeCacheService`。
+
+```c#
+private static OrderService CreateService(
+        AppDbContext context,
+        FakeCarRepository? carRepo = null)
+    {
+        var orderRepo = new EfOrderRepository(context);
+        return new OrderService(
+            new FakeCacheService(),
+            carRepo ?? new FakeCarRepository(),
+            context,
+            NullLogger<OrderService>.Instance,
+            orderRepo
+        );
+    }
+```
+
+再跑一遍：
+
+```bash
+dotnet build
+dotnet test
+```
+
+
+
+### 12. Git 提交
+
+```bash
+git add .
+git commit -m "feat: Redis cache layer - ICacheService, RedisCacheService, car list caching"
+git push origin feature/v3-redis-cache
+
+# 合并回 develop
+git checkout develop
+git merge --no-ff feature/v3-redis-cache -m "merge: feature/v3-redis-cache into develop"
+git push origin develop
+git branch -d feature/v3-redis-cache
+git push origin --delete feature/v3-redis-cache
+```
+
+
+
+### Step 58 完成状态
+
+```
+✅ 理解 Cache-Aside 模式（读查缓存→未命中查DB→写缓存；写删缓存）
+✅ 理解 TTL 设计原则（变化越频繁 TTL 越短）
+✅ 理解 IMemoryCache vs Redis 的区别（选 Redis，生产就绪）
+✅ Docker Compose 加入 Redis 容器（redis:7-alpine）
+✅ 安装 StackExchange.Redis + Microsoft.Extensions.Caching.StackExchangeRedis
+✅ ICacheService 接口（GetOrSetAsync / RemoveAsync / RemoveByPrefixAsync）
+✅ RedisCacheService 实现（降级策略：Redis 故障时不影响系统可用性）
+✅ CacheKeys 常量类（集中管理，防止 Key 拼写错误）
+✅ CarService.GetPublishedCarsAsync 接入缓存（TTL 60s）
+✅ AdminCarService 审核通过/拒绝时主动 invalidate 缓存
+✅ OrderService 创建/取消时主动 invalidate 缓存
+✅ FakeCacheService（单元测试透明执行，不依赖 Redis）
+✅ dotnet build + dotnet test 全部通过
+✅ 本地验证：Cache HIT/MISS 日志正确，redis-cli 能看到缓存 Key
+✅ Git commit + 合并回 develop 完成
+```
