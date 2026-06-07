@@ -97,8 +97,9 @@ try
         options.InstanceName = "uucars:";
     });
 
-    // 缓存服务（Singleton，因为它依赖 Singleton 的 IConnectionMultiplexer）
-    builder.Services.AddSingleton<ICacheService, RedisCacheService>();
+    // 限流策略服务 - 自定义的扩展方法
+    builder.Services.AddRateLimiting();
+
 
     // 用户模块
     // AddScoped：每次 HTTP 请求创建一个新实例，请求结束后销毁
@@ -116,6 +117,10 @@ try
     // 它内部用 AsyncLocal<T> 保证线程安全，每个请求有自己独立的 HttpContext
     builder.Services.AddHttpContextAccessor();
     builder.Services.AddScoped<CurrentUserService>();
+
+    // 缓存服务（Singleton，因为它依赖 Singleton 的 IConnectionMultiplexer）
+    builder.Services.AddSingleton<ICacheService, RedisCacheService>();
+
 
     // 车辆模块
     builder.Services.AddScoped<ICarRepository, EfCarRepository>();
@@ -150,6 +155,7 @@ try
     // 全局异常处理，放最前面，兜住所有后续中间件的异常
     app.UseMiddleware<GlobalExceptionMiddleware>();
 
+
     // 开发环境才挂载 API 文档
     if (app.Environment.IsDevelopment())
     {
@@ -166,6 +172,15 @@ try
     // 如果 CORS 在 Auth 之后，Preflight 会因为没有 Token 被拦截，
     // 导致浏览器认为服务器不支持跨域
     app.UseCors(CorsExtensions.PolicyName);
+
+    // ✅ 限流中间件
+    // 必须在 UseCors之后
+    // 原因：限流策略导致的响应码 429，响应没有 CORS 头，浏览器拦截
+    // 必须在 UseAuthentication / UseAuthorization 之前
+    // 原因：限流是最外层的防护，不管请求有没有 Token，都要先过限流检查
+    // 这样攻击者带着无效 Token 的请求也能被拦截，不会浪费认证处理的开销
+
+    app.UseRateLimiter();
 
     // UseAuthentication 必须在 UseAuthorization 之前
     // 原因：Authorization 需要读取 Authentication 的结果（HttpContext.User）

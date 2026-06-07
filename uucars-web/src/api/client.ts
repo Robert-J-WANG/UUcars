@@ -1,6 +1,7 @@
 // src/api/client.ts
-import axios from "axios";
+import axios, { AxiosError } from "axios";
 import type { ApiResponse } from "@/types";
+import { toast } from "sonner";
 
 // 创建 Axios 实例
 // 所有请求都基于这个实例，统一配置 baseURL 和超时
@@ -48,9 +49,35 @@ apiClient.interceptors.response.use(
 
     return response;
   },
-  (error) => {
-    // 请求失败（HTTP 4xx / 5xx / 网络错误）
+  (error: AxiosError) => {
+    // ✅ 处理 429 Too Many Requests
+    if (error.response?.status === 429) {
+      // 读取 Retry-After 响应头（后端返回的秒数）
+      const retryAfterHeader = error.response.headers["retry-after"];
+      const seconds = retryAfterHeader ? parseInt(retryAfterHeader, 10) : 60; // 没有 Retry-After 头就默认提示60秒
+
+      // 用 sonner toast 给用户友好提示
+      toast.error(
+        `Too many requests. Please wait ${seconds} seconds before trying again.`,
+        { duration: 5000 },
+      );
+
+      // 返回一个标准格式的错误，让调用方知道是限流问题
+      return Promise.reject(
+        new Error(`Rate limited. Retry after ${seconds}s.`),
+      );
+    }
+
+    // 处理用户 Token 过期时
+    if (error.response?.status === 401) {
+      localStorage.removeItem("accessToken");
+      // 跳转登录页，带上当前路径方便登录后回跳
+      window.location.href = `/login?redirect=${encodeURIComponent(window.location.pathname)}`;
+      return Promise.reject(new Error("Session expired, please login again"));
+    }
+
     if (error.response) {
+      // 请求失败（HTTP 4xx / 5xx / 网络错误）
       // 服务端返回了错误响应
       const apiResponse = error.response.data as ApiResponse<unknown>;
       const message = apiResponse?.message ?? "An error occurred";

@@ -1394,7 +1394,7 @@ public static class CacheKeys
 添加缓存的操作如下：
 
 | Service         | 方法                  | 缓存Key             | TTL  |      |
-| --------------- | --------------------- | ------------------- | ---- | ---- |
+| --- | --- | - | ---- | ---- |
 | CarService      | GetPublishedCarsAsync | PublishedCarsPrefix | 60s  |      |
 | AdminCarService | GetPendingCarsAsync   | PendingCarsPrefix   | 30s  |      |
 
@@ -1507,7 +1507,7 @@ public class AdminCarService
 清除缓存的操作如下：
 
 | Service           | 方法                   | 清除的Key                                   | 原因                                             |
-| ----------------- | ---------------------- | ------------------------------------------- | ------------------------------------------------ |
+| ----- | ---- | - |  |
 | AdminCarService   | ApproveAsync           | PublishedCarsPrefix + PendingCarsPrefix | 车辆从待审核进入公开列表，两个列表同时变化       |
 |    | RejectAsync            | PendingCarsPrefix                         | 车辆退回Draft，只影响待审核列表                  |
 |  | AdminDeleteAsync     | PublishedCarsPrefix + PendingCarsPrefix | 车辆可能处于任何状态被删除，两个列表都可能受影响 |
@@ -1962,7 +1962,7 @@ Azure部署时， 可以用 Azure Cache for Redis， 但作为学习项目，使
 #### 12.1 选 Upstash的Redis
 
 |          | Upstash                                         | Azure Cache for Redis   |
-| -------- | ----------------------------------------------- | ----------------------- |
+| -- | ----- | ----- |
 | 费用     | 免费套餐（10,000 requests/天）                  | 最低 $16/月（Basic C0） |
 | 架构     | 独立托管服务，和 Azure Cache for Redis 完全一致 | 独立托管服务            |
 | 迁移成本 | 只需换连接字符串，代码零改动                    | -                       |
@@ -1996,7 +1996,7 @@ ConnectionStrings__Redis = exact-dove111625.upstash.io:6379,password=gQAAAAAAAAb
 #### 12.4 本地开发 vs 生产环境
 
 |                                  | 连接的 Redis                         |
-| -------------------------------- | ------------------------------------ |
+| -- |  |
 | 本地开发（docker-compose）       | `redis:6379`（本地容器）             |
 | 集成测试                         | `FakeCacheService`（不连任何 Redis） |
 | 生产环境（Azure Container Apps） | Upstash（Azure 环境变量配置）        |
@@ -2038,5 +2038,922 @@ git push origin --delete feature/v3-redis-cache
 ✅ dotnet build + dotnet test 全部通过
 ✅ 本地验证：Cache HIT/MISS 日志正确，redis-cli 能看到缓存 Key
 ✅ Azure部署Upstash Redis
+✅ Git commit + 合并回 develop 完成
+```
+
+
+
+## Step 59 · API 限流（Rate Limiting）
+
+### 这一步做什么
+
+Step 58 加了缓存，保护了数据库。但缓存只能减少数据库压力，无法阻止恶意请求本身进入系统。
+
+现在有两个没有解决的安全问题：
+
+**问题一：暴力破解密码。** 攻击者对 `POST /auth/login` 接口每秒发几百次请求，逐个尝试密码组合。没有任何限制，服务器只能照单全收。
+
+**问题二：爬虫绕过缓存。** Step 58 里的缓存 Key 包含过滤参数。攻击者写个脚本，每次换一个不同的 `minPrice` 或 `brand` 参数，每次都是缓存未命中，直接打到数据库。缓存完全帮不上忙。
+
+**限流（Rate Limiting）** 是解决这两个问题的标准方案：限制同一个来源在一段时间内最多能发多少请求，超出后返回 `429 Too Many Requests`，让客户端等待后重试。
+
+
+
+### 1. 切出分支
+
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b feature/v3-rate-limiting
+git push origin feature/v3-rate-limiting
+```
+
+
+
+### 2. 限流算法
+
+ASP.NET Core 8 内置了限流中间件，支持多种算法。
+
+#### 2.1 固定窗口（Fixed Window）
+
+把时间切成固定大小的窗口，窗口内统计请求数，超过上限就拒绝。
+
+```
+窗口大小：60秒，上限：10次
+
+时间轴：  0s ─────────────────── 60s ─────────────────── 120s
+          [        窗口1          ]   [        窗口2          ]
+
+第 5s：请求1  → 计数 1/10 ✅
+第 30s：请求2  → 计数 2/10 ✅
+...
+第 55s：请求10 → 计数 10/10 ✅
+第 58s：请求11 → 计数 11/10 ❌ 拒绝
+第 61s：窗口重置 → 计数 0/10，重新开始
+```
+
+**缺陷：边界突刺问题。**
+
+```
+第 59s 发 10 次 → 窗口1用完 10 次
+第 61s 发 10 次 → 窗口2重置，又可以 10 次
+结果：2秒内发了 20 次，是限制的两倍
+```
+
+**适用场景：** 要求不那么严格的接口，实现简单，资源消耗最小。
+
+#### 2.2 滑动窗口（Sliding Window）
+
+不用固定边界，而是"以当前时间为终点，往前推 N 秒"的动态窗口。没有边界突刺问题。
+
+```
+窗口大小：60秒，上限：10次
+
+当前时间：70s
+统计窗口：[10s ~ 70s] 内的请求数
+如果这个窗口内已有 10 次，则拒绝
+
+→ 不管攻击者怎么在边界附近集中请求，60秒内永远不超过 10 次
+```
+
+**缺陷：** 需要记录每次请求的精确时间戳，内存占用比固定窗口高。
+
+**适用场景：** 需要精确控制频率的场景，比如登录接口。
+
+#### 2.3 令牌桶（Token Bucket）
+
+系统以固定速率往桶里放令牌（比如每秒放 2 个），每次请求消耗一个令牌，桶里没令牌就拒绝请求，桶有上限（防止令牌无限积累）。
+
+```
+桶容量：10个令牌
+填充速率：每秒2个令牌
+
+用户突发 10 次请求：
+  → 消耗 10 个令牌（桶瞬间清空）✅（允许突发）
+  → 第 11 次请求：桶空，等待 0.5 秒补充 1 个令牌
+  → 之后：每 0.5 秒可以发 1 次（稳定速率 2次/秒）
+```
+
+**特点：** 允许短暂突发流量（正常用户偶尔高频操作），然后平滑降速。对用户体验最友好。
+
+**适用场景：** 浏览接口，允许用户快速翻几页，但不允许持续高频。
+
+
+
+### 3. 实现限流
+
+#### 3.1 零依赖：ASP.NET Core 8 内置
+
+不需要安装任何 NuGet 包。`Microsoft.AspNetCore.RateLimiting` 是 ASP.NET Core 8 内置的，`.csproj` 文件里不需要添加任何引用。
+
+直接调用AddRateLimiter方法可以实现配置
+
+```c#{
+builder.Services.AddRateLimiter(options =>
+{
+    //限流配置
+}
+```
+
+- 被限流时统一返回码（比如429， TooManyRequests）
+- 请求被拒绝时执行的回调函数 `OnRejected`
+- 限流策略的配置 `AddPolicy`
+
+#### 3.2 配置限流策略
+
+和jwtAuthentication的配置一致，我们也封装成扩展方法，保持Program.cs文件的简洁。
+
+新建 `UUcars.API/Extensions/RateLimitingExtensions.cs`
+
+```c#
+using System.Security.Claims;
+using System.Threading.RateLimiting;
+
+namespace UUcars.API.Extensions;
+
+public static class RateLimitingExtensions
+{
+    public static IServiceCollection AddRateLimiting(this IServiceCollection services)
+    {
+        services.AddRateLimiter(options =>
+        {
+            // 被限流时统一返回 429，并附上标准 ApiResponse 格式的错误信息
+            options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+
+            // OnRejected：每次有请求被拒绝时执行的回调
+            // 用途：
+            //   1. 写入 Retry-After 响应头（告诉客户端多少秒后重试）
+            //   2. 返回符合我们 ApiResponse 格式的 JSON，而不是空响应
+            options.OnRejected = async (context, cancellationToken) =>
+            {
+                var httpContext = context.HttpContext;
+                httpContext.Response.StatusCode = StatusCodes.Status429TooManyRequests;
+                httpContext.Response.ContentType = "application/json";
+
+                // 从限流器里取出"多少秒后可以重试"
+                // 不是所有限流器都提供这个信息，所以用 TryGetMetadata 安全读取
+                if (context.Lease.TryGetMetadata(
+                        MetadataName.RetryAfter, out var retryAfter))
+                    httpContext.Response.Headers.RetryAfter =
+                        ((int)retryAfter.TotalSeconds).ToString();
+
+                // 返回符合 ApiResponse 格式的 JSON
+                var response = new
+                {
+                    success = false,
+                    message = "Too many requests. Please slow down and try again later.",
+                    errors = (object?)null
+                };
+
+                await httpContext.Response.WriteAsJsonAsync(
+                    response, cancellationToken);
+            };
+
+ 
+            // ── 限流策略(比如给注册接口限流）
+            // 算法：固定窗口
+            // 规则：同一 IP，每小时最多 5 次
+            // 原因：防止批量注册垃圾账号
+            options.AddPolicy("register", httpContext =>
+            {
+                var ipAddress = httpContext.Connection.RemoteIpAddress?.ToString()
+                                ?? "unknown";
+                return RateLimitPartition.GetFixedWindowLimiter(
+                    $"register:{ipAddress}",
+                    _ => new FixedWindowRateLimiterOptions
+                    {
+                        Window = TimeSpan.FromHours(1),
+                        PermitLimit = 5,
+                        QueueLimit = 0
+                    });
+            });
+
+        });
+        return services;
+    }
+}
+```
+
+> **为什么 `QueueLimit = 0`？**
+>
+> `QueueLimit` 是排队等待的请求数。设为 0 表示"超出上限立刻拒绝，不排队等待"。
+>
+> 如果设为 5，超出限制的请求会在内存里等待，直到有新令牌/配额才继续处理。 对我们的场景来说，攻击者的请求不应该被排队——排队只会占用服务器内存，正常用户的请求反而被拖慢。
+
+
+
+#### 3.2 注册限流配置
+
+打开 `UUcars.API/Program.cs`，调用扩展方法注册：
+
+```csharp
+builder.Services.AddRateLimiting();
+```
+
+#### 3.3 在中间件管道里启用限流
+
+打开 `Program.cs` 中间件管道部分，加入 `UseRateLimiter()`：
+
+```csharp
+    // =============================================
+    // 中间件管道
+    // 顺序很重要：GlobalExceptionMiddleware 必须在最外层
+    // =============================================
+
+    // 全局异常处理，放最前面，兜住所有后续中间件的异常
+    app.UseMiddleware<GlobalExceptionMiddleware>();
+
+
+    // 开发环境才挂载 API 文档
+    if (app.Environment.IsDevelopment())
+    {
+        app.MapOpenApi();
+        app.MapScalarApiReference(options =>
+            options
+                .WithTitle("UUcars API Documentation")
+                .WithTheme(ScalarTheme.Moon)
+        );
+    }
+
+    // CORS 必须在 Authentication 和 Authorization 之前
+    // 原因：Preflight 请求（OPTIONS）不携带 Token，
+    // 如果 CORS 在 Auth 之后，Preflight 会因为没有 Token 被拦截，
+    // 导致浏览器认为服务器不支持跨域
+    app.UseCors(CorsExtensions.PolicyName);
+
+    // ✅ 限流中间件
+    // 必须在 UseCors之后
+    // 原因：限流策略导致的响应码 429，响应没有 CORS 头，浏览器拦截
+    // 必须在 UseAuthentication / UseAuthorization 之前
+    // 原因：限流是最外层的防护，不管请求有没有 Token，都要先过限流检查
+    // 这样攻击者带着无效 Token 的请求也能被拦截，不会浪费认证处理的开销
+
+    app.UseRateLimiter();
+
+    // UseAuthentication 必须在 UseAuthorization 之前
+    // 原因：Authorization 需要读取 Authentication 的结果（HttpContext.User）
+    // 如果顺序反了，[Authorize] 读到的 HttpContext.User 是空的，永远判定为未认证
+    app.UseAuthentication();
+    app.UseAuthorization();
+
+    app.MapControllers();
+```
+
+> **中间件顺序的本质：** ASP.NET Core 的中间件是一个管道，请求从上往下穿过每一层，响应从下往上返回。越靠前的中间件越早执行，越能在请求消耗任何资源之前就拦截掉它。限流放最前面，被拒绝的请求连认证处理都不需要跑。
+
+#### 3.4 在 Controller 上应用限流策略
+
+限流策略的应用，在controller上， 通过 ` [EnableRateLimiting("限流策略名")]`的形式。以注册接口限流为例：
+
+打开 `UUcars.API/Controllers/AuthController.cs`：
+
+```c#
+using Microsoft.AspNetCore.RateLimiting;
+
+[ApiController]
+[Route("auth")]
+public class AuthController : ControllerBase
+{
+    // ✅ 使用限流策略：每IP每小时5次
+    [HttpPost("register")]
+    [EnableRateLimiting(RateLimitPolicies.Register)]
+    public async Task<IActionResult> Register(...) { ... }
+
+   ...
+}
+```
+
+#### 3.5 哪些些接口需要限流？
+
+处理上面实例中的注册接口，我们项目的其他接口哪些还需要进行限流？使用什么算法？？
+
+对于auth认证类的接口:
+
+- 注册/登录需要限流，防止恶意注册/登录（比如暴力破解密码）
+- 重发验证邮件(`resend-verification` )必须限流，它会触发发邮件，攻击者可以反复调用让系统滥发邮件
+- ~~`verify-email` 和 `reset-password` 需要有效的 token 参数才能操作，攻击者无法无限枚举，可以不限流。~~
+
+对于业务接口：
+
+- 读操作（`GET`）, 需要登录认证后操作的，不需要限流，而对于不需要登录的公共接口，需要限流，防止刷单，我们设置一个browse策略，统一配置公共的读操作的接口
+- 写操作（`POST/PUT/DELETE`）, 有些需要限流，比如 `POST /cars`, 限流可以防止批量创建车辆草稿刷库； 而有些不需要限流，比如 `POST /cars/{id}/submit` , 一辆车只能提交一次，状态机已限制， 因此无需限流。 对于写操作的限流，我们设置一个write策略，统一配置这些写操作的接口限流。
+
+完整的限流策策略算法和接口如下：
+
+```
+策略名              算法      规则                    应用接口
+──────────────────────────────────────────────────────────────────────
+login               固定窗口  每IP 10次/分            POST /auth/login
+register            固定窗口  每IP 5次/时             POST /auth/register
+forgot-password     固定窗口  每IP 3次/时             POST /auth/forgot-password
+resend-verification 固定窗口  每IP 3次/时             POST /auth/resend-verification
+browse              令牌桶    登录120/分，未登录60/分  GET /cars
+                                                    GET /cars/{id}
+                                                    GET /reviews/seller/{id}
+                                                    
+write               令牌桶    每用户 30次/分           POST /cars
+                                                     POST /cars/{id}/images
+                                                     POST /orders
+                                                     POST /orders/{id}/cancel
+                                                     POST /favorites/{carId}
+                                                     DELETE /favorites/{carId}
+                                                     PUT /users/me
+                                                     POST /reviews
+```
+
+#### 3.6 集中管理策略名字符串
+
+我们对策略名字符串集中管理，和 `CacheKeys` 的思路完全一样。防止在 配置限流策略和在Controller 里使用时，手写字符串拼错：
+
+新建 `UUcars.API/Extensions/RateLimitPolicies.cs`
+
+```c#
+namespace UUcars.API.Extensions;
+
+/// <summary>
+///     限流策略名称常量
+///     用于 [EnableRateLimiting("xxx")] 和策略注册时保持一致
+/// </summary>
+public static class RateLimitPolicies
+{
+    public const string Login = "login";
+    public const string Register = "register";
+    public const string ForgotPassword = "forgot-password";
+    public const string ResendVerification = "resend-verification";
+    public const string Browse = "browse";
+    public const string Write = "write";
+}
+```
+
+#### 3.7 完整的限流策略配置
+
+补充上面扩展方法里的完整限流策略，并使用集中管理策略名字符串
+
+```c#
+using System.Security.Claims;
+using System.Threading.RateLimiting;
+
+namespace UUcars.API.Extensions;
+
+public static class RateLimitingExtensions
+{
+    public static IServiceCollection AddRateLimiting(this IServiceCollection services)
+    {
+        services.AddRateLimiter(options =>
+        {
+            // 被限流时统一返回 429，并附上标准 ApiResponse 格式的错误信息
+            options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+
+            // OnRejected：每次有请求被拒绝时执行的回调
+            options.OnRejected = async (context, cancellationToken) =>
+            {
+               ...
+            };
+
+            // ── 策略1： 登录接口 ─────────────────────────
+            // 算法：固定窗口
+            // 规则：同一 IP，每分钟最多 10 次
+            // 原因：防止暴力破解密码
+            //       10次/分钟 对正常用户完全够用（谁会一分钟内登录10次？）
+            //       对暴力破解来说，10次/分钟意味着破解一个8位密码要几百万年
+            options.AddPolicy(RateLimitPolicies.Login, httpContext =>
+            {
+                // 按 IP 分区：不同 IP 各自独立计数
+                // 为什么不按用户 ID？登录接口还没有用户 ID（正在尝试登录）
+                var ipAddress = httpContext.Connection.RemoteIpAddress?.ToString()
+                                ?? "unknown";
+                return RateLimitPartition.GetFixedWindowLimiter(
+                    $"login:{ipAddress}",
+                    _ => new FixedWindowRateLimiterOptions
+                    {
+                        Window = TimeSpan.FromMinutes(1),
+                        PermitLimit = 10,
+                        QueueLimit = 0, // 不排队，超出直接拒绝
+                        QueueProcessingOrder = QueueProcessingOrder.OldestFirst
+                    });
+            });
+
+            // ── 策略2：注册接口 ───────────────────────────
+            // 算法：固定窗口
+            // 规则：同一 IP，每小时最多 5 次
+            // 原因：防止批量注册垃圾账号
+            options.AddPolicy(RateLimitPolicies.Register, httpContext =>
+            {
+                var ipAddress = httpContext.Connection.RemoteIpAddress?.ToString()
+                                ?? "unknown";
+                return RateLimitPartition.GetFixedWindowLimiter(
+                    $"register:{ipAddress}",
+                    _ => new FixedWindowRateLimiterOptions
+                    {
+                        Window = TimeSpan.FromHours(1),
+                        PermitLimit = 5,
+                        QueueLimit = 0
+                    });
+            });
+
+            // ── 策略3：忘记密码接口 ─────────────────────────
+            // 算法：固定窗口
+            // 规则：同一 IP，每小时最多 3 次
+            // 原因：防止滥发密码重置邮件（有邮件发送成本，也是骚扰手段）
+            options.AddPolicy(RateLimitPolicies.ForgotPassword, httpContext =>
+            {
+                var ipAddress = httpContext.Connection.RemoteIpAddress?.ToString()
+                                ?? "unknown";
+                return RateLimitPartition.GetFixedWindowLimiter(
+                    $"forgot-password:{ipAddress}",
+                    _ => new FixedWindowRateLimiterOptions
+                    {
+                        Window = TimeSpan.FromHours(1),
+                        PermitLimit = 3,
+                        QueueLimit = 0
+                    });
+            });
+
+            // ── 策略4：重发验证邮件 ───────────────────────
+            // 算法：固定窗口
+            // 规则：同一 IP，每小时最多 3 次
+            // 原因：它会触发发邮件，攻击者可以反复调用让系统滥发邮件
+            options.AddPolicy(RateLimitPolicies.ResendVerification, httpContext =>
+            {
+                var ip = httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+                return RateLimitPartition.GetFixedWindowLimiter(
+                    $"resend-verification:{ip}",
+                    _ => new FixedWindowRateLimiterOptions
+                    {
+                        Window = TimeSpan.FromHours(1),
+                        PermitLimit = 3,
+                        QueueLimit = 0
+                    });
+            });
+
+            // ── 策略5：公开浏览接口 ──────────────────────────
+            // 算法：令牌桶
+            // 规则：
+            //   已登录用户：按用户ID分区，每分钟 120 次（更宽松）
+            //   未登录用户：按 IP 分区，每分钟 60 次
+            // 原因：
+            //   - 允许正常用户快速翻页（令牌桶支持短暂突发）
+            //   - 已登录用户给更高配额（他们是真实注册用户，风险更低）
+            //   - 公司/学校共用 IP 的情况下，按 IP 限制可能误伤，
+            //     但未登录用户无法区分个体，只能按 IP
+            options.AddPolicy(RateLimitPolicies.Browse, httpContext =>
+            {
+                // 检查是否已登录（JWT 认证中间件已经处理过了）
+                var userId = httpContext.User?.FindFirst(
+                    ClaimTypes.NameIdentifier)?.Value;
+
+                if (!string.IsNullOrEmpty(userId))
+                    // 已登录：按用户 ID 分区，配额更高
+                    return RateLimitPartition.GetTokenBucketLimiter(
+                        $"browse:user:{userId}",
+                        _ => new TokenBucketRateLimiterOptions
+                        {
+                            TokenLimit = 120, // 桶容量：最多积累 120 个令牌
+                            ReplenishmentPeriod = TimeSpan.FromMinutes(1), // 每分钟补充
+                            TokensPerPeriod = 120, // 每分钟补充 120 个令牌
+                            AutoReplenishment = true, // 自动补充
+                            QueueLimit = 0
+                        });
+
+                // 未登录：按 IP 分区
+                var ipAddress = httpContext.Connection.RemoteIpAddress?.ToString()
+                                ?? "unknown";
+                return RateLimitPartition.GetTokenBucketLimiter(
+                    $"browse:ip:{ipAddress}",
+                    _ => new TokenBucketRateLimiterOptions
+                    {
+                        TokenLimit = 60,
+                        ReplenishmentPeriod = TimeSpan.FromMinutes(1),
+                        TokensPerPeriod = 60,
+                        AutoReplenishment = true,
+                        QueueLimit = 0
+                    });
+            });
+
+            // ── 策略6：写操作 ─────────────────────────
+            // 算法：令牌桶
+            // 规则：
+            //   已登录用户每分钟30次
+            //   写操作必须登录，所以按用户 ID 分区
+            //   未登录的写请求会被 [Authorize] 拦截，走不到这里
+            options.AddPolicy(RateLimitPolicies.Write, httpContext =>
+            {
+                var userId = httpContext.User?.FindFirst(
+                                 ClaimTypes.NameIdentifier)?.Value
+                             ?? httpContext.Connection.RemoteIpAddress?.ToString()
+                             ?? "unknown";
+
+                return RateLimitPartition.GetTokenBucketLimiter(
+                    $"write:{userId}",
+                    _ => new TokenBucketRateLimiterOptions
+                    {
+                        TokenLimit = 30,
+                        ReplenishmentPeriod = TimeSpan.FromMinutes(1),
+                        TokensPerPeriod = 30,
+                        AutoReplenishment = true,
+                        QueueLimit = 0
+                    });
+            });
+        });
+        return services;
+    }
+}
+```
+
+#### 3.8 限流策略完整的应用
+
+给所有需要添加限流的接口使用对应的限流策略
+
+##### AuthController
+
+打开 `UUcars.API/Controllers/AuthController.cs`：
+
+```csharp
+using Microsoft.AspNetCore.RateLimiting;
+
+[ApiController]
+[Route("auth")]
+public class AuthController : ControllerBase
+{
+    // ✅ 注册
+    [HttpPost("register")]
+    [EnableRateLimiting(RateLimitPolicies.Register)]
+    public async Task<IActionResult> Register(...) { ... }
+
+    // ✅ 登录
+    [HttpPost("login")]
+    [EnableRateLimiting(RateLimitPolicies.Login)]
+    public async Task<IActionResult> Login(...) { ... }
+
+    // ✅ 忘记密码
+    [HttpPost("forgot-password")]
+    [EnableRateLimiting(RateLimitPolicies.ForgotPassword)]
+    public async Task<IActionResult> ForgotPassword(...) { ... }
+    
+    // ✅ 重发验证邮件
+    [HttpPost("resend-verification")]
+    [EnableRateLimiting(RateLimitPolicies.ResendVerification)]
+    public async Task<IActionResult> ResendVerification(...) {...}
+    
+
+    // 验证邮箱、重置密码接口不加限流
+    // 原因：需要有效的 token 参数才能操作，攻击者无法无限枚举
+}
+```
+
+##### CarsController
+
+打开 `UUcars.API/Controllers/CarsController.cs`
+
+```csharp
+using Microsoft.AspNetCore.RateLimiting;
+
+[ApiController]
+[Route("cars")]
+public class CarsController : ControllerBase
+{
+    // ✅ 公开车辆列表：令牌桶限流
+    [HttpGet]
+    [EnableRateLimiting(RateLimitPolicies.Browse)]
+    public async Task<IActionResult> GetPaged(...) { ... }
+
+    // ✅ 车辆详情：令牌桶限流
+    [HttpGet("{id:int}")]
+    [EnableRateLimiting(RateLimitPolicies.Browse)]
+    public async Task<IActionResult> GetById(...) { ... }
+    
+    
+    // ✅ 创建车辆草稿：令牌桶限流
+    [HttpPost]
+    [Authorize]
+    [EnableRateLimiting(RateLimitPolicies.Write)]
+    public async Task<IActionResult> Create(...) { ... }
+    
+    // ✅ 上传车辆图片：令牌桶限流
+    [HttpPost("{id:int}/images")]
+    [Authorize]
+    [EnableRateLimiting(RateLimitPolicies.Write)]
+    public async Task<IActionResult> AddImage(...) { ... }
+
+    // 其他接口无需格外的限流
+    ...
+}
+```
+
+##### OrdersController
+
+打开 `UUcars.API/Controllers/OrdersController.cs`
+
+```c#
+[ApiController]
+[Route("orders")]
+[Authorize] 
+public class OrdersController : ControllerBase
+{
+    ...
+
+    // ✅ 创建订单：令牌桶限流(防止刷单)
+    [HttpPost]
+    [Authorize]
+    [EnableRateLimiting(RateLimitPolicies.Write)]
+    public async Task<IActionResult> Create(...) { ... }
+
+    // ✅ 取消订单：令牌桶限流(防止刷库)
+    [HttpPost("{id:int}/cancel")]
+    [Authorize]
+    [EnableRateLimiting(RateLimitPolicies.Write)]
+    public async Task<IActionResult> Cancel(...) { ... }
+    
+    // 其他接口无需格外的限流
+    ...
+    
+}
+```
+
+##### FavoritesController
+
+打开 `UUcars.API/Controllers/FavoritesController.cs`
+
+```c#
+[ApiController]
+[Route("favorites")]
+[Authorize] 
+public class FavoritesController : ControllerBase
+{
+    ...
+
+    [HttpPost("{carId:int}")]
+    [Authorize]
+    [EnableRateLimiting(RateLimitPolicies.Write)]
+    public async Task<IActionResult> AddFavorite(...) { ... }
+
+    [HttpDelete("{carId:int}")]
+    [Authorize]
+    [EnableRateLimiting(RateLimitPolicies.Write)]
+    public async Task<IActionResult> RemoveFavorite(...) { ... }
+    
+    // 其他接口无需格外的限流
+    ...
+    
+}
+```
+
+##### UsersController
+
+打开 `UUcars.API/Controllers/UsersController.cs`
+
+```c#
+[ApiController]
+[Route("users")]
+[Authorize]
+public class UsersController : ControllerBase
+{
+    ...
+
+    // PUT /users/me
+    [HttpPut("me")]
+        
+    public async Task<IActionResult> UpdateMe( ... ) { ... }
+    
+    
+}
+```
+
+##### ReviewsController
+
+打开 `UUcars.API/Controllers/ReviewsController.cs`
+
+```c#
+[ApiController]
+[Route("reviews")]
+public class ReviewsController : ControllerBase
+{
+    ...
+
+    // POST /reviews
+    [HttpPost]
+    [Authorize]
+    [EnableRateLimiting(RateLimitPolicies.Write)]
+    public async Task<IActionResult> Create( ... ) { ... }
+    
+    [HttpGet("seller/{id:int}")]
+    [EnableRateLimiting(RateLimitPolicies.Browse)]
+    public async Task<IActionResult> GetSellerRating( ...) { ... }
+       
+}
+```
+
+> AdminController的接口:
+>
+> Admin 接口由 `[Authorize(Roles = "Admin")]` 严格保护，管理员数量极少，不需要限流。
+
+
+
+### 4. 前端处理 429 响应
+
+限流不只是后端的事。用户触发限流时，前端不应该显示一个红色的网络错误，而应该给友好的提示并告知等待时间。
+
+因此我们需要在响应拦截器里进行处理：
+
+打开 `uucars-web/src/api/client.ts`，在响应拦截器的错误处理里加入 429 的处理：
+
+```typescript
+// 在响应拦截器的 error 处理里（加在其他错误处理之前）
+apiClient.interceptors.response.use(
+  (response) => {
+    // 成功处理（原有逻辑不变）
+    return response;
+  },
+  (error: AxiosError) => {
+
+    // ✅ 处理 429 Too Many Requests
+    if (error.response?.status === 429) {
+      // 读取 Retry-After 响应头（后端返回的秒数）
+      const retryAfterHeader = error.response.headers["retry-after"];
+      const seconds = retryAfterHeader
+        ? parseInt(retryAfterHeader, 10)
+        : 60; // 没有 Retry-After 头就默认提示60秒
+
+      // 用 sonner toast 给用户友好提示
+      toast.error(
+        `Too many requests. Please wait ${seconds} seconds before trying again.`,
+        { duration: 5000 }
+      );
+
+      // 返回一个标准格式的错误，让调用方知道是限流问题
+      return Promise.reject(
+        new Error(`Rate limited. Retry after ${seconds}s.`)
+      );
+    }
+
+    // 其他错误处理（原有逻辑不变）
+    return Promise.reject(error);
+  }
+);
+```
+
+
+
+### 5. 本地验证
+
+启动项目（确保 Redis 也在运行）：
+
+```bash
+cd UUcars.API
+dotnet run
+```
+
+用命令行快速发多次登录请求，验证限流生效：
+
+```bash
+# 快速发 15 次登录请求（限制是每分钟10次）
+for i in $(seq 1 15); do
+  STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+    -X POST http://localhost:5085/auth/login \
+    -H "Content-Type: application/json" \
+    -d '{"email":"test@test.com","password":"wrong"}')
+  echo "请求 $i: HTTP $STATUS"
+done
+```
+
+预期输出：
+
+```
+请求 1: HTTP 401   ← 密码错误（正常处理）
+请求 2: HTTP 401
+...
+请求 10: HTTP 401
+请求 11: HTTP 429  ← 被限流
+请求 12: HTTP 429
+请求 13: HTTP 429
+请求 14: HTTP 429
+请求 15: HTTP 429
+```
+
+验证响应头里有 `Retry-After`：
+
+```bash
+curl -v -X POST http://localhost:5085/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@test.com","password":"wrong"}' 2>&1 | grep -i "retry-after"
+
+# 预期输出类似：
+# < Retry-After: 47
+```
+
+
+
+### 6. 关于测试的处理
+
+#### 6.1 单元测试
+
+单元测试不走 HTTP 管道，直接调用 Service 方法，不受限流影响，无需任何改动。
+
+#### 6.2 集成测试
+
+限流会干扰集成测试。比如 `CoreFlowIntegrationTests` 里多次调用 `/auth/register` 或 `/auth/login`，可能触发限流导致测试失败。
+
+在 `SqlServerTestFactory.cs` 的 `ConfigureWebHost` 里，把限流禁用掉（测试环境不需要限流）：
+
+```csharp
+protected override void ConfigureWebHost(IWebHostBuilder builder)
+{
+    builder.ConfigureServices(services =>
+    {
+        // 原有替换（DbContext、EmailService、Redis）...
+
+        // ✅ 新增：测试环境禁用限流
+            // 先移除所有已注册的 RateLimiter 相关服务
+            var rateLimiterDescriptors = services
+                .Where(d => d.ServiceType.FullName != null &&
+                            d.ServiceType.FullName.Contains("RateLimit"))
+                .ToList();
+            foreach (var d in rateLimiterDescriptors)
+                services.Remove(d);
+
+            // 再注册完全无限制的 
+            services.AddRateLimiter(options =>
+            {
+                // 覆盖全局限流
+                options.GlobalLimiter =
+                    PartitionedRateLimiter.Create<HttpContext, string>(_ =>
+                        RateLimitPartition.GetNoLimiter("no-limit"));
+
+                // ✅ 必须把所有命名策略都注册为 NoLimiter
+                // 否则 [EnableRateLimiting("xxx")] 找不到策略会抛 500
+                foreach (var policyName in new[]
+                             { "login", "register", "forgot-password", "resend-verification", "browse", "write" })
+                    options.AddPolicy(policyName, _ =>
+                        RateLimitPartition.GetNoLimiter("no-limit"));
+            });
+    });
+
+    builder.UseEnvironment("Testing");
+}
+```
+
+> **`RateLimitPartition.GetNoLimiter` 是什么？**
+>
+> ASP.NET Core 内置的"无限制"分区，任何请求都直接通过，相当于把限流关掉。只在测试环境用，生产环境绝对不用。
+
+
+
+### 7. 编译和测试
+
+```bash
+dotnet build
+dotnet test
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+
+Test summary: total: XX, failed: 0, succeeded: XX
+```
+
+
+
+### 8. Git 提交
+
+```bash
+git add .
+git commit -m "feat: rate limiting"
+git push origin feature/v3-rate-limiting
+
+# 合并回 develop
+git checkout develop
+git merge --no-ff feature/v3-rate-limiting \
+  -m "merge: feature/v3-rate-limiting into develop"
+git push origin develop
+git branch -d feature/v3-rate-limiting
+git push origin --delete feature/v3-rate-limiting
+```
+
+
+
+### Step 59 完成状态
+
+```
+知识点：
+✅ 理解固定窗口算法（原理、边界突刺缺陷、适用场景）
+✅ 理解滑动窗口算法（无边界突刺、内存占用更高）
+✅ 理解令牌桶算法（允许突发、平滑限速、适合浏览接口）
+✅ 理解 QueueLimit=0 的含义（超出直接拒绝，不排队等待）
+✅ 理解限流中间件在管道里的位置（必须在认证之前）
+✅ 理解按 IP 和按用户 ID 分区的区别和选择依据
+
+实现：
+✅ 零依赖，使用 ASP.NET Core 8 内置 RateLimiter
+✅ 6 个限流策略
+✅ OnRejected 回调（返回标准 ApiResponse + Retry-After 响应头）
+✅ [EnableRateLimiting] 应用到 AuthController 和 CarsController
+✅ 前端 Axios 拦截器处理 429（读 Retry-After，显示 toast）
+✅ 集成测试里用 GetNoLimiter 禁用限流
+✅ 命令行验证：前10次401，后5次429，Retry-After 头存在
+✅ dotnet build + dotnet test 通过
 ✅ Git commit + 合并回 develop 完成
 ```

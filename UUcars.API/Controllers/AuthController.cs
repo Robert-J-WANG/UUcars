@@ -1,7 +1,9 @@
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 using UUcars.API.DTOs;
 using UUcars.API.DTOs.Requests;
 using UUcars.API.DTOs.Responses;
+using UUcars.API.Extensions;
 using UUcars.API.Services;
 
 namespace UUcars.API.Controllers;
@@ -18,6 +20,9 @@ public class AuthController : ControllerBase
     }
 
     [HttpPost("register")]
+    // 使用限流
+    // ✅ 注册：每IP每小时5次
+    [EnableRateLimiting(RateLimitPolicies.Register)]
     public async Task<IActionResult> Register(
         [FromBody] RegisterRequest request,
         CancellationToken cancellationToken)
@@ -35,6 +40,9 @@ public class AuthController : ControllerBase
     }
 
     [HttpPost("login")]
+    // 使用限流
+    // ✅ 登录：每IP每分钟10次
+    [EnableRateLimiting(RateLimitPolicies.Login)]
     public async Task<IActionResult> Login(
         [FromBody] LoginRequest request,
         CancellationToken cancellationToken)
@@ -62,6 +70,7 @@ public class AuthController : ControllerBase
     }
 
     [HttpPost("resend-verification")]
+    [EnableRateLimiting(RateLimitPolicies.ResendVerification)]
     public async Task<IActionResult> ResendVerification(
         [FromBody] ResendVerificationRequest request,
         CancellationToken cancellationToken)
@@ -77,6 +86,9 @@ public class AuthController : ControllerBase
 
     // POST /auth/forgot-password
     [HttpPost("forgot-password")]
+    // 使用限流
+    // ✅ 忘记密码：每IP每小时3次
+    [EnableRateLimiting(RateLimitPolicies.ForgotPassword)]
     public async Task<IActionResult> ForgotPassword(
         [FromBody] ForgotPasswordRequest request,
         CancellationToken cancellationToken)

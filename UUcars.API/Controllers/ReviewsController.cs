@@ -1,8 +1,10 @@
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 using UUcars.API.DTOs;
 using UUcars.API.DTOs.Requests;
 using UUcars.API.DTOs.Responses;
+using UUcars.API.Extensions;
 using UUcars.API.Services;
 
 namespace UUcars.API.Controllers;
@@ -25,6 +27,8 @@ public class ReviewsController : ControllerBase
     // POST /reviews
     [HttpPost]
     [Authorize]
+    // 限流
+    [EnableRateLimiting(RateLimitPolicies.Write)]
     public async Task<IActionResult> Create(
         [FromBody] CreateReviewRequest request,
         CancellationToken cancellationToken)
@@ -43,6 +47,8 @@ public class ReviewsController : ControllerBase
     // GET /reviews/seller/{id}
     // 公开接口，不需要登录，任何人都可以查看卖家的评价
     [HttpGet("seller/{id:int}")]
+    // 限流
+    [EnableRateLimiting(RateLimitPolicies.Browse)]
     public async Task<IActionResult> GetSellerRating(
         int id,
         CancellationToken cancellationToken)

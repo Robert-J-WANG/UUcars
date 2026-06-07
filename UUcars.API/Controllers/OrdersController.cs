@@ -1,8 +1,10 @@
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 using UUcars.API.DTOs;
 using UUcars.API.DTOs.Requests;
 using UUcars.API.DTOs.Responses;
+using UUcars.API.Extensions;
 using UUcars.API.Services;
 
 namespace UUcars.API.Controllers;
@@ -23,6 +25,8 @@ public class OrdersController : ControllerBase
 
     // POST /orders
     [HttpPost]
+    // 限流
+    [EnableRateLimiting(RateLimitPolicies.Write)]
     public async Task<IActionResult> Create(
         [FromBody] OrderCreateRequest request,
         CancellationToken cancellationToken)
@@ -39,6 +43,8 @@ public class OrdersController : ControllerBase
 
     // POST /orders/{id}/cancel
     [HttpPost("{id:int}/cancel")]
+    // 限流
+    [EnableRateLimiting(RateLimitPolicies.Write)]
     public async Task<IActionResult> Cancel(int id, CancellationToken cancellationToken)
     {
         var currentUserId = _currentUserService.GetCurrentUserId();

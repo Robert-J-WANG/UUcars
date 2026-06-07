@@ -1,8 +1,10 @@
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 using UUcars.API.DTOs;
 using UUcars.API.DTOs.Requests;
 using UUcars.API.DTOs.Responses;
+using UUcars.API.Extensions;
 using UUcars.API.Services;
 
 namespace UUcars.API.Controllers;
@@ -23,6 +25,8 @@ public class UsersController : ControllerBase
 
     // GET /users/me
     [HttpGet("me")]
+    // 限流
+    [EnableRateLimiting(RateLimitPolicies.Write)]
     public async Task<IActionResult> GetMe(CancellationToken cancellationToken)
     {
         var userId = _currentUserService.GetCurrentUserId();
