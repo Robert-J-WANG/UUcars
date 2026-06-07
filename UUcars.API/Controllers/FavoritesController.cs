@@ -1,8 +1,10 @@
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 using UUcars.API.DTOs;
 using UUcars.API.DTOs.Requests;
 using UUcars.API.DTOs.Responses;
+using UUcars.API.Extensions;
 using UUcars.API.Services;
 
 namespace UUcars.API.Controllers;
@@ -12,8 +14,8 @@ namespace UUcars.API.Controllers;
 [Authorize] // 收藏系统所有接口都需要登录
 public class FavoritesController : ControllerBase
 {
-    private readonly FavoriteService _favoriteService;
     private readonly CurrentUserService _currentUserService;
+    private readonly FavoriteService _favoriteService;
 
     public FavoritesController(
         FavoriteService favoriteService,
@@ -25,6 +27,8 @@ public class FavoritesController : ControllerBase
 
     // POST /favorites/{carId}
     [HttpPost("{carId:int}")]
+    // 限流
+    [EnableRateLimiting(RateLimitPolicies.Write)]
     public async Task<IActionResult> AddFavorite(int carId, CancellationToken cancellationToken)
     {
         var userId = _currentUserService.GetCurrentUserId();
@@ -39,6 +43,8 @@ public class FavoritesController : ControllerBase
 
     // DELETE /favorites/{carId}
     [HttpDelete("{carId:int}")]
+    // 限流
+    [EnableRateLimiting(RateLimitPolicies.Write)]
     public async Task<IActionResult> RemoveFavorite(int carId, CancellationToken cancellationToken)
     {
         var userId = _currentUserService.GetCurrentUserId();

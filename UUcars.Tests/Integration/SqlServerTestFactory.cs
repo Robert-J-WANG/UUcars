@@ -1,4 +1,7 @@
+using System.Threading.RateLimiting;
+using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.EntityFrameworkCore;
@@ -72,6 +75,31 @@ public class SqlServerTestFactory : WebApplicationFactory<Program>, IAsyncLifeti
             if (cacheDescriptor != null)
                 services.Remove(cacheDescriptor);
             services.AddSingleton<ICacheService, FakeCacheService>();
+
+            // ✅ 新增：测试环境禁用限流
+            // 先移除所有已注册的 RateLimiter 相关服务
+            var rateLimiterDescriptors = services
+                .Where(d => d.ServiceType.FullName != null &&
+                            d.ServiceType.FullName.Contains("RateLimit"))
+                .ToList();
+            foreach (var d in rateLimiterDescriptors)
+                services.Remove(d);
+
+            // 再注册完全无限制的 
+            services.AddRateLimiter(options =>
+            {
+                // 覆盖全局限流
+                options.GlobalLimiter =
+                    PartitionedRateLimiter.Create<HttpContext, string>(_ =>
+                        RateLimitPartition.GetNoLimiter("no-limit"));
+
+                // ✅ 必须把所有命名策略都注册为 NoLimiter
+                // 否则 [EnableRateLimiting("xxx")] 找不到策略会抛 500
+                foreach (var policyName in new[]
+                             { "login", "register", "forgot-password", "resend-verification", "browse", "write" })
+                    options.AddPolicy(policyName, _ =>
+                        RateLimitPartition.GetNoLimiter("no-limit"));
+            });
         });
 
         // 使用测试环境，避免加载生产配置
