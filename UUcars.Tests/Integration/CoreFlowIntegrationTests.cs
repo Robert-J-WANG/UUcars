@@ -1,4 +1,5 @@
 using System.Net;
+using Microsoft.EntityFrameworkCore;
 
 namespace UUcars.Tests.Integration;
 
@@ -66,9 +67,12 @@ public class CoreFlowIntegrationTests : IntegrationTestBase
             password = "Test@123456"
         }));
 
-        // ← 新增：验证邮箱
-        var verifyToken = Factory.FakeEmail.SentVerificationEmails
-            .Last(x => x.Email == "test@example.com").Token;
+        // V3 更新：直接从数据库取 Token
+        await using var db = Factory.GetDbContext();
+        var user = await db.Users
+            .FirstOrDefaultAsync(u => u.Email == "test@example.com");
+        var verifyToken = user!.EmailConfirmationToken;
+
         await Client.GetAsync($"/auth/verify-email?token={verifyToken}");
 
         var response = await Client.PostAsync("/auth/login", JsonContent(new

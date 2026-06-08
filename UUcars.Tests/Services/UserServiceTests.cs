@@ -12,9 +12,12 @@ namespace UUcars.Tests.Services;
 
 public class UserServiceTests
 {
-    // 返回 (service, fakeEmailService) 元组
-    // fakeEmailService 供测试里断言邮件是否发送、发给谁、Token 是什么
-    private static (UserService Service, FakeEmailService EmailService)
+    // v3 更新：
+    // - 返回 (service, fakeBackgroundJobClient) 元组
+    // - fakeEmailService 内部保留但不再从外部断言邮件内容
+    //   原因：邮件改为 Hangfire 异步入队，不再直接发送
+    //   Token 的验证改为从 FakeUserRepository 直接读取
+    private static (UserService Service, FakeBackgroundJobClient JobClient)
         CreateService(FakeUserRepository repo)
     {
         var jwtSettings = Options.Create(new JwtSettings
@@ -26,27 +29,30 @@ public class UserServiceTests
         });
 
         var fakeEmailService = new FakeEmailService();
+        var fakeBackgroundJobClient = new FakeBackgroundJobClient();
 
         var service = new UserService(
             repo,
             new PasswordHasher<User>(),
             new JwtTokenGenerator(jwtSettings),
             fakeEmailService,
+            fakeBackgroundJobClient,
             NullLogger<UserService>.Instance
         );
 
-        return (service, fakeEmailService);
+        return (service, fakeBackgroundJobClient);
     }
 
-    // ===== 注册测试（更新）=====
+    // ===== 注册测试 =====
 
     [Fact]
-    public async Task RegisterAsync_WithNewEmail_ShouldReturnUserResponseAndSendEmail()
+    public async Task RegisterAsync_WithNewEmail_ShouldReturnUserResponseAndEnqueueEmailJob()
     {
         var repo = new FakeUserRepository();
-        var (service, emailService) = CreateService(repo);
+        var (service, jobClient) = CreateService(repo);
 
-        var result = await service.RegisterAsync("testuser",
+        var result = await service.RegisterAsync(
+            "testuser",
             "test@example.com",
             "Test@123456"
         );
@@ -55,10 +61,9 @@ public class UserServiceTests
         Assert.Equal("test@example.com", result.Email);
         Assert.Equal("User", result.Role);
 
-        // V2 新增：验证邮件已发送
-        Assert.Single(emailService.SentVerificationEmails);
-        Assert.Equal("test@example.com",
-            emailService.SentVerificationEmails[0].Email);
+        // V3 更新：验证邮件 Job 已入队（不再验证邮件是否直接发送）
+        Assert.Single(jobClient.EnqueuedJobs);
+        Assert.Contains("SendEmailVerificationAsync", jobClient.EnqueuedJobs);
     }
 
     [Fact]
@@ -101,7 +106,7 @@ public class UserServiceTests
         Assert.True(stored.PasswordHash.Length > 20);
     }
 
-    // ===== 登录测试（更新）=====
+    // ===== 登录测试 =====
 
     [Fact]
     public async Task LoginAsync_WithUnverifiedEmail_ShouldThrowEmailNotConfirmedException()
@@ -109,14 +114,13 @@ public class UserServiceTests
         var repo = new FakeUserRepository();
         var (service, _) = CreateService(repo);
 
-        // 注册但不验证邮箱
         await service.RegisterAsync(
             "testuser",
             "test@example.com",
             "Test@123456"
         );
 
-        // 直接尝试登录，应该被拒绝（密码正确但邮箱未验证）
+        // 注册后不验证邮箱，直接登录应被拒绝
         await Assert.ThrowsAsync<EmailNotConfirmedException>(() => service.LoginAsync(
             "test@example.com",
             "Test@123456"
@@ -127,7 +131,7 @@ public class UserServiceTests
     public async Task LoginAsync_WithVerifiedEmail_ShouldReturnLoginResponse()
     {
         var repo = new FakeUserRepository();
-        var (service, emailService) = CreateService(repo);
+        var (service, _) = CreateService(repo);
 
         await service.RegisterAsync(
             "testuser",
@@ -135,13 +139,12 @@ public class UserServiceTests
             "Test@123456"
         );
 
-        // 用注册时发出的 Token 完成邮箱验证
-        var token = emailService.SentVerificationEmails[0].Token;
-        await service.VerifyEmailAsync(
-            token
-        );
+        // V3 更新：Token 直接从 repo 读取，不再从 FakeEmailService 取
+        // 原因：邮件改为异步入队，FakeEmailService 不再收到真实调用
+        var user = await repo.GetByEmailAsync("test@example.com");
+        var token = user!.EmailConfirmationToken;
+        await service.VerifyEmailAsync(token!);
 
-        // 验证后登录应该成功
         var result = await service.LoginAsync(
             "test@example.com",
             "Test@123456"
@@ -181,13 +184,13 @@ public class UserServiceTests
         ));
     }
 
-    // ===== 邮箱验证测试（V2 新增）=====
+    // ===== 邮箱验证测试 =====
 
     [Fact]
     public async Task VerifyEmailAsync_WithValidToken_ShouldConfirmEmail()
     {
         var repo = new FakeUserRepository();
-        var (service, emailService) = CreateService(repo);
+        var (service, _) = CreateService(repo);
 
         await service.RegisterAsync(
             "testuser",
@@ -195,17 +198,16 @@ public class UserServiceTests
             "Test@123456"
         );
 
-        // 从 FakeEmailService 里取出注册时发出的 Token
-        var token = emailService.SentVerificationEmails[0].Token;
-
-        await service.VerifyEmailAsync(
-            token
-        );
-
+        // V3 更新：直接从 repo 取 Token
         var user = await repo.GetByEmailAsync("test@example.com");
-        Assert.True(user!.EmailConfirmed);
-        Assert.Null(user.EmailConfirmationToken); // Token 已清除
-        Assert.Null(user.EmailConfirmationTokenExpiry);
+        var token = user!.EmailConfirmationToken;
+
+        await service.VerifyEmailAsync(token!);
+
+        var updated = await repo.GetByEmailAsync("test@example.com");
+        Assert.True(updated!.EmailConfirmed);
+        Assert.Null(updated.EmailConfirmationToken);
+        Assert.Null(updated.EmailConfirmationTokenExpiry);
     }
 
     [Fact]
@@ -223,7 +225,6 @@ public class UserServiceTests
     public async Task VerifyEmailAsync_WithExpiredToken_ShouldThrowInvalidTokenException()
     {
         var repo = new FakeUserRepository();
-
         repo.Seed(new User
         {
             Id = 1,
@@ -244,10 +245,10 @@ public class UserServiceTests
     }
 
     [Fact]
-    public async Task ResendVerificationAsync_WithUnverifiedEmail_ShouldSendNewEmail()
+    public async Task ResendVerificationAsync_WithUnverifiedEmail_ShouldEnqueueEmailJob()
     {
         var repo = new FakeUserRepository();
-        var (service, emailService) = CreateService(repo);
+        var (service, jobClient) = CreateService(repo);
 
         await service.RegisterAsync(
             "testuser",
@@ -255,78 +256,71 @@ public class UserServiceTests
             "Test@123456"
         );
 
-        Assert.Single(emailService.SentVerificationEmails);
+        // 注册时已入队一次
+        Assert.Single(jobClient.EnqueuedJobs);
 
-        await service.ResendVerificationAsync(
-            "test@example.com"
-        );
+        await service.ResendVerificationAsync("test@example.com");
 
-        // 重发后共有两封验证邮件
-        Assert.Equal(2, emailService.SentVerificationEmails.Count);
+        // 重发后共入队两次
+        Assert.Equal(2, jobClient.EnqueuedJobs.Count);
+        Assert.All(jobClient.EnqueuedJobs,
+            job => Assert.Equal("SendEmailVerificationAsync", job));
     }
 
     [Fact]
-    public async Task ResendVerificationAsync_WithNonExistentEmail_ShouldNotThrowOrSendEmail()
+    public async Task ResendVerificationAsync_WithNonExistentEmail_ShouldNotEnqueueJob()
     {
         var repo = new FakeUserRepository();
-        var (service, emailService) = CreateService(repo);
+        var (service, jobClient) = CreateService(repo);
 
-        // 不存在的邮箱：静默返回，不发邮件，不抛异常
-        await service.ResendVerificationAsync(
-            "nobody@example.com"
-        );
+        // 不存在的邮箱：静默返回，不入队
+        await service.ResendVerificationAsync("nobody@example.com");
 
-        Assert.Empty(emailService.SentVerificationEmails);
+        Assert.Empty(jobClient.EnqueuedJobs);
     }
 
-
-    // ===== 密码重置测试（Step 39 新增）=====
+    // ===== 密码重置测试 =====
 
     [Fact]
-    public async Task ForgotPasswordAsync_WithValidVerifiedEmail_ShouldSendResetEmail()
+    public async Task ForgotPasswordAsync_WithValidVerifiedEmail_ShouldEnqueueResetEmailJob()
     {
         var repo = new FakeUserRepository();
-        var (service, emailService) = CreateService(repo);
+        var (service, jobClient) = CreateService(repo);
 
-        // 注册 + 完成邮箱验证
+        // 注册 + 验证邮箱
         await service.RegisterAsync(
             "testuser",
             "test@example.com",
             "Test@123456"
         );
-        var verifyToken = emailService.SentVerificationEmails[0].Token;
-        await service.VerifyEmailAsync(
-            verifyToken
-        );
+        var user = await repo.GetByEmailAsync("test@example.com");
+        await service.VerifyEmailAsync(user!.EmailConfirmationToken!);
 
-        await service.ForgotPasswordAsync(
-            "test@example.com"
-        );
+        // 发起重置密码
+        await service.ForgotPasswordAsync("test@example.com");
 
-        Assert.Single(emailService.SentPasswordResetEmails);
-        Assert.Equal("test@example.com",
-            emailService.SentPasswordResetEmails[0].Email);
+        // 注册时入队一次(SendEmailVerificationAsync)
+        // ForgotPassword 入队一次(SendPasswordResetAsync)
+        Assert.Equal(2, jobClient.EnqueuedJobs.Count);
+        Assert.Contains("SendPasswordResetAsync", jobClient.EnqueuedJobs);
     }
 
     [Fact]
-    public async Task ForgotPasswordAsync_WithNonExistentEmail_ShouldNotSendEmail()
+    public async Task ForgotPasswordAsync_WithNonExistentEmail_ShouldNotEnqueueJob()
     {
         var repo = new FakeUserRepository();
-        var (service, emailService) = CreateService(repo);
+        var (service, jobClient) = CreateService(repo);
 
-        // 不存在的邮箱：静默返回，不发邮件
-        await service.ForgotPasswordAsync(
-            "nobody@example.com"
-        );
+        await service.ForgotPasswordAsync("nobody@example.com");
 
-        Assert.Empty(emailService.SentPasswordResetEmails);
+        Assert.Empty(jobClient.EnqueuedJobs);
     }
 
     [Fact]
-    public async Task ForgotPasswordAsync_WithUnverifiedEmail_ShouldNotSendEmail()
+    public async Task ForgotPasswordAsync_WithUnverifiedEmail_ShouldNotEnqueueJob()
     {
         var repo = new FakeUserRepository();
-        var (service, emailService) = CreateService(repo);
+        var (service, jobClient) = CreateService(repo);
 
         // 注册但不验证邮箱
         await service.RegisterAsync(
@@ -335,43 +329,39 @@ public class UserServiceTests
             "Test@123456"
         );
 
-        // 未验证的账号不能重置密码
-        await service.ForgotPasswordAsync(
-            "test@example.com"
-        );
+        // 清空注册时产生的入队记录，专注测试 ForgotPassword 的行为
+        jobClient.EnqueuedJobs.Clear();
 
-        Assert.Empty(emailService.SentPasswordResetEmails);
+        // 未验证的账号不能重置密码，不应入队
+        await service.ForgotPasswordAsync("test@example.com");
+
+        Assert.Empty(jobClient.EnqueuedJobs);
     }
 
     [Fact]
     public async Task ResetPasswordAsync_WithValidToken_ShouldUpdatePasswordAndClearToken()
     {
         var repo = new FakeUserRepository();
-        var (service, emailService) = CreateService(repo);
+        var (service, _) = CreateService(repo);
 
-        // 注册 + 验证邮箱 + 发起重置
+        // 注册 + 验证邮箱
         await service.RegisterAsync(
             "testuser",
             "test@example.com",
             "Test@123456"
         );
-        var verifyToken = emailService.SentVerificationEmails[0].Token;
-        await service.VerifyEmailAsync(
-            verifyToken
-        );
+        var user = await repo.GetByEmailAsync("test@example.com");
+        await service.VerifyEmailAsync(user!.EmailConfirmationToken!);
 
-        await service.ForgotPasswordAsync(
-            "test@example.com"
-        );
-        var resetToken = emailService.SentPasswordResetEmails[0].Token;
+        // 发起重置，Token 直接从 repo 读
+        await service.ForgotPasswordAsync("test@example.com");
+        var updatedUser = await repo.GetByEmailAsync("test@example.com");
+        var resetToken = updatedUser!.ResetPasswordToken;
 
         // 用新密码重置
-        await service.ResetPasswordAsync(
-            resetToken,
-            "NewPassword@123"
-        );
+        await service.ResetPasswordAsync(resetToken!, "NewPassword@123");
 
-        // 验证：用新密码能登录
+        // 验证：新密码可以登录
         var loginResult = await service.LoginAsync(
             "test@example.com",
             "NewPassword@123"
@@ -385,9 +375,9 @@ public class UserServiceTests
         ));
 
         // 验证：Token 已清除，不能重复使用
-        var updatedUser = await repo.GetByEmailAsync("test@example.com");
-        Assert.Null(updatedUser!.ResetPasswordToken);
-        Assert.Null(updatedUser.ResetPasswordTokenExpiry);
+        var finalUser = await repo.GetByEmailAsync("test@example.com");
+        Assert.Null(finalUser!.ResetPasswordToken);
+        Assert.Null(finalUser.ResetPasswordTokenExpiry);
     }
 
     [Fact]
@@ -406,8 +396,6 @@ public class UserServiceTests
     public async Task ResetPasswordAsync_WithExpiredToken_ShouldThrowInvalidTokenException()
     {
         var repo = new FakeUserRepository();
-
-        // 直接注入一个已过期 Token 的用户
         repo.Seed(new User
         {
             Id = 1,

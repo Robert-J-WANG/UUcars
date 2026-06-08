@@ -2957,3 +2957,1933 @@ git push origin --delete feature/v3-rate-limiting
 ✅ dotnet build + dotnet test 通过
 ✅ Git commit + 合并回 develop 完成
 ```
+
+
+
+## Step 60 · Hangfire 后台任务 + Application Insights
+
+### 这一步做什么
+
+Step 59 加了限流，保护了系统入口。现在来解决一个一直存在但还没修复的问题：**邮件发送的脆弱性**。
+
+用户注册这个动作，本质上包含两件**性质不同**的事：
+
+```
+用户注册  =  [核心事务]  +  [后续副作用]
+              写数据库        发验证邮件
+              必须成功         失败可补救
+              要快             可以慢
+```
+
+打开 V2 的注册流程
+
+```c#
+public class UserService
+{
+    ...
+
+    public async Task<UserResponse> RegisterAsync(string username, string email, string password,
+        CancellationToken cancellationToken = default)
+    {
+        // 1. 检查邮箱是否已被注册
+        var existing = await _userRepository.GetByEmailAsync(email, cancellationToken);
+        if (existing != null) throw new UserAlreadyExistsException(email);
+
+        // 2. 构建用户实体（先不填 PasswordHash）
+        var user = new User
+        {
+            Username = username,
+            Email = email.ToLower(), // 统一存小写，保持一致性
+            Role = UserRole.User, // 注册的用户默认是普通用户
+            EmailConfirmed = false, // V1 不做邮箱验证，默认 false
+            // 邮件验证的token
+            EmailConfirmationToken = TokenGenerator.Generate(),
+            EmailConfirmationTokenExpiry = DateTime.UtcNow.AddHours(24),
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        // 3. Hash 密码（细节在 Step 09 讲解）
+        user.PasswordHash = _passwordHasher.HashPassword(user, password);
+
+        // 4. 存入数据库
+        var created = await _userRepository.AddAsync(user, cancellationToken);
+
+        // 先保存用户，再发邮件
+        // 如果邮件发送失败，用户可以通过"重新发送"功能补救
+        try
+        {
+            await _emailService.SendEmailVerificationAsync(
+                created.Email,
+                created.EmailConfirmationToken!,
+                cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            // 邮件发送失败不阻断注册流程
+            // 用户已成功写入数据库，可以通过"重新发送验证邮件"功能补救
+            _logger.LogWarning(ex, "Failed to send verification email to {Email}", created.Email);
+        }
+
+        _logger.LogInformation("New user registered: {Email}", created.Email);
+
+        // 5. 返回 DTO（不包含 PasswordHash）
+        return MapToResponse(created);
+    }
+    
+    ...
+
+}
+```
+
+逻辑是这样的：
+
+```
+用户点击注册
+  → AuthController.Register()
+    → UserService.RegisterAsync()
+      → 写入数据库
+      → EmailService.SendEmailConfirmationAsync()   ← 同步调用 Resend API
+        → 等待 Resend 响应（可能 200ms，可能 2000ms，可能超时）
+    → 返回 201
+```
+
+问题出在第三步：`await` 的方式把这两件事**串在同一条链上**， 导致注册逻辑和**邮件发送是同步（耦合）的**。
+
+整个注册请求必须等待 Resend API 响应才能返回给用户。
+
+这意味着：
+
+- Resend 慢了 → 用户等待
+- Resend 短暂故障 → 注册失败（虽然用户数据已经写入数据库）
+- Resend 超时 → 用户看到 500 错误，但账号其实已经创建了
+
+**这是一个典型的"主流程不应该依赖外部服务"的问题。** 
+
+在真实生产项目里，任何发邮件、发短信、发通知的操作，都应该异步化——把任务放入队列，立即返回给用户，后台慢慢处理。
+
+这样用户的体验从：
+
+```
+用户点击"注册" 
+→ 等待... 等待... 等待...（3秒，邮件发完才返回）
+→ "注册成功"
+
+如果邮件服务挂掉
+→ "注册失败" ❌
+
+但实际上数据库已经写入了。
+用户再试一次 → "邮箱已被注册" ❌
+
+用户懵了。
+```
+
+变成
+
+```
+用户点击"注册"
+→ 立刻返回（< 100ms）
+→ "注册成功，验证邮件已发送"
+→ 几秒后邮件到达收件箱
+
+如果邮件服务挂掉
+用户账号正常创建。
+邮件服务恢复后，队列自动补发邮件。
+用户最终会收到，只是晚了一点。
+```
+
+这就是 **后台任务队列（Background Job Queue）** 的核心价值。
+
+**一句话总结**：
+
+> **await：邮件发送的问题，变成了用户注册的问题。**
+>
+> **队列：邮件发送的问题，只是邮件发送的问题。**
+
+
+
+### 为什么用 Hangfire方案？
+
+可能的几种后台任务的方案：
+
+**方案一：`IHostedService` / `BackgroundService`（.NET 内置）**
+
+```csharp
+// 这是最简单的后台任务方式
+public class EmailBackgroundService : BackgroundService
+{
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            // 自己轮询，自己实现重试，自己实现持久化...
+        }
+    }
+}
+```
+
+问题：需要自己实现任务队列、重试机制、失败记录、可视化面板。工作量很大，而且没有持久化——应用重启后，队列里还没执行的任务全部丢失。
+
+**方案二：Azure Service Bus / RabbitMQ / Redis Streams**
+
+分布式消息队列。功能强大，但复杂度高，需要额外的基础设施。对于我们的场景（单实例应用，任务量不大）是过度设计。
+
+**方案三：Hangfire**
+
+```
+优点：
+- 任务持久化到 SQL Server（应用重启不丢失）
+- 内置重试机制（失败自动重试，指数退避）
+- 内置 Dashboard（可视化查看任务状态）
+- 支持多种任务类型（Fire-and-Forget / Recurring / Delayed / Continuation）
+- 复用现有 SQL Server，不需要额外基础设施
+- 生产项目里非常常见，面试被问到的概率高
+
+缺点：
+- 给 SQL Server 加了几张系统表（Hangfire 自动创建）
+- 不适合极高频任务（每秒几千个）
+```
+
+对于 UUcars 的场景（注册邮件、密码重置邮件、定时清理），Hangfire 是最合适的选择。
+
+
+
+### Hangfire 的核心概念
+
+Hangfire提供了一些核心方法和配置属性来实现不同的任务
+
+- 核心方法， 通过静态工具类， 比如 `BackgroundJob`，提供的方法
+- 核心配置， 通过扩展方法， 比如`AddHangfire`, 挂在 `IServiceCollection` 上进行配置
+
+#### 任务类型
+
+##### **Fire-and-Forget（触发即忘）**
+
+```csharp
+BackgroundJob.Enqueue(() => emailService.SendAsync(...));
+```
+
+- 调用后立即返回，任务放入队列
+- 后台 Worker 取出任务执行
+- 执行失败自动重试（默认重试 10 次，指数退避）
+- **适用场景：发邮件、发通知、记录日志等一次性任务**
+
+##### **Recurring Job（定时任务）**
+
+```csharp
+RecurringJob.AddOrUpdate("cleanup-tokens", 
+    () => cleanupService.CleanExpiredTokensAsync(), 
+    Cron.Daily);
+```
+
+- 按 Cron 表达式定期执行
+- 应用启动时自动注册，重启后继续执行
+- **适用场景：每天清理过期数据、每小时生成报表等**
+
+##### **Delayed Job（延迟执行）**
+
+```csharp
+BackgroundJob.Schedule(() => someService.DoSomething(), TimeSpan.FromHours(24));
+```
+
+- 在指定时间后执行
+- **适用场景：24小时后发送提醒邮件、订单超时自动取消等**
+
+##### **Continuation（链式任务）**
+
+```csharp
+var jobId = BackgroundJob.Enqueue(() => step1());
+BackgroundJob.ContinueJobWith(jobId, () => step2());
+```
+
+- 前一个任务完成后触发下一个
+- **适用场景：数据处理流水线**
+
+这一步用到前两种：Fire-and-Forget（邮件发送）和 Recurring Job（Token 清理）。
+
+#### 核心配置
+
+进行配置的静态方法都挂在 `IServiceCollection` 上。 类似如下：
+
+```c#
+// Hangfire 包内部大概长这样
+public static class HangfireServiceCollectionExtensions
+{
+    public static IServiceCollection AddHangfire(
+        this IServiceCollection services,   // this 关键字 = 扩展方法
+        Action<IGlobalConfiguration> configuration)
+    {
+        // 内部帮你注册一堆 Hangfire 需要的服务
+        ...
+        return services;
+    }
+}
+```
+
+> `this IServiceCollection` 这个语法的意思是：**把这个方法挂到 IServiceCollection 类型上**，可以像调用它自己的方法一样调用。
+>
+> ```c#
+> builder.Services.AddControllers();        // ASP.NET 提供的扩展方法
+> builder.Services.AddDbContext<AppDbContext>(); // EF Core 提供的扩展方法
+> builder.Services.AddHangfire(...);        // Hangfire 提供的扩展方法
+> builder.Services.AddScoped<IUserRepository, UserRepository>(); // 原生方法
+> ```
+
+常用的核心配置：
+
+##### 存储配置（必须配）
+
+```c#
+// Program.cs
+builder.Services.AddHangfire(config => config
+    .UsePostgreSqlStorage(connectionString)   // PostgreSQL
+    .UseSqlServerStorage(connectionString)    // SQL Server
+    .UseRedis(connectionString)               // Redis
+    .UseInMemoryStorage()                     // 内存，仅开发用，重启丢失
+);
+```
+
+```
+选哪个：你数据库用什么就用什么，不需要额外部署新服务
+```
+
+##### Worker 数量配置
+
+```c#
+builder.Services.AddHangfireServer(options => {
+    options.WorkerCount = 5;  // 同时执行几个任务，默认是 CPU核心数 * 5
+});
+```
+
+```
+使用场景：
+发邮件任务不需要太多并发 → 设小一点，比如 3-5
+CPU密集型任务             → 设成 CPU 核心数
+```
+
+##### Dashboard 配置
+
+```c#
+app.UseHangfireDashboard("/hangfire", new DashboardOptions {
+    // 生产环境加权限控制，不然任何人都能访问
+    Authorization = [new HangfireAuthFilter()]
+});
+
+// 权限过滤器示例
+public class HangfireAuthFilter : IDashboardAuthorizationFilter {
+    public bool Authorize(DashboardContext context) {
+        var httpContext = context.GetHttpContext();
+        return httpContext.User.IsInRole("Admin");  // 只有 Admin 能看
+    }
+}
+```
+
+##### 过期任务清理
+
+```c#
+builder.Services.AddHangfire(config => config
+    .UsePostgreSqlStorage(connectionString, new PostgreSqlStorageOptions {
+        JobExpirationCheckInterval = TimeSpan.FromHours(1),  // 多久检查一次过期任务
+    })
+    .WithJobExpirationTimeout(TimeSpan.FromDays(7))  // 成功的任务保留多久
+);
+```
+
+#### Hangfire 的架构
+
+```
+你的代码
+  ↓  BackgroundJob.Enqueue(...)
+Hangfire Client
+  ↓  序列化任务信息（方法名、参数）
+SQL Server（Hangfire 系统表）
+  ↑  轮询取任务
+Hangfire Server（后台 Worker）
+  ↓  反序列化，调用实际方法
+你的 Service（EmailService、CleanupService 等）
+```
+
+关键点：
+
+1. 任务信息（方法名+参数）被序列化后存入 SQL Server
+2. 应用重启不影响已入队的任务
+3. Hangfire Server 是在应用进程里运行的（不是单独的进程），通过 `AddHangfireServer()` 启动
+
+
+
+### 1. 切出功能分支
+
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b feature/v3-hangfire
+git push -u origin feature/v3-hangfire
+```
+
+
+
+### 2. 安装 NuGet 包
+
+```bash
+cd UUcars.API
+dotnet add package Hangfire --version 1.8.14
+dotnet add package Hangfire.SqlServer --version 1.8.14
+```
+
+> **为什么选 `Hangfire.SqlServer`？**
+>
+> Hangfire 支持多种存储后端（SQL Server、Redis、PostgreSQL 等）。我们已经有 SQL Server，直接复用，不增加新的基础设施依赖。Hangfire 会在数据库里自动创建几张系统表（`HangFire.Job`、`HangFire.State` 等），第一次启动时自动完成，不需要手动建表。
+
+确认包已安装：
+
+```bash
+cat UUcars.API.csproj | grep Hangfire
+```
+
+预期输出：
+
+```xml
+<PackageReference Include="Hangfire" Version="1.8.14" />
+<PackageReference Include="Hangfire.SqlServer" Version="1.8.14" />
+```
+
+
+
+### 3. 配置 Hangfire（扩展方法）
+
+和前面的 JWT、CORS、RateLimiting 配置保持一致的风格——封装成扩展方法，保持 `Program.cs` 简洁。
+
+新建 `UUcars.API/Extensions/HangfireExtensions.cs`：
+
+```csharp
+using Hangfire;
+using Hangfire.SqlServer;
+
+namespace UUcars.API.Extensions;
+
+public static class HangfireExtensions
+{
+    public static IServiceCollection AddHangfireServices(
+        this IServiceCollection services,
+        IConfiguration configuration)
+    {
+        var connectionString = configuration.GetConnectionString("DefaultConnection")
+            ?? throw new InvalidOperationException(
+                "Connection string 'DefaultConnection' not found.");
+
+        services.AddHangfire(config => config
+            // 使用 SQL Server 作为存储后端
+            .UseSqlServerStorage(connectionString, new SqlServerStorageOptions
+            {
+               	// 队列轮询间隔：Hangfire Server 多久检查一次队列
+                // 默认 15 秒，对邮件发送来说可以接受
+                // 如果需要更快响应，可以降到 5 秒
+                QueuePollInterval = TimeSpan.FromSeconds(15),
+
+                // 任务滑动不可见超时：任务被取走后多久没有完成算超时
+                // 超时后重新放回队列（防止 Worker 崩溃导致任务永久丢失）
+                SlidingInvisibilityTimeout = TimeSpan.FromMinutes(5), // 官方推荐显式设置
+
+                // 自动删除已完成的任务（保留 7 天，避免数据库无限增长）
+                JobExpirationCheckInterval = TimeSpan.FromHours(1)
+            })
+            // 使用结构化日志（接入已有的 Serilog）
+            .UseRecommendedSerializerSettings()
+        );
+
+        // 注册 Hangfire Server（在当前进程里运行后台 Worker）
+        services.AddHangfireServer(options =>
+        {
+            // Worker 线程数：同时处理多少个任务
+            // 默认是 CPU 核心数 * 5，对我们足够
+            options.WorkerCount = 5;
+
+            // 队列名称：Worker 只处理哪些队列
+            // 默认只处理 "default" 队列，我们暂时只用这一个
+            options.Queues = new[] { "default" };
+        });
+
+        return services;
+    }
+
+}
+```
+
+**注册 Hangfire 服务**
+
+打开 `UUcars.API/Program.cs`，在服务注册区域（其他 `Add*` 扩展方法附近）加入：
+
+```csharp
+// ── Hangfire 后台任务 ──────────
+builder.Services.AddHangfireServices(builder.Configuration);
+
+```
+
+
+
+### 4. 邮件发送改为异步队列
+
+这是这一步的核心改动：把同步邮件发送改为 Hangfire 异步任务。
+
+#### 4.1 理解改动的范围
+
+当前 V2 的邮件发送流程：
+
+```csharp
+// UserService.cs（当前 V2 代码）
+public async Task<UserResponse> RegisterAsync(RegisterRequest request, ...)
+{
+    // ... 创建用户 ...
+    await _context.SaveChangesAsync();
+
+    // ❌ 同步发送邮件：整个请求等这一行完成
+    await _emailService.SendEmailConfirmationAsync(user.Email, confirmationUrl);
+
+    return MapToResponse(user);
+}
+```
+
+改造目标：
+
+```csharp
+// UserService.cs（改造后）
+public async Task<UserResponse> RegisterAsync(RegisterRequest request, ...)
+{
+    // ... 创建用户 ...
+    await _context.SaveChangesAsync();
+
+    // ✅ 异步入队：立即返回，邮件在后台发送
+    BackgroundJob.Enqueue<IEmailService>(
+        service => service.SendEmailConfirmationAsync(user.Email, confirmationUrl));
+
+    return MapToResponse(user);
+}
+```
+
+注意两处差异：
+
+1. `await` 去掉了——不再等待邮件发送完成
+2. 用 `BackgroundJob.Enqueue<IEmailService>` 而不是直接调用 `_emailService` （原因见下方说明）
+
+#### 4.2 为什么用 `BackgroundJob.Enqueue<IEmailService>` 而不是 `_emailService`？
+
+**方式一（错误）：**
+
+```csharp
+BackgroundJob.Enqueue(() => _emailService.SendEmailConfirmationAsync(email, url));
+```
+
+问题：Hangfire 序列化任务时，会把 `_emailService` 这个对象实例序列化进去。 `IEmailService` 的实现（`ResendEmailService`）包含 `HttpClient`、API Key 等， 无法被正确序列化和反序列化。应用重启后，从 SQL Server 恢复任务时， Hangfire 无法还原这个对象，任务会永久失败。
+
+**方式二（正确）：**
+
+```csharp
+BackgroundJob.Enqueue<IEmailService>(
+    service => service.SendEmailConfirmationAsync(email, url));
+```
+
+Hangfire 序列化的是：
+
+- 类型：`IEmailService`
+- 方法：`SendEmailConfirmationAsync`
+- 参数：`email`（字符串），`url`（字符串）
+
+执行时，Hangfire 从 DI 容器里解析 `IEmailService`，调用对应方法。 DI 容器保证每次都拿到正确配置的实例。这才是正确的姿势。
+
+#### 4.3 注入 `IBackgroundJobClient`
+
+`UserService` 当前的构造函数里没有 Hangfire 依赖，需要注入。
+
+打开 `UUcars.API/Services/UserService.cs`：
+
+```csharp
+using Hangfire;
+
+public class UserService
+{
+    private readonly IUserRepository _userRepository;
+    private readonly IEmailService _emailService;
+    private readonly IBackgroundJobClient _backgroundJobClient;
+    private readonly ILogger<UserService> _logger;
+
+    public UserService(
+        IUserRepository userRepository,
+        IEmailService emailService,
+        IBackgroundJobClient backgroundJobClient,   // ✅ 新增
+        ILogger<UserService> logger)
+    {
+        _userRepository = userRepository;
+        _emailService = emailService;
+        _backgroundJobClient = backgroundJobClient; // ✅ 新增
+        _logger = logger;
+    }
+```
+
+> **`IBackgroundJobClient` 是什么？**
+>
+> 这是 Hangfire 提供的接口，封装了 `BackgroundJob.Enqueue` 等静态方法的实例版本。
+>
+> 为什么用接口而不是直接调静态方法 `BackgroundJob.Enqueue(...)`？
+>
+> **可测试性**。静态方法无法在单元测试里被替换（Mock）， 而 `IBackgroundJobClient` 是接口，可以在测试里注入 `FakeBackgroundJobClient`， 验证"邮件任务是否被正确入队"而不真的发邮件。
+>
+> Hangfire 注册 `AddHangfire()` 后，`IBackgroundJobClient` 会自动注册到 DI 容器。
+
+#### 4.4 修改 RegisterAsync
+
+找到 `UserService.RegisterAsync` 方法，修改邮件发送部分：
+
+```csharp
+// 改之前
+try
+{
+    await _emailService.SendEmailVerificationAsync(
+        created.Email,
+        created.EmailConfirmationToken!,
+        cancellationToken);
+}
+catch (Exception ex)
+{
+    // 邮件发送失败不阻断注册流程
+    // 用户已成功写入数据库，可以通过"重新发送验证邮件"功能补救
+    _logger.LogWarning(ex, "Failed to send verification email to {Email}", created.Email);
+}
+
+_logger.LogInformation("New user registered: {Email}", created.Email);
+```
+
+```c#
+// 改之后
+// try/catch 不再需要：Hangfire 有内置重试机制（失败自动重试10次，指数退避）
+// 邮件发送失败会在 Hangfire Dashboard 里显示，可以手动重试
+_backgroundJobClient.Enqueue<IEmailService>(
+    service => service.SendEmailVerificationAsync(
+        created.Email,
+        created.EmailConfirmationToken!,
+        CancellationToken.None));  // Hangfire 序列化参数时不支持 CancellationToken，必须用 None
+
+_logger.LogInformation(
+    "New user registered: {Email}, verification email job enqueued", created.Email);
+```
+
+关键改动：
+
+- `await _emailService.SendEmailConfirmationAsync(...)` → `_backgroundJobClient.Enqueue<IEmailService>(...)`
+- 去掉了 `await`（不等待）
+- 日志改为"job enqueued"，明确表示任务已入队而不是邮件已发送
+
+#### 4.5 修改 ResendVerificationAsync
+
+```c#
+// 改之前
+await _emailService.SendEmailVerificationAsync(
+    user.Email, newToken, cancellationToken);
+
+_logger.LogInformation("Verification email resent to: {Email}", email);
+```
+
+```c#
+// 改之后
+_backgroundJobClient.Enqueue<IEmailService>(
+    service => service.SendEmailVerificationAsync(
+        user.Email, newToken, CancellationToken.None));
+
+_logger.LogInformation(
+    "Verification email resend job enqueued for: {Email}", email);
+```
+
+#### 4.6 修改 ForgotPasswordAsync
+
+同样找到 `ForgotPasswordAsync` 方法，修改邮件发送部分：
+
+```csharp
+// 改之前
+await _emailService.SendPasswordResetAsync(
+    user.Email, resetToken, cancellationToken);
+
+_logger.LogInformation("Password reset email sent to: {Email}", email);
+```
+
+```c#
+// 改之后
+_backgroundJobClient.Enqueue<IEmailService>(
+    service => service.SendPasswordResetAsync(
+        user.Email, resetToken, CancellationToken.None));
+
+_logger.LogInformation(
+    "Password reset email job enqueued for: {Email}", email);
+```
+
+#### 4.7 不需要修改的地方
+
+- `_emailService` 字段**保留**，`VerifyEmailAsync`、`ResetPasswordAsync` 等方法不涉及发邮件，不需要改
+- `LoginAsync`、`GetCurrentUserAsync`、`UpdateCurrentUserAsync`、`MapToResponse` **完全不变**
+- `VerifyEmailAsync`、`ResetPasswordAsync` **完全不变**
+
+
+
+### 5. 更新测试
+
+`UserService` 的构造函数多了 `IBackgroundJobClient` 依赖，现有的单元测试会编译失败。
+
+#### 5.1 新建 FakeBackgroundJobClient
+
+打开 `UUcars.Tests/Fakes/`，新建 `FakeBackgroundJobClient.cs`：
+
+```csharp
+using Hangfire;
+
+namespace UUcars.Tests.Fakes;
+
+/// <summary>
+///     测试用的 BackgroundJobClient：记录入队的任务，不真正执行
+/// </summary>
+public class FakeBackgroundJobClient : IBackgroundJobClient
+{
+    // 记录所有入队的任务（方便在测试里断言"是否入队了"）
+    public List<string> EnqueuedJobs { get; } = new();
+
+    public string Enqueue(Job job, IState state)
+    {
+        EnqueuedJobs.Add(job.Method.Name);
+        return Guid.NewGuid().ToString(); // 返回一个假的 Job ID
+    }
+
+    public bool ChangeState(string jobId, IState state, string? expectedCurrentState)
+        => true;
+
+    public string Create(Job job, IState state)
+    {
+        EnqueuedJobs.Add(job.Method.Name);
+        return Guid.NewGuid().ToString();
+    }
+}
+```
+
+#### 5.2 更新 UserServiceTests 单元测试
+
+打开 `UUcars.Tests/Services/UserServiceTests.cs`，在 `CreateService` 辅助方法里加入 `FakeBackgroundJobClient`：
+
+```csharp
+private static (UserService service, FakeBackgroundJobClient jobClient) CreateService(
+    FakeUserRepository? userRepo = null)
+{
+    var jobClient = new FakeBackgroundJobClient();
+    var config = new ConfigurationBuilder()
+        .AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["App:FrontendUrl"] = "https://localhost:5173"
+        })
+        .Build();
+
+    var service = new UserService(
+        userRepo ?? new FakeUserRepository(),
+        new FakeEmailService(),
+        jobClient,                              // ✅ 新增
+        NullLogger<UserService>.Instance
+    );
+
+    return (service, jobClient);
+}
+```
+
+**改为 Hangfire 后，测试逻辑如何调整？**
+
+当前很多测试依赖 `FakeEmailService` 里存的 Token：
+
+```c#
+// 注册后从 FakeEmailService 里取出 Token 做后续操作
+var token = emailService.SentVerificationEmails[0].Token;
+await service.VerifyEmailAsync(token);
+```
+
+改为 Hangfire 后，邮件是"入队"而不是"直接发送"，`FakeBackgroundJobClient` 只记录了方法名，**没有记录 Token 参数**。这意味着这些测试无法再从邮件服务里取 Token。
+
+**思路：直接从数据库（FakeUserRepository）取 Token**
+
+不依赖邮件服务，注册后直接从 `repo` 里读用户的 `EmailConfirmationToken`：
+
+```c#
+var user = await repo.GetByEmailAsync("test@example.com");
+var token = user!.EmailConfirmationToken;
+```
+
+这更符合测试的本质：测的是业务逻辑，不是邮件发送。
+
+修改后的单元测试
+
+```c#
+public class UserServiceTests
+{
+    // v3 更新：
+    // - 返回 (service, fakeBackgroundJobClient) 元组
+    // - fakeEmailService 内部保留但不再从外部断言邮件内容
+    //   原因：邮件改为 Hangfire 异步入队，不再直接发送
+    //   Token 的验证改为从 FakeUserRepository 直接读取
+    private static (UserService Service, FakeBackgroundJobClient JobClient)
+        CreateService(FakeUserRepository repo)
+    {
+        var jwtSettings = Options.Create(new JwtSettings
+        {
+            Secret = "test-secret-key-at-least-32-characters!",
+            ExpiresInMinutes = 60,
+            Issuer = "TestIssuer",
+            Audience = "TestAudience"
+        });
+
+        var fakeEmailService = new FakeEmailService();
+        var fakeBackgroundJobClient = new FakeBackgroundJobClient();
+
+        var service = new UserService(
+            repo,
+            new PasswordHasher<User>(),
+            new JwtTokenGenerator(jwtSettings),
+            fakeEmailService,
+            fakeBackgroundJobClient,
+            NullLogger<UserService>.Instance
+        );
+
+        return (service, fakeBackgroundJobClient);
+    }
+
+    // ===== 注册测试 =====
+
+    [Fact]
+    public async Task RegisterAsync_WithNewEmail_ShouldReturnUserResponseAndEnqueueEmailJob()
+    {
+        var repo = new FakeUserRepository();
+        var (service, jobClient) = CreateService(repo);
+
+        var result = await service.RegisterAsync(
+            "testuser",
+            "test@example.com",
+            "Test@123456"
+        );
+
+        Assert.NotNull(result);
+        Assert.Equal("test@example.com", result.Email);
+        Assert.Equal("User", result.Role);
+
+        // V3 更新：验证邮件 Job 已入队（不再验证邮件是否直接发送）
+        Assert.Single(jobClient.EnqueuedJobs);
+        Assert.Contains("SendEmailVerificationAsync", jobClient.EnqueuedJobs);
+    }
+
+    [Fact]
+    public async Task RegisterAsync_WithExistingEmail_ShouldThrowUserAlreadyExistsException()
+    {
+        var repo = new FakeUserRepository();
+        repo.Seed(new User
+        {
+            Id = 1,
+            Email = "existing@example.com",
+            Username = "existing",
+            PasswordHash = "somehash",
+            Role = UserRole.User
+        });
+
+        var (service, _) = CreateService(repo);
+
+        await Assert.ThrowsAsync<UserAlreadyExistsException>(() => service.RegisterAsync(
+            "newuser",
+            "existing@example.com",
+            "Test@123456"
+        ));
+    }
+
+    [Fact]
+    public async Task RegisterAsync_ShouldNotStorePasswordAsPlainText()
+    {
+        var repo = new FakeUserRepository();
+        var (service, _) = CreateService(repo);
+
+        await service.RegisterAsync(
+            "testuser",
+            "test@example.com",
+            "Test@123456"
+        );
+
+        var stored = await repo.GetByEmailAsync("test@example.com");
+        Assert.NotNull(stored);
+        Assert.NotEqual("Test@123456", stored.PasswordHash);
+        Assert.True(stored.PasswordHash.Length > 20);
+    }
+
+    // ===== 登录测试 =====
+
+    [Fact]
+    public async Task LoginAsync_WithUnverifiedEmail_ShouldThrowEmailNotConfirmedException()
+    {
+        var repo = new FakeUserRepository();
+        var (service, _) = CreateService(repo);
+
+        await service.RegisterAsync(
+            "testuser",
+            "test@example.com",
+            "Test@123456"
+        );
+
+        // 注册后不验证邮箱，直接登录应被拒绝
+        await Assert.ThrowsAsync<EmailNotConfirmedException>(() => service.LoginAsync(
+            "test@example.com",
+            "Test@123456"
+        ));
+    }
+
+    [Fact]
+    public async Task LoginAsync_WithVerifiedEmail_ShouldReturnLoginResponse()
+    {
+        var repo = new FakeUserRepository();
+        var (service, _) = CreateService(repo);
+
+        await service.RegisterAsync(
+            "testuser",
+            "test@example.com",
+            "Test@123456"
+        );
+
+        // V3 更新：Token 直接从 repo 读取，不再从 FakeEmailService 取
+        // 原因：邮件改为异步入队，FakeEmailService 不再收到真实调用
+        var user = await repo.GetByEmailAsync("test@example.com");
+        var token = user!.EmailConfirmationToken;
+        await service.VerifyEmailAsync(token!);
+
+        var result = await service.LoginAsync(
+            "test@example.com",
+            "Test@123456"
+        );
+
+        Assert.NotNull(result);
+        Assert.NotEmpty(result.Token);
+    }
+
+    [Fact]
+    public async Task LoginAsync_WithWrongPassword_ShouldThrowInvalidCredentialsException()
+    {
+        var repo = new FakeUserRepository();
+        var (service, _) = CreateService(repo);
+
+        await service.RegisterAsync(
+            "testuser",
+            "test@example.com",
+            "Test@123456"
+        );
+
+        await Assert.ThrowsAsync<InvalidCredentialsException>(() => service.LoginAsync(
+            "test@example.com",
+            "WrongPassword"
+        ));
+    }
+
+    [Fact]
+    public async Task LoginAsync_WithNonExistentEmail_ShouldThrowInvalidCredentialsException()
+    {
+        var repo = new FakeUserRepository();
+        var (service, _) = CreateService(repo);
+
+        await Assert.ThrowsAsync<InvalidCredentialsException>(() => service.LoginAsync(
+            "notexist@example.com",
+            "Test@123456"
+        ));
+    }
+
+    // ===== 邮箱验证测试 =====
+
+    [Fact]
+    public async Task VerifyEmailAsync_WithValidToken_ShouldConfirmEmail()
+    {
+        var repo = new FakeUserRepository();
+        var (service, _) = CreateService(repo);
+
+        await service.RegisterAsync(
+            "testuser",
+            "test@example.com",
+            "Test@123456"
+        );
+
+        // V3 更新：直接从 repo 取 Token
+        var user = await repo.GetByEmailAsync("test@example.com");
+        var token = user!.EmailConfirmationToken;
+
+        await service.VerifyEmailAsync(token!);
+
+        var updated = await repo.GetByEmailAsync("test@example.com");
+        Assert.True(updated!.EmailConfirmed);
+        Assert.Null(updated.EmailConfirmationToken);
+        Assert.Null(updated.EmailConfirmationTokenExpiry);
+    }
+
+    [Fact]
+    public async Task VerifyEmailAsync_WithInvalidToken_ShouldThrowInvalidTokenException()
+    {
+        var repo = new FakeUserRepository();
+        var (service, _) = CreateService(repo);
+
+        await Assert.ThrowsAsync<InvalidTokenException>(() => service.VerifyEmailAsync(
+            "completely-wrong-token"
+        ));
+    }
+
+    [Fact]
+    public async Task VerifyEmailAsync_WithExpiredToken_ShouldThrowInvalidTokenException()
+    {
+        var repo = new FakeUserRepository();
+        repo.Seed(new User
+        {
+            Id = 1,
+            Email = "test@example.com",
+            Username = "testuser",
+            PasswordHash = "hash",
+            Role = UserRole.User,
+            EmailConfirmed = false,
+            EmailConfirmationToken = "expired-token",
+            EmailConfirmationTokenExpiry = DateTime.UtcNow.AddHours(-1)
+        });
+
+        var (service, _) = CreateService(repo);
+
+        await Assert.ThrowsAsync<InvalidTokenException>(() => service.VerifyEmailAsync(
+            "expired-token"
+        ));
+    }
+
+    [Fact]
+    public async Task ResendVerificationAsync_WithUnverifiedEmail_ShouldEnqueueEmailJob()
+    {
+        var repo = new FakeUserRepository();
+        var (service, jobClient) = CreateService(repo);
+
+        await service.RegisterAsync(
+            "testuser",
+            "test@example.com",
+            "Test@123456"
+        );
+
+        // 注册时已入队一次
+        Assert.Single(jobClient.EnqueuedJobs);
+
+        await service.ResendVerificationAsync("test@example.com");
+
+        // 重发后共入队两次
+        Assert.Equal(2, jobClient.EnqueuedJobs.Count);
+        Assert.All(jobClient.EnqueuedJobs,
+            job => Assert.Equal("SendEmailVerificationAsync", job));
+    }
+
+    [Fact]
+    public async Task ResendVerificationAsync_WithNonExistentEmail_ShouldNotEnqueueJob()
+    {
+        var repo = new FakeUserRepository();
+        var (service, jobClient) = CreateService(repo);
+
+        // 不存在的邮箱：静默返回，不入队
+        await service.ResendVerificationAsync("nobody@example.com");
+
+        Assert.Empty(jobClient.EnqueuedJobs);
+    }
+
+    // ===== 密码重置测试 =====
+
+    [Fact]
+    public async Task ForgotPasswordAsync_WithValidVerifiedEmail_ShouldEnqueueResetEmailJob()
+    {
+        var repo = new FakeUserRepository();
+        var (service, jobClient) = CreateService(repo);
+
+        // 注册 + 验证邮箱
+        await service.RegisterAsync(
+            "testuser",
+            "test@example.com",
+            "Test@123456"
+        );
+        var user = await repo.GetByEmailAsync("test@example.com");
+        await service.VerifyEmailAsync(user!.EmailConfirmationToken!);
+
+        // 发起重置密码
+        await service.ForgotPasswordAsync("test@example.com");
+
+        // 注册时入队一次(SendEmailVerificationAsync)
+        // ForgotPassword 入队一次(SendPasswordResetAsync)
+        Assert.Equal(2, jobClient.EnqueuedJobs.Count);
+        Assert.Contains("SendPasswordResetAsync", jobClient.EnqueuedJobs);
+    }
+
+    [Fact]
+    public async Task ForgotPasswordAsync_WithNonExistentEmail_ShouldNotEnqueueJob()
+    {
+        var repo = new FakeUserRepository();
+        var (service, jobClient) = CreateService(repo);
+
+        await service.ForgotPasswordAsync("nobody@example.com");
+
+        Assert.Empty(jobClient.EnqueuedJobs);
+    }
+
+    [Fact]
+    public async Task ForgotPasswordAsync_WithUnverifiedEmail_ShouldNotEnqueueJob()
+    {
+        var repo = new FakeUserRepository();
+        var (service, jobClient) = CreateService(repo);
+
+        // 注册但不验证邮箱
+        await service.RegisterAsync(
+            "testuser",
+            "test@example.com",
+            "Test@123456"
+        );
+
+        // 清空注册时产生的入队记录，专注测试 ForgotPassword 的行为
+        jobClient.EnqueuedJobs.Clear();
+
+        // 未验证的账号不能重置密码，不应入队
+        await service.ForgotPasswordAsync("test@example.com");
+
+        Assert.Empty(jobClient.EnqueuedJobs);
+    }
+
+    [Fact]
+    public async Task ResetPasswordAsync_WithValidToken_ShouldUpdatePasswordAndClearToken()
+    {
+        var repo = new FakeUserRepository();
+        var (service, _) = CreateService(repo);
+
+        // 注册 + 验证邮箱
+        await service.RegisterAsync(
+            "testuser",
+            "test@example.com",
+            "Test@123456"
+        );
+        var user = await repo.GetByEmailAsync("test@example.com");
+        await service.VerifyEmailAsync(user!.EmailConfirmationToken!);
+
+        // 发起重置，Token 直接从 repo 读
+        await service.ForgotPasswordAsync("test@example.com");
+        var updatedUser = await repo.GetByEmailAsync("test@example.com");
+        var resetToken = updatedUser!.ResetPasswordToken;
+
+        // 用新密码重置
+        await service.ResetPasswordAsync(resetToken!, "NewPassword@123");
+
+        // 验证：新密码可以登录
+        var loginResult = await service.LoginAsync(
+            "test@example.com",
+            "NewPassword@123"
+        );
+        Assert.NotEmpty(loginResult.Token);
+
+        // 验证：旧密码不能再登录
+        await Assert.ThrowsAsync<InvalidCredentialsException>(() => service.LoginAsync(
+            "test@example.com",
+            "Test@123456"
+        ));
+
+        // 验证：Token 已清除，不能重复使用
+        var finalUser = await repo.GetByEmailAsync("test@example.com");
+        Assert.Null(finalUser!.ResetPasswordToken);
+        Assert.Null(finalUser.ResetPasswordTokenExpiry);
+    }
+
+    [Fact]
+    public async Task ResetPasswordAsync_WithInvalidToken_ShouldThrowInvalidTokenException()
+    {
+        var repo = new FakeUserRepository();
+        var (service, _) = CreateService(repo);
+
+        await Assert.ThrowsAsync<InvalidTokenException>(() => service.ResetPasswordAsync(
+            "invalid-token",
+            "NewPassword@123"
+        ));
+    }
+
+    [Fact]
+    public async Task ResetPasswordAsync_WithExpiredToken_ShouldThrowInvalidTokenException()
+    {
+        var repo = new FakeUserRepository();
+        repo.Seed(new User
+        {
+            Id = 1,
+            Email = "test@example.com",
+            Username = "testuser",
+            PasswordHash = "hash",
+            Role = UserRole.User,
+            EmailConfirmed = true,
+            ResetPasswordToken = "expired-reset-token",
+            ResetPasswordTokenExpiry = DateTime.UtcNow.AddHours(-1)
+        });
+
+        var (service, _) = CreateService(repo);
+
+        await Assert.ThrowsAsync<InvalidTokenException>(() => service.ResetPasswordAsync(
+            "expired-reset-token",
+            "NewPassword@123"
+        ));
+    }
+}
+```
+
+#### 5.3 更新集成测试
+
+**问题所在**
+
+集成测试里取 Token 的方式是：
+
+```c#
+// IntegrationTestBase.cs
+var verifyToken = Factory.FakeEmail.SentVerificationEmails
+    .Last(x => x.Email == email).Token;
+
+// CoreFlowIntegrationTests.cs
+var verifyToken = Factory.FakeEmail.SentVerificationEmails
+    .Last(x => x.Email == "test@example.com").Token;
+```
+
+改为 Hangfire 后，`UserService.RegisterAsync` 调用的是：
+
+```c#
+_backgroundJobClient.Enqueue<IEmailService>(
+    service => service.SendEmailVerificationAsync(...));
+```
+
+**`IEmailService` 不再被直接调用**，所以 `FakeEmailService.SentVerificationEmails` 永远是空列表，`Last()` 会抛 `InvalidOperationException`，测试直接崩。
+
+**解决思路**
+
+和单元测试一样：**直接从数据库查 Token**，不再依赖 `FakeEmailService`。
+
+集成测试有真实的数据库（Testcontainers SQL Server），可以直接通过 `DbContext` 查询。
+
+需要在 `SqlServerTestFactory` 里暴露一个查询 Token 的方法。
+
+##### 修改一：`SqlServerTestFactory.cs`
+
+**移除 `FakeEmail` 属性，改为暴露 `DbContext` 或直接提供查 Token 的辅助方法：**
+
+```csharp
+public class SqlServerTestFactory : WebApplicationFactory<Program>, IAsyncLifetime
+{
+    // ✅ 移除：不再需要 FakeEmail
+    // public FakeEmailService FakeEmail { get; } = new();
+
+    // ✅ 新增：暴露 DbContext 查询能力，供 IntegrationTestBase 直接查 Token
+    public AppDbContext GetDbContext()
+    {
+        var scope = Services.CreateScope();
+        return scope.ServiceProvider.GetRequiredService<AppDbContext>();
+    }
+
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    {
+        builder.ConfigureServices(services =>
+        {
+            // 原有：替换 DbContext（不变）
+            // ...
+
+            // ✅ 移除：不再需要替换 IEmailService 为 FakeEmailService
+            // var emailDescriptor = services.SingleOrDefault(...)
+            // services.Remove(emailDescriptor);
+            // services.AddSingleton<IEmailService>(FakeEmail);
+
+            // ✅ 新增：替换 IBackgroundJobClient 为 Fake
+            // 原因：不能在测试里真正调用 Hangfire（需要 SQL Server Hangfire 系统表）
+            // FakeBackgroundJobClient 静默处理入队，不真正执行任务
+            var jobClientDescriptor = services.SingleOrDefault(
+                d => d.ServiceType == typeof(IBackgroundJobClient));
+            if (jobClientDescriptor != null)
+                services.Remove(jobClientDescriptor);
+
+            services.AddSingleton<IBackgroundJobClient>(new FakeBackgroundJobClient());
+        });
+
+        builder.UseEnvironment("Testing");
+    }
+
+    // InitializeDatabaseAsync 和 CleanDatabaseAsync 完全不变
+}
+```
+
+> **为什么要替换 `IBackgroundJobClient`？**
+>
+> Hangfire 注册后，`IBackgroundJobClient` 的真实实现会尝试把 Job 写入 SQL Server 的 Hangfire 系统表（`HangFire.Job` 等）。
+>
+> 但集成测试用的是 Testcontainers 临时数据库，`InitializeDatabaseAsync` 只跑了你的业务 Migration，没有 Hangfire 系统表。真实的 `IBackgroundJobClient` 一调用就会报错：表不存在。
+>
+> 替换为 `FakeBackgroundJobClient` 后，`Enqueue` 调用静默成功，不真正写任何东西。
+
+##### 修改二：`IntegrationTestBase.cs`
+
+**取 Token 的方式从 `FakeEmailService` 改为直接查数据库：**
+
+```c#
+protected async Task<string> RegisterAndLoginAsync(
+    string email = "test@example.com",
+    string username = "testuser",
+    string password = "Test@123456")
+{
+    // Step 1：注册
+    await Client.PostAsync("/auth/register", JsonContent(new
+    {
+        username, email, password
+    }));
+
+    // Step 2：直接从数据库取 EmailConfirmationToken
+    // V3 更新：邮件改为 Hangfire 异步入队，FakeEmailService 不再收到调用
+    // Token 已写入数据库，直接查比依赖 FakeEmailService 更可靠
+    using var db = Factory.GetDbContext();
+    var user = await db.Users
+        .FirstOrDefaultAsync(u => u.Email == email.ToLower());
+    var verifyToken = user!.EmailConfirmationToken;
+
+    // Step 3：验证邮箱
+    await Client.GetAsync($"/auth/verify-email?token={verifyToken}");
+
+    // Step 4：登录拿 JWT
+    var loginResponse = await Client.PostAsync("/auth/login", JsonContent(new
+    {
+        email, password
+    }));
+
+    var result = await DeserializeAsync<ApiResponseWrapper<LoginData>>(loginResponse);
+    return result?.Data?.Token ?? string.Empty;
+}
+```
+
+##### 修改三：`CoreFlowIntegrationTests.cs`
+
+**`Login_WithValidCredentials_ShouldReturnToken` 里同样改为查数据库取 Token：**
+
+```c#
+[Fact]
+public async Task Login_WithValidCredentials_ShouldReturnToken()
+{
+    await Client.PostAsync("/auth/register", JsonContent(new
+    {
+        username = "testuser",
+        email = "test@example.com",
+        password = "Test@123456"
+    }));
+
+    // V3 更新：直接从数据库取 Token
+    using var db = Factory.GetDbContext();
+    var user = await db.Users
+        .FirstOrDefaultAsync(u => u.Email == "test@example.com");
+    var verifyToken = user!.EmailConfirmationToken;
+
+    await Client.GetAsync($"/auth/verify-email?token={verifyToken}");
+
+    var response = await Client.PostAsync("/auth/login", JsonContent(new
+    {
+        email = "test@example.com",
+        password = "Test@123456"
+    }));
+
+    Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    var result = await DeserializeAsync<ApiResponseWrapper<LoginData>>(response);
+    Assert.NotNull(result?.Data?.Token);
+    Assert.NotEmpty(result!.Data!.Token);
+}
+```
+
+##### 修改四：AddServices 扩展方法
+
+测试是，我们不需要注册Hangfire框架以及相关的中间件，因此直接过滤掉
+
+```c#
+public static class HangfireExtensions
+{
+    public static IServiceCollection AddHangfireServices(
+        this IServiceCollection services, 
+        IConfiguration configuration,
+        IWebHostEnvironment environment // 新增
+    )
+    {
+        // ✅ Testing 环境完全跳过 Hangfire 配置
+        // 原因：AddHangfire 的 UseSqlServerStorage 会尝试连接数据库初始化系统表
+        // Testcontainers 的数据库里没有 Hangfire 系统表，直接崩溃
+        // Testing 环境只需要 FakeBackgroundJobClient（在 SqlServerTestFactory 里注册）
+        if (environment.IsEnvironment("Testing"))
+            return services;
+
+        // 其余内容不变
+
+        return services;
+    }
+}
+```
+
+同时修改注册服务的参数
+
+```c#
+    // Hangfire服务
+    builder.Services.AddHangfireServices(builder.Configuration, builder.Environment);
+```
+
+
+
+##### 总结
+
+| 文件                          | 修改内容                                                     |
+| ----------------------------- | ------------------------------------------------------------ |
+| `SqlServerTestFactory.cs`     | 移除 `FakeEmail` 属性 + 移除替换 `IEmailService` 的代码 + 新增替换 `IBackgroundJobClient` 为 `FakeBackgroundJobClient` + 新增 `GetDbContext()` 方法 |
+| `IntegrationTestBase.cs`      | `RegisterAndLoginAsync` 里取 Token 改为查数据库              |
+| `CoreFlowIntegrationTests.cs` | `Login_WithValidCredentials` 里取 Token 改为查数据库         |
+| 其余集成测试                  | **完全不变**，都通过 `RegisterAndLoginAsync` 取 Token，只改一处即可 |
+
+
+
+### 6. 定期清除token
+
+Hangfire除了能实现异步队列（BackgroundJob.Enqueue）的功能外，也能实现定时任务（RecurringJob.AddOrUpdate）。
+
+我们使用Hangfire使用定期清除token的功能。
+
+#### 6.1. 新建 TokenCleanupService
+
+新建 `UUcars.API/Services/TokenCleanupService.cs`：
+
+```csharp
+using Microsoft.EntityFrameworkCore;
+using UUcars.API.Data;
+
+namespace UUcars.API.Services;
+
+/// <summary>
+///     负责清理数据库里的过期 Token
+///     由 Hangfire 每天凌晨定时调用
+/// </summary>
+public class TokenCleanupService
+{
+    private readonly AppDbContext _context;
+    private readonly ILogger<TokenCleanupService> _logger;
+
+    public TokenCleanupService(AppDbContext context, ILogger<TokenCleanupService> logger)
+    {
+        _context = context;
+        _logger = logger;
+    }
+
+    public async Task CleanExpiredTokensAsync()
+    {
+        var now = DateTime.UtcNow;
+
+        // 清理过期的密码重置 Token
+        // 找出所有 ResetPasswordTokenExpiry 已过期的用户，清空他们的 Token 字段
+        var expiredPasswordResets = await _context.Users
+            .Where(u => u.ResetPasswordTokenExpiry != null
+                        && u.ResetPasswordTokenExpiry < now)
+            .ToListAsync();
+
+        if (expiredPasswordResets.Count > 0)
+        {
+            foreach (var user in expiredPasswordResets)
+            {
+                user.ResetPasswordToken = null;
+                user.ResetPasswordTokenExpiry = null;
+                user.UpdatedAt = now;
+            }
+
+            await _context.SaveChangesAsync();
+
+            _logger.LogInformation(
+                "Cleaned {Count} expired password reset tokens",
+                expiredPasswordResets.Count);
+        }
+        else
+        {
+            _logger.LogInformation("No expired password reset tokens found");
+        }
+    }
+}
+```
+
+> **为什么不直接用 `ExecuteDeleteAsync`（批量删除）？**
+>
+> `ExecuteDeleteAsync` 是 EF Core 7+ 的批量操作，性能更好，但对 Token 清理来说， 我们需要把 Token 字段清空（设为 null），而不是删除整行用户记录。 所以这里是 `ExecuteUpdate` 更合适，但为了代码清晰易懂， 先用标准的"查出来再改"方式，数量不大时性能没有区别。
+>
+> V3 学习阶段先写清楚逻辑，性能优化不是这里的重点。
+
+#### 6.2 封装定时任务扩展方法
+
+在现有的扩展方法里封装新的方法，并使用TokenCleanupService
+
+```c#
+public static class HangfireExtensions
+{
+    public static IServiceCollection AddHangfireServices(this IServiceCollection services, IConfiguration configuration)
+    {
+        ...
+    }
+
+    // 注册定时任务（Recurring Jobs）
+    // 在 app.UseHangfire() 里调用，确保在应用完全启动后执行
+    public static void UseHangfireJobs(this IApplicationBuilder app)
+    {
+        // 过期 Token 清理任务
+        // Cron.Daily = 每天凌晨 00:00 执行
+        // 凌晨执行原因：流量最低，对用户无感知
+        RecurringJob.AddOrUpdate<TokenCleanupService>(
+            "cleanup-expired-tokens", // 任务 ID（唯一标识，方便在 Dashboard 里识别）
+            service => service.CleanExpiredTokensAsync(),
+            Cron.Daily, // 执行频率
+            new RecurringJobOptions
+            {
+                TimeZone = TimeZoneInfo.Utc // 统一用 UTC，避免时区问题
+            }
+        );
+    }
+}
+```
+
+#### 6.3 使用定时任务扩展方法
+
+在主程序的中间件管道部分使用
+
+```c#
+...
+app.UseCors(CorsExtensions.PolicyName);
+app.UseRateLimiter();
+app.UseAuthentication();
+app.UseAuthorization();
+
+...
+// 定时清除过期token    
+app.UseHangfireJobs();
+
+app.MapControllers();
+app.Run();
+```
+
+
+
+### 7. Hangfire面板
+
+Hangfire 提供了控制面板，通过自定义配置，可以使用。
+
+控制面板需要权限判断，比如只有管理员的角色才可以访问。
+
+Hangfire Dashboard 有自己的访问控制接口 `IDashboardAuthorizationFilter`，我们需要实现它来把 Dashboard 的访问权限接入已有的 JWT + Role 认证体系。
+
+新建 `UUcars.API/Auth/HangfireAdminAuthorizationFilter.cs`：
+
+```csharp
+using Hangfire.Dashboard;
+
+namespace UUcars.API.Auth;
+
+/// <summary>
+///     Hangfire Dashboard 访问授权过滤器
+///     只允许已认证的 Admin 角色用户访问 /hangfire 路由
+/// </summary>
+public class HangfireAdminAuthorizationFilter : IDashboardAuthorizationFilter
+{
+    public bool Authorize(DashboardContext context)
+    {
+        var httpContext = context.GetHttpContext();
+
+        // 必须已认证（登录）
+        if (!httpContext.User.Identity?.IsAuthenticated ?? true)
+            return false;
+
+        // 必须是 Admin 角色
+        return httpContext.User.IsInRole("Admin");
+    }
+}
+```
+
+> **注意：开发环境的特殊处理**
+>
+> 在本地开发时，你可能想直接访问 Dashboard 而不用每次都登录 Admin 账号。 可以在 `DashboardOptions` 里加判断：
+>
+> ```csharp
+> Authorization = app.Environment.IsDevelopment()
+>  ? new[] { new HangfireLocalDevAuthorizationFilter() }   // 开发环境：直接放行
+>  : new[] { new HangfireAdminAuthorizationFilter() }      // 生产环境：必须 Admin
+> ```
+>
+> 其中 `HangfireLocalDevAuthorizationFilter` 直接 `return true`。
+>
+> ```c#
+> using Hangfire.Dashboard;
+> 
+> namespace UUcars.API.Auth;
+> 
+> /// <summary>
+> /// 开发环境专用：直接放行，不做任何认证检查
+> /// 只在 IsDevelopment() 时使用，生产环境永远不用这个
+> /// </summary>
+> public class HangfireLocalDevAuthorizationFilter : IDashboardAuthorizationFilter
+> {
+>     public bool Authorize(DashboardContext context)
+>     {
+>         return true;
+>     }
+> }
+> ```
+>
+> 也可以为了保持一致性（开发环境和生产环境行为一致，避免"在我机器上好好的"问题）， 统一使用 `HangfireAdminAuthorizationFilter`。 开发时直接用 Admin 账号登录再访问 Dashboard。
+
+
+
+**挂载 Hangfire相关中间件**
+
+在 `app.Build()` 之后的中间件管道部分，加入 Hangfire 相关中间件：
+
+完整的中间件顺序应该是：
+
+```csharp
+...
+
+app.UseCors(CorsExtensions.PolicyName);
+app.UseRateLimiter();
+app.UseAuthentication();
+app.UseAuthorization();
+
+// ✅ 非 Testing 环境才挂载 Hangfire Dashboard 和定时任务
+if (!app.Environment.IsEnvironment("Testing"))
+{
+    // ✅ Hangfire Dashboard（在认证之后）
+    app.UseHangfireDashboard("/hangfire", new DashboardOptions
+    {
+        Authorization = app.Environment.IsDevelopment()
+            ? new[] { new HangfireLocalDevAuthorizationFilter() } // 开发：直接放行
+            : new[] { new HangfireAdminAuthorizationFilter() } // 生产：必须 Admin
+    });
+    // 定时清除过期token
+    app.UseHangfireJobs();
+}
+
+app.MapControllers();
+app.Run();
+```
+
+
+
+###  8. Application Insights 接入
+
+#### 为什么要接入 Application Insights？
+
+V2 的 Serilog 配置把日志输出到控制台和文件。本地开发时没问题，但在 Azure Container Apps 上：
+
+- 日志分散在容器实例里，多实例时查日志很麻烦
+- 文件日志在容器重启后丢失
+- 没有统一的查询界面
+
+Application Insights 是 Azure 的统一可观测性平台：
+
+- 所有日志集中存储，可跨实例查询
+- 自动收集请求追踪、异常、性能指标
+- 提供 KQL（Kusto Query Language）查询界面
+- 免费额度：5GB/月，对学习项目完全够用
+
+#### 8.1 安装 NuGet 包
+
+```bash
+dotnet add package Serilog.Sinks.ApplicationInsights --version 4.0.0
+dotnet add package Microsoft.ApplicationInsights.AspNetCore --version 2.22.0
+```
+
+#### 8.2 在 Azure Portal 创建 Application Insights 资源
+
+1. 进入 [portal.azure.com](https://portal.azure.com/)
+
+2. 搜索 **Application Insights** → 创建
+
+3. 配置：
+    - 订阅：选择你的订阅
+    - 资源组：选择和 Container Apps 相同的资源组（如 `uucars-rg`）
+    - 名称：`uucars-appinsights`
+    - 区域：和 Container Apps 相同的区域
+    - 资源模式：**基于工作区**（推荐，可以和 Log Analytics 整合）
+
+4. 创建完成后，进入资源 → **概述** → 复制 **连接字符串** 格式类似：
+
+    ```
+    InstrumentationKey=5b68dc35-74f5-4651-b081-e8cd17527ffb;IngestionEndpoint=https://australiaeast-1.in.applicationinsights.azure.com/;LiveEndpoint=https://australiaeast.livediagnostics.monitor.azure.com/;ApplicationId=e7f5c240-d73b-4987-adcb-a1aa860c5634
+    ```
+
+    
+
+#### 8.3 配置 Connection String
+
+**本地开发（`appsettings.Development.json`）：**
+
+不在本地配置 Application Insights，本地只用控制台输出，避免把开发时的测试日志发到 Azure。
+
+```json
+{
+  "ApplicationInsights": {
+    "ConnectionString": ""
+  }
+}
+```
+
+**生产环境（Azure Container Apps 环境变量）：**
+
+Azure Portal → Container Apps → `uucars-api` → **环境变量** → 添加：
+
+```
+ApplicationInsights__ConnectionString = InstrumentationKey=xxx;IngestionEndpoint=https://...
+```
+
+> **为什么用双下划线 `__`？**
+>
+> ASP.NET Core 的配置系统用 `__` 表示嵌套层级， 等价于 `appsettings.json` 里的 `{ "ApplicationInsights": { "ConnectionString": "xxx" } }`。
+
+#### 8.4 更新 Serilog 配置
+
+打开 `UUcars.API/Program.cs`，找到 Serilog 的 Bootstrap Logger 配置，更新 `UseSerilog` 部分：
+
+```csharp
+  builder.Host.UseSerilog((context, services, configuration) =>
+    {
+        configuration
+            .ReadFrom.Configuration(context.Configuration)
+            .ReadFrom.Services(services)
+            .WriteTo.Console()
+            .WriteTo.File(
+                "logs/uucars-.log",
+                rollingInterval: RollingInterval.Day,
+                retainedFileCountLimit: 30
+            );
+
+        // ← 新增：只在配置了 ConnectionString 时才挂载 Application Insights Sink
+        // 用 if 而不是 Conditional，原因：
+        // Conditional 的第二个参数是委托，Serilog 在配置阶段就会执行它构建 Sink
+        // 此时 GetRequiredService<TelemetryConfiguration> 如果服务未注册会直接抛异常
+        var aiConnStr = context.Configuration["ApplicationInsights:ConnectionString"];
+        if (!string.IsNullOrEmpty(aiConnStr))
+            configuration.WriteTo.ApplicationInsights(
+                services.GetRequiredService
+                    <Microsoft.ApplicationInsights.Extensibility.TelemetryConfiguration>(),
+                new TraceTelemetryConverter()
+            );
+    });
+```
+
+同时在服务注册里加入 Application Insights SDK：
+
+```csharp
+// ── Application Insights 服务 ──
+    // 只在配置了 ConnectionString 时才注册 Application Insights 服务
+    // 必须在 Serilog 配置之后、在 UseSerilog 的 lambda 执行之前完成注册
+    // 原因：Serilog 的 lambda 里 GetRequiredService<TelemetryConfiguration> 依赖这里的注册
+    var aiConnectionString = builder.Configuration["ApplicationInsights:ConnectionString"];
+    if (!string.IsNullOrEmpty(aiConnectionString))
+        builder.Services.AddApplicationInsightsTelemetry(options => { options.ConnectionString = aiConnectionString; });
+
+```
+
+#### 8.5 验证 Application Insights 接收到日志
+
+部署到 Azure 后（或者本地配置了 Connection String 后），验证步骤：
+
+1. 进入 Azure Portal → Application Insights → **日志（Logs）**
+2. 在查询编辑器里运行以下 KQL 查询（掌握这 4 个，工作中够用）：
+
+**查询最近 1 小时的错误日志：**
+
+```kusto
+traces
+| where timestamp > ago(1h)
+| where severityLevel >= 3    // 3 = Warning, 4 = Error, 5 = Critical
+| project timestamp, message, severityLevel, customDimensions
+| order by timestamp desc
+```
+
+**查询响应时间超过 1 秒的请求：**
+
+```kusto
+requests
+| where timestamp > ago(1h)
+| where duration > 1000       // 单位：毫秒
+| project timestamp, name, url, duration, resultCode
+| order by duration desc
+```
+
+**查询某个用户的操作轨迹（按 UserId）：**
+
+```kusto
+traces
+| where timestamp > ago(24h)
+| where customDimensions["UserId"] == "123"
+| project timestamp, message, customDimensions
+| order by timestamp asc
+```
+
+**查询某个接口的调用频率（每 5 分钟）：**
+
+```kusto
+requests
+| where timestamp > ago(1h)
+| where name contains "Cars"  // 过滤包含 "Cars" 的接口
+| summarize count() by bin(timestamp, 5m), name
+| render timechart
+```
+
+
+
+### 9. 本地验证
+
+#### 9.1 确保 SQL Server 正在运行
+
+```bash
+docker ps | grep sqlserver
+```
+
+如果没有运行：
+
+```bash
+docker-compose up -d sqlserver
+```
+
+#### 9.2 启动 API
+
+```bash
+cd UUcars.API
+dotnet run
+```
+
+第一次启动时，Hangfire 会自动在数据库里创建系统表。查看日志，应该看到类似：
+
+```
+[Information] Starting Hangfire Server...
+[Information] Hangfire Server started. Queues: 'default'
+```
+
+#### 9.3 访问 Hangfire Dashboard
+
+用浏览器打开：`http://localhost:5085/hangfire`
+
+你需要先登录 Admin 账号（通过前端登录页，或者直接用 Swagger/Scalar 登录获取 Token），然后才能访问 Dashboard。
+
+Dashboard 里能看到：
+
+- **Enqueued**：待处理的任务
+- **Processing**：正在处理的任务
+- **Succeeded**：已成功的任务
+- **Failed**：失败的任务（可以手动重试）
+- **Recurring**：定时任务列表
+
+#### 10.4 测试邮件异步化
+
+用 Scalar（`http://localhost:5065/scalar`）或 curl 注册一个新用户：
+
+```bash
+curl -X POST http://localhost:5065/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "testuser11",
+    "email": "test111@example.com",
+    "password": "Test@1234"
+  }'
+```
+
+预期行为：
+
+1. **立即收到 201 响应**（不再等待邮件发送）
+
+2. 查看控制台日志，看到：
+
+    ```
+    [Information] User 5 registered, email confirmation job enqueued
+    ```
+
+    注意：不是"email sent"，是"job enqueued"
+
+3. 刷新 Hangfire Dashboard → **Enqueued** 或 **Succeeded** 里能看到 `SendEmailConfirmationAsync` 任务
+
+#### 10.5 测试 TokenCleanupService 定时任务
+
+不需要等到凌晨验证。可以在 Hangfire Dashboard 里手动触发：
+
+1. Dashboard → **Recurring Jobs**
+2. 找到 `cleanup-expired-tokens`
+3. 点击 **Trigger now**
+4. 切到 **Succeeded** 标签，确认任务执行成功
+
+
+
+### 11. 编译和测试
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+dotnet test
+```
+
+预期：
+
+```
+Test summary: total: XX, failed: 0, succeeded: XX
+```
+
+如果有测试失败，检查：
+
+- `UserServiceTests` 的 `CreateService` 方法是否更新了 `IBackgroundJobClient` 参数
+- `FakeBackgroundJobClient` 是否正确实现了接口
+- 集成测试的 `SqlServerTestFactory` 是否需要处理 Hangfire（**通常不需要**，集成测试走 HTTP 管道，`IBackgroundJobClient` 已经注册在 DI 里，Hangfire Server 不影响测试）
+
+
+
+### 12. Git 提交
+
+```bash
+# 确认所有修改
+git status
+
+# 暂存所有修改
+git add .
+
+# 提交
+git commit -m "feat: Hangfire background jobs - async email sending + token cleanup + Application insights"
+
+# 推送
+git push origin feature/v3-hangfire
+
+# 合并回 develop
+git checkout develop
+git merge --no-ff feature/v3-hangfire \
+  -m "merge: feature/v3-hangfire into develop"
+git push origin develop
+
+# 删除功能分支（本地 + 远程）
+git branch -d feature/v3-hangfire
+git push origin --delete feature/v3-hangfire
+```
+
+
+
+### Step 60 完成状态
+
+```
+知识点：
+✅ 理解同步邮件发送的脆弱性，以及异步队列的价值
+✅ 理解 Hangfire 的核心架构（Client → SQL Server → Server → Service）
+✅ 理解 Fire-and-Forget vs Recurring Job 的区别和适用场景
+✅ 理解 BackgroundJob.Enqueue<T>() 的正确用法（类型参数 + DI 解析）
+✅ 理解为什么用 IBackgroundJobClient 接口而不是静态方法（可测试性）
+✅ 理解 Hangfire Dashboard 的访问控制（IDashboardAuthorizationFilter）
+✅ 理解 Application Insights 在云端可观测性中的角色
+✅ 掌握 4 个工作中常用的 KQL 查询
+
+实现：
+✅ 安装 Hangfire + Hangfire.SqlServer
+✅ HangfireExtensions（服务注册 + Dashboard + 定时任务注册）
+✅ HangfireAdminAuthorizationFilter（Admin 才能访问 Dashboard）
+✅ TokenCleanupService（清理过期密码重置 Token）
+✅ UserService.RegisterAsync 改为异步入队
+✅ UserService.ForgotPasswordAsync 改为异步入队
+✅ FakeBackgroundJobClient（单元测试用）
+✅ UserServiceTests 更新（验证"入队"而不是"发送"）
+✅ Application Insights 接入（Serilog Conditional Sink）
+✅ 4 个 KQL 查询（错误日志、慢请求、用户轨迹、接口频率）
+✅ 本地验证：注册后立即返回201，Dashboard 能看到任务
+✅ dotnet build + dotnet test 通过
+✅ Git commit + 合并回 develop 完成
+```
