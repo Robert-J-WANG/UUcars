@@ -1,9 +1,12 @@
+using Hangfire;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using Scalar.AspNetCore;
 using Serilog;
+using Serilog.Sinks.ApplicationInsights.TelemetryConverters; // ← 新增
 using StackExchange.Redis;
 using UUcars.API.Auth;
+using UUcars.API.Auth.Hangfire;
 using UUcars.API.Data;
 using UUcars.API.Entities;
 using UUcars.API.Extensions;
@@ -33,17 +36,32 @@ try
     // ReadFrom.Configuration：从 appsettings.json 读取日志级别等配置
     // WriteTo.Console / File：输出目标
     // =============================================
+
     builder.Host.UseSerilog((context, services, configuration) =>
+    {
         configuration
             .ReadFrom.Configuration(context.Configuration)
             .ReadFrom.Services(services)
             .WriteTo.Console()
             .WriteTo.File(
                 "logs/uucars-.log",
-                rollingInterval: RollingInterval.Day, // 每天滚动一个新文件
-                retainedFileCountLimit: 30 // 最多保留 30 天
-            )
-    );
+                rollingInterval: RollingInterval.Day,
+                retainedFileCountLimit: 30
+            );
+
+        // ← 新增：只在配置了 ConnectionString 时才挂载 Application Insights Sink
+        // 用 if 而不是 Conditional，原因：
+        // Conditional 的第二个参数是委托，Serilog 在配置阶段就会执行它构建 Sink
+        // 此时 GetRequiredService<TelemetryConfiguration> 如果服务未注册会直接抛异常
+        var aiConnStr = context.Configuration["ApplicationInsights:ConnectionString"];
+        if (!string.IsNullOrEmpty(aiConnStr))
+            configuration.WriteTo.ApplicationInsights(
+                services.GetRequiredService
+                    <Microsoft.ApplicationInsights.Extensibility.TelemetryConfiguration>(),
+                new TraceTelemetryConverter()
+            );
+    });
+
 
     // =============================================
     // 服务注册
@@ -77,6 +95,14 @@ try
 
     // 存储服务
     builder.Services.AddStorageService(builder.Configuration);
+
+    // ── Application Insights 服务 ──
+    // 只在配置了 ConnectionString 时才注册 Application Insights 服务
+    // 必须在 Serilog 配置之后、在 UseSerilog 的 lambda 执行之前完成注册
+    // 原因：Serilog 的 lambda 里 GetRequiredService<TelemetryConfiguration> 依赖这里的注册
+    var aiConnectionString = builder.Configuration["ApplicationInsights:ConnectionString"];
+    if (!string.IsNullOrEmpty(aiConnectionString))
+        builder.Services.AddApplicationInsightsTelemetry(options => { options.ConnectionString = aiConnectionString; });
 
     // ── Redis Cache服务 ──
 
@@ -120,6 +146,9 @@ try
 
     // 缓存服务（Singleton，因为它依赖 Singleton 的 IConnectionMultiplexer）
     builder.Services.AddSingleton<ICacheService, RedisCacheService>();
+
+    // Hangfire服务
+    builder.Services.AddHangfireServices(builder.Configuration, builder.Environment);
 
 
     // 车辆模块
@@ -187,6 +216,21 @@ try
     // 如果顺序反了，[Authorize] 读到的 HttpContext.User 是空的，永远判定为未认证
     app.UseAuthentication();
     app.UseAuthorization();
+
+    // ✅ 非 Testing 环境才挂载 Hangfire Dashboard 和定时任务
+    if (!app.Environment.IsEnvironment("Testing"))
+    {
+        // ✅ Hangfire Dashboard（在认证之后）
+        app.UseHangfireDashboard("/hangfire", new DashboardOptions
+        {
+            Authorization = app.Environment.IsDevelopment()
+                ? new[] { new HangfireLocalDevAuthorizationFilter() } // 开发：直接放行
+                : new[] { new HangfireAdminAuthorizationFilter() } // 生产：必须 Admin
+        });
+        // 定时清除过期token
+        app.UseHangfireJobs();
+    }
+
 
     app.MapControllers();
 

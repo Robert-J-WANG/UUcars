@@ -1,4 +1,5 @@
 using System.Threading.RateLimiting;
+using Hangfire;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
@@ -27,8 +28,15 @@ public class SqlServerTestFactory : WebApplicationFactory<Program>, IAsyncLifeti
         .WithPassword("TestStrong!Passw0rd")
         .Build();
 
-    // 新增：暴露给 IntegrationTestBase 使用，取注册时发出的 token
-    public FakeEmailService FakeEmail { get; } = new();
+    // ✅ 移除：不再需要 FakeEmail
+    // public FakeEmailService FakeEmail { get; } = new();
+
+    // ✅ 新增：暴露 DbContext 查询能力，供 IntegrationTestBase 直接查 Token
+    public AppDbContext GetDbContext()
+    {
+        var scope = Services.CreateScope();
+        return scope.ServiceProvider.GetRequiredService<AppDbContext>();
+    }
 
     // IAsyncLifetime.InitializeAsync：测试类实例化时自动调用
     // xUnit 发现这个接口后，会在运行第一个测试前先执行这个方法
@@ -62,13 +70,19 @@ public class SqlServerTestFactory : WebApplicationFactory<Program>, IAsyncLifeti
                 options.UseSqlServer(_sqlContainer.GetConnectionString()));
 
 
-            // 新增：替换 IEmailService，避免真实调用 Resend API
-            var emailDescriptor = services.SingleOrDefault(d => d.ServiceType == typeof(IEmailService));
-            if (emailDescriptor != null)
-                services.Remove(emailDescriptor);
+            // ✅ 移除：不再需要替换 IEmailService 为 FakeEmailService
+            // var emailDescriptor = services.SingleOrDefault(...)
+            // services.Remove(emailDescriptor);
+            // services.AddSingleton<IEmailService>(FakeEmail);
 
-            // Singleton：整个测试共享同一个实例，token 才能被正确读取
-            services.AddSingleton<IEmailService>(FakeEmail);
+            // ✅ 新增：替换 IBackgroundJobClient 为 Fake
+            // 原因：不能在测试里真正调用 Hangfire（需要 SQL Server Hangfire 系统表）
+            // FakeBackgroundJobClient 静默处理入队，不真正执行任务
+            var jobClientDescriptor = services.SingleOrDefault(d => d.ServiceType == typeof(IBackgroundJobClient));
+            if (jobClientDescriptor != null)
+                services.Remove(jobClientDescriptor);
+
+            services.AddSingleton<IBackgroundJobClient>(new FakeBackgroundJobClient());
 
             // ✅ 替换 ICacheService，集成测试不依赖真实 Redis
             var cacheDescriptor = services.SingleOrDefault(d => d.ServiceType == typeof(ICacheService));

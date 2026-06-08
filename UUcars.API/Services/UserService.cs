@@ -1,3 +1,4 @@
+using Hangfire;
 using Microsoft.AspNetCore.Identity;
 using UUcars.API.Auth;
 using UUcars.API.DTOs.Responses;
@@ -11,7 +12,8 @@ namespace UUcars.API.Services;
 
 public class UserService
 {
-    // email服务
+    // 后台队列服务
+    private readonly IBackgroundJobClient _backgroundJobClient;
     private readonly IEmailService _emailService;
     private readonly JwtTokenGenerator _jwtTokenGenerator;
     private readonly ILogger<UserService> _logger;
@@ -25,12 +27,14 @@ public class UserService
         IPasswordHasher<User> passwordHasher, // 改为接口注入
         JwtTokenGenerator jwtTokenGenerator,
         IEmailService emailService,
+        IBackgroundJobClient backgroundJobClient, // 新增后台队列
         ILogger<UserService> logger)
     {
         _userRepository = userRepository;
         _passwordHasher = passwordHasher;
         _jwtTokenGenerator = jwtTokenGenerator;
         _emailService = emailService;
+        _backgroundJobClient = backgroundJobClient;
         _logger = logger;
     }
 
@@ -67,29 +71,20 @@ public class UserService
         var created = await _userRepository.AddAsync(user, cancellationToken);
 
         // =============================================
-        // 注册（V2 更新：注册后发验证邮件）
+        // V3 更新：邮件发送改为 Hangfire 异步任务
+        // try/catch 不再需要：Hangfire 有内置重试机制（失败自动重试10次，指数退避）
+        // 邮件发送失败会在 Hangfire Dashboard 里显示，可以手动重试`
         // =============================================
-
-        // 先保存用户，再发邮件
-        // 顺序很重要：确保用户已写入数据库，邮件里的验证链接才有意义
-        // 如果反过来——邮件发出去了但数据库写入失败，
-        // 用户点链接时服务端找不到这个 Token，验证永远失败
-        // 如果邮件发送失败，用户可以通过"重新发送"功能补救
-        try
-        {
-            await _emailService.SendEmailVerificationAsync(
+        _backgroundJobClient.Enqueue<IEmailService>(service =>
+            service.SendEmailVerificationAsync(
                 created.Email,
                 created.EmailConfirmationToken!,
-                cancellationToken);
-        }
-        catch (Exception ex)
-        {
-            // 邮件发送失败不阻断注册流程
-            // 用户已成功写入数据库，可以通过"重新发送验证邮件"功能补救
-            _logger.LogWarning(ex, "Failed to send verification email to {Email}", created.Email);
-        }
+                CancellationToken.None // Hangfire 序列化参数时不支持 CancellationToken，必须用 None
+            )
+        );
 
-        _logger.LogInformation("New user registered: {Email}", created.Email);
+        _logger.LogInformation(
+            "New user registered: {Email}, verification email job enqueued", created.Email);
 
         // 5. 返回 DTO（不包含 PasswordHash）
         return MapToResponse(created);
@@ -218,10 +213,12 @@ public class UserService
 
         await _userRepository.UpdateAsync(user, cancellationToken);
 
-        await _emailService.SendEmailVerificationAsync(
-            user.Email, newToken, cancellationToken);
+        // v3: 改为 Hangfire 异步任务
+        _backgroundJobClient.Enqueue<IEmailService>(service =>
+            service.SendEmailVerificationAsync(user.Email, newToken, CancellationToken.None));
 
-        _logger.LogInformation("Verification email resent to: {Email}", email);
+        _logger.LogInformation(
+            "Verification email resend job enqueued for: {Email}", email);
     }
 
     // =============================================
@@ -262,10 +259,12 @@ public class UserService
 
         await _userRepository.UpdateAsync(user, cancellationToken);
 
-        await _emailService.SendPasswordResetAsync(
-            user.Email, resetToken, cancellationToken);
+        // v3: 改为 Hangfire 异步任务
+        _backgroundJobClient.Enqueue<IEmailService>(service =>
+            service.SendPasswordResetAsync(user.Email, resetToken, CancellationToken.None));
 
-        _logger.LogInformation("Password reset email sent to: {Email}", email);
+        _logger.LogInformation(
+            "Password reset email job enqueued for: {Email}", email);
     }
 
     // =============================================
