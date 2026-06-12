@@ -21,6 +21,9 @@ public class AppDbContext : DbContext
     public DbSet<Favorite> Favorites => Set<Favorite>();
     public DbSet<Review> Reviews => Set<Review>(); // 新增
 
+    // 注册refresh token
+    public DbSet<RefreshToken> RefreshTokens => Set<RefreshToken>();
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         base.OnModelCreating(modelBuilder);

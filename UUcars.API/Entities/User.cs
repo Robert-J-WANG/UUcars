@@ -30,4 +30,7 @@ public class User : BaseEntity
 
     // 一个用户可以收藏多辆车
     public ICollection<Favorite> Favorites { get; set; } = [];
+
+    // 一个用户可以有多个refresh token
+    public ICollection<RefreshToken> RefreshTokens { get; set; } = [];
 }

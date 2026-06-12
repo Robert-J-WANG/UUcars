@@ -44,9 +44,23 @@ public class TokenCleanupService
                 "Cleaned {Count} expired password reset tokens",
                 expiredPasswordResets.Count);
         }
+
         else
         {
             _logger.LogInformation("No expired password reset tokens found");
         }
+
+        // ── 清理过期或已撤销的 RefreshToken ──────────────
+        // 使用 EF Core 批量删除（ExecuteDeleteAsync），性能更好
+        // 这里是真正的删除行，而不是清空字段，所以用 Delete
+        var deletedCount = await _context.RefreshTokens
+            .Where(rt => rt.IsRevoked || rt.ExpiresAt < now)
+            .ExecuteDeleteAsync();
+
+        if (deletedCount > 0)
+            _logger.LogInformation(
+                "Cleaned {Count} expired or revoked refresh tokens", deletedCount);
+        else
+            _logger.LogInformation("No expired refresh tokens found");
     }
 }
