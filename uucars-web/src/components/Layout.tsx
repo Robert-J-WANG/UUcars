@@ -25,17 +25,30 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { navLinkClass } from "@/lib/navLinkClass";
 import { cn } from "@/lib/utils";
+import { authApi } from "@/api";
 
 export default function Layout() {
-  const { user, isAuthenticated, logout } = useAuthStore();
+  const { user, isAuthenticated, clearAuth } = useAuthStore();
   const navigate = useNavigate();
   const [mobileOpen, setMobileOpen] = useState(false);
   const isAdmin = user?.role === "Admin";
 
-  const handleLogout = () => {
-    logout();
-    navigate("");
-    setMobileOpen(false);
+  const handleLogout = async () => {
+    try {
+      // 通知后端撤销 RefreshToken
+      // 后端会把数据库里的 IsRevoked 设为 true，并清除 Cookie
+      // 即使这个请求失败（网络问题），前端也要继续登出
+      await authApi.logout();
+    } catch {
+      // 静默处理：不能因为后端失败导致用户无法登出
+    } finally {
+      // 清除前端状态（authStore + localStorage 里的 user）
+      clearAuth();
+      // 关闭移动端菜单
+      setMobileOpen(false);
+      // 跳转首页
+      navigate("/");
+    }
   };
 
   return (

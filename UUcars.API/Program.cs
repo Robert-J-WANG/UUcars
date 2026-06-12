@@ -171,6 +171,10 @@ try
     builder.Services.AddScoped<IReviewRepository, EfReviewRepository>();
     builder.Services.AddScoped<ReviewService>();
 
+    // ── Refresh Token ──────────────────────────────────
+    builder.Services.AddScoped<IRefreshTokenRepository, EfRefreshTokenRepository>();
+    builder.Services.AddScoped<RefreshTokenService>();
+
     // =============================================
     // 构建应用
     // =============================================

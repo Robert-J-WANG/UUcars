@@ -4322,7 +4322,7 @@ public static class HangfireExtensions
 ##### 总结
 
 | 文件                          | 修改内容                                                     |
-| ----------------------------- | ------------------------------------------------------------ |
+| ----- |  |
 | `SqlServerTestFactory.cs`     | 移除 `FakeEmail` 属性 + 移除替换 `IEmailService` 的代码 + 新增替换 `IBackgroundJobClient` 为 `FakeBackgroundJobClient` + 新增 `GetDbContext()` 方法 |
 | `IntegrationTestBase.cs`      | `RegisterAndLoginAsync` 里取 Token 改为查数据库              |
 | `CoreFlowIntegrationTests.cs` | `Login_WithValidCredentials` 里取 Token 改为查数据库         |
@@ -4884,6 +4884,1526 @@ git push origin --delete feature/v3-hangfire
 ✅ Application Insights 接入（Serilog Conditional Sink）
 ✅ 4 个 KQL 查询（错误日志、慢请求、用户轨迹、接口频率）
 ✅ 本地验证：注册后立即返回201，Dashboard 能看到任务
+✅ dotnet build + dotnet test 通过
+✅ Git commit + 合并回 develop 完成
+```
+
+
+
+## Step 61 · Refresh Token 机制
+
+### 这一步做什么
+
+Step 60 解决了邮件发送的脆弱性。现在来解决认证体系里一个同样真实的问题：**用户体验差的 Token 过期策略**。
+
+V2 的认证流程，Token 的生命周期是这样的：
+
+```
+用户登录
+  → 服务端签发 AccessToken（JWT，60分钟有效）
+  → 前端存入 localStorage / authStore
+  → 用户操作一切正常
+
+60分钟后：
+  → 前端发请求 → 服务端验证 Token → 401 Unauthorized
+  → 前端收到 401 → 清除 authStore → 跳转登录页
+  → 用户被迫重新登录
+```
+
+这个流程有两个问题：
+
+**问题一：用户体验差** 
+
+- 用户正在填写一个表单（比如发布车辆），突然页面跳转到登录页，填写的内容全部丢失
+
+**问题二：安全和便利的矛盾**
+
+- AccessToken 有效期太短（10分钟）→ 用户频繁被踢出，体验差
+- AccessToken 有效期太长（7天）→ Token 被盗后攻击者有很长时间可以使用，安全风险高
+
+Refresh Token 机制是解决这个矛盾的标准方案：
+
+```
+AccessToken：有效期短（60分钟），用于 API 请求认证
+RefreshToken：有效期长（7天），只用于换取新的 AccessToken，存在 HttpOnly Cookie 里
+
+正常流程：
+  → AccessToken 过期 → 前端自动用 RefreshToken 换新 AccessToken
+  → 用户无感知，继续操作
+
+攻击者盗取 AccessToken：
+  → 最多只有 60 分钟可用，之后失效
+
+攻击者盗取 RefreshToken（比 AccessToken 更难，因为在 HttpOnly Cookie 里）：
+  → Token 轮换：每次刷新后旧 Token 立即作废
+  → 可以检测到 Token 被重复使用（安全告警）
+```
+
+
+
+
+
+### 理解 HttpOnly Cookie 的安全意义
+
+在讲实现之前，先把一个关键的安全概念想清楚。
+
+**为什么 AccessToken 放 Response Body，RefreshToken 放 HttpOnly Cookie？**
+
+**AccessToken（放 Body/localStorage）：**
+
+```
+1. 服务器通过 Response Body 把 Token 传过来
+   （前端怎么知道 Token 是什么？就是从 Body 里读的）
+
+2. 前端 JS 读取 Body 里的 Token
+   然后存到 localStorage
+
+3. 之后每次请求从 localStorage 取出来
+   放到 Authorization: Bearer xxx 头里
+```
+
+- 前端 JS 需要读取它，然后放在每个请求的 `Authorization: Bearer xxx` 头里
+- 所以必须让 JS 能访问到
+- 风险：如果网站有 XSS 漏洞，攻击者的 JS 能读取到 Token
+
+**RefreshToken（放 HttpOnly Cookie）：**
+
+```
+Cookie 方式：
+  服务器 → Set-Cookie Header 设置 → 浏览器自动存
+  前端 JS 完全不参与，浏览器自己管
+```
+
+- `HttpOnly` 属性：浏览器不允许 JS 读取这个 Cookie
+- 只有浏览器发请求时会自动带上，后端能读到，前端 JS 永远读不到
+- 所以即使有 XSS 漏洞，攻击者的 JS 也无法读取 RefreshToken
+- 这就是为什么 RefreshToken 比 AccessToken 更难被盗
+
+```
+攻击者的 JS 能做什么：
+  ✅ 读 localStorage → 拿到 AccessToken（有效期 60 分钟）
+  ❌ 读 HttpOnly Cookie → 拿不到 RefreshToken
+
+这就是两者分开存储的安全价值。
+```
+
+**Cookie 的完整安全属性：**
+
+```
+Set-Cookie: refreshToken=xxx;
+  HttpOnly;           ← JS 无法读取
+  Secure;             ← 只通过 HTTPS 传输（生产环境必须）
+  SameSite=Strict;    ← 只在同源请求里发送（防 CSRF）
+  Path=/auth;         ← 只在 /auth 路径下发送（减少暴露范围）
+  Max-Age=604800;     ← 7天有效期（秒）
+```
+
+
+
+### Token 轮换（Token Rotation）
+
+Refresh Token 还有一个重要的安全机制：**每次使用后立即作废，换新的**。
+
+```
+用户持有 RefreshToken_A（有效）
+  → 调 POST /auth/refresh
+  → 服务端：
+      1. 验证 RefreshToken_A 有效
+      2. 生成新的 AccessToken
+      3. 生成新的 RefreshToken_B
+      4. 把 RefreshToken_A 标记为 IsRevoked = true
+      5. 返回新 AccessToken + 设置 RefreshToken_B 到 Cookie
+  → 用户现在持有 RefreshToken_B（有效），RefreshToken_A 已作废
+```
+
+**为什么这样更安全？**
+
+如果攻击者在某个时间点盗取了 RefreshToken_A：
+
+- 正常用户先用了 → RefreshToken_A 作废，换了 RefreshToken_B
+- 攻击者后用 RefreshToken_A → 发现已作废 → **可以检测到 Token 被重复使用**
+- 系统可以据此撤销所有相关 Token，强制用户重新登录
+
+这叫 **Refresh Token Rotation**，是 OAuth 2.0 推荐的最佳实践。
+
+
+
+### 1. 切出功能分支
+
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b feature/v3-refresh-token
+git push -u origin feature/v3-refresh-token
+```
+
+
+
+### 2. 数据库：新建 RefreshTokens 表
+
+RefreshToken要存储到数据库，这样服务端才有权限管理状态，因此我们需要新的一张数据库表
+
+#### 2.1 新建实体类
+
+新建 `UUcars.API/Entities/RefreshToken.cs`：
+
+```csharp
+namespace UUcars.API.Entities;
+
+public class RefreshToken
+{
+    public int Id { get; set; }
+
+    /// <summary>
+    /// Token 本体：随机生成的不透明字符串（不是 JWT）
+    /// 存数据库，每次使用后作废（Token 轮换）
+    /// </summary>
+    public string Token { get; set; } = string.Empty;
+
+    /// <summary>
+    /// 所属用户
+    /// </summary>
+    public int UserId { get; set; }
+    public User User { get; set; } = null!;
+
+    /// <summary>
+    /// 过期时间：7天后
+    /// </summary>
+    public DateTime ExpiresAt { get; set; }
+
+    /// <summary>
+    /// 是否已被撤销
+    /// true = 已使用过（Token 轮换）或用户主动登出
+    /// </summary>
+    public bool IsRevoked { get; set; } = false;
+
+    public DateTime CreatedAt { get; set; }
+}
+```
+
+#### 2.2 给 User 实体加导航属性
+
+打开 `UUcars.API/Entities/User.cs`，加入导航属性：
+
+```csharp
+// 在现有导航属性的最后加入
+public ICollection<RefreshToken> RefreshTokens { get; set; } = [];
+```
+
+#### 2.3 新建 EF Core 配置
+
+新建 `UUcars.API/Data/Configurations/RefreshTokenConfiguration.cs`：
+
+```csharp
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+using UUcars.API.Entities;
+
+namespace UUcars.API.Data.Configurations;
+
+public class RefreshTokenConfiguration : IEntityTypeConfiguration<RefreshToken>
+{
+    public void Configure(EntityTypeBuilder<RefreshToken> builder)
+    {
+        builder.HasKey(rt => rt.Id);
+
+        builder.Property(rt => rt.Token)
+            .IsRequired()
+            .HasMaxLength(256);
+
+        // Token 必须唯一：防止碰撞，也方便快速查找
+        builder.HasIndex(rt => rt.Token)
+            .IsUnique();
+
+        // 查询时常见的过滤条件：UserId + IsRevoked + ExpiresAt
+        // 加复合索引加速验证查询
+        builder.HasIndex(rt => new { rt.UserId, rt.IsRevoked, rt.ExpiresAt })
+            .HasDatabaseName("IX_RefreshTokens_UserId_IsRevoked_ExpiresAt");
+
+        builder.Property(rt => rt.ExpiresAt)
+            .IsRequired();
+
+        builder.Property(rt => rt.IsRevoked)
+            .IsRequired()
+            .HasDefaultValue(false);
+
+        builder.Property(rt => rt.CreatedAt)
+            .IsRequired();
+
+        // 关联 User
+        builder.HasOne(rt => rt.User)
+            .WithMany(u => u.RefreshTokens)
+            .HasForeignKey(rt => rt.UserId)
+            .OnDelete(DeleteBehavior.Cascade); // 用户删除时，其所有 RefreshToken 跟着删
+    }
+}
+```
+
+#### 2.4 在 AppDbContext 里注册
+
+打开 `UUcars.API/Data/AppDbContext.cs`，加入 DbSet：
+
+```csharp
+public DbSet<RefreshToken> RefreshTokens => Set<RefreshToken>();
+```
+
+`ApplyConfigurationsFromAssembly` 会自动扫描 `RefreshTokenConfiguration`，不需要手动注册。
+
+#### 2.5 生成 Migration
+
+```bash
+cd UUcars.API
+dotnet ef migrations add AddRefreshTokensTable 
+```
+
+检查生成的 Migration 文件，确认：
+
+- 创建了 `RefreshTokens` 表（Id、Token、UserId、ExpiresAt、IsRevoked、CreatedAt）
+- 创建了 `IX_RefreshTokens_Token`（唯一索引）
+- 创建了 `IX_RefreshTokens_UserId_IsRevoked_ExpiresAt`（复合索引）
+- 添加了 `Users` 表到 `RefreshTokens` 的外键约束
+
+```bash
+dotnet ef database update
+```
+
+预期输出：
+
+```
+Applying migration '20240xxx_AddRefreshTokensTable'.
+Done.
+```
+
+
+
+### 3. Repository 层
+
+#### 3.1 新建接口
+
+新建 `UUcars.API/Repositories/IRefreshTokenRepository.cs`：
+
+```csharp
+using UUcars.API.Entities;
+
+namespace UUcars.API.Repositories;
+
+public interface IRefreshTokenRepository
+{
+    /// <summary>
+    /// 根据 Token 字符串查找（验证时使用）
+    /// </summary>
+    Task<RefreshToken?> GetByTokenAsync(
+        string token,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 保存新的 RefreshToken
+    /// </summary>
+    Task AddAsync(
+        RefreshToken refreshToken,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 撤销单个 Token（登出 / Token 轮换时使用）
+    /// </summary>
+    Task RevokeAsync(
+        RefreshToken refreshToken,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 撤销某个用户的所有 Token（强制全设备登出时使用）
+    /// </summary>
+    Task RevokeAllByUserIdAsync(
+        int userId,
+        CancellationToken cancellationToken = default);
+}
+```
+
+#### 3.2 EF Core 实现
+
+新建 `UUcars.API/Repositories/EfRefreshTokenRepository.cs`：
+
+```csharp
+using Microsoft.EntityFrameworkCore;
+using UUcars.API.Data;
+using UUcars.API.Entities;
+
+namespace UUcars.API.Repositories;
+
+public class EfRefreshTokenRepository : IRefreshTokenRepository
+{
+    private readonly AppDbContext _context;
+
+    public EfRefreshTokenRepository(AppDbContext context)
+    {
+        _context = context;
+    }
+
+    public async Task<RefreshToken?> GetByTokenAsync(
+        string token,
+        CancellationToken cancellationToken = default)
+    {
+        return await _context.RefreshTokens
+            // Include User 是因为后续需要用 user.Id 签发新的 AccessToken
+            .Include(rt => rt.User)
+            .FirstOrDefaultAsync(rt => rt.Token == token, cancellationToken);
+    }
+
+    public async Task AddAsync(
+        RefreshToken refreshToken,
+        CancellationToken cancellationToken = default)
+    {
+        _context.RefreshTokens.Add(refreshToken);
+        await _context.SaveChangesAsync(cancellationToken);
+    }
+
+    public async Task RevokeAsync(
+        RefreshToken refreshToken,
+        CancellationToken cancellationToken = default)
+    {
+        refreshToken.IsRevoked = true;
+        await _context.SaveChangesAsync(cancellationToken);
+    }
+
+    public async Task RevokeAllByUserIdAsync(
+        int userId,
+        CancellationToken cancellationToken = default)
+    {
+        // EF Core 7+ 批量更新，不需要先 Select 再逐条修改
+        await _context.RefreshTokens
+            .Where(rt => rt.UserId == userId && !rt.IsRevoked)
+            .ExecuteUpdateAsync(
+                setters => setters.SetProperty(rt => rt.IsRevoked, true),
+                cancellationToken);
+    }
+}
+```
+
+
+
+### 4. DTOs
+
+#### 4.1 新增 RefreshTokenResponse
+
+新建 `UUcars.API/DTOs/RefreshTokenResponse.cs`：
+
+```csharp
+namespace UUcars.API.DTOs.Auth;
+
+public class RefreshTokenResponse
+{
+    /// <summary>
+    /// 新签发的 AccessToken
+    /// 前端收到后更新 authStore，替换旧的 Token
+    /// </summary>
+    public string AccessToken { get; set; } = string.Empty;
+}
+```
+
+> **为什么 Response 里只有 AccessToken，没有 RefreshToken？**
+>
+> 新的 RefreshToken 通过 `Set-Cookie` 响应头写入 HttpOnly Cookie， 不出现在 Response Body 里。 这样前端 JS 永远无法读到 RefreshToken，只能依赖浏览器自动管理 Cookie。
+
+#### 4.2 新增 LogoutRequest（可选）
+
+`POST /auth/logout` 不需要 Request Body——RefreshToken 从 Cookie 里读， UserId 从 JWT Claims 里读。不需要额外的 DTO。
+
+
+
+### 5. Service 层
+
+#### 5.1 新建 RefreshTokenService
+
+新建 `UUcars.API/Services/RefreshTokenService.cs`：
+
+```csharp
+using UUcars.API.Auth;
+using UUcars.API.Data;
+using UUcars.API.Entities;
+using UUcars.API.Exceptions;
+using UUcars.API.Repositories;
+
+namespace UUcars.API.Services;
+
+public class RefreshTokenService
+{
+    private readonly IRefreshTokenRepository _refreshTokenRepository;
+    private readonly JwtTokenGenerator _jwtTokenGenerator;
+    private readonly AppDbContext _context;
+    private readonly ILogger<RefreshTokenService> _logger;
+
+    // RefreshToken 有效期：7天
+    private const int RefreshTokenExpiryDays = 7;
+
+    public RefreshTokenService(
+        IRefreshTokenRepository refreshTokenRepository,
+        JwtTokenGenerator jwtTokenGenerator,
+        AppDbContext context,
+        ILogger<RefreshTokenService> logger)
+    {
+        _refreshTokenRepository = refreshTokenRepository;
+        _jwtTokenGenerator = jwtTokenGenerator;
+        _context = context;
+        _logger = logger;
+    }
+
+    /// <summary>
+    /// 生成新的 RefreshToken 并存入数据库
+    /// 在登录成功后调用
+    /// </summary>
+    public async Task<RefreshToken> CreateRefreshTokenAsync(
+        int userId,
+        CancellationToken cancellationToken = default)
+    {
+        var refreshToken = new RefreshToken
+        {
+            Token = TokenGenerator.Generate(),
+            UserId = userId,
+            ExpiresAt = DateTime.UtcNow.AddDays(RefreshTokenExpiryDays),
+            IsRevoked = false,
+            CreatedAt = DateTime.UtcNow
+        };
+
+        await _refreshTokenRepository.AddAsync(refreshToken, cancellationToken);
+        return refreshToken;
+    }
+
+    /// <summary>
+    /// 验证 RefreshToken，签发新的 AccessToken + RefreshToken（Token 轮换）
+    /// </summary>
+    public async Task<(string NewAccessToken, RefreshToken NewRefreshToken)> RefreshAsync(
+        string token,
+        CancellationToken cancellationToken = default)
+    {
+        // 1. 根据 Token 字符串查找记录
+        var existingToken = await _refreshTokenRepository
+            .GetByTokenAsync(token, cancellationToken);
+
+        // 2. Token 不存在
+        if (existingToken == null)
+        {
+            _logger.LogWarning("Refresh attempt with unknown token");
+            throw new InvalidTokenException();
+        }
+
+        // 3. Token 已被撤销
+        // ⚠️ 重要安全检查：如果已撤销的 Token 被使用，说明可能发生了 Token 盗用
+        if (existingToken.IsRevoked)
+        {
+            _logger.LogWarning(
+                "Revoked refresh token used for user {UserId}. Possible token theft detected.",
+                existingToken.UserId);
+
+            // 安全措施：撤销该用户的所有 Token，强制重新登录
+            // 这是防止 Token 盗用的关键步骤
+            await _refreshTokenRepository.RevokeAllByUserIdAsync(
+                existingToken.UserId, cancellationToken);
+
+            throw new InvalidTokenException();
+        }
+
+        // 4. Token 已过期
+        if (existingToken.ExpiresAt < DateTime.UtcNow)
+        {
+            _logger.LogInformation(
+                "Expired refresh token used for user {UserId}",
+                existingToken.UserId);
+            throw new InvalidTokenException();
+        }
+
+        var user = existingToken.User;
+
+        // 5. Token 轮换：撤销旧 Token
+        await _refreshTokenRepository.RevokeAsync(existingToken, cancellationToken);
+        
+        // 6. 签发新 AccessToken
+        var newAccessToken = _jwtTokenGenerator.GenerateToken(user);
+
+        // 7. 生成新 RefreshToken
+        var newRefreshToken = new RefreshToken
+        {
+            Token = TokenGenerator.Generate(),
+            UserId = user.Id,
+            ExpiresAt = DateTime.UtcNow.AddDays(RefreshTokenExpiryDays),
+            IsRevoked = false,
+            CreatedAt = DateTime.UtcNow
+        };
+
+        await _refreshTokenRepository.AddAsync(newRefreshToken, cancellationToken);
+
+        // 8. 一次性保存（旧 Token 撤销 + 新 Token 创建，保证原子性）
+        await _context.SaveChangesAsync(cancellationToken);
+
+        _logger.LogInformation(
+            "Refresh token rotated for user {UserId}", user.Id);
+
+        return (newAccessToken, newRefreshToken);
+    }
+
+    /// <summary>
+    /// 撤销当前用户的 RefreshToken（登出）
+    /// </summary>
+    public async Task RevokeAsync(
+        string token,
+        CancellationToken cancellationToken = default)
+    {
+        var existingToken = await _refreshTokenRepository
+            .GetByTokenAsync(token, cancellationToken);
+
+        // Token 不存在或已撤销：静默处理，不报错
+        // 原因：前端可能重复调登出接口，或 Token 已过期被清理，都应该返回成功
+        if (existingToken == null || existingToken.IsRevoked)
+        {
+            _logger.LogInformation("Logout: token not found or already revoked");
+            return;
+        }
+
+        await _refreshTokenRepository.RevokeAsync(existingToken, cancellationToken);
+
+        _logger.LogInformation(
+            "Refresh token revoked for user {UserId}", existingToken.UserId);
+    }
+}
+```
+
+
+
+### 6. 更新 AuthController
+
+我们现在需要把RefreshToken写入Cookie里，而Cookie 是 HTTP 协议层的概念，属于 Controller 的职责,。 因此，我们需要在controll层处理：
+
+```
+Controller 层：处理 HTTP 请求和响应（Headers、Cookies、状态码）
+Service 层：处理业务逻辑（Token生成、验证、轮换、存储）
+```
+
+完整的controller操作如下：
+
+```
+AuthController.Login()
+  → 调用 UserService.LoginAsync()        ← 验证用户名密码（Service）
+  → 调用 RefreshTokenService.CreateAsync() ← 生成并存储RefreshToken（Service）
+  → SetRefreshTokenCookie(token, expiry)  ← 写Cookie（Controller私有方法）
+  → 返回 AccessToken 在 Response Body
+
+AuthController.Refresh()
+  → 从 Request.Cookies 读 RefreshToken   ← 读Cookie（Controller）
+  → 调用 RefreshTokenService.RefreshAsync() ← 验证+轮换（Service）
+  → SetRefreshTokenCookie(newToken, expiry) ← 写新Cookie（Controller）
+  → 返回新 AccessToken 在 Response Body
+
+AuthController.Logout()
+  → 从 Request.Cookies 读 RefreshToken   ← 读Cookie（Controller）
+  → 调用 RefreshTokenService.RevokeAsync() ← 撤销（Service）
+  → Response.Cookies.Delete("refreshToken") ← 删Cookie（Controller）
+  → 返回 200
+```
+
+#### 6.1 新建 SetRefreshTokenCookie 私有方法：
+
+对于access token, 我们直接写入Response Body的
+
+```c#
+return new LoginResponse
+{
+    Token = token,
+    ExpiresAt = DateTime.UtcNow.AddMinutes(60),
+    User = MapToResponse(user)
+};
+```
+
+```c#
+return Ok(ApiResponse<LoginResponse>.SuccessResult(result));
+```
+
+但是，对于refresh token, 我们需要写入 `Set-Cookie` 响应头，不出现在 Body 里。 因此封装如下私有方法
+
+```csharp
+[ApiController]
+[Route("auth")]
+public class AuthController : ControllerBase
+{
+	...
+    /// 其他公开接口不变
+    
+    /// <summary>
+    /// 把 RefreshToken 写入 HttpOnly Cookie
+    /// 提取为私有方法：Login 和 Refresh 都需要调用
+    /// </summary>
+    private void SetRefreshTokenCookie(string token, DateTime expiresAt)
+    {
+        var cookieOptions = new CookieOptions
+        {
+            HttpOnly = true,     // JS 无法读取
+            Secure = true,       // 只通过 HTTPS 传输
+            SameSite = SameSiteMode.Strict, // 防 CSRF
+            Expires = expiresAt, // 和 RefreshToken 过期时间一致
+            Path = "/auth"       // 只在 /auth 路径下发送 Cookie，减少暴露范围
+        };
+
+        // 开发环境：Secure=false（本地没有 HTTPS）
+        // 通过环境变量判断，避免本地开发时 Cookie 无法设置
+        if (HttpContext.RequestServices
+            .GetRequiredService<IWebHostEnvironment>()
+            .IsDevelopment())
+        {
+            cookieOptions.Secure = false;
+        }
+
+        Response.Cookies.Append("refreshToken", token, cookieOptions);
+    }
+}
+```
+
+从而实现 acess token和refresh token 区别传递的形式：
+
+```
+Response Body（Json）  ← Ok(ApiResponse<LoginResponse>) 这一行
+  └── data.token = AccessToken（前端JS能读到，存authStore）
+
+Response Header（Set-Cookie）  ← SetRefreshTokenCookie() 这一行
+  └── refreshToken = RefreshToken（HttpOnly，前端JS读不到）
+```
+
+
+
+#### 6.2 更新登录接口：响应里加 RefreshToken Cookie
+
+打开 `UUcars.API/Controllers/AuthController.cs`。
+
+**注入 RefreshTokenService：**
+
+```csharp
+private readonly UserService _userService;
+private readonly RefreshTokenService _refreshTokenService; // ✅ 新增
+private readonly ILogger<AuthController> _logger;
+
+public AuthController(
+    UserService userService,
+    RefreshTokenService refreshTokenService, // ✅ 新增
+    ILogger<AuthController> logger)
+{
+    _userService = userService;
+    _refreshTokenService = refreshTokenService;
+    _logger = logger;
+}
+```
+
+**更新 Login 方法：**
+
+找到现有的 `Login` 方法，在返回 AccessToken 的同时，把 RefreshToken 写入 Cookie：
+
+```csharp
+[HttpPost("login")]
+// 使用限流
+// ✅ 登录：每IP每分钟10次
+[EnableRateLimiting(RateLimitPolicies.Login)]
+public async Task<IActionResult> Login(
+    [FromBody] LoginRequest request,
+    CancellationToken cancellationToken)
+{
+    var result = await _userService.LoginAsync(request.Email, request.Password, cancellationToken);
+
+    // ✅ 新增：生成 RefreshToken 并写入 HttpOnly Cookie
+
+    var refreshToken=await _refreshTokenService.CreateRefreshTokenAsync(result.User.Id, cancellationToken);
+    SetRefreshTokenCookie(refreshToken.Token, refreshToken.ExpiresAt);
+
+    // 登录成功返回 200 OK（不是 201，登录不是"创建资源"）
+    return Ok(ApiResponse<LoginResponse>.Ok(result, "Login successful."));
+}
+```
+
+#### 6.3 新增 Refresh 接口
+
+在 `AuthController` 里加入：
+
+```csharp
+/// <summary>
+/// 用 RefreshToken 换取新的 AccessToken
+/// RefreshToken 从 HttpOnly Cookie 里自动读取，不需要前端手动传
+/// </summary>
+[HttpPost("refresh")]
+[EnableRateLimiting(RateLimitPolicies.Write)]
+public async Task<IActionResult> Refresh(CancellationToken cancellationToken)
+{
+    // 从 Cookie 里读取 RefreshToken
+    // 前端不需要传任何 Body，浏览器自动携带 Cookie
+    if (!Request.Cookies.TryGetValue("refreshToken", out var token)
+        || string.IsNullOrEmpty(token))
+        return Unauthorized(ApiResponse<object>.Fail("Refresh token not found"));
+
+    var (newAccessToken, newRefreshToken) = await _refreshTokenService
+        .RefreshAsync(token, cancellationToken);
+
+    // 更新 Cookie（新的 RefreshToken 覆盖旧的）
+    SetRefreshTokenCookie(newRefreshToken.Token, newRefreshToken.ExpiresAt);
+
+    var response = new RefreshTokenResponse
+    {
+        AccessToken = newAccessToken
+    };
+
+    return Ok(ApiResponse<RefreshTokenResponse>.Ok(response, "token refreshed"));
+}
+```
+
+#### 6.3 新增 Logout 接口
+
+```csharp
+/// <summary>
+/// 登出：撤销当前设备的 RefreshToken，清除 Cookie
+/// </summary>
+[HttpPost("logout")]
+[EnableRateLimiting(RateLimitPolicies.Write)]
+public async Task<IActionResult> Logout(CancellationToken cancellationToken)
+{
+    // 从 Cookie 里读取 RefreshToken
+    Request.Cookies.TryGetValue("refreshToken", out var token);
+
+    // 撤销 Token（即使 Token 不存在也静默处理）
+    if (!string.IsNullOrEmpty(token)) await _refreshTokenService.RevokeAsync(token, cancellationToken);
+
+    // 清除 Cookie
+    Response.Cookies.Delete("refreshToken", new CookieOptions
+    {
+        Path = "/auth" // Path 必须和设置时一致，否则删不掉
+    });
+
+    return Ok(ApiResponse<object>.Ok("Logged out successfully"));
+}
+```
+
+
+
+### 7. 更新 RateLimitPolicies 常量
+
+打开 `UUcars.API/Configurations/RateLimitPolicies.cs`（或你存放常量的位置）， 确认有以下条目（Step 59 应已有，确认一下）：
+
+```csharp
+public static class RateLimitPolicies
+{
+    public const string Register = "register";
+    public const string Login = "login";
+    public const string ForgotPassword = "forgot-password";
+    public const string ResendVerification = "resend-verification";
+    public const string Browse = "browse";
+    public const string Write = "write";
+}
+```
+
+`/auth/refresh` 和 `/auth/logout` 用 `Write` 策略，无需新增。
+
+
+
+### 8. 注册依赖
+
+打开 `UUcars.API/Program.cs`，在服务注册区域加入：
+
+```csharp
+// ── Refresh Token ──────────────────────────────────
+builder.Services.AddScoped<IRefreshTokenRepository, EfRefreshTokenRepository>();
+builder.Services.AddScoped<RefreshTokenService>();
+```
+
+
+
+### 9. 更新 TokenCleanupService（复用 Hangfire）
+
+Step 60 里已经创建了 `TokenCleanupService`，现在把 RefreshToken 的清理逻辑也加进去：
+
+打开 `UUcars.API/Services/TokenCleanupService.cs`，更新 `CleanExpiredTokensAsync`：
+
+```csharp
+namespace UUcars.API.Services.Hangfire;
+
+using Microsoft.EntityFrameworkCore;
+using Data;
+
+/// <summary>
+///     负责清理数据库里的过期 Token
+///     由 Hangfire 每天凌晨定时调用
+/// </summary>
+public class TokenCleanupService
+{
+    private readonly AppDbContext _context;
+    private readonly ILogger<TokenCleanupService> _logger;
+
+    public TokenCleanupService(AppDbContext context, ILogger<TokenCleanupService> logger)
+    {
+        _context = context;
+        _logger = logger;
+    }
+
+    public async Task CleanExpiredTokensAsync()
+    {
+        var now = DateTime.UtcNow;
+
+        // 清理过期的密码重置 Token
+        // 找出所有 ResetPasswordTokenExpiry 已过期的用户，清空他们的 Token 字段
+        var expiredPasswordResets = await _context.Users
+            .Where(u => u.ResetPasswordTokenExpiry != null
+                        && u.ResetPasswordTokenExpiry < now)
+            .ToListAsync();
+
+        if (expiredPasswordResets.Count > 0)
+        {
+            foreach (var user in expiredPasswordResets)
+            {
+                user.ResetPasswordToken = null;
+                user.ResetPasswordTokenExpiry = null;
+                user.UpdatedAt = now;
+            }
+
+            await _context.SaveChangesAsync();
+
+            _logger.LogInformation(
+                "Cleaned {Count} expired password reset tokens",
+                expiredPasswordResets.Count);
+        }
+
+        else
+        {
+            _logger.LogInformation("No expired password reset tokens found");
+        }
+
+        // ── 清理过期或已撤销的 RefreshToken ──────────────
+        // 使用 EF Core 批量删除（ExecuteDeleteAsync），性能更好
+        // 这里是真正的删除行，而不是清空字段，所以用 Delete
+        var deletedCount = await _context.RefreshTokens
+            .Where(rt => rt.IsRevoked || rt.ExpiresAt < now)
+            .ExecuteDeleteAsync();
+
+        if (deletedCount > 0)
+            _logger.LogInformation(
+                "Cleaned {Count} expired or revoked refresh tokens", deletedCount);
+        else
+            _logger.LogInformation("No expired refresh tokens found");
+    }
+}
+```
+
+
+
+### 10. 前端：Axios 拦截器自动刷新
+
+这是前端这一步的核心工作：实现**无感知的 Token 自动刷新**。
+
+#### 10.1 理解当前前端的认证流程
+
+V2 的 Axios 实例（`src/api/client.ts` ）请求拦截器：
+
+```typescript
+// =============================================
+// 请求拦截器：自动附加 JWT Token
+// =============================================
+// 每次请求发出前，从 localStorage 取出 Token 附加到请求头
+// 这样所有需要认证的接口不需要手动传 Token
+apiClient.interceptors.request.use((config) => {
+  const token = localStorage.getItem("accessToken");
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
+```
+
+和响应拦截器：
+
+```typescript
+// 现有代码（处理 401 / 429 等）
+// =============================================
+// 响应拦截器：统一处理响应和错误
+// =============================================
+apiClient.interceptors.response.use(
+  (response) => {
+    ...
+    }
+
+    return response;
+  },
+  (error: AxiosError) => {
+    // ✅ 处理 429 Too Many Requests
+    ...
+
+    // 处理用户 Token 过期时
+    if (error.response?.status === 401) {
+      localStorage.removeItem("accessToken");
+      // 跳转登录页，带上当前路径方便登录后回跳
+      window.location.href = `/login?redirect=${encodeURIComponent(window.location.pathname)}`;
+      return Promise.reject(new Error("Session expired, please login again"));
+    }
+
+    // 请求失败（HTTP 4xx / 5xx / 网络错误）
+   ...
+  },
+);
+```
+
+问题：
+
+- 每次请求，都是从从 localStorage 直接读toke。accessToken 短期有效（60分钟），持久化意义不大，且存在 localStorage 里有 XSS 风险（JS 可以读取）
+- 响应拦截器里，收到 401 就立即跳登录页，没有尝试用 RefreshToken 刷新。
+
+更新思路：
+
+- accessToken不再持久化到localStorage， 而是每次请确实，直接从 authStore 读取 （authStore 是唯一数据源，拦截器刷新后也会更新 authStore）
+- 响应拦截器里，对401的响应进行refresh token的处理，换取新的access token
+
+#### 10.2 更新 authStore
+
+打开 `src/store/authStore.ts`，需要加入 `setAccessToken` 方法（供拦截器更新 Token 用）：
+
+```typescript
+import { create } from "zustand";
+import { persist } from "zustand/middleware";
+import type { User } from "@/types";
+
+interface AuthState {
+  user: User | null;
+  accessToken: string | null;
+
+  // 登录成功后调用：保存用户信息和 Token
+  setAuth: (user: User, token: string) => void;
+
+  // ✅ 新增：只更新 AccessToken（拦截器刷新后调用）
+  // 不影响 user 信息，只替换 Token
+  setAccessToken: (token: string) => void;
+
+  // 退出登录：清除所有状态
+  logout: () => void;
+
+  // 判断当前是否已登录
+  isAuthenticated: () => boolean;
+}
+
+export const useAuthStore = create<AuthState>()(
+  // persist 中间件：把 store 的状态同步到 localStorage
+  // 页面刷新后状态不会丢失，用户不需要重新登录
+  persist(
+    (set, get) => ({
+      user: null,
+      accessToken: null,
+
+      setAuth: (user, token) => {
+        // ✅ 移除：不再把 accessToken 单独存 localStorage
+        // 原因：accessToken 短期有效（60分钟），持久化意义不大
+        // 且存在 localStorage 里有 XSS 风险（JS 可以读取）
+        // 刷新页面后通过 /auth/refresh 重新获取，RefreshToken 在 HttpOnly Cookie 里
+        set({ user, accessToken: token });
+      },
+
+      // ✅ 新增：拦截器刷新成功后调用，只更新 Token
+      setAccessToken: (token) => {
+        set({ accessToken: token });
+      },
+
+      clearAuth: () => {
+        // ✅ 移除：不再需要单独清 localStorage 的 accessToken
+        // persist 中间件会自动把 null 同步到 localStorage
+        set({ user: null, accessToken: null });
+      },
+
+      isAuthenticated: () => {
+        return get().accessToken !== null && get().user !== null;
+      },
+    }),
+    {
+      name: "auth-storage", // localStorage 里的 key 名称
+      // ✅ 更新：只持久化 user，不持久化 accessToken
+      // 原因：
+      // 1. accessToken 60分钟过期，持久化后刷新页面拿到的可能是过期 Token
+      // 2. 存 localStorage 有 XSS 风险
+      // 3. 刷新页面时拦截器会自动用 RefreshToken（HttpOnly Cookie）换新 AccessToken
+      //    用户无感知，不需要持久化 accessToken
+      partialize: (state) => ({
+        user: state.user,
+      }),
+    },
+  ),
+);
+
+```
+
+> **等一下：`partialize` 把 accessToken 排除在 localStorage 之外？**
+>
+> 是的。这是一个权衡：
+>
+> - 如果把 accessToken 存 localStorage → 刷新页面后立即可用，但有 XSS 风险
+> - 如果不存 → 刷新页面后 accessToken 是 null，需要先调 /auth/refresh 重新获取
+>
+> 当用户刷新页面时：
+>
+> 1. authStore 里 accessToken = null（没有存 localStorage）
+> 2. 第一个 API 请求发出 → 收到 401
+> 3. 拦截器触发 → 调 /auth/refresh（Cookie 里的 RefreshToken 还在）
+> 4. 刷新成功 → 拿到新 AccessToken → 重试原请求
+> 5. 用户无感知
+>
+> 这个流程在网络好的情况下只有几十毫秒的额外延迟，但安全性大幅提升。 这是现代 SPA 认证的推荐做法。
+
+#### 10.3 更新 Axios 拦截器
+
+打开 `src/api/client.ts`，**完整替换**响应拦截器：
+
+```typescript
+// src/api/client.ts
+import axios, { AxiosError, type InternalAxiosRequestConfig } from "axios";
+import type { ApiResponse } from "@/types";
+import { toast } from "sonner";
+import { useAuthStore } from "@/stores/authStore";
+
+// 创建 Axios 实例
+// 所有请求都基于这个实例，统一配置 baseURL 和超时
+const apiClient = axios.create({
+  baseURL: import.meta.env.VITE_API_BASE_URL,
+  timeout: 10000, // 10秒超时
+  headers: {
+    "Content-Type": "application/json",
+  },
+  // ✅ 新增：允许跨域请求携带 Cookie
+  // 原因：RefreshToken 存在 HttpOnly Cookie 里
+  // withCredentials=true 告诉浏览器在跨域请求时携带 Cookie
+  // 需要后端 CORS 同步配置 AllowCredentials()
+  withCredentials: true,
+});
+
+// =============================================
+// 请求拦截器：自动附加 JWT Token
+// =============================================
+// 每次请求发出前，从 localStorage 取出 Token 附加到请求头
+// 这样所有需要认证的接口不需要手动传 Token
+apiClient.interceptors.request.use((config) => {
+  // ✅ 从 authStore 读取 accessToken
+  // 不再从 localStorage 直接读
+  // 原因：accessToken 不再持久化到 localStorage
+  // authStore 是唯一数据源，拦截器刷新后也会更新 authStore
+  const token = useAuthStore.getState().accessToken;
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
+// =============================================
+// 响应拦截器：统一处理响应和错误
+// =============================================
+apiClient.interceptors.response.use(
+  (response) => {
+    // 204 No Content：没有响应体（DELETE 接口），直接放行
+    if (response.status === 204) {
+      return response;
+    }
+
+    // 请求成功（HTTP 2xx）
+    // 后端所有接口都用 ApiResponse<T> 包装
+    // 直接解包返回 data 字段，调用方不需要每次都写 response.data.data
+    const apiResponse = response.data as ApiResponse<unknown>;
+
+    if (!apiResponse.success) {
+      // HTTP 状态码是 2xx，但业务逻辑失败（success: false）
+      // 把业务错误信息包装成 Error 抛出，调用方统一用 catch 处理
+      return Promise.reject(new Error(apiResponse.message ?? "Request failed"));
+    }
+
+    return response;
+  },
+
+  async (error: AxiosError) => {
+    // error.config 包含了失败请求的完整配置（url、method、headers等）
+    // 用 as 做类型断言，告诉 TypeScript 这个对象的类型
+    // & { _retry?: boolean } 是交叉类型：在 Axios 原有类型基础上，
+    // 扩展一个我们自己加的 _retry 字段
+    // 原因：InternalAxiosRequestConfig 里没有 _retry，
+    // 不声明的话 TypeScript 会报错"该属性不存在"
+    const originalRequest = error.config as InternalAxiosRequestConfig & {
+      // _retry 标志：防止无限重试
+      // 第一次 401 → _retry 为 undefined（falsy）→ 进入刷新逻辑 → 设为 true
+      // 刷新后重试原请求 → 如果还是 401 → _retry 为 true → 跳过刷新 → 走普通错误处理
+      _retry?: boolean;
+    };
+
+    // =============================================
+    // 处理 401 Token 过期：自动刷新后重试
+    // =============================================
+    if (error.response?.status === 401 && !originalRequest._retry) {
+      // 标记这个请求已经尝试过刷新
+      // 防止刷新后重试的请求再次触发刷新（死循环）
+      originalRequest._retry = true;
+
+      try {
+        // 调用刷新接口
+        // 用原生 axios 而不是 apiClient 的原因：
+        // 避免触发 apiClient 自己的拦截器（否则刷新失败又触发401，又来刷新，死循环）
+        // withCredentials：携带 HttpOnly Cookie 里的 RefreshToken
+        // RefreshToken 由浏览器自动附加，前端 JS 不需要（也无法）手动读取
+        const response = await axios.post(
+          `${import.meta.env.VITE_API_BASE_URL}/auth/refresh`,
+          null,
+          { withCredentials: true },
+        );
+
+        // 从响应里取出新的 AccessToken
+        // 后端返回格式：{ success: true, data: { accessToken: "..." } }
+        const newAccessToken = response.data.data.accessToken;
+
+        // 把新 Token 存入 authStore（内存），供后续请求使用
+        // 不存 localStorage 的原因：AccessToken 短期有效，持久化意义不大
+        // 且 localStorage 可被 JS 读取，有 XSS 风险
+        useAuthStore.getState().setAccessToken(newAccessToken);
+
+        // 用新 Token 更新原请求的 Authorization 头，然后重新发送
+        // 对调用方完全透明：await apiClient.get("/cars") 最终正常返回数据
+        // 用户不知道中间发生了一次 Token 刷新
+        originalRequest.headers.Authorization = `Bearer ${newAccessToken}`;
+        return apiClient(originalRequest);
+      } catch {
+        // 刷新失败：说明 RefreshToken 也过期了或被撤销（比如已在其他设备登出）
+        // 无法继续保持登录状态，必须让用户重新登录
+
+        // 清除前端的用户状态（authStore + localStorage 里的 user）
+        useAuthStore.getState().clearAuth();
+
+        // 跳转登录页
+        // 带上当前路径（redirect 参数），登录成功后可以回到原来的页面
+        window.location.href = `/login?redirect=${encodeURIComponent(window.location.pathname)}`;
+
+        return Promise.reject(new Error("Session expired, please login again"));
+      }
+    }
+
+    // =============================================
+    // 处理 429 Too Many Requests（原有逻辑不变）
+    // =============================================
+    if (error.response?.status === 429) {
+      // 读取 Retry-After 响应头（后端返回的秒数）
+      const retryAfterHeader = error.response.headers["retry-after"];
+      const seconds = retryAfterHeader ? parseInt(retryAfterHeader, 10) : 60; // 没有 Retry-After 头就默认提示60秒
+
+      // 用 sonner toast 给用户友好提示
+      toast.error(
+        `Too many requests. Please wait ${seconds} seconds before trying again.`,
+        { duration: 5000 },
+      );
+
+      // 返回一个标准格式的错误，让调用方知道是限流问题
+      return Promise.reject(
+        new Error(`Rate limited. Retry after ${seconds}s.`),
+      );
+    }
+
+    // =============================================
+    // 处理其他错误（原有逻辑不变）
+    // =============================================
+    if (error.response) {
+      // 请求失败（HTTP 4xx / 5xx / 网络错误）
+      // 服务端返回了错误响应
+      const apiResponse = error.response.data as ApiResponse<unknown>;
+      const message = apiResponse?.message ?? "An error occurred";
+      return Promise.reject(new Error(message));
+    }
+
+    if (error.code === "ECONNABORTED") {
+      return Promise.reject(new Error("Request timeout, please try again"));
+    }
+
+    // 网络错误（断网等）
+    return Promise.reject(
+      new Error("Network error, please check your connection"),
+    );
+  },
+);
+
+export default apiClient;
+
+```
+
+#### 10.4 更新登录逻辑
+
+登录成功后，后端会在 Set-Cookie 里设置 RefreshToken。 前端只需要存 AccessToken 和用户信息，不需要处理 Cookie。
+
+打开登录逻辑（ `LoginPage.tsx`  Hook 里）：
+
+登录逻辑不变
+
+```typescript
+const onSubmit = async (data: LoginForm) => {
+    // 清除上次的服务端错误
+    setServerError(null);
+
+    try {
+      // 调用登录 API
+      const result = await authApi.login(data);
+
+      // 登录成功：把用户信息和 Token 存入 Zustand
+      // setAuth 内部只会把写入 result.user 到 localStorage
+      setAuth(result.user, result.token);
+
+      // 跳转
+      // 有来源页就跳回去，没有的话 Admin 跳管理页、普通用户跳首页
+      ...
+    } catch (error) {
+      ...
+    }
+  };
+```
+
+#### 10.5 更新登出逻辑
+
+登出时需要调后端 `/auth/logout` 接口，让服务端撤销 RefreshToken：
+
+路由表中添加logout路由
+
+```ts
+// src/api/auth.ts
+import apiClient from "./client";
+import type {
+  LoginRequest,
+  LoginResponse,
+  RegisterRequest,
+  User,
+  ApiResponse,
+} from "@/types";
+
+export const authApi = {
+ 
+  ...
+    
+  // 新增logout接口
+  logout: async (): Promise<void> => {
+    await apiClient.post<ApiResponse<void>>("/auth/logout");
+  },
+
+  ...
+};
+
+```
+
+更新logout逻辑 
+
+调用后端接口， 清除后端token
+
+```typescript
+// src/components/Layout.ts
+
+const handleLogout = async () => {
+    try {
+      // 通知后端撤销 RefreshToken
+      // 后端会把数据库里的 IsRevoked 设为 true，并清除 Cookie
+      // 即使这个请求失败（网络问题），前端也要继续登出
+      await authApi.logout();
+    } catch {
+      // 静默处理：不能因为后端失败导致用户无法登出
+    } finally {
+      // 清除前端状态（authStore + localStorage 里的 user）
+      clearAuth();
+      // 关闭移动端菜单
+      setMobileOpen(false);
+      // 跳转首页
+      navigate("/");
+    }
+  };
+```
+
+
+
+### 11. 处理 CORS（允许 Cookie 跨域）
+
+V2 的 CORS 配置需要更新，允许携带 Credentials（Cookie）。
+
+打开 `UUcars.API/Extensions/CorsExtensions.cs`：
+
+```csharp
+namespace UUcars.API.Extensions;
+
+public static class CorsExtensions
+{
+    // CORS 策略名称，在注册和使用时保持一致
+    public const string PolicyName = "UUcarsCorsPolicy";
+
+    public static IServiceCollection AddUUcarsCors(
+        this IServiceCollection services,
+        IConfiguration configuration)
+    {
+        // 从配置文件读取允许的前端地址列表
+        var allowedOrigins = configuration
+            .GetSection("Cors:AllowedOrigins")
+            .Get<string[]>() ?? [];
+
+        services.AddCors(options =>
+        {
+            options.AddPolicy(PolicyName, policy =>
+            {
+                policy
+                    // 只允许配置里指定的域名，不用 AllowAnyOrigin
+                    // 原因：AllowAnyOrigin 表示任何网站都可以调用你的 API，
+                    // 配合 AllowCredentials（允许携带 Cookie）时甚至会报错——
+                    // 浏览器要求：如果允许携带凭证，Origin 不能是通配符
+                    .WithOrigins(allowedOrigins)
+
+                    // 允许所有 HTTP 方法（GET、POST、PUT、DELETE 等）
+                    .AllowAnyMethod()
+
+                    // 允许所有请求头（Content-Type、Authorization 等）
+                    .AllowAnyHeader()
+
+                    // 允许携带凭证（Cookie）
+                    // V3 的 Refresh Token 存在 HttpOnly Cookie 里，需要这个
+                    .AllowCredentials();
+            });
+        });
+
+        return services;
+    }
+}
+```
+
+> **为什么必须加 `AllowCredentials()`？**
+>
+> 浏览器的 CORS 机制：当请求配置了 `withCredentials: true`， 服务端必须在响应头里返回 `Access-Control-Allow-Credentials: true`， 浏览器才会把 Cookie 发出去。
+>
+> `AllowCredentials()` 就是让 ASP.NET Core 自动加这个响应头。 如果不加，Cookie 永远不会被发送，RefreshToken 机制完全失效。
+
+
+
+### 12. 本地验证
+
+#### 12.1 启动服务
+
+```bash
+# 确保 SQL Server 运行
+docker-compose up -d sqlserver
+
+# 启动 API
+cd UUcars.API
+dotnet run
+
+# 启动前端
+cd uucars-web
+npm run dev
+```
+
+#### 12.2 验证登录后 Cookie 被设置
+
+1. 用浏览器前端登录
+
+2. 打开 DevTools → Application → Cookies → `http://localhost:5173`
+
+3. 应该看到 
+
+    ```
+    refreshToken
+    ```
+
+     Cookie：
+
+    - `HttpOnly`：✅（值显示为 `(HttpOnly)` 或不可读）
+    - `Path`：`/auth`
+    - 有过期时间（7天后）
+
+#### 12.3 验证 Token 自动刷新
+
+模拟 AccessToken 过期的方法：
+
+**方法一（快速）：** 临时把 JWT 有效期改为 10 秒，等待过期后操作页面，观察拦截器是否自动刷新。
+
+```csharp
+// 临时修改 JwtOptions 或 JwtTokenGenerator，把 ExpiresAt 改为 10 秒
+// 验证完成后改回 60 分钟
+```
+
+**方法二（精确）：** 在 DevTools Console 里手动清除 accessToken：
+
+```javascript
+// 注入一个过期的假 Token，触发 401
+const store = JSON.parse(localStorage.getItem('auth-storage'))
+// 直接修改内存里的 store（需要找到对应的 zustand store）
+```
+
+**方法三（最简单）：** 在 Network 面板里观察正常使用时的请求序列：
+
+1. 登录
+2. 浏览车辆列表（应该有 `GET /cars` 请求，正常 200）
+3. 在 Hangfire Dashboard 里手动删除刚才创建的 RefreshToken（模拟 Token 作废）
+4. 再次操作 → 观察是否出现 `/auth/refresh` 请求 → 最终失败跳转登录页
+
+#### 12.4 验证 Token 轮换
+
+1. 登录
+2. 等 AccessToken 快过期（或临时设短有效期）
+3. 操作页面触发自动刷新
+4. 用 Scalar 或 SQL 客户端查询 `RefreshTokens` 表
+5. 应该看到：旧 Token `IsRevoked = 1`，新 Token `IsRevoked = 0`
+
+#### 12.5 验证登出
+
+1. 点击登出按钮
+2. 查看 DevTools Network：应该有 `POST /auth/logout` 请求
+3. Cookie 被清除（DevTools → Application → Cookies → refreshToken 消失）
+4. 再次用旧的 refreshToken 调 `/auth/refresh` → 应该收到 401
+
+
+
+### 13. 编译和测试
+
+```bash
+dotnet build
+dotnet test
+```
+
+如果有单元测试需要更新（`AuthController` 或 `UserService` 相关）， 检查测试里的依赖注入是否需要加入 `RefreshTokenService`。
+
+集成测试（`Testcontainers`）通常不需要修改—— 登录接口的集成测试只验证 AccessToken 的返回， RefreshToken 的 Cookie 是额外的，不影响已有断言。
+
+
+
+#### 14. Git 提交
+
+```bash
+git add .
+git commit -m "feat: Refresh Token mechanism with token rotation and HttpOnly Cookie"
+git push origin feature/v3-refresh-token
+
+# 合并回 develop
+git checkout develop
+git merge --no-ff feature/v3-refresh-token \
+  -m "merge: feature/v3-refresh-token into develop"
+git push origin develop
+
+# 删除功能分支
+git branch -d feature/v3-refresh-token
+git push origin --delete feature/v3-refresh-token
+```
+
+
+
+#### Step 61 完成状态
+
+```
+知识点：
+✅ 理解 AccessToken 和 RefreshToken 各自的职责和存储位置
+✅ 理解 HttpOnly Cookie 的安全意义（防 XSS 读取 RefreshToken）
+✅ 理解 Cookie 的完整安全属性（HttpOnly/Secure/SameSite/Path）
+✅ 理解 Token 轮换（Rotation）的安全价值
+✅ 理解已撤销 Token 被重复使用时的安全响应（撤销所有 Token）
+✅ 理解 Axios 请求队列处理（多并发 401 只触发一次刷新）
+✅ 理解 withCredentials=true 和 AllowCredentials() 的关联
+✅ 理解 partialize 把 accessToken 排除在 localStorage 之外的原因
+
+实现：
+✅ RefreshToken 实体 + EF Core 配置 + 复合索引
+✅ Migration: AddRefreshTokensTable
+✅ IRefreshTokenRepository + EfRefreshTokenRepository
+✅ RefreshTokenService（创建/刷新/撤销，含 Token 轮换逻辑）
+✅ GenerateSecureToken（RandomNumberGenerator，密码学安全）
+✅ AuthController：Login 写 Cookie + Refresh 接口 + Logout 接口
+✅ SetRefreshTokenCookie 私有方法（开发/生产环境 Secure 属性判断）
+✅ TokenCleanupService 更新（加入 RefreshToken 清理）
+✅ Axios 拦截器完整实现（isRefreshing 标志 + failedQueue 队列）
+✅ authStore 更新（setAccessToken 方法 + partialize 排除 accessToken）
+✅ CORS 更新（AllowCredentials）
+✅ 本地验证：Cookie 设置、自动刷新、Token 轮换、登出撤销
 ✅ dotnet build + dotnet test 通过
 ✅ Git commit + 合并回 develop 完成
 ```

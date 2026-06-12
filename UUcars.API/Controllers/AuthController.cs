@@ -13,10 +13,12 @@ namespace UUcars.API.Controllers;
 public class AuthController : ControllerBase
 {
     private readonly UserService _userService;
+    private readonly RefreshTokenService _refreshTokenService;
 
-    public AuthController(UserService userService)
+    public AuthController(UserService userService, RefreshTokenService refreshTokenService)
     {
         _userService = userService;
+        _refreshTokenService = refreshTokenService;
     }
 
     [HttpPost("register")]
@@ -48,6 +50,11 @@ public class AuthController : ControllerBase
         CancellationToken cancellationToken)
     {
         var result = await _userService.LoginAsync(request.Email, request.Password, cancellationToken);
+
+        // ✅ 新增：生成 RefreshToken 并写入 HttpOnly Cookie
+
+        var refreshToken = await _refreshTokenService.CreateRefreshTokenAsync(result.User.Id, cancellationToken);
+        SetRefreshTokenCookie(refreshToken.Token, refreshToken.ExpiresAt);
 
         // 登录成功返回 200 OK（不是 201，登录不是"创建资源"）
         return Ok(ApiResponse<LoginResponse>.Ok(result, "Login successful."));
@@ -110,5 +117,82 @@ public class AuthController : ControllerBase
         await _userService.ResetPasswordAsync(request.Token, request.NewPassword, cancellationToken);
         return Ok(ApiResponse<object>.Ok(null!,
             "Password has been reset successfully. You can now log in with your new password."));
+    }
+
+
+    /// <summary>
+    /// 用 RefreshToken 换取新的 AccessToken
+    /// RefreshToken 从 HttpOnly Cookie 里自动读取，不需要前端手动传
+    /// </summary>
+    [HttpPost("refresh")]
+    [EnableRateLimiting(RateLimitPolicies.Write)]
+    public async Task<IActionResult> Refresh(CancellationToken cancellationToken)
+    {
+        // 从 Cookie 里读取 RefreshToken
+        // 前端不需要传任何 Body，浏览器自动携带 Cookie
+        if (!Request.Cookies.TryGetValue("refreshToken", out var token)
+            || string.IsNullOrEmpty(token))
+            return Unauthorized(ApiResponse<object>.Fail("Refresh token not found"));
+
+        var (newAccessToken, newRefreshToken) = await _refreshTokenService
+            .RefreshAsync(token, cancellationToken);
+
+        // 更新 Cookie（新的 RefreshToken 覆盖旧的）
+        SetRefreshTokenCookie(newRefreshToken.Token, newRefreshToken.ExpiresAt);
+
+        var response = new RefreshTokenResponse
+        {
+            AccessToken = newAccessToken
+        };
+
+        return Ok(ApiResponse<RefreshTokenResponse>.Ok(response, "token refreshed"));
+    }
+
+
+    /// <summary>
+    /// 登出：撤销当前设备的 RefreshToken，清除 Cookie
+    /// </summary>
+    [HttpPost("logout")]
+    [EnableRateLimiting(RateLimitPolicies.Write)]
+    public async Task<IActionResult> Logout(CancellationToken cancellationToken)
+    {
+        // 从 Cookie 里读取 RefreshToken
+        Request.Cookies.TryGetValue("refreshToken", out var token);
+
+        // 撤销 Token（即使 Token 不存在也静默处理）
+        if (!string.IsNullOrEmpty(token)) await _refreshTokenService.RevokeAsync(token, cancellationToken);
+
+        // 清除 Cookie
+        Response.Cookies.Delete("refreshToken", new CookieOptions
+        {
+            Path = "/auth" // Path 必须和设置时一致，否则删不掉
+        });
+
+        return Ok(ApiResponse<object>.Ok("Logged out successfully"));
+    }
+
+    /// <summary>
+    /// 把 RefreshToken 写入 HttpOnly Cookie
+    /// 提取为私有方法：Login 和 Refresh 都需要调用
+    /// </summary>
+    private void SetRefreshTokenCookie(string token, DateTime expiresAt)
+    {
+        var cookieOptions = new CookieOptions
+        {
+            HttpOnly = true, // JS 无法读取
+            Secure = true, // 只通过 HTTPS 传输
+            SameSite = SameSiteMode.Strict, // 防 CSRF
+            Expires = expiresAt, // 和 RefreshToken 过期时间一致
+            Path = "/auth" // 只在 /auth 路径下发送 Cookie，减少暴露范围
+        };
+
+        // 开发环境：Secure=false（本地没有 HTTPS）
+        // 通过环境变量判断，避免本地开发时 Cookie 无法设置
+        if (HttpContext.RequestServices
+            .GetRequiredService<IWebHostEnvironment>()
+            .IsDevelopment())
+            cookieOptions.Secure = false;
+
+        Response.Cookies.Append("refreshToken", token, cookieOptions);
     }
 }
