@@ -124,6 +124,7 @@ public class AuthController : ControllerBase
     /// 用 RefreshToken 换取新的 AccessToken
     /// RefreshToken 从 HttpOnly Cookie 里自动读取，不需要前端手动传
     /// </summary>
+    // POST /auth/refresh
     [HttpPost("refresh")]
     [EnableRateLimiting(RateLimitPolicies.Write)]
     public async Task<IActionResult> Refresh(CancellationToken cancellationToken)
@@ -165,7 +166,7 @@ public class AuthController : ControllerBase
         // 清除 Cookie
         Response.Cookies.Delete("refreshToken", new CookieOptions
         {
-            Path = "/auth" // Path 必须和设置时一致，否则删不掉
+            Path = "/" // 和 SetRefreshTokenCookie 里的 Path 保持一致，否则删不掉
         });
 
         return Ok(ApiResponse<object>.Ok("Logged out successfully"));
@@ -183,7 +184,7 @@ public class AuthController : ControllerBase
             Secure = true, // 只通过 HTTPS 传输
             SameSite = SameSiteMode.Strict, // 防 CSRF
             Expires = expiresAt, // 和 RefreshToken 过期时间一致
-            Path = "/auth" // 只在 /auth 路径下发送 Cookie，减少暴露范围
+            Path = "/" // 全站发送，避免非/auth路径下无法携带Cookie
         };
 
         // 开发环境：Secure=false（本地没有 HTTPS）

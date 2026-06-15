@@ -5538,7 +5538,7 @@ public class AuthController : ControllerBase
             Secure = true,       // 只通过 HTTPS 传输
             SameSite = SameSiteMode.Strict, // 防 CSRF
             Expires = expiresAt, // 和 RefreshToken 过期时间一致
-            Path = "/auth"       // 只在 /auth 路径下发送 Cookie，减少暴露范围
+            Path = "/"           // 全站发送，避免非/auth路径下无法携带Cookie
         };
 
         // 开发环境：Secure=false（本地没有 HTTPS）
@@ -5667,7 +5667,7 @@ public async Task<IActionResult> Logout(CancellationToken cancellationToken)
     // 清除 Cookie
     Response.Cookies.Delete("refreshToken", new CookieOptions
     {
-        Path = "/auth" // Path 必须和设置时一致，否则删不掉
+        Path = "/" // 和 SetRefreshTokenCookie 里的 Path 保持一致，否则删不掉
     });
 
     return Ok(ApiResponse<object>.Ok("Logged out successfully"));
@@ -6265,11 +6265,254 @@ public static class CorsExtensions
 >
 > `AllowCredentials()` 就是让 ASP.NET Core 自动加这个响应头。 如果不加，Cookie 永远不会被发送，RefreshToken 机制完全失效。
 
+### 12. 应用初始化时静默刷新（auth state rehydration）
+
+#### 12.1 有什么问题?
+
+当前的方案中， accessToken只存内存（zustand - authStore，不persist），refreshToken存httpOnly cookie，localStorage只persist user信息。
+
+刷新页面后会发生：
+
+- zustand内存清空 → `accessToken = null`
+- localStorage里的`user`还在（zustand persist恢复）
+- refreshToken（cookie）还在
+
+此时`isAuthenticated()`检查`accessToken !== null && user !== null`，因为`accessToken`是`null`，返回`false` → UI显示未登录。
+
+#### 12.2 如何导致的？
+
+理论上401拦截器可以兜底：发请求→401→自动refresh→重试成功。
+
+但实际发现刷新后未登录，原因是：
+
+1. 首页是公开路由（不经过`ProtectedRoute`），即使`isAuthenticated()`为`false`也不会跳转登录页，只是UI显示未登录样式
+2. 首页本身可能不发任何需要鉴权的请求，所以401压根没机会触发
+3. 没有任何代码在应用启动时主动调用`/auth/refresh`
+
+也就是说：`accessToken`一旦变`null`，没有任何机制把它变回非null，除非用户偶然点击了一个需要鉴权的页面/操作，触发401→refresh的被动恢复链路。
+
+#### 12.3 错误方案
+
+通过把 `authStore` 里的 `isAuthenticated()`判断修改
+
+```ts
+isAuthenticated: () => {
+        return get().user !== null;
+      },
+```
+
+是否授权只依赖local storage里有没有user数据（登陆过），这样虽然可以解决登录后刷新页面是 渲染为已经登录的假象， 但和实际鉴权状态（accessToken是否有效）脱钩：
+
+- `isAuthenticated()`语义从"现在能直接发请求"变成了"曾经登录过"
+- 代价：刷新页面后，**第一个需要鉴权的请求必然先401再重试**，多了一次必然发生的失败往返，影响体验
+- 隐患：未来任何依赖`isAuthenticated()===true`来判断"可以直接用accessToken"的代码都可能出错
+
+#### 12.4 最终方案：应用启动时主动refresh
+
+会话恢复（session restoration）或 **初始化时静默刷新（auth state rehydration）**。
+
+核心思路：在`accessToken`被任何地方检查之前，先用refreshToken（cookie）主动换一次新的accessToken。
+
+比如，刷新页面后，先主动发送一次refreshToken，在渲染页面。
+
+##### 修改**`authStore.ts`**
+
+- 新增`isInitializing`状态（初始为`true`）
+
+    这个状态是必须的，否则 `ProtectedRoute` 在 初始化 完成之前就渲染了，会出现短暂的"未登录→已登录"闪烁。
+
+- 新增 `initialize()`初始化方法：
+
+    - 检查persist恢复的`user`是否存在
+    - 存在 → 调用`/auth/refresh`（`withCredentials: true`带上cookie），成功则`setAccessToken`，失败则清空`user`
+    - 不存在 → 直接结束
+    - 最终都将`isInitializing`置为`false`
+
+- `isAuthenticated()同时检查`accessToken !== null && user !== null`（语义恢复正确）
+
+```ts
+interface AuthState {
+  ...
+  
+  // 新增：是否在做启动时的token恢复
+  isInitializing: boolean;
+
+  ...
+
+  // 新增：应用启动时调用，尝试用 refresh token 恢复登录态
+  initialize: () => Promise<void>;
+}
+
+export const useAuthStore = create<AuthState>()(
+  // persist 中间件：把 store 的状态同步到 localStorage
+  // 页面刷新后状态不会丢失，用户不需要重新登录
+  persist(
+    (set, get) => ({
+      user: null,
+      accessToken: null,
+      isInitializing: true, // 初始为true，应用启动时正在恢复
+
+      ...
+
+      initialize: async () => {
+        const { user } = get();
+
+        // localStorage里没有user信息 → 从未登录过，无需refresh
+        if (!user) {
+          set({ isInitializing: false });
+          return;
+        }
+
+        // 有user信息 → 尝试用 refresh token (cookie) 换新的 access token
+        try {
+          const response = await axios.post(
+            `${import.meta.env.VITE_API_BASE_URL}/auth/refresh`,
+            null,
+            { withCredentials: true },
+          );
+          const newAccessToken = response.data.data.accessToken;
+          set({ accessToken: newAccessToken, isInitializing: false });
+        } catch {
+          // refresh token也失效了 → 清除登录态
+          set({ user: null, accessToken: null, isInitializing: false });
+        }
+      },
+    }),
+    {
+      name: "auth-storage", // localStorage 里的 key 名称
+      partialize: (state) => ({
+        user: state.user,
+      }),
+    },
+  ),
+);
+
+```
+
+注意：调用端口时用原生 `axios` 而不是 `apiClient` 
+
+```typescript
+const response = await axios.post(
+  `${import.meta.env.VITE_API_BASE_URL}/auth/refresh`,
+  null,
+  { withCredentials: true }
+);
+```
+
+正`initialize()` 在 `apiClient` 拦截器之外运行，用原生 `axios` 避免循环触发拦截器。和拦截器里的刷新保持一致的写法。
+
+##### **新建`AuthInitializer`组件**
+
+- `useEffect`中调用`initialize()`
+- `isInitializing`为`true`时渲染loading占位
+- 为`false`时渲染`children`（即整个路由树）
+
+在 `RouterProvider` 渲染之前完成初始化，确保所有路由组件（包括 `ProtectedRoute`）看到的都是已经恢复好的认证状态。
+
+```tsx
+import { useEffect } from "react";
+import { useAuthStore } from "@/stores/authStore";
+
+export default function AuthInitializer({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  const initialize = useAuthStore((state) => state.initialize);
+  const isInitializing = useAuthStore((state) => state.isInitializing);
+
+  useEffect(() => {
+    initialize();
+  }, [initialize]);
+
+  if (isInitializing) {
+    return (
+      <div
+        className="flex h-screen w-full items-center justify-center"
+        style={{ backgroundColor: "var(--color-bg)" }}
+      >
+        <div className="flex items-center gap-2">
+          <svg className="h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none">
+            <circle
+              className="opacity-25"
+              cx="12"
+              cy="12"
+              r="10"
+              stroke="var(--color-accent)"
+              strokeWidth="4"
+            />
+            <path
+              className="opacity-75"
+              fill="var(--color-accent)"
+              d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
+            />
+          </svg>
+          <span
+            className="text-sm"
+            style={{ color: "var(--color-text-muted)" }}
+          >
+            Loading...
+          </span>
+        </div>
+      </div>
+    );
+  }
+
+  return <>{children}</>;
+}
 
 
-### 12. 本地验证
+```
 
-#### 12.1 启动服务
+
+
+##### 修改**`main.tsx`**
+
+- 用`AuthInitializer`包裹`RouterProvider`
+- `App.tsx`是死代码（main.tsx直接渲染router，未引用App.tsx），可删除或忽略
+
+```tsx
+...
+
+createRoot(document.getElementById("root")!).render(
+  <StrictMode>
+    <QueryClientProvider client={queryClient}>
+        
+      <AuthInitializer>
+        <RouterProvider router={router} />
+      </AuthInitializer>
+        
+ 
+      <Toaster position="bottom-right" />
+    </QueryClientProvider>
+  </StrictMode>,
+);
+
+```
+
+为什么这样组织
+
+- `AuthInitializer`在`RouterProvider`渲染**之前**先跑`initialize()`,确保`ProtectedRoute`等组件被渲染时,`accessToken`已经恢复完毕(或确认无法恢复)。
+- `Toaster`放在`AuthInitializer`外面,这样初始化期间loading画面也能正常弹toast(虽然这个场景一般不会触发)。
+
+**总结：**
+
+```
+持久化 accessToken（方案A）：
+  优点：实现简单，不需要 AuthInitializer，不需要 Loading 状态
+  缺点：accessToken 在 localStorage 里，有 XSS 风险（理论上）
+
+不持久化 + 静默刷新（方案B，你现在的）：
+  优点：accessToken 只在内存，安全性更高
+  缺点：多了 AuthInitializer 组件，每次刷新页面多一次网络请求
+        需要处理 Loading 状态
+```
+
+
+
+### 13. 本地验证
+
+#### 13.1 启动服务
 
 ```bash
 # 确保 SQL Server 运行
@@ -6284,7 +6527,7 @@ cd uucars-web
 npm run dev
 ```
 
-#### 12.2 验证登录后 Cookie 被设置
+#### 13.2 验证登录后 Cookie 被设置
 
 1. 用浏览器前端登录
 
@@ -6302,7 +6545,7 @@ npm run dev
     - `Path`：`/auth`
     - 有过期时间（7天后）
 
-#### 12.3 验证 Token 自动刷新
+#### 13.3 验证 Token 自动刷新
 
 模拟 AccessToken 过期的方法：
 
@@ -6328,7 +6571,7 @@ const store = JSON.parse(localStorage.getItem('auth-storage'))
 3. 在 Hangfire Dashboard 里手动删除刚才创建的 RefreshToken（模拟 Token 作废）
 4. 再次操作 → 观察是否出现 `/auth/refresh` 请求 → 最终失败跳转登录页
 
-#### 12.4 验证 Token 轮换
+#### 13.4 验证 Token 轮换
 
 1. 登录
 2. 等 AccessToken 快过期（或临时设短有效期）
@@ -6336,7 +6579,7 @@ const store = JSON.parse(localStorage.getItem('auth-storage'))
 4. 用 Scalar 或 SQL 客户端查询 `RefreshTokens` 表
 5. 应该看到：旧 Token `IsRevoked = 1`，新 Token `IsRevoked = 0`
 
-#### 12.5 验证登出
+#### 13.5 验证登出
 
 1. 点击登出按钮
 2. 查看 DevTools Network：应该有 `POST /auth/logout` 请求
@@ -6345,7 +6588,7 @@ const store = JSON.parse(localStorage.getItem('auth-storage'))
 
 
 
-### 13. 编译和测试
+### 14. 编译和测试
 
 ```bash
 dotnet build
@@ -6358,7 +6601,7 @@ dotnet test
 
 
 
-#### 14. Git 提交
+#### 15. Git 提交
 
 ```bash
 git add .
@@ -6401,9 +6644,11 @@ git push origin --delete feature/v3-refresh-token
 ✅ SetRefreshTokenCookie 私有方法（开发/生产环境 Secure 属性判断）
 ✅ TokenCleanupService 更新（加入 RefreshToken 清理）
 ✅ Axios 拦截器完整实现（isRefreshing 标志 + failedQueue 队列）
-✅ authStore 更新（setAccessToken 方法 + partialize 排除 accessToken）
+✅ authStore 更新（setAccessToken 方法 + partialize 排除 accessTtoken
 ✅ CORS 更新（AllowCredentials）
+✅ 实现应用初始化时静默刷新（auth state rehydration）
 ✅ 本地验证：Cookie 设置、自动刷新、Token 轮换、登出撤销
 ✅ dotnet build + dotnet test 通过
 ✅ Git commit + 合并回 develop 完成
 ```
+

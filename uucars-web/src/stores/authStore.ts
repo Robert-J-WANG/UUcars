@@ -1,10 +1,14 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import type { User } from "@/types";
+import axios from "axios";
 
 interface AuthState {
   user: User | null;
   accessToken: string | null;
+
+  // 新增：是否在做启动时的token恢复
+  isInitializing: boolean;
 
   // 登录成功后调用：保存用户信息和 Token
   setAuth: (user: User, token: string) => void;
@@ -18,6 +22,9 @@ interface AuthState {
 
   // 判断当前是否已登录
   isAuthenticated: () => boolean;
+
+  // 新增：应用启动时调用，尝试用 refresh token 恢复登录态
+  initialize: () => Promise<void>;
 }
 
 export const useAuthStore = create<AuthState>()(
@@ -27,6 +34,7 @@ export const useAuthStore = create<AuthState>()(
     (set, get) => ({
       user: null,
       accessToken: null,
+      isInitializing: true, // 初始为true，应用启动时正在恢复
 
       setAuth: (user, token) => {
         // ✅ 移除：不再把 accessToken 单独存 localStorage
@@ -49,6 +57,30 @@ export const useAuthStore = create<AuthState>()(
 
       isAuthenticated: () => {
         return get().accessToken !== null && get().user !== null;
+      },
+
+      initialize: async () => {
+        const { user } = get();
+
+        // localStorage里没有user信息 → 从未登录过，无需refresh
+        if (!user) {
+          set({ isInitializing: false });
+          return;
+        }
+
+        // 有user信息 → 尝试用 refresh token (cookie) 换新的 access token
+        try {
+          const response = await axios.post(
+            `${import.meta.env.VITE_API_BASE_URL}/auth/refresh`,
+            null,
+            { withCredentials: true },
+          );
+          const newAccessToken = response.data.data.accessToken;
+          set({ accessToken: newAccessToken, isInitializing: false });
+        } catch {
+          // refresh token也失效了 → 清除登录态
+          set({ user: null, accessToken: null, isInitializing: false });
+        }
       },
     }),
     {
