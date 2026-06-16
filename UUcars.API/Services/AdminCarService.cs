@@ -1,3 +1,4 @@
+using Microsoft.EntityFrameworkCore;
 using UUcars.API.DTOs;
 using UUcars.API.DTOs.Requests;
 using UUcars.API.DTOs.Responses;
@@ -40,16 +41,28 @@ public class AdminCarService
         car.Status = CarStatus.Published;
         car.UpdatedAt = DateTime.UtcNow;
 
-        var updated = await _carRepository.UpdateAsync(car, cancellationToken);
+        try
+        {
+            var updated = await _carRepository.UpdateAsync(car, cancellationToken);
 
-        // ✅ 车辆上架 → 公开列表变了 → 清掉公开列表的所有缓存
-        // 用前缀删除：一次清掉所有分页（page1/page2/page3...）
-        await _cache.RemoveByPrefixAsync(CacheKeys.PublishedCarsPrefix, cancellationToken);
-        await _cache.RemoveByPrefixAsync(CacheKeys.PendingCarsPrefix, cancellationToken);
+            // ✅ 车辆上架 → 公开列表变了 → 清掉公开列表的所有缓存
+            // 用前缀删除：一次清掉所有分页（page1/page2/page3...）
+            await _cache.RemoveByPrefixAsync(CacheKeys.PublishedCarsPrefix, cancellationToken);
+            await _cache.RemoveByPrefixAsync(CacheKeys.PendingCarsPrefix, cancellationToken);
 
-        _logger.LogInformation("Car {CarId} approved by admin, now Published", carId);
+            _logger.LogInformation("Car {CarId} approved by admin, now Published", carId);
 
-        return CarService.MapToResponse(updated);
+            return CarService.MapToResponse(updated);
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            // 两个 Admin 同时审核同一辆车：先提交的成功，后提交的触发这个异常
+            // RowVersion 不匹配：说明这辆车在读取之后已经被其他操作修改了
+            // 告诉调用方：请刷新后重试
+            _logger.LogWarning(
+                "Concurrency conflict when approving car {CarId}", carId);
+            throw new ConcurrencyException();
+        }
     }
 
     public async Task<CarResponse> RejectAsync(
@@ -69,17 +82,26 @@ public class AdminCarService
         car.Status = CarStatus.Draft;
         car.UpdatedAt = DateTime.UtcNow;
 
-        var updated = await _carRepository.UpdateAsync(car, cancellationToken);
+        try
+        {
+            var updated = await _carRepository.UpdateAsync(car, cancellationToken);
 
-        // ✅ 车辆退回 → 待审核列表变了 → 清待审核列表缓存
-        await _cache.RemoveByPrefixAsync(CacheKeys.PendingCarsPrefix, cancellationToken);
+            // ✅ 车辆退回 → 待审核列表变了 → 清待审核列表缓存
+            await _cache.RemoveByPrefixAsync(CacheKeys.PendingCarsPrefix, cancellationToken);
 
-        _logger.LogInformation("Car {CarId} rejected by admin, returned to Draft", carId);
+            _logger.LogInformation("Car {CarId} rejected by admin, returned to Draft", carId);
 
-        return CarService.MapToResponse(updated);
+            return CarService.MapToResponse(updated);
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            _logger.LogWarning(
+                "Concurrency conflict when rejecting car {CarId}", carId);
+            throw new ConcurrencyException();
+        }
     }
 
-
+    // GetPendingCarsAsync 和 AdminDeleteAsync 不涉及并发冲突场景，保持不变
     // ✅ 待审核车辆列表：加缓存
     public async Task<PagedResponse<CarResponse>> GetPendingCarsAsync(
         CarQueryRequest query,

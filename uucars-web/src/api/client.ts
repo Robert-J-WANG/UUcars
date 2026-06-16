@@ -124,6 +124,23 @@ apiClient.interceptors.response.use(
     }
 
     // =============================================
+    // 处理 409 Conflict（并发冲突）
+    // =============================================
+    if (error.response?.status === 409) {
+      // 并发冲突：两个操作同时修改了同一条数据
+      // 后端用乐观锁（RowVersion）检测到冲突，返回 409
+      // 提示用户刷新后重试，不需要任何特殊的恢复逻辑
+      const apiResponse = error.response.data as ApiResponse<unknown>;
+      const message =
+        apiResponse?.message ??
+        "This resource was modified by another operation. Please refresh and try again.";
+
+      toast.error(message, { duration: 5000 });
+
+      return Promise.reject(new Error(message));
+    }
+
+    // =============================================
     // 处理 429 Too Many Requests（原有逻辑不变）
     // =============================================
     if (error.response?.status === 429) {

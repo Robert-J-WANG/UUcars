@@ -6652,3 +6652,675 @@ git push origin --delete feature/v3-refresh-token
 ✅ Git commit + 合并回 develop 完成
 ```
 
+
+
+## Step 62 · 乐观锁与并发安全（RowVersion）
+
+### 这一步做什么
+
+Step 61 完善了认证体系。现在来解决一个数据层面的真实问题：**并发竞态条件（Race Condition）**。
+
+考虑以下两个场景：
+
+**场景一：两个 Admin 同时审核同一辆车**
+
+```
+T1: Admin A 读取车辆（Status = PendingReview）
+T1: Admin B 读取车辆（Status = PendingReview）
+T2: Admin A 审核通过 → Status = Published → SaveChanges ✅
+T2: Admin B 审核通过 → Status = Published → SaveChanges ✅（重复操作，没报错）
+```
+
+更危险的情况：
+
+```
+T1: Admin A 读取车辆（Status = PendingReview）
+T1: Admin B 读取车辆（Status = PendingReview）
+T2: Admin A 审核通过 → Status = Published
+T2: Admin B 审核拒绝 → Status = Draft（把刚通过的车又退回了！）
+```
+
+A 刚通过的车，被 B 的"拒绝"操作悄悄覆盖，数据不一致。
+
+**场景二：两个买家同时下单同一辆车**
+
+```
+T1: 买家A 读取车辆（Status = Published）→ 验证通过
+T1: 买家B 读取车辆（Status = Published）→ 验证通过
+T2: 买家A 创建订单 → Status = Sold → SaveChanges ✅
+T2: 买家B 创建订单 → Status = Sold → SaveChanges ✅（同一辆车被卖了两次！）
+```
+
+这是真实生产系统里的高危问题。
+
+
+
+### 乐观锁 vs 悲观锁
+
+解决并发冲突有两种思路：
+
+**悲观锁（Pessimistic Locking）：**
+
+```
+假设冲突一定会发生 → 操作前先锁住资源 → 其他人等着
+类比：厕所门锁，进去先锁门，别人只能等
+-- SQL Server 悲观锁
+SELECT * FROM Cars WITH (UPDLOCK) WHERE Id = @id
+```
+
+缺点：
+
+- 持锁期间其他请求全部阻塞，性能差
+- 容易死锁（A 等 B 的锁，B 等 A 的锁）
+- 适合冲突极高频的场景（秒杀抢购）
+
+**乐观锁（Optimistic Locking）：**
+
+```
+假设冲突很少发生 → 操作时不加锁 → 提交时检查有没有人动过
+类比：Google Docs 协作编辑，保存时如果别人改过同一段，提示冲突
+```
+
+实现原理：给每行数据加一个版本号（`RowVersion`），每次更新时版本号自动递增。
+
+```
+读取时：car.RowVersion = [0x01, 0x02, ...]
+更新时：WHERE Id = @id AND RowVersion = [0x01, 0x02, ...]
+        如果行不存在（RowVersion 已经被别人改了）→ 0 rows affected → 抛并发异常
+```
+
+优点：
+
+- 不阻塞其他请求，性能好
+- 适合冲突低频的场景（Admin 审核车辆、普通用户下单）
+
+**UUcars 的场景属于低频冲突，乐观锁是正确选择。**
+
+
+
+### EF Core 的 `RowVersion` 机制
+
+EF Core 内置对乐观锁的支持，通过 `[Timestamp]` 特性配置：
+
+```csharp
+// 实体上加 RowVersion 字段
+[Timestamp]
+public byte[] RowVersion { get; set; } = [];
+
+// EF Core 自动：
+// 1. 映射为 SQL Server 的 rowversion（timestamp）类型，每次行更新自动递增
+// 2. 在 UPDATE 语句里自动加 WHERE RowVersion = @originalRowVersion 条件
+// 3. 如果影响行数为 0（说明 RowVersion 已变），抛 DbUpdateConcurrencyException
+```
+
+只需要：
+
+1. 实体里加 `RowVersion` 字段
+2. 在 Service 层捕获 `DbUpdateConcurrencyException`
+3. 转换成 `ConcurrencyException`（409）抛出
+4. `GlobalExceptionMiddleware` 自动处理（无需修改）
+
+
+
+### 1. 切出功能分支
+
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b feature/v3-optimistic-lock
+git push -u origin feature/v3-optimistic-lock
+```
+
+
+
+### 2. 新建 ConcurrencyException
+
+异常目录（`UUcars.API/Exceptions/`）里已有完整的异常体系，`AppException` 是基类。 现在新增 `ConcurrencyException`，返回 409 Conflict。
+
+新建 `UUcars.API/Exceptions/ConcurrencyException.cs`：
+
+```csharp
+namespace UUcars.API.Exceptions;
+
+/// <summary>
+///     并发冲突异常
+///     当两个操作同时修改同一条数据，EF Core 检测到 RowVersion 不匹配时抛出
+///     对应 HTTP 409 Conflict
+/// </summary>
+public class ConcurrencyException : AppException
+{
+    public ConcurrencyException() : base(StatusCodes.Status409Conflict,
+        "The resource was modified by another operation. Please refresh and try again.")
+    {
+    }
+}
+```
+
+> **为什么返回 409 Conflict？**
+>
+> HTTP 语义：409 表示"请求与资源当前状态冲突"。 并发冲突的本质就是：你想做的操作和数据库当前状态产生了冲突（别人先你一步改了它）。 比 500 更准确，让前端能区分"服务器出错"和"并发冲突"这两种情况，给出不同的提示。
+
+`ConcurrencyException` 继承自 `AppException`，现有的 `GlobalExceptionMiddleware` 会 自动捕获它并返回 409.
+
+
+
+### 3. 更新 Car 实体
+
+打开 `UUcars.API/Entities/Car.cs`，加入 `RowVersion` 字段, 用于存储版本号：
+
+- 同时使用特征标注 `[Timestamp]` , 它会告诉 EF Core 这个字段是并发令牌，EF Core 会在生成的 `UPDATE` 语句的 `WHERE` 子句里自动带上它。
+
+```csharp
+using System.ComponentModel.DataAnnotations;
+using UUcars.API.Entities.Enums;
+
+namespace UUcars.API.Entities;
+
+public class Car : BaseEntity
+{
+    public string Title { get; set; } = string.Empty;
+    public string Brand { get; set; } = string.Empty;
+    public string Model { get; set; } = string.Empty;
+    public int Year { get; set; }
+    public decimal Price { get; set; }
+    public int Mileage { get; set; }
+    public string? Description { get; set; }   // 允许为 null
+
+    // 外键 + 导航属性
+    public int SellerId { get; set; }
+    public User Seller { get; set; } = null!;
+
+    public CarStatus Status { get; set; } = CarStatus.Draft;
+
+    // ✅ 新增：乐观锁并发令牌
+    // SQL Server rowversion 类型：每次行更新自动递增，不需要手动维护
+    // EF Core 用它在 UPDATE 时加 WHERE RowVersion = @original 条件
+    // 如果影响行数为 0，说明有人先改了这行 → 抛 DbUpdateConcurrencyException
+    [Timestamp]
+    public byte[] RowVersion { get; set; } = [];
+
+    // 导航属性
+    public ICollection<CarImage> Images { get; set; } = [];
+    public ICollection<Order> Orders { get; set; } = [];
+    public ICollection<Favorite> Favorites { get; set; } = [];
+}
+```
+
+> **为什么用 `[Timestamp]` 而不是 Fluent API？**
+>
+> 两种方式等价，但 `[Timestamp]` 直接写在实体上，看代码时一眼就能看到这个字段是并发令牌， 不需要去 Configuration 文件里找。项目里其他实体已经用 Data Annotation 风格，保持一致。
+>
+> **乐观锁并发令牌 `RowVersion` 实际上存的是什么？？**
+>
+> 不是时间值（timestamp标注后，表面上好像是时间戳）， SQL Server 里 `rowversion`（对应 `[Timestamp]`）存的是一个**数据库级别的全局递增计数器**，跟时间没有任何关系。
+>
+> ```
+> 数据库启动后维护一个内部计数器：1, 2, 3, 4, 5 ...
+> 
+> 任何表的任何行被 UPDATE → 计数器 +1 → 把新值写入该行的 rowversion 字段
+> ```
+>
+> 所以它实际上是个**全局版本号**，只是用 8 字节二进制表示：
+>
+> ```
+> 0x0000000000000001  ← 第1次写入
+> 0x0000000000000002  ← 第2次写入（可能是另一张表的另一行）
+> 0x0000000000000047  ← 第71次写入
+> ```
+>
+> **为什么叫 Timestamp??**
+>
+> 这是 SQL Server 早期的历史遗留命名，微软自己后来也觉得这名字不好，在 SQL Server 2008 就把类型改名成了 `rowversion`，但 `timestamp` 作为别名还保留着。`[Timestamp]` 这个 EF Core 特性名也是沿用了这个历史叫法。
+
+
+
+### 4. 生成 Migration
+
+```bash
+cd UUcars.API
+dotnet ef migrations add AddCarRowVersion 
+```
+
+检查生成的 Migration 文件，确认：
+
+- 给 `Cars` 表添加了 `RowVersion` 列（`rowversion` 类型）
+- 没有其他意外改动
+
+```bash
+dotnet ef database update
+```
+
+预期输出：
+
+```
+Applying migration '20240xxx_AddCarRowVersion'.
+Done.
+```
+
+
+
+### 5. 更新 AdminCarService
+
+打开 `UUcars.API/Services/AdminCarService.cs`。
+
+在 `ApproveAsync` 和 `RejectAsync` 里，把 `UpdateAsync` 包在 `try/catch` 里， 捕获 `DbUpdateConcurrencyException` 并转换为 `ConcurrencyException`：
+
+```csharp
+using Microsoft.EntityFrameworkCore;
+using UUcars.API.DTOs;
+using UUcars.API.DTOs.Requests;
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Entities.Enums;
+using UUcars.API.Exceptions;
+using UUcars.API.Repositories;
+using UUcars.API.Services.Cache;
+
+namespace UUcars.API.Services;
+
+public class AdminCarService
+{
+    private readonly ICacheService _cache;
+    private readonly ICarRepository _carRepository;
+    private readonly ILogger<AdminCarService> _logger;
+
+    public AdminCarService(
+        ICarRepository carRepository,
+        ILogger<AdminCarService> logger,
+        ICacheService cache)
+    {
+        _carRepository = carRepository;
+        _logger = logger;
+        _cache = cache;
+    }
+
+    public async Task<CarResponse> ApproveAsync(
+        int carId,
+        CancellationToken cancellationToken = default)
+    {
+        var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+        if (car == null)
+            throw new CarNotFoundException(carId);
+
+        // 只有 PendingReview 状态才能审核通过
+        if (car.Status != CarStatus.PendingReview)
+            throw new CarStatusException(car.Id, car.Status, CarStatus.PendingReview);
+
+        car.Status = CarStatus.Published;
+        car.UpdatedAt = DateTime.UtcNow;
+
+        try
+        {
+            var updated = await _carRepository.UpdateAsync(car, cancellationToken);
+
+            // 车辆上架 → 公开列表变了 → 清掉公开列表的所有缓存
+            await _cache.RemoveByPrefixAsync(CacheKeys.PublishedCarsPrefix, cancellationToken);
+            await _cache.RemoveByPrefixAsync(CacheKeys.PendingCarsPrefix, cancellationToken);
+
+            _logger.LogInformation("Car {CarId} approved by admin, now Published", carId);
+
+            return CarService.MapToResponse(updated);
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            // 两个 Admin 同时审核同一辆车：先提交的成功，后提交的触发这个异常
+            // RowVersion 不匹配：说明这辆车在读取之后已经被其他操作修改了
+            // 告诉调用方：请刷新后重试
+            _logger.LogWarning(
+                "Concurrency conflict when approving car {CarId}", carId);
+            throw new ConcurrencyException();
+        }
+    }
+
+    public async Task<CarResponse> RejectAsync(
+        int carId,
+        CancellationToken cancellationToken = default)
+    {
+        var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+        if (car == null)
+            throw new CarNotFoundException(carId);
+
+        // 同样只有 PendingReview 状态才能被拒绝
+        if (car.Status != CarStatus.PendingReview)
+            throw new CarStatusException(car.Id, car.Status, CarStatus.PendingReview);
+
+        car.Status = CarStatus.Draft;
+        car.UpdatedAt = DateTime.UtcNow;
+
+        try
+        {
+            var updated = await _carRepository.UpdateAsync(car, cancellationToken);
+
+            // 车辆退回 → 待审核列表变了 → 清待审核列表缓存
+            await _cache.RemoveByPrefixAsync(CacheKeys.PendingCarsPrefix, cancellationToken);
+
+            _logger.LogInformation(
+                "Car {CarId} rejected by admin, returned to Draft", carId);
+
+            return CarService.MapToResponse(updated);
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            _logger.LogWarning(
+                "Concurrency conflict when rejecting car {CarId}", carId);
+            throw new ConcurrencyException();
+        }
+    }
+
+    // GetPendingCarsAsync 和 AdminDeleteAsync 不涉及并发冲突场景，保持不变
+    public async Task<PagedResponse<CarResponse>> GetPendingCarsAsync(
+        CarQueryRequest query,
+        CancellationToken cancellationToken = default)
+    {
+       ...
+    }
+
+    public async Task AdminDeleteAsync(
+        int carId,
+        CancellationToken cancellationToken = default)
+    {
+        ...
+}
+```
+
+
+
+### 6. 更新 OrderService
+
+打开 `UUcars.API/Services/OrderService.cs`。
+
+只需要更新 `CreateAsync` 里的 `SaveChangesAsync` 部分，其余方法完全不变。
+
+找到第6步的代码块，替换如下：
+
+```csharp
+// 6. 在同一个事务里保存订单和车辆状态变更
+// EF Core 事务保证：订单创建和车辆状态变更要么同时成功，要么同时回滚
+_context.Orders.Add(order);
+_context.Cars.Update(car);
+
+try
+{
+    await _context.SaveChangesAsync(cancellationToken);
+}
+catch (DbUpdateConcurrencyException)
+{
+    // 两个买家同时下单同一辆车：先提交的成功，后提交的触发这个异常
+    // 此时车辆的 RowVersion 已经被第一个买家的操作更新了
+    // 第二个买家持有的是旧 RowVersion，EF Core 检测到不匹配，抛出异常
+    _logger.LogWarning(
+        "Concurrency conflict when creating order for car {CarId}", request.CarId);
+    throw new ConcurrencyException();
+}
+
+// ✅ 车辆变 Sold，从公开列表消失，清缓存
+// 注意：缓存清理在 try/catch 外面
+// 原因：只有 SaveChangesAsync 成功，才需要清缓存
+// 如果抛了 ConcurrencyException，catch 里直接 throw，缓存清理代码不会执行
+await _cache.RemoveByPrefixAsync(CacheKeys.PublishedCarsPrefix, cancellationToken);
+```
+
+同时在文件顶部加上 `using`（如果还没有）：
+
+```csharp
+using Microsoft.EntityFrameworkCore;
+```
+
+
+
+### 7. 前端处理 409
+
+打开 `src/api/client.ts`，在响应拦截器的错误处理部分，在现有的 `429` 处理之前加入 `409` 处理：
+
+```typescript
+// =============================================
+// 处理 409 Conflict（并发冲突）
+// =============================================
+if (error.response?.status === 409) {
+  // 并发冲突：两个操作同时修改了同一条数据
+  // 后端用乐观锁（RowVersion）检测到冲突，返回 409
+  // 提示用户刷新后重试，不需要任何特殊的恢复逻辑
+  const apiResponse = error.response.data as ApiResponse<unknown>;
+  const message =
+    apiResponse?.message ??
+    "This resource was modified by another operation. Please refresh and try again.";
+
+  toast.error(message, { duration: 5000 });
+
+  return Promise.reject(new Error(message));
+}
+```
+
+更新后响应拦截器的错误处理顺序：
+
+```typescript
+// 401 → 自动刷新 Token（原有）
+// 409 → Toast 提示并发冲突  ← 新增
+// 429 → Toast 提示限流（原有）
+// 其他 4xx/5xx → 提取 message（原有）
+// 超时 → 提示超时（原有）
+// 网络错误 → 提示网络错误（原有）
+```
+
+
+
+### 8. 单元测试
+
+进行AdminCarService 并发冲突测试。
+
+新建 `UUcars.Tests/Services/AdminCarServiceTests.cs`，加入以下测试：
+
+```csharp
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging.Abstractions;
+using UUcars.API.Entities;
+using UUcars.API.Entities.Enums;
+using UUcars.API.Exceptions;
+using UUcars.API.Repositories;
+using UUcars.API.Services;
+using UUcars.Tests.Fakes;
+
+namespace UUcars.Tests.Services;
+
+public class AdminCarServiceTests
+{
+    [Fact]
+    public async Task ApproveAsync_WhenConcurrencyConflict_ThrowsConcurrencyException()
+    {
+        // Arrange
+        var fakeRepo = new ConcurrencyCarRepository();
+        var service = new AdminCarService(
+            fakeRepo,
+            NullLogger<AdminCarService>.Instance,
+            new FakeCacheService()
+        );
+
+        fakeRepo.Seed(new Car
+        {
+            Id = 1,
+            Title = "Test Car",
+            Brand = "Toyota",
+            Model = "Corolla",
+            Year = 2020,
+            Price = 10000,
+            Mileage = 50000,
+            SellerId = 1,
+            Status = CarStatus.PendingReview,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        });
+
+        // Act & Assert
+        await Assert.ThrowsAsync<ConcurrencyException>(() => service.ApproveAsync(1));
+    }
+
+    [Fact]
+    public async Task RejectAsync_WhenConcurrencyConflict_ThrowsConcurrencyException()
+    {
+        // Arrange
+        var fakeRepo = new ConcurrencyCarRepository();
+        var service = new AdminCarService(
+            fakeRepo,
+            NullLogger<AdminCarService>.Instance,
+            new FakeCacheService()
+        );
+
+        fakeRepo.Seed(new Car
+        {
+            Id = 1,
+            Title = "Test Car",
+            Brand = "Toyota",
+            Model = "Corolla",
+            Year = 2020,
+            Price = 10000,
+            Mileage = 50000,
+            SellerId = 1,
+            Status = CarStatus.PendingReview,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        });
+
+        // Act & Assert
+        await Assert.ThrowsAsync<ConcurrencyException>(() => service.RejectAsync(1));
+    }
+}
+
+/// <summary>
+///     专门用于测试并发冲突的假 Repository
+///     UpdateAsync 固定抛 DbUpdateConcurrencyException，模拟 RowVersion 不匹配的场景
+/// </summary>
+/// 
+/// <remarks>
+///     为什么用显式接口实现而不是 override 或 new？
+///
+///     FakeCarRepository.UpdateAsync 不是 virtual，无法 override。
+///
+///     new（方法隐藏）虽然可以声明同名方法，但通过接口调用时走的仍是父类的实现，
+///     因为 new 只影响继承链，不影响接口的方法映射。
+///
+///     显式接口实现（ICarRepository.UpdateAsync(...)）会直接绑定到
+///     接口的方法映射上，优先级高于继承来的实现，所以通过接口调用时会走这里。
+/// 
+///     其他未显式实现的方法仍继承自 FakeCarRepository。
+/// </remarks>
+internal class ConcurrencyCarRepository : FakeCarRepository, ICarRepository
+{
+    Task<Car> ICarRepository.UpdateAsync(
+        Car car,
+        CancellationToken cancellationToken)
+    {
+        // 模拟乐观锁检测到 RowVersion 不匹配时抛出的异常
+        throw new DbUpdateConcurrencyException(
+            "Simulated concurrency conflict: RowVersion mismatch");
+    }
+}
+```
+
+
+
+### 9. 本地验证
+
+#### 9.1 确认 Migration 生效
+
+用数据库工具查看 `Cars` 表，确认有 `RowVersion` 列，类型是 `rowversion`（SQL Server 显示为 `timestamp`）。
+
+#### 9.2 验证正常流程不受影响
+
+用前端正常操作：
+
+- 卖家发布车辆 → 提交审核
+- Admin 审核通过
+- 买家下单
+
+确认所有正常流程不受影响（乐观锁不阻塞任何操作，只在真正冲突时才触发）。
+
+#### 9.3 验证 409 响应和前端 Toast
+
+用 Scalar（`http://localhost:5065/scalar`）验证：
+
+1. 找一辆 `PendingReview` 状态的车，记录 `carId`
+2. Admin 登录，拿到 Token
+3. 调 `POST /admin/cars/{carId}/approve` → 200，车辆变为 `Published`
+4. 再调一次 `POST /admin/cars/{carId}/approve` → 触发 `CarStatusException`（400），因为状态已不是 `PendingReview`
+
+> **说明：** 手动模拟真正的 RowVersion 冲突需要两个请求在毫秒级同时到达， 实际验证通过单元测试覆盖。 前端 Toast 可以用 Scalar 直接调接口，构造一个会返回 409 的场景来验证显示效果。
+
+
+
+### 10. 编译和测试
+
+```bash
+dotnet build
+```
+
+预期：
+
+```bash
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+
+```
+
+```bash
+dotnet test
+```
+
+预期：
+
+```bash
+Test summary: total: XX, failed: 0, succeeded: XX
+```
+
+新增了2个测试（`ApproveAsync_WhenConcurrencyConflict` 和 `RejectAsync_WhenConcurrencyConflict`）， 应该都通过。
+
+
+
+### 11. Git 提交
+
+```bash
+git add .
+git commit -m "feat: optimistic locking with RowVersion for concurrent car operations"
+git push origin feature/v3-optimistic-lock
+
+# 合并回 develop
+git checkout develop
+git merge --no-ff feature/v3-optimistic-lock \
+  -m "merge: feature/v3-optimistic-lock into develop"
+git push origin develop
+
+# 删除功能分支
+git branch -d feature/v3-optimistic-lock
+git push origin --delete feature/v3-optimistic-lock
+```
+
+
+
+### Step 62 完成状态
+
+```
+知识点：
+✅ 理解竞态条件（Race Condition）的本质和危害
+✅ 理解乐观锁 vs 悲观锁的选择依据
+✅ 理解 EF Core RowVersion 机制：
+   - [Timestamp] 映射为 SQL Server rowversion 类型，每次行更新自动递增
+   - EF Core 在 UPDATE 时自动加 WHERE RowVersion = @original 条件
+   - 影响行数为 0 时抛 DbUpdateConcurrencyException
+✅ 理解 409 Conflict 的 HTTP 语义（请求与资源当前状态冲突）
+✅ 理解为什么 UUcars 适合乐观锁（低频冲突场景）
+✅ 理解 new（方法隐藏）和 override（多态重写）的区别
+
+实现：
+✅ ConcurrencyException（继承 AppException，StatusCode = 409）
+✅ GlobalExceptionMiddleware 自动处理（无需修改）
+✅ Car 实体加 [Timestamp] RowVersion 字段
+✅ Migration: AddCarRowVersion
+✅ AdminCarService.ApproveAsync：try/catch DbUpdateConcurrencyException → ConcurrencyException
+✅ AdminCarService.RejectAsync：try/catch DbUpdateConcurrencyException → ConcurrencyException
+✅ OrderService.CreateAsync：try/catch DbUpdateConcurrencyException → ConcurrencyException
+✅ 前端 client.ts：新增 409 处理（Toast 提示）
+✅ 单元测试：ConcurrencyCarRepository + 2个并发冲突测试用例
+✅ dotnet build + dotnet test 通过
+✅ Git commit + 合并回 develop 完成
+```
