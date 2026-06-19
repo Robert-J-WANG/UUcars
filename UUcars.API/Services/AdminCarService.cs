@@ -1,27 +1,40 @@
 using Microsoft.EntityFrameworkCore;
+using UUcars.API.Data;
 using UUcars.API.DTOs;
 using UUcars.API.DTOs.Requests;
 using UUcars.API.DTOs.Responses;
+using UUcars.API.Entities.Audit;
 using UUcars.API.Entities.Enums;
 using UUcars.API.Exceptions;
 using UUcars.API.Repositories;
+using UUcars.API.Services.Audit;
 using UUcars.API.Services.Cache;
 
 namespace UUcars.API.Services;
 
 public class AdminCarService
 {
-    private readonly ICacheService _cache; // ✅ 新增
+    private readonly ICacheService _cache;
     private readonly ICarRepository _carRepository;
     private readonly ILogger<AdminCarService> _logger;
 
+    private readonly IAuditLogService _auditLogService; // ✅ 新增
+    private readonly CurrentUserService _currentUserService; // ✅ 新增
 
-    public AdminCarService(ICarRepository carRepository, ILogger<AdminCarService> logger, ICacheService cache)
+    // 构造函数加入 AppDbContext
+    private readonly AppDbContext _context; // ✅ 新增：仅用于审计日志查询
+
+    public AdminCarService(ICacheService cache, ICarRepository carRepository, ILogger<AdminCarService> logger,
+        IAuditLogService auditLogService, CurrentUserService currentUserService, AppDbContext context)
     {
+        _cache = cache;
         _carRepository = carRepository;
         _logger = logger;
-        _cache = cache;
+        _auditLogService = auditLogService;
+        _currentUserService = currentUserService;
+        _context = context;
     }
+
 
     public async Task<CarResponse> ApproveAsync(
         int carId,
@@ -49,6 +62,15 @@ public class AdminCarService
             // 用前缀删除：一次清掉所有分页（page1/page2/page3...）
             await _cache.RemoveByPrefixAsync(CacheKeys.PublishedCarsPrefix, cancellationToken);
             await _cache.RemoveByPrefixAsync(CacheKeys.PendingCarsPrefix, cancellationToken);
+
+            // ✅ 写审计日志
+            // GetCurrentUserId 理论上不会返回 null（Controller 已用 [Authorize(Roles="Admin")] 保护）
+            // 但做防御性判断，避免极端情况下空引用
+            var adminId = _currentUserService.GetCurrentUserId();
+            if (adminId.HasValue)
+                await _auditLogService.LogAsync(
+                    adminId.Value, AuditActions.CarApproved, "Car", carId,
+                    cancellationToken: cancellationToken);
 
             _logger.LogInformation("Car {CarId} approved by admin, now Published", carId);
 
@@ -88,6 +110,13 @@ public class AdminCarService
 
             // ✅ 车辆退回 → 待审核列表变了 → 清待审核列表缓存
             await _cache.RemoveByPrefixAsync(CacheKeys.PendingCarsPrefix, cancellationToken);
+
+            // ✅ 写审计日志
+            var adminId = _currentUserService.GetCurrentUserId();
+            if (adminId.HasValue)
+                await _auditLogService.LogAsync(
+                    adminId.Value, AuditActions.CarRejected, "Car", carId,
+                    cancellationToken: cancellationToken);
 
             _logger.LogInformation("Car {CarId} rejected by admin, returned to Draft", carId);
 
@@ -154,8 +183,52 @@ public class AdminCarService
         if (previousStatus == CarStatus.PendingReview)
             await _cache.RemoveByPrefixAsync(CacheKeys.PendingCarsPrefix, cancellationToken);
 
+        // ✅ 写审计日志
+        var adminId = _currentUserService.GetCurrentUserId();
+        if (adminId.HasValue)
+            await _auditLogService.LogAsync(
+                adminId.Value, AuditActions.CarDeleted, "Car", carId,
+                $"Previous status: {previousStatus}",
+                cancellationToken);
+
         _logger.LogInformation(
             "Car {CarId} forcefully deleted by admin (was {Status}), cache invalidated",
             carId, previousStatus);
+    }
+
+
+    // 在 AdminDeleteAsync 之后加入这个新方法
+    public async Task<PagedResponse<AuditLogResponse>> GetAuditLogsAsync(
+        int page,
+        int pageSize,
+        CancellationToken cancellationToken = default)
+    {
+        page = page < 1 ? 1 : page;
+        pageSize = Math.Min(pageSize < 1 ? 20 : pageSize, 50);
+
+        var query = _context.AuditLogs
+            .Include(a => a.Admin)
+            .OrderByDescending(a => a.CreatedAt);
+
+        var totalCount = await query.CountAsync(cancellationToken);
+
+        var logs = await query
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .ToListAsync(cancellationToken);
+
+        var items = logs.Select(a => new AuditLogResponse
+        {
+            Id = a.Id,
+            AdminId = a.AdminId,
+            AdminUsername = a.Admin?.Username ?? string.Empty,
+            Action = a.Action,
+            EntityType = a.EntityType,
+            EntityId = a.EntityId,
+            Detail = a.Detail,
+            CreatedAt = a.CreatedAt
+        }).ToList();
+
+        return PagedResponse<AuditLogResponse>.Create(items, totalCount, page, pageSize);
     }
 }

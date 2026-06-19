@@ -1,6 +1,7 @@
 using Hangfire;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Net.Http.Headers;
 using Scalar.AspNetCore;
 using Serilog;
 using Serilog.Sinks.ApplicationInsights.TelemetryConverters; // ← 新增
@@ -13,6 +14,7 @@ using UUcars.API.Extensions;
 using UUcars.API.Middleware;
 using UUcars.API.Repositories;
 using UUcars.API.Services;
+using UUcars.API.Services.Audit;
 using UUcars.API.Services.Cache;
 using UUcars.API.Services.Email;
 using UUcars.API.Services.Storage;
@@ -30,6 +32,7 @@ Log.Logger = new LoggerConfiguration()
 try
 {
     var builder = WebApplication.CreateBuilder(args);
+
 
     // =============================================
     // 替换默认日志系统为 Serilog
@@ -166,6 +169,7 @@ try
 
     // Admin 模块
     builder.Services.AddScoped<AdminCarService>();
+    builder.Services.AddScoped<IAuditLogService, AuditLogService>(); // ✅ 新增
 
     // 评价模块
     builder.Services.AddScoped<IReviewRepository, EfReviewRepository>();
@@ -180,6 +184,7 @@ try
     // =============================================
     var app = builder.Build();
 
+
     // =============================================
     // 中间件管道
     // 顺序很重要：GlobalExceptionMiddleware 必须在最外层
@@ -188,6 +193,8 @@ try
     // 全局异常处理，放最前面，兜住所有后续中间件的异常
     app.UseMiddleware<GlobalExceptionMiddleware>();
 
+    // ✅ 安全响应头（新增）
+    app.UseSecurityHeaders();
 
     // 开发环境才挂载 API 文档
     if (app.Environment.IsDevelopment())
