@@ -48,6 +48,17 @@ public class AdminController : ControllerBase
         return Ok(ApiResponse<PagedResponse<CarResponse>>.Ok(result));
     }
 
+    // GET /admin/audit-logs
+    [HttpGet("audit-logs")]
+    public async Task<IActionResult> GetAuditLogs(
+        [FromQuery] int page = 1,
+        [FromQuery] int pageSize = 20,
+        CancellationToken cancellationToken = default)
+    {
+        var result = await _adminCarService.GetAuditLogsAsync(page, pageSize, cancellationToken);
+        return Ok(ApiResponse<PagedResponse<AuditLogResponse>>.Ok(result));
+    }
+
     // DELETE /admin/cars/{id}
     [HttpDelete("cars/{id:int}")]
     public async Task<IActionResult> DeleteCar(int id, CancellationToken cancellationToken)
