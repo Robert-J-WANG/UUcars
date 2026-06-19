@@ -1,14 +1,21 @@
+using Hangfire;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Net.Http.Headers;
 using Scalar.AspNetCore;
 using Serilog;
+using Serilog.Sinks.ApplicationInsights.TelemetryConverters; // ← 新增
+using StackExchange.Redis;
 using UUcars.API.Auth;
+using UUcars.API.Auth.Hangfire;
 using UUcars.API.Data;
 using UUcars.API.Entities;
 using UUcars.API.Extensions;
 using UUcars.API.Middleware;
 using UUcars.API.Repositories;
 using UUcars.API.Services;
+using UUcars.API.Services.Audit;
+using UUcars.API.Services.Cache;
 using UUcars.API.Services.Email;
 using UUcars.API.Services.Storage;
 
@@ -26,22 +33,38 @@ try
 {
     var builder = WebApplication.CreateBuilder(args);
 
+
     // =============================================
     // 替换默认日志系统为 Serilog
     // ReadFrom.Configuration：从 appsettings.json 读取日志级别等配置
     // WriteTo.Console / File：输出目标
     // =============================================
+
     builder.Host.UseSerilog((context, services, configuration) =>
+    {
         configuration
             .ReadFrom.Configuration(context.Configuration)
             .ReadFrom.Services(services)
             .WriteTo.Console()
             .WriteTo.File(
                 "logs/uucars-.log",
-                rollingInterval: RollingInterval.Day, // 每天滚动一个新文件
-                retainedFileCountLimit: 30 // 最多保留 30 天
-            )
-    );
+                rollingInterval: RollingInterval.Day,
+                retainedFileCountLimit: 30
+            );
+
+        // ← 新增：只在配置了 ConnectionString 时才挂载 Application Insights Sink
+        // 用 if 而不是 Conditional，原因：
+        // Conditional 的第二个参数是委托，Serilog 在配置阶段就会执行它构建 Sink
+        // 此时 GetRequiredService<TelemetryConfiguration> 如果服务未注册会直接抛异常
+        var aiConnStr = context.Configuration["ApplicationInsights:ConnectionString"];
+        if (!string.IsNullOrEmpty(aiConnStr))
+            configuration.WriteTo.ApplicationInsights(
+                services.GetRequiredService
+                    <Microsoft.ApplicationInsights.Extensibility.TelemetryConfiguration>(),
+                new TraceTelemetryConverter()
+            );
+    });
+
 
     // =============================================
     // 服务注册
@@ -76,6 +99,37 @@ try
     // 存储服务
     builder.Services.AddStorageService(builder.Configuration);
 
+    // ── Application Insights 服务 ──
+    // 只在配置了 ConnectionString 时才注册 Application Insights 服务
+    // 必须在 Serilog 配置之后、在 UseSerilog 的 lambda 执行之前完成注册
+    // 原因：Serilog 的 lambda 里 GetRequiredService<TelemetryConfiguration> 依赖这里的注册
+    var aiConnectionString = builder.Configuration["ApplicationInsights:ConnectionString"];
+    if (!string.IsNullOrEmpty(aiConnectionString))
+        builder.Services.AddApplicationInsightsTelemetry(options => { options.ConnectionString = aiConnectionString; });
+
+    // ── Redis Cache服务 ──
+
+    // Redis 连接（IConnectionMultiplexer 是线程安全的，注册为 Singleton）
+    // Singleton：整个应用生命周期只创建一次连接，所有请求共享
+    // 不用 Scoped 的原因：Redis 连接是昂贵的资源，每次请求创建一个连接会耗尽连接池
+    var redisConnectionString = builder.Configuration
+        .GetConnectionString("Redis") ?? "localhost:6379";
+
+    builder.Services.AddSingleton<IConnectionMultiplexer>(
+        ConnectionMultiplexer.Connect(redisConnectionString));
+
+    // IDistributedCache 的 Redis 实现
+    builder.Services.AddStackExchangeRedisCache(options =>
+    {
+        options.Configuration = redisConnectionString;
+        // Key 前缀：区分不同应用共用同一个 Redis 实例时的 Key 冲突
+        options.InstanceName = "uucars:";
+    });
+
+    // 限流策略服务 - 自定义的扩展方法
+    builder.Services.AddRateLimiting();
+
+
     // 用户模块
     // AddScoped：每次 HTTP 请求创建一个新实例，请求结束后销毁
     // Repository 和 Service 都用 Scoped，因为它们依赖 DbContext（也是 Scoped）
@@ -93,6 +147,13 @@ try
     builder.Services.AddHttpContextAccessor();
     builder.Services.AddScoped<CurrentUserService>();
 
+    // 缓存服务（Singleton，因为它依赖 Singleton 的 IConnectionMultiplexer）
+    builder.Services.AddSingleton<ICacheService, RedisCacheService>();
+
+    // Hangfire服务
+    builder.Services.AddHangfireServices(builder.Configuration, builder.Environment);
+
+
     // 车辆模块
     builder.Services.AddScoped<ICarRepository, EfCarRepository>();
     builder.Services.AddScoped<CarService>();
@@ -108,15 +169,21 @@ try
 
     // Admin 模块
     builder.Services.AddScoped<AdminCarService>();
+    builder.Services.AddScoped<IAuditLogService, AuditLogService>(); // ✅ 新增
 
     // 评价模块
     builder.Services.AddScoped<IReviewRepository, EfReviewRepository>();
     builder.Services.AddScoped<ReviewService>();
 
+    // ── Refresh Token ──────────────────────────────────
+    builder.Services.AddScoped<IRefreshTokenRepository, EfRefreshTokenRepository>();
+    builder.Services.AddScoped<RefreshTokenService>();
+
     // =============================================
     // 构建应用
     // =============================================
     var app = builder.Build();
+
 
     // =============================================
     // 中间件管道
@@ -125,6 +192,9 @@ try
 
     // 全局异常处理，放最前面，兜住所有后续中间件的异常
     app.UseMiddleware<GlobalExceptionMiddleware>();
+
+    // ✅ 安全响应头（新增）
+    app.UseSecurityHeaders();
 
     // 开发环境才挂载 API 文档
     if (app.Environment.IsDevelopment())
@@ -143,11 +213,35 @@ try
     // 导致浏览器认为服务器不支持跨域
     app.UseCors(CorsExtensions.PolicyName);
 
+    // ✅ 限流中间件
+    // 必须在 UseCors之后
+    // 原因：限流策略导致的响应码 429，响应没有 CORS 头，浏览器拦截
+    // 必须在 UseAuthentication / UseAuthorization 之前
+    // 原因：限流是最外层的防护，不管请求有没有 Token，都要先过限流检查
+    // 这样攻击者带着无效 Token 的请求也能被拦截，不会浪费认证处理的开销
+
+    app.UseRateLimiter();
+
     // UseAuthentication 必须在 UseAuthorization 之前
     // 原因：Authorization 需要读取 Authentication 的结果（HttpContext.User）
     // 如果顺序反了，[Authorize] 读到的 HttpContext.User 是空的，永远判定为未认证
     app.UseAuthentication();
     app.UseAuthorization();
+
+    // ✅ 非 Testing 环境才挂载 Hangfire Dashboard 和定时任务
+    if (!app.Environment.IsEnvironment("Testing"))
+    {
+        // ✅ Hangfire Dashboard（在认证之后）
+        app.UseHangfireDashboard("/hangfire", new DashboardOptions
+        {
+            Authorization = app.Environment.IsDevelopment()
+                ? new[] { new HangfireLocalDevAuthorizationFilter() } // 开发：直接放行
+                : new[] { new HangfireAdminAuthorizationFilter() } // 生产：必须 Admin
+        });
+        // 定时清除过期token
+        app.UseHangfireJobs();
+    }
+
 
     app.MapControllers();
 

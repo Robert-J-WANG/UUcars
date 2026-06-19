@@ -1,4 +1,8 @@
+using System.Threading.RateLimiting;
+using Hangfire;
+using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.EntityFrameworkCore;
@@ -7,7 +11,9 @@ using Testcontainers.MsSql;
 using UUcars.API.Data;
 using UUcars.API.Entities;
 using UUcars.API.Entities.Enums;
+using UUcars.API.Services.Cache;
 using UUcars.API.Services.Email;
+using UUcars.Tests.Fakes;
 using UUcars.Tests.Services;
 
 namespace UUcars.Tests.Integration;
@@ -22,8 +28,15 @@ public class SqlServerTestFactory : WebApplicationFactory<Program>, IAsyncLifeti
         .WithPassword("TestStrong!Passw0rd")
         .Build();
 
-    // 新增：暴露给 IntegrationTestBase 使用，取注册时发出的 token
-    public FakeEmailService FakeEmail { get; } = new();
+    // ✅ 移除：不再需要 FakeEmail
+    // public FakeEmailService FakeEmail { get; } = new();
+
+    // ✅ 新增：暴露 DbContext 查询能力，供 IntegrationTestBase 直接查 Token
+    public AppDbContext GetDbContext()
+    {
+        var scope = Services.CreateScope();
+        return scope.ServiceProvider.GetRequiredService<AppDbContext>();
+    }
 
     // IAsyncLifetime.InitializeAsync：测试类实例化时自动调用
     // xUnit 发现这个接口后，会在运行第一个测试前先执行这个方法
@@ -57,13 +70,50 @@ public class SqlServerTestFactory : WebApplicationFactory<Program>, IAsyncLifeti
                 options.UseSqlServer(_sqlContainer.GetConnectionString()));
 
 
-            // 新增：替换 IEmailService，避免真实调用 Resend API
-            var emailDescriptor = services.SingleOrDefault(d => d.ServiceType == typeof(IEmailService));
-            if (emailDescriptor != null)
-                services.Remove(emailDescriptor);
+            // ✅ 移除：不再需要替换 IEmailService 为 FakeEmailService
+            // var emailDescriptor = services.SingleOrDefault(...)
+            // services.Remove(emailDescriptor);
+            // services.AddSingleton<IEmailService>(FakeEmail);
 
-            // Singleton：整个测试共享同一个实例，token 才能被正确读取
-            services.AddSingleton<IEmailService>(FakeEmail);
+            // ✅ 新增：替换 IBackgroundJobClient 为 Fake
+            // 原因：不能在测试里真正调用 Hangfire（需要 SQL Server Hangfire 系统表）
+            // FakeBackgroundJobClient 静默处理入队，不真正执行任务
+            var jobClientDescriptor = services.SingleOrDefault(d => d.ServiceType == typeof(IBackgroundJobClient));
+            if (jobClientDescriptor != null)
+                services.Remove(jobClientDescriptor);
+
+            services.AddSingleton<IBackgroundJobClient>(new FakeBackgroundJobClient());
+
+            // ✅ 替换 ICacheService，集成测试不依赖真实 Redis
+            var cacheDescriptor = services.SingleOrDefault(d => d.ServiceType == typeof(ICacheService));
+            if (cacheDescriptor != null)
+                services.Remove(cacheDescriptor);
+            services.AddSingleton<ICacheService, FakeCacheService>();
+
+            // ✅ 新增：测试环境禁用限流
+            // 先移除所有已注册的 RateLimiter 相关服务
+            var rateLimiterDescriptors = services
+                .Where(d => d.ServiceType.FullName != null &&
+                            d.ServiceType.FullName.Contains("RateLimit"))
+                .ToList();
+            foreach (var d in rateLimiterDescriptors)
+                services.Remove(d);
+
+            // 再注册完全无限制的 
+            services.AddRateLimiter(options =>
+            {
+                // 覆盖全局限流
+                options.GlobalLimiter =
+                    PartitionedRateLimiter.Create<HttpContext, string>(_ =>
+                        RateLimitPartition.GetNoLimiter("no-limit"));
+
+                // ✅ 必须把所有命名策略都注册为 NoLimiter
+                // 否则 [EnableRateLimiting("xxx")] 找不到策略会抛 500
+                foreach (var policyName in new[]
+                             { "login", "register", "forgot-password", "resend-verification", "browse", "write" })
+                    options.AddPolicy(policyName, _ =>
+                        RateLimitPartition.GetNoLimiter("no-limit"));
+            });
         });
 
         // 使用测试环境，避免加载生产配置

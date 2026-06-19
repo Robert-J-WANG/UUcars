@@ -32,7 +32,7 @@ public static class CorsExtensions
                     .AllowAnyHeader()
 
                     // 允许携带凭证（Cookie）
-                    // V2 的 Refresh Token 存在 HttpOnly Cookie 里，需要这个
+                    // V3 的 Refresh Token 存在 HttpOnly Cookie 里，需要这个
                     .AllowCredentials();
             });
         });

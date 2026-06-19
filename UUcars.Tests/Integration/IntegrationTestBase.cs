@@ -1,6 +1,7 @@
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using Microsoft.EntityFrameworkCore;
 
 namespace UUcars.Tests.Integration;
 
@@ -69,13 +70,19 @@ public abstract class IntegrationTestBase : IAsyncLifetime
         }));
 
 
-        // Step 2：从已有的 FakeEmailService 取 token，调用验证接口
-        var verifyToken = Factory.FakeEmail.SentVerificationEmails
-            .Last(x => x.Email == email).Token;
+        // Step 2：直接从数据库取 EmailConfirmationToken
+        // V3 更新：邮件改为 Hangfire 异步入队，FakeEmailService 不再收到调用
+        // Token 已写入数据库，直接查比依赖 FakeEmailService 更可靠
+        await using var db = Factory.GetDbContext();
+        var user = await db.Users
+            .FirstOrDefaultAsync(u => u.Email == email.ToLower());
+        var verifyToken = user!.EmailConfirmationToken;
+
+        // Step 3：验证邮箱
         await Client.GetAsync($"/auth/verify-email?token={verifyToken}");
 
 
-        // Step 3：EmailConfirmed = true，登录正常拿 JWT
+        // Step 4：EmailConfirmed = true，登录正常拿 JWT
         var loginResponse = await Client.PostAsync("/auth/login", JsonContent(new
         {
             email, password

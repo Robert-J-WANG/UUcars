@@ -22,6 +22,47 @@ namespace UUcars.API.Migrations
 
             SqlServerModelBuilderExtensions.UseIdentityColumns(modelBuilder);
 
+            modelBuilder.Entity("UUcars.API.Entities.AuditLog", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("int");
+
+                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<string>("Action")
+                        .IsRequired()
+                        .HasMaxLength(50)
+                        .HasColumnType("nvarchar(50)");
+
+                    b.Property<int>("AdminId")
+                        .HasColumnType("int");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("datetime2");
+
+                    b.Property<string>("Detail")
+                        .HasMaxLength(500)
+                        .HasColumnType("nvarchar(500)");
+
+                    b.Property<int>("EntityId")
+                        .HasColumnType("int");
+
+                    b.Property<string>("EntityType")
+                        .IsRequired()
+                        .HasMaxLength(50)
+                        .HasColumnType("nvarchar(50)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("AdminId");
+
+                    b.HasIndex("Action", "CreatedAt")
+                        .HasDatabaseName("IX_AuditLogs_Action_CreatedAt");
+
+                    b.ToTable("AuditLogs");
+                });
+
             modelBuilder.Entity("UUcars.API.Entities.Car", b =>
                 {
                     b.Property<int>("Id")
@@ -53,6 +94,12 @@ namespace UUcars.API.Migrations
                     b.Property<decimal>("Price")
                         .HasColumnType("decimal(18,2)");
 
+                    b.Property<byte[]>("RowVersion")
+                        .IsConcurrencyToken()
+                        .IsRequired()
+                        .ValueGeneratedOnAddOrUpdate()
+                        .HasColumnType("rowversion");
+
                     b.Property<int>("SellerId")
                         .HasColumnType("int");
 
@@ -74,7 +121,19 @@ namespace UUcars.API.Migrations
 
                     b.HasKey("Id");
 
-                    b.HasIndex("SellerId");
+                    b.HasIndex("Status", "Brand")
+                        .HasDatabaseName("IX_Cars_Status_Brand");
+
+                    b.HasIndex("Status", "CreatedAt")
+                        .IsDescending(false, true)
+                        .HasDatabaseName("IX_Cars_Status_CreatedAt");
+
+                    b.HasIndex("Status", "Price")
+                        .HasDatabaseName("IX_Cars_Status_Price");
+
+                    b.HasIndex("SellerId", "Status", "CreatedAt")
+                        .IsDescending(false, false, true)
+                        .HasDatabaseName("IX_Cars_SellerId_Status_CreatedAt");
 
                     b.ToTable("Cars");
                 });
@@ -165,6 +224,44 @@ namespace UUcars.API.Migrations
                     b.HasIndex("SellerId");
 
                     b.ToTable("Orders");
+                });
+
+            modelBuilder.Entity("UUcars.API.Entities.RefreshToken", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("int");
+
+                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("datetime2");
+
+                    b.Property<DateTime>("ExpiresAt")
+                        .HasColumnType("datetime2");
+
+                    b.Property<bool>("IsRevoked")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bit")
+                        .HasDefaultValue(false);
+
+                    b.Property<string>("Token")
+                        .IsRequired()
+                        .HasMaxLength(256)
+                        .HasColumnType("nvarchar(256)");
+
+                    b.Property<int>("UserId")
+                        .HasColumnType("int");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Token")
+                        .IsUnique();
+
+                    b.HasIndex("UserId", "IsRevoked", "ExpiresAt")
+                        .HasDatabaseName("IX_RefreshTokens_UserId_IsRevoked_ExpiresAt");
+
+                    b.ToTable("RefreshTokens");
                 });
 
             modelBuilder.Entity("UUcars.API.Entities.Review", b =>
@@ -283,6 +380,17 @@ namespace UUcars.API.Migrations
                         });
                 });
 
+            modelBuilder.Entity("UUcars.API.Entities.AuditLog", b =>
+                {
+                    b.HasOne("UUcars.API.Entities.User", "Admin")
+                        .WithMany()
+                        .HasForeignKey("AdminId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+
+                    b.Navigation("Admin");
+                });
+
             modelBuilder.Entity("UUcars.API.Entities.Car", b =>
                 {
                     b.HasOne("UUcars.API.Entities.User", "Seller")
@@ -351,6 +459,17 @@ namespace UUcars.API.Migrations
                     b.Navigation("Seller");
                 });
 
+            modelBuilder.Entity("UUcars.API.Entities.RefreshToken", b =>
+                {
+                    b.HasOne("UUcars.API.Entities.User", "User")
+                        .WithMany("RefreshTokens")
+                        .HasForeignKey("UserId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("User");
+                });
+
             modelBuilder.Entity("UUcars.API.Entities.Review", b =>
                 {
                     b.HasOne("UUcars.API.Entities.Order", "Order")
@@ -394,6 +513,8 @@ namespace UUcars.API.Migrations
                     b.Navigation("Cars");
 
                     b.Navigation("Favorites");
+
+                    b.Navigation("RefreshTokens");
 
                     b.Navigation("SellerOrders");
                 });

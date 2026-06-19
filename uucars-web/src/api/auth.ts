@@ -11,7 +11,7 @@ export const authApi = {
   register: async (data: RegisterRequest): Promise<User> => {
     const response = await apiClient.post<ApiResponse<User>>(
       "/auth/register",
-      data
+      data,
     );
     return response.data.data!;
   },
@@ -19,9 +19,14 @@ export const authApi = {
   login: async (data: LoginRequest): Promise<LoginResponse> => {
     const response = await apiClient.post<ApiResponse<LoginResponse>>(
       "/auth/login",
-      data
+      data,
     );
     return response.data.data!;
+  },
+
+  // 新增logout接口
+  logout: async (): Promise<void> => {
+    await apiClient.post<ApiResponse<void>>("/auth/logout");
   },
 
   verifyEmail: async (token: string): Promise<void> => {

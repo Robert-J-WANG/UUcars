@@ -1,8 +1,10 @@
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 using UUcars.API.DTOs;
 using UUcars.API.DTOs.Requests;
 using UUcars.API.DTOs.Responses;
+using UUcars.API.Extensions;
 using UUcars.API.Services;
 
 namespace UUcars.API.Controllers;
@@ -25,6 +27,8 @@ public class CarsController : ControllerBase
     // 只在需要登录的 Action 上单独加 [Authorize]
     [HttpPost]
     [Authorize]
+    // 限流
+    [EnableRateLimiting(RateLimitPolicies.Write)]
     public async Task<IActionResult> Create(
         [FromBody] CarCreateRequest request,
         CancellationToken cancellationToken)
@@ -52,7 +56,7 @@ public class CarsController : ControllerBase
         var car = await _carService.SubmitForReviewAsync(id, currentUserId.Value, cancellationToken);
         return Ok(ApiResponse<CarResponse>.Ok(car, "Car submitted for review successfully."));
     }
-    
+
     // PUT /cars/{id}
     [HttpPut("{id:int}")]
     [Authorize]
@@ -68,7 +72,7 @@ public class CarsController : ControllerBase
         var car = await _carService.UpdateAsync(id, currentUserId.Value, request, cancellationToken);
         return Ok(ApiResponse<CarResponse>.Ok(car, "Car updated successfully."));
     }
-    
+
     // DELETE /cars/{id}
     [HttpDelete("{id:int}")]
     [Authorize]
@@ -84,10 +88,12 @@ public class CarsController : ControllerBase
         // 不用 ApiResponse 包装，因为没有数据需要返回
         return NoContent();
     }
-    
+
     // POST /cars/{id}/images
     [HttpPost("{id:int}/images")]
     [Authorize]
+    // 限流
+    [EnableRateLimiting(RateLimitPolicies.Write)]
     public async Task<IActionResult> AddImage(
         int id,
         [FromForm] CarImageAddRequest request,
@@ -102,7 +108,7 @@ public class CarsController : ControllerBase
         return StatusCode(StatusCodes.Status201Created,
             ApiResponse<CarImageResponse>.Ok(image, "Image added successfully."));
     }
-    
+
     // DELETE /cars/{id}/images/{imageId}
     [HttpDelete("{id:int}/images/{imageId:int}")]
     [Authorize]
@@ -119,51 +125,56 @@ public class CarsController : ControllerBase
 
         return NoContent();
     }
-    
+
     // GET /cars?page=1&pageSize=20
     // 这个接口不需要 [Authorize]，公开访问
     // [FromQuery]：告诉框架从 URL 的 Query 参数里绑定 CarQueryRequest 的属性
     // 比如 /cars?page=2&pageSize=10 会自动绑定成 query.Page=2, query.PageSize=10
 
     [HttpGet]
+    // 限流
+    [EnableRateLimiting(RateLimitPolicies.Browse)]
     public async Task<IActionResult> GetPaged(
-        [FromQuery] CarQueryRequest request ,CancellationToken cancellationToken)
+        [FromQuery] CarQueryRequest request, CancellationToken cancellationToken)
     {
         var result = await _carService.GetPublishedCarsAsync(request, cancellationToken);
-        
-        return StatusCode(StatusCodes.Status200OK, ApiResponse<PagedResponse<CarResponse>>.Ok(result, "Cars retrieved successfully."));
+
+        return StatusCode(StatusCodes.Status200OK,
+            ApiResponse<PagedResponse<CarResponse>>.Ok(result, "Cars retrieved successfully."));
     }
-    
+
     // GET /cars/my-listings
     // 必须放在 GET /cars/{id:int} 之前定义，虽然 :int 约束已经能区分，
     // 但显式把固定路径放在参数路由之前是更好的习惯，意图更清晰
     [HttpGet("my-listings")]
-    [Authorize]     // 卖家接口，必须登录
+    [Authorize] // 卖家接口，必须登录
     public async Task<IActionResult> GetMyListings([FromQuery] CarQueryRequest request,
         CancellationToken cancellationToken)
     {
         var currentUserId = _currentUserService.GetCurrentUserId();
-        if(currentUserId==null) return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
-        
-        var result= await _carService.GetSellerCarsAsync(currentUserId.Value, request, cancellationToken);
-        
-        return StatusCode(StatusCodes.Status200OK, ApiResponse<PagedResponse<CarResponse>>.Ok(result, "Cars retrieved successfully."));
-        
+        if (currentUserId == null) return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+        var result = await _carService.GetSellerCarsAsync(currentUserId.Value, request, cancellationToken);
+
+        return StatusCode(StatusCodes.Status200OK,
+            ApiResponse<PagedResponse<CarResponse>>.Ok(result, "Cars retrieved successfully."));
     }
-    
+
     // GET /cars/{id}
     // 不需要 [Authorize]：公开接口，但权限判断在 Service 层处理
     [HttpGet("{id:int}")]
+    // 限流
+    [EnableRateLimiting(RateLimitPolicies.Browse)]
     public async Task<IActionResult> GetById(int id, CancellationToken cancellationToken)
     {
         // 从 Token 里获取当前用户信息（未登录时为 null）
         var currentUserId = _currentUserService.GetCurrentUserId();
-        
+
         // 判断当前用户是否是 Admin
         // User.IsInRole：ASP.NET Core 提供的方法，读取 ClaimsPrincipal 里的 Role Claim
         // 未登录时 User.IsInRole 返回 false，不会抛异常
         var isAdmin = User.IsInRole("Admin");
-        
+
         var car = await _carService.GetDetailAsync(id, currentUserId, isAdmin, cancellationToken);
 
         return StatusCode(StatusCodes.Status200OK,

@@ -5,27 +5,30 @@ using UUcars.API.Entities;
 using UUcars.API.Entities.Enums;
 using UUcars.API.Exceptions;
 using UUcars.API.Repositories;
+using UUcars.API.Services.Cache;
 using UUcars.API.Services.Storage;
 
 namespace UUcars.API.Services;
 
 public class CarService
 {
+    private readonly ICacheService _cache; // ✅ 新增
+
     private readonly ICarImageRepository _carImageRepository;
     private readonly ICarRepository _carRepository;
-
     private readonly ILogger<CarService> _logger;
 
     // 构造函数新增 IStorageService
     private readonly IStorageService _storageService;
 
-    public CarService(ICarRepository carRepository, ICarImageRepository carImageRepository,
-        IStorageService storageService, ILogger<CarService> logger)
+    public CarService(ICacheService cache, ICarImageRepository carImageRepository, ICarRepository carRepository,
+        ILogger<CarService> logger, IStorageService storageService)
     {
-        _carRepository = carRepository;
+        _cache = cache; // ✅ 新增
         _carImageRepository = carImageRepository;
-        _storageService = storageService;
+        _carRepository = carRepository;
         _logger = logger;
+        _storageService = storageService;
     }
 
     public async Task<CarResponse> CreateAsync(
@@ -87,6 +90,9 @@ public class CarService
         car.UpdatedAt = DateTime.UtcNow;
 
         var updated = await _carRepository.UpdateAsync(car, cancellationToken);
+
+        //清除待审核车辆列表缓存
+        await _cache.RemoveByPrefixAsync(CacheKeys.PendingCarsPrefix, cancellationToken);
 
         _logger.LogInformation("Car {CarId} submitted for review by seller {SellerId}",
             car.Id, currentUserId);
@@ -235,19 +241,34 @@ public class CarService
     }
 
 
+    // ✅ 公开车辆列表：加缓存
     public async Task<PagedResponse<CarResponse>> GetPublishedCarsAsync(
         CarQueryRequest request,
         CancellationToken cancellationToken = default)
     {
-        var (cars, totalCount) = await _carRepository.GetPagedAsync(
-            CarStatus.Published,
-            request,
+        var page = request.Page < 1 ? 1 : request.Page;
+        var pageSize = Math.Min(request.PageSize < 1 ? 20 : request.PageSize, 50);
+
+        // 构建缓存 Key（包含所有过滤参数，不同参数对应不同缓存）
+        var cacheKey = CacheKeys.PublishedCars(page, pageSize, request.Brand, request.MinPrice, request.MaxPrice,
+            request.MinYear, request.MaxYear);
+
+        // GetOrSetAsync：有缓存直接返回；没有则查数据库并缓存结果
+        return await _cache.GetOrSetAsync(cacheKey, async () =>
+            {
+                // 这个 lambda 只在缓存未命中时执行
+                var (cars, totalCount) = await _carRepository.GetPagedAsync(
+                    CarStatus.Published,
+                    request,
+                    cancellationToken);
+
+                var items = cars.Select(MapToResponse).ToList();
+
+                // PagedResponse.Create 会自动计算 TotalPages
+                return PagedResponse<CarResponse>.Create(items, totalCount, page, pageSize);
+            },
+            TimeSpan.FromSeconds(60), // 公开列表缓存 60 秒
             cancellationToken);
-
-        var items = cars.Select(MapToResponse).ToList();
-
-        // PagedResponse.Create 会自动计算 TotalPages
-        return PagedResponse<CarResponse>.Create(items, totalCount, request.Page, request.PageSize);
     }
 
     public async Task<PagedResponse<CarResponse>> GetSellerCarsAsync(int sellerId, CarQueryRequest request,

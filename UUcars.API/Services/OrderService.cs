@@ -1,3 +1,4 @@
+using Microsoft.EntityFrameworkCore;
 using UUcars.API.Data;
 using UUcars.API.DTOs;
 using UUcars.API.DTOs.Requests;
@@ -6,26 +7,27 @@ using UUcars.API.Entities;
 using UUcars.API.Entities.Enums;
 using UUcars.API.Exceptions;
 using UUcars.API.Repositories;
+using UUcars.API.Services.Cache;
 
 namespace UUcars.API.Services;
 
 public class OrderService
 {
+    private readonly ICacheService _cache;
+
     private readonly ICarRepository _carRepository;
     private readonly AppDbContext _context;
     private readonly ILogger<OrderService> _logger;
     private readonly IOrderRepository _orderRepository;
 
-    public OrderService(
-        IOrderRepository orderRepository,
-        ICarRepository carRepository,
-        AppDbContext context,
-        ILogger<OrderService> logger)
+    public OrderService(ICacheService cache, ICarRepository carRepository, AppDbContext context,
+        ILogger<OrderService> logger, IOrderRepository orderRepository)
     {
-        _orderRepository = orderRepository;
+        _cache = cache;
         _carRepository = carRepository;
         _context = context;
         _logger = logger;
+        _orderRepository = orderRepository;
     }
 
     public async Task<OrderResponse> CreateAsync(
@@ -72,7 +74,25 @@ public class OrderService
         // 任何一步失败都会全部回滚。
         _context.Orders.Add(order);
         _context.Cars.Update(car);
-        await _context.SaveChangesAsync(cancellationToken);
+        try
+        {
+            await _context.SaveChangesAsync(cancellationToken);
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            // 两个买家同时下单同一辆车：先提交的成功，后提交的触发这个异常
+            // 此时车辆的 RowVersion 已经被第一个买家的操作更新了
+            // 第二个买家持有的是旧 RowVersion，EF Core 检测到不匹配，抛出异常
+            _logger.LogWarning(
+                "Concurrency conflict when creating order for car {CarId}", request.CarId);
+            throw new ConcurrencyException();
+        }
+
+        // ✅ 车辆变 Sold，从公开列表消失，清缓存
+        // 注意：缓存清理在 try/catch 外面
+        // 原因：只有 SaveChangesAsync 成功，才需要清缓存
+        // 如果抛了 ConcurrencyException，catch 里直接 throw，缓存清理代码不会执行
+        await _cache.RemoveByPrefixAsync(CacheKeys.PublishedCarsPrefix, cancellationToken);
 
         _logger.LogInformation(
             "Order {OrderId} created: buyer {BuyerId} purchased car {CarId} from seller {SellerId}",
@@ -133,6 +153,9 @@ public class OrderService
         if (car != null)
             _context.Cars.Update(car);
         await _context.SaveChangesAsync(cancellationToken);
+
+        // ✅ 车辆恢复 Published，重回公开列表，清缓存
+        await _cache.RemoveByPrefixAsync(CacheKeys.PublishedCarsPrefix, cancellationToken);
 
         _logger.LogInformation(
             "Order {OrderId} cancelled by buyer {BuyerId}, car {CarId} restored to Published",

@@ -19,7 +19,13 @@ public class AppDbContext : DbContext
     public DbSet<CarImage> CarImages => Set<CarImage>();
     public DbSet<Order> Orders => Set<Order>();
     public DbSet<Favorite> Favorites => Set<Favorite>();
-    public DbSet<Review> Reviews => Set<Review>(); // 新增
+    public DbSet<Review> Reviews => Set<Review>();
+
+    // 新增
+    public DbSet<AuditLog> AuditLogs => Set<AuditLog>();
+
+    // 注册refresh token
+    public DbSet<RefreshToken> RefreshTokens => Set<RefreshToken>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {

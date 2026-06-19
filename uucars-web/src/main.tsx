@@ -9,6 +9,7 @@ import {
 import { router } from "./router";
 import { toast, Toaster } from "sonner";
 import "./index.css";
+import AuthInitializer from "./components/AuthInitializer";
 
 // 创建 QueryClient 实例
 // 所有查询的缓存都存在这个实例里
@@ -38,7 +39,9 @@ createRoot(document.getElementById("root")!).render(
     {/* QueryClientProvider 必须包在 RouterProvider 外面 */}
     {/* 这样路由里的所有组件都能使用 TanStack Query */}
     <QueryClientProvider client={queryClient}>
-      <RouterProvider router={router} />
+      <AuthInitializer>
+        <RouterProvider router={router} />
+      </AuthInitializer>
       {/* Toaster 放在最外层，所有页面都能用 */}
       <Toaster position="bottom-right" />
     </QueryClientProvider>
