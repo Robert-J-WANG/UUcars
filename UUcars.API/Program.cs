@@ -52,17 +52,31 @@ try
                 retainedFileCountLimit: 30
             );
 
-        // ← 新增：只在配置了 ConnectionString 时才挂载 Application Insights Sink
-        // 用 if 而不是 Conditional，原因：
-        // Conditional 的第二个参数是委托，Serilog 在配置阶段就会执行它构建 Sink
-        // 此时 GetRequiredService<TelemetryConfiguration> 如果服务未注册会直接抛异常
+        // V3 修复：原本用 GetRequiredService<TelemetryConfiguration>()，
+        // 一旦该服务未被成功注册就会直接抛 InvalidOperationException，
+        // 导致 builder.Build() 失败、应用启动崩溃（2026-06 在 Container App
+        // 上线后实际发生过一次，根因是订阅状态变动后 AI SDK 的服务注册
+        // 出现了异常，具体内部原因未完全定位，详见 PR 描述）。
+        //
+        // 改用 GetService（允许返回 null）+ 判空，把"是否启用 Application
+        // Insights 日志"降级为非关键路径：即使该服务因为任何原因未注册成功，
+        // 应用本身依然能正常启动并提供核心业务功能，只是会失去 AI 日志能力。
+        //
+        // else 分支打印 Console 警告，是为了避免这种"静默失效"难以察觉——
+        // 万一以后又复现类似问题，至少能在 Container App 的 Console log
+        // stream 里看到提示，而不是悄无声息地丢失可观测性却毫无察觉。
         var aiConnStr = context.Configuration["ApplicationInsights:ConnectionString"];
         if (!string.IsNullOrEmpty(aiConnStr))
-            configuration.WriteTo.ApplicationInsights(
-                services.GetRequiredService
-                    <Microsoft.ApplicationInsights.Extensibility.TelemetryConfiguration>(),
-                new TraceTelemetryConverter()
-            );
+        {
+            var telemetryConfig = services.GetService
+                <Microsoft.ApplicationInsights.Extensibility.TelemetryConfiguration>();
+
+            if (telemetryConfig != null)
+                configuration.WriteTo.ApplicationInsights(telemetryConfig, new TraceTelemetryConverter());
+            else
+                Console.WriteLine("[WARNING] ApplicationInsights ConnectionString 已配置，" +
+                                  "但 TelemetryConfiguration 服务未成功注册，AI 日志功能未启用。");
+        }
     });
 
 
@@ -100,12 +114,23 @@ try
     builder.Services.AddStorageService(builder.Configuration);
 
     // ── Application Insights 服务 ──
-    // 只在配置了 ConnectionString 时才注册 Application Insights 服务
-    // 必须在 Serilog 配置之后、在 UseSerilog 的 lambda 执行之前完成注册
-    // 原因：Serilog 的 lambda 里 GetRequiredService<TelemetryConfiguration> 依赖这里的注册
+    // V3 修复：原本用 if (!string.IsNullOrEmpty(aiConnectionString)) 包裹，
+    // 只在配置了 ConnectionString 时才注册，目的是避免本地开发环境
+    // 把测试日志发到 Azure，同时省去不必要的初始化开销。
+    //
+    // 但这种"按需注册"模式存在隐患：UseSerilog 的 lambda 里（见下方）
+    // 同样独立判断了一次 ConnectionString 是否为空，两边的判断理论上该同步，
+    // 但 AddApplicationInsightsTelemetry() 内部的注册逻辑不完全透明，
+    // 实测出现过"传入了合法的 ConnectionString，却没有把
+    // TelemetryConfiguration 真正注册进 DI 容器"的情况，导致下游
+    // GetRequiredService<TelemetryConfiguration> 直接抛异常，整个应用启动崩溃。
+    //
+    // 改为无条件注册：AddApplicationInsightsTelemetry 即使传入空字符串
+    // 也不会报错，只是会处于"禁用遥测"状态（不发送数据），但依然会把
+    // TelemetryConfiguration 服务注册进容器。这样可以从根上保证该服务
+    // 一定存在，避免"注册条件"和"使用条件"不同步导致的崩溃。
     var aiConnectionString = builder.Configuration["ApplicationInsights:ConnectionString"];
-    if (!string.IsNullOrEmpty(aiConnectionString))
-        builder.Services.AddApplicationInsightsTelemetry(options => { options.ConnectionString = aiConnectionString; });
+    builder.Services.AddApplicationInsightsTelemetry(options => { options.ConnectionString = aiConnectionString; });
 
     // ── Redis Cache服务 ──
 
