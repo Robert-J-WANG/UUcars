@@ -8,7 +8,7 @@ import { useAuthStore } from "@/stores/authStore";
 // 所有请求都基于这个实例，统一配置 baseURL 和超时
 const apiClient = axios.create({
   baseURL: import.meta.env.VITE_API_BASE_URL,
-  timeout: 10000, // 10秒超时
+  timeout: 30000, // 改成30秒，10秒Azure冷启动时间不够
   headers: {
     "Content-Type": "application/json",
   },
