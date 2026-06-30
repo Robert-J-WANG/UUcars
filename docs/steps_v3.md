@@ -8446,3 +8446,277 @@ git checkout develop
 ✅ 理解接口化设计在测试中的价值：单元测试只验证流程逻辑，
    真实写入效果交给集成测试验证（这是分层测试策略的体现）
 ```
+
+
+
+## fixed Issues 
+
+### Fix 1. 并发 Refresh Token 请求竞态条件（Refresh Token Rotation Race Condition）
+
+#### 1. 切出fix分支
+
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b fix/refresh-token-rotation-race-condition
+git push -u origin fix/refresh-token-rotation-race-condition
+```
+
+#### 2. 问题描述
+
+前端应用启动, 并成功登陆后，快速连续刷新登录后的页面，用户被自动登出。
+
+具体来说：前端在应用启动时通过 `AuthInitializer` 组件调用 `authStore.initialize()`，检测到 localStorage 里有 `user` 数据后，向 `/auth/refresh` 发送请求，用 HttpOnly cookie 里的 refresh token 换取新的 access token，实现页面刷新后的静默重登录。
+
+**当用户快速连续刷新页面时**，浏览器会在极短时间内启动多个页面实例，每个实例都独立执行 `initialize()`。由于 `isInitializing` 只是 Zustand 的 UI 渲染标志，无法阻止两个调用同时执行到 `axios.post` 那一行，结果是两个请求几乎同时发出，携带的是**同一个 refresh token**。
+
+后端 `RefreshTokenService.RefreshAsync()` 实现了 token rotation：第一个请求到达后，旧 token 被标记为 `IsRevoked = true`，新 token 写入数据库。第二个请求随后到达，查到的 token 已经是 revoked 状态，触发安全机制 `RevokeAllByUserIdAsync()`，撤销该用户所有 token，返回 400。前端 `catch` 块执行 `clearAuth()`，用户被登出。
+
+#### 3. 根本原因
+
+`isInitializing` 是 Zustand state，只控制 UI 渲染，不是执行锁。两个并发的 `initialize()` 调用都能同时通过 `if (!user)` 检查并到达 `axios.post`，形成竞态。
+
+#### 4. 解决方案
+
+设置模块级 Promise 锁（In-flight Deduplication）
+
+在 `authStore.ts` 模块级别（store 外部）声明一个 `initializePromise` 变量。`initialize()` 执行时先检查这个变量：
+
+- 如果已有飞行中的 Promise，直接返回它，不发新请求
+- 如果没有，创建 Promise 并赋值给 `initializePromise`，`finally` 里清空
+
+这样无论多少个并发调用，实际只会发出一个 HTTP 请求，后续调用都等待并复用第一个请求的结果。这个模式叫做 **Request Coalescing（请求合并）** 或 **In-flight Deduplication（飞行中去重）**。
+
+```c#
+import { create } from "zustand";
+import { persist } from "zustand/middleware";
+import type { User } from "@/types";
+import axios from "axios";
+
+interface AuthState {
+  ...
+}
+
+// fix： 定义模块级 Promise 锁
+let initializePromise: Promise<void> | null = null;
+
+export const useAuthStore = create<AuthState>()(
+  persist(
+    (set, get) => ({
+     
+      ...
+
+      initialize: async () => {
+        const { user } = get();
+
+        // localStorage里没有user信息 → 从未登录过，无需refresh
+        if (!user) {
+          set({ isInitializing: false });
+          return;
+        }
+
+        // 有user信息 → 尝试用 refresh token (cookie) 换新的 access token
+
+        if (initializePromise) {
+          console.log(111);
+          return initializePromise;
+        }
+
+        initializePromise = (async () => {
+          try {
+            const response = await axios.post(
+              `${import.meta.env.VITE_API_BASE_URL}/auth/refresh`,
+              null,
+              { withCredentials: true },
+            );
+            const newAccessToken = response.data.data.accessToken;
+            set({ accessToken: newAccessToken, isInitializing: false });
+          } catch {
+            // refresh token也失效了 → 清除登录态
+            set({ user: null, accessToken: null, isInitializing: false });
+          } finally {
+            initializePromise = null;
+          }
+        })();
+        return initializePromise;
+      },
+    }),
+    {
+      name: "auth-storage", // localStorage 里的 key 名称
+      ...
+      }),
+    },
+  ),
+);
+
+```
+
+#### 5. 测试并合并分支
+
+用户登录成功后，在当期页面连续刷新，Dev tools后台工具的Network里观察到只发送一次refresh请求。
+
+合并回主分支
+
+```bash
+git add .
+git commit -m "fix: prevent concurrent refresh token requests on initialize"
+git push origin fix/refresh-token-rotation-race-condition
+
+# 合并回 develop
+git checkout develop
+git merge --no-ff fix/refresh-token-rotation-race-condition \
+  -m "merge: fix/refresh-token-rotation-race-condition into develop"
+git push origin develop
+
+# 删除功能分支
+git branch -d fix/refresh-token-rotation-race-condition
+git push origin --delete fix/refresh-token-rotation-race-condition
+```
+
+
+
+### Fix 2：生产环境 Refresh Token Cookie 跨域丢失
+
+#### 1. 切出 fix 分支
+
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b fix/cookie-samesite-production
+git push -u origin fix/cookie-samesite-production
+```
+
+#### 2. 问题描述
+
+部署到 Azure 后，用户登录成功，但浏览器里没有 `refreshToken` cookie。本地开发完全正常。导致生产环境任何页面刷新都会登出，因为 `initialize()` 调用 `/auth/refresh` 时没有 cookie 可以携带。
+
+#### 3. 根本原因
+
+本地开发时前端（`localhost:5173`）和后端（`localhost:5000`）同域，我们在SetRefreshTokenCookie里显式设置的`SameSite=Strict` 没有问题。
+
+```c#
+var cookieOptions = new CookieOptions
+{
+    HttpOnly = true,
+    Secure = true,
+    SameSite = SameSiteMode.Strict, // ← 显式设置
+    Expires = expiresAt,
+    Path = "/"
+};
+```
+
+但是， 部署到 Azure 后，前端（`xxx.azurestaticapps.net`）和后端（`xxx.azurecontainerapps.io`）是不同域名，属于跨域。浏览器对 `SameSite=Strict` 的处理是：跨域请求时直接拒绝存储 cookie，`Set-Cookie` 响应头被静默忽略。
+
+同理，`Logout` 里的 `Cookies.Delete` 也因为属性不匹配而删不掉 cookie。
+
+**那么之前的版本为什么要设置 `SameSite = SameSiteMode.Strict`?**
+
+`SameSite` 的本质目的是防御 **CSRF（跨站请求伪造）攻击**。
+
+攻击场景：用户登录了网站，坏人的网站偷偷发一个请求到 API，浏览器会自动携带 cookie，服务器以为是合法用户操作。
+
+- `Strict`：最严格，任何跨域请求都不带 cookie，CSRF 完全无法成立
+- `Lax`：部分防护，导航跳转可以带，`fetch`/`XHR` 不带
+- `None`：不防护，所有请求都带 cookie，但需要额外的 CSRF 防护手段
+
+当前架构是**前后端分离 + 不同域名**，这本身就是跨域。前端发的每一个请求对浏览器来说都是"跨站"的，`Strict` 和 `Lax` 都会把自己的请求拦掉。
+
+用了 `None` 之后 CSRF 防护就靠其他手段来补：
+
+- 我们的 CORS 已经配了 `WithOrigins(allowedOrigins)`，只允许指定域名，不是 `*`
+- `AllowCredentials()` 配合指定 Origin，浏览器会验证请求来源
+- 这两个加在一起已经把 CSRF 的风险降到很低了
+
+#### 4. 解决方案
+
+跨域场景下 cookie 必须设置 `SameSite=None` + `Secure=true`。生产环境通过 `IsDevelopment()` 判断切换。
+
+- 本地环境
+
+    ```bash
+    SameSite=None
+    Secure=false
+    ```
+
+- 生成环境
+
+    ```bash
+    SameSite=None
+    Secure=true
+    ```
+
+修改``AuthController.cs`里的`SetRefreshTokenCookie` 方法：
+
+```c#
+
+private void SetRefreshTokenCookie(string token, DateTime expiresAt)
+{
+    var cookieOptions = new CookieOptions
+    {
+        HttpOnly = true, 
+        Secure = true, 
+        SameSite = SameSiteMode.None, //允许跨域， 防 CSRF 通过其他配置
+        Expires = expiresAt, 
+        Path = "/" 
+    };
+
+    ,,,
+}
+```
+
+更新 `Logout`
+
+```c#
+
+[HttpPost("logout")]
+[EnableRateLimiting(RateLimitPolicies.Write)]
+public async Task<IActionResult> Logout(CancellationToken cancellationToken)
+{
+    ...
+
+    // 清除 Cookie
+    Response.Cookies.Delete("refreshToken", new CookieOptions
+    {
+        Path = "/", // 和 SetRefreshTokenCookie 里的 Path 保持一致，否则删不掉
+        SameSite = SameSiteMode.None, // 必须和 Set-Cookie 时的属性一致才能删掉
+        Secure = true
+    });
+
+    return Ok(ApiResponse<object>.Ok("Logged out successfully"));
+}
+```
+
+#### 5. 测试并合并分支
+
+部署到 Azure 后，登录成功，浏览器 Application → Cookies 里可以看到 `refreshToken`。刷新页面不再登出。Logout 后 cookie 被正确清除。
+
+合并分支：
+
+```bash
+git add .
+git commit -m "fix: use SameSite=None in production for cross-origin cookie"
+git push origin fix/cookie-samesite-production
+
+git checkout develop
+git merge --no-ff fix/cookie-samesite-production \
+  -m "merge: fix/cookie-samesite-production into develop"
+git push origin develop
+
+git branch -d fix/cookie-samesite-production
+git push origin --delete fix/cookie-samesite-production
+
+```
+
+合并回main分支
+
+```bash
+git checkout main
+git pull origin main
+git merge --no-ff develop \
+  -m "merge: fix/cookie-samesite-production into main"
+git push origin main
+git checkout develop
+```
+
+
+
