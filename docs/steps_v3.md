@@ -8451,7 +8451,7 @@ git checkout develop
 
 ## fixed Issues 
 
-### 1. 并发 Refresh Token 请求竞态条件（Refresh Token Rotation Race Condition）
+### Fix 1. 并发 Refresh Token 请求竞态条件（Refresh Token Rotation Race Condition）
 
 #### 1. 切出fix分支
 
@@ -8571,6 +8571,151 @@ git push origin develop
 # 删除功能分支
 git branch -d fix/refresh-token-rotation-race-condition
 git push origin --delete fix/refresh-token-rotation-race-condition
+```
+
+
+
+### Fix 2：生产环境 Refresh Token Cookie 跨域丢失
+
+#### 1. 切出 fix 分支
+
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b fix/cookie-samesite-production
+git push -u origin fix/cookie-samesite-production
+```
+
+#### 2. 问题描述
+
+部署到 Azure 后，用户登录成功，但浏览器里没有 `refreshToken` cookie。本地开发完全正常。导致生产环境任何页面刷新都会登出，因为 `initialize()` 调用 `/auth/refresh` 时没有 cookie 可以携带。
+
+#### 3. 根本原因
+
+本地开发时前端（`localhost:5173`）和后端（`localhost:5000`）同域，我们在SetRefreshTokenCookie里显式设置的`SameSite=Strict` 没有问题。
+
+```c#
+var cookieOptions = new CookieOptions
+{
+    HttpOnly = true,
+    Secure = true,
+    SameSite = SameSiteMode.Strict, // ← 显式设置
+    Expires = expiresAt,
+    Path = "/"
+};
+```
+
+但是， 部署到 Azure 后，前端（`xxx.azurestaticapps.net`）和后端（`xxx.azurecontainerapps.io`）是不同域名，属于跨域。浏览器对 `SameSite=Strict` 的处理是：跨域请求时直接拒绝存储 cookie，`Set-Cookie` 响应头被静默忽略。
+
+同理，`Logout` 里的 `Cookies.Delete` 也因为属性不匹配而删不掉 cookie。
+
+**那么之前的版本为什么要设置 `SameSite = SameSiteMode.Strict`?**
+
+`SameSite` 的本质目的是防御 **CSRF（跨站请求伪造）攻击**。
+
+攻击场景：用户登录了网站，坏人的网站偷偷发一个请求到 API，浏览器会自动携带 cookie，服务器以为是合法用户操作。
+
+- `Strict`：最严格，任何跨域请求都不带 cookie，CSRF 完全无法成立
+- `Lax`：部分防护，导航跳转可以带，`fetch`/`XHR` 不带
+- `None`：不防护，所有请求都带 cookie，但需要额外的 CSRF 防护手段
+
+当前架构是**前后端分离 + 不同域名**，这本身就是跨域。前端发的每一个请求对浏览器来说都是"跨站"的，`Strict` 和 `Lax` 都会把自己的请求拦掉。
+
+用了 `None` 之后 CSRF 防护就靠其他手段来补：
+
+- 我们的 CORS 已经配了 `WithOrigins(allowedOrigins)`，只允许指定域名，不是 `*`
+- `AllowCredentials()` 配合指定 Origin，浏览器会验证请求来源
+- 这两个加在一起已经把 CSRF 的风险降到很低了
+
+#### 4. 解决方案
+
+跨域场景下 cookie 必须设置 `SameSite=None` + `Secure=true`。生产环境通过 `IsDevelopment()` 判断切换。
+
+- 本地环境
+
+    ```bash
+    SameSite=None
+    Secure=false
+    ```
+
+- 生成环境
+
+    ```bash
+    SameSite=None
+    Secure=true
+    ```
+
+修改``AuthController.cs`里的`SetRefreshTokenCookie` 方法：
+
+```c#
+
+private void SetRefreshTokenCookie(string token, DateTime expiresAt)
+{
+    var cookieOptions = new CookieOptions
+    {
+        HttpOnly = true, 
+        Secure = true, 
+        SameSite = SameSiteMode.None, //允许跨域， 防 CSRF 通过其他配置
+        Expires = expiresAt, 
+        Path = "/" 
+    };
+
+    ,,,
+}
+```
+
+更新 `Logout`
+
+```c#
+
+[HttpPost("logout")]
+[EnableRateLimiting(RateLimitPolicies.Write)]
+public async Task<IActionResult> Logout(CancellationToken cancellationToken)
+{
+    ...
+
+    // 清除 Cookie
+    Response.Cookies.Delete("refreshToken", new CookieOptions
+    {
+        Path = "/", // 和 SetRefreshTokenCookie 里的 Path 保持一致，否则删不掉
+        SameSite = SameSiteMode.None, // 必须和 Set-Cookie 时的属性一致才能删掉
+        Secure = true
+    });
+
+    return Ok(ApiResponse<object>.Ok("Logged out successfully"));
+}
+```
+
+#### 5. 测试并合并分支
+
+部署到 Azure 后，登录成功，浏览器 Application → Cookies 里可以看到 `refreshToken`。刷新页面不再登出。Logout 后 cookie 被正确清除。
+
+合并分支：
+
+```bash
+git add .
+git commit -m "fix: use SameSite=None in production for cross-origin cookie"
+git push origin fix/cookie-samesite-production
+
+git checkout develop
+git merge --no-ff fix/cookie-samesite-production \
+  -m "merge: fix/cookie-samesite-production into develop"
+git push origin develop
+
+git branch -d fix/cookie-samesite-production
+git push origin --delete fix/cookie-samesite-production
+
+```
+
+合并回main分支
+
+```bash
+git checkout main
+git pull origin main
+git merge --no-ff develop \
+  -m "merge: fix/cookie-samesite-production into main"
+git push origin main
+git checkout develop
 ```
 
 

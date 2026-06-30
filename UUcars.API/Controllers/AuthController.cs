@@ -166,7 +166,9 @@ public class AuthController : ControllerBase
         // 清除 Cookie
         Response.Cookies.Delete("refreshToken", new CookieOptions
         {
-            Path = "/" // 和 SetRefreshTokenCookie 里的 Path 保持一致，否则删不掉
+            Path = "/", // 和 SetRefreshTokenCookie 里的 Path 保持一致，否则删不掉
+            SameSite = SameSiteMode.None, // 必须和 Set-Cookie 时的属性一致才能删掉
+            Secure = true
         });
 
         return Ok(ApiResponse<object>.Ok("Logged out successfully"));
@@ -182,7 +184,7 @@ public class AuthController : ControllerBase
         {
             HttpOnly = true, // JS 无法读取
             Secure = true, // 只通过 HTTPS 传输
-            SameSite = SameSiteMode.Strict, // 防 CSRF
+            SameSite = SameSiteMode.None, // 防 CSRF 通过其他配置
             Expires = expiresAt, // 和 RefreshToken 过期时间一致
             Path = "/" // 全站发送，避免非/auth路径下无法携带Cookie
         };
