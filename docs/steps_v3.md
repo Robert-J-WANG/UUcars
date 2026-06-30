@@ -8446,3 +8446,132 @@ git checkout develop
 ✅ 理解接口化设计在测试中的价值：单元测试只验证流程逻辑，
    真实写入效果交给集成测试验证（这是分层测试策略的体现）
 ```
+
+
+
+## fixed Issues 
+
+### 1. 并发 Refresh Token 请求竞态条件（Refresh Token Rotation Race Condition）
+
+#### 1. 切出fix分支
+
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b fix/refresh-token-rotation-race-condition
+git push -u origin fix/refresh-token-rotation-race-condition
+```
+
+#### 2. 问题描述
+
+前端应用启动, 并成功登陆后，快速连续刷新登录后的页面，用户被自动登出。
+
+具体来说：前端在应用启动时通过 `AuthInitializer` 组件调用 `authStore.initialize()`，检测到 localStorage 里有 `user` 数据后，向 `/auth/refresh` 发送请求，用 HttpOnly cookie 里的 refresh token 换取新的 access token，实现页面刷新后的静默重登录。
+
+**当用户快速连续刷新页面时**，浏览器会在极短时间内启动多个页面实例，每个实例都独立执行 `initialize()`。由于 `isInitializing` 只是 Zustand 的 UI 渲染标志，无法阻止两个调用同时执行到 `axios.post` 那一行，结果是两个请求几乎同时发出，携带的是**同一个 refresh token**。
+
+后端 `RefreshTokenService.RefreshAsync()` 实现了 token rotation：第一个请求到达后，旧 token 被标记为 `IsRevoked = true`，新 token 写入数据库。第二个请求随后到达，查到的 token 已经是 revoked 状态，触发安全机制 `RevokeAllByUserIdAsync()`，撤销该用户所有 token，返回 400。前端 `catch` 块执行 `clearAuth()`，用户被登出。
+
+#### 3. 根本原因
+
+`isInitializing` 是 Zustand state，只控制 UI 渲染，不是执行锁。两个并发的 `initialize()` 调用都能同时通过 `if (!user)` 检查并到达 `axios.post`，形成竞态。
+
+#### 4. 解决方案
+
+设置模块级 Promise 锁（In-flight Deduplication）
+
+在 `authStore.ts` 模块级别（store 外部）声明一个 `initializePromise` 变量。`initialize()` 执行时先检查这个变量：
+
+- 如果已有飞行中的 Promise，直接返回它，不发新请求
+- 如果没有，创建 Promise 并赋值给 `initializePromise`，`finally` 里清空
+
+这样无论多少个并发调用，实际只会发出一个 HTTP 请求，后续调用都等待并复用第一个请求的结果。这个模式叫做 **Request Coalescing（请求合并）** 或 **In-flight Deduplication（飞行中去重）**。
+
+```c#
+import { create } from "zustand";
+import { persist } from "zustand/middleware";
+import type { User } from "@/types";
+import axios from "axios";
+
+interface AuthState {
+  ...
+}
+
+// fix： 定义模块级 Promise 锁
+let initializePromise: Promise<void> | null = null;
+
+export const useAuthStore = create<AuthState>()(
+  persist(
+    (set, get) => ({
+     
+      ...
+
+      initialize: async () => {
+        const { user } = get();
+
+        // localStorage里没有user信息 → 从未登录过，无需refresh
+        if (!user) {
+          set({ isInitializing: false });
+          return;
+        }
+
+        // 有user信息 → 尝试用 refresh token (cookie) 换新的 access token
+
+        if (initializePromise) {
+          console.log(111);
+          return initializePromise;
+        }
+
+        initializePromise = (async () => {
+          try {
+            const response = await axios.post(
+              `${import.meta.env.VITE_API_BASE_URL}/auth/refresh`,
+              null,
+              { withCredentials: true },
+            );
+            const newAccessToken = response.data.data.accessToken;
+            set({ accessToken: newAccessToken, isInitializing: false });
+          } catch {
+            // refresh token也失效了 → 清除登录态
+            set({ user: null, accessToken: null, isInitializing: false });
+          } finally {
+            initializePromise = null;
+          }
+        })();
+        return initializePromise;
+      },
+    }),
+    {
+      name: "auth-storage", // localStorage 里的 key 名称
+      ...
+      }),
+    },
+  ),
+);
+
+```
+
+#### 5. 测试并合并分支
+
+用户登录成功后，在当期页面连续刷新，Dev tools后台工具的Network里观察到只发送一次refresh请求。
+
+合并回主分支
+
+```bash
+git add .
+git commit -m "fix: prevent concurrent refresh token requests on initialize"
+git push origin fix/refresh-token-rotation-race-condition
+
+# 合并回 develop
+git checkout develop
+git merge --no-ff fix/refresh-token-rotation-race-condition \
+  -m "merge: fix/refresh-token-rotation-race-condition into develop"
+git push origin develop
+
+# 删除功能分支
+git branch -d fix/refresh-token-rotation-race-condition
+git push origin --delete fix/refresh-token-rotation-race-condition
+```
+
+
+

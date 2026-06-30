@@ -27,6 +27,9 @@ interface AuthState {
   initialize: () => Promise<void>;
 }
 
+// fix： 定义模块级 Promise 锁
+let initializePromise: Promise<void> | null = null;
+
 export const useAuthStore = create<AuthState>()(
   // persist 中间件：把 store 的状态同步到 localStorage
   // 页面刷新后状态不会丢失，用户不需要重新登录
@@ -69,18 +72,29 @@ export const useAuthStore = create<AuthState>()(
         }
 
         // 有user信息 → 尝试用 refresh token (cookie) 换新的 access token
-        try {
-          const response = await axios.post(
-            `${import.meta.env.VITE_API_BASE_URL}/auth/refresh`,
-            null,
-            { withCredentials: true },
-          );
-          const newAccessToken = response.data.data.accessToken;
-          set({ accessToken: newAccessToken, isInitializing: false });
-        } catch {
-          // refresh token也失效了 → 清除登录态
-          set({ user: null, accessToken: null, isInitializing: false });
+
+        if (initializePromise) {
+          console.log(111);
+          return initializePromise;
         }
+
+        initializePromise = (async () => {
+          try {
+            const response = await axios.post(
+              `${import.meta.env.VITE_API_BASE_URL}/auth/refresh`,
+              null,
+              { withCredentials: true },
+            );
+            const newAccessToken = response.data.data.accessToken;
+            set({ accessToken: newAccessToken, isInitializing: false });
+          } catch {
+            // refresh token也失效了 → 清除登录态
+            set({ user: null, accessToken: null, isInitializing: false });
+          } finally {
+            initializePromise = null;
+          }
+        })();
+        return initializePromise;
       },
     }),
     {
