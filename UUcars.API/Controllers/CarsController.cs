@@ -109,6 +109,21 @@ public class CarsController : ControllerBase
             ApiResponse<CarImageResponse>.Ok(image, "Image added successfully."));
     }
 
+    // POST cars/{id}/images/batch
+    [HttpPost("{id:int}/images/batch")]
+    [Authorize]
+    [EnableRateLimiting(RateLimitPolicies.Write)]
+    public async Task<IActionResult> AddImagesBatch(int id, [FromForm] CarImageBatchAddRequest request,
+        CancellationToken cancellationToken)
+    {
+        var currentUserId = _currentUserService.GetCurrentUserId();
+        if (currentUserId == null)
+            return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+        var images = await _carService.AddImagesBatchAsync(id, currentUserId.Value, request, cancellationToken);
+        return StatusCode(StatusCodes.Status201Created,
+            ApiResponse<List<CarImageResponse>>.Ok(images, "Images added successfully."));
+    }
+
     // DELETE /cars/{id}/images/{imageId}
     [HttpDelete("{id:int}/images/{imageId:int}")]
     [Authorize]

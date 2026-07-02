@@ -194,7 +194,11 @@ public class AuthController : ControllerBase
         if (HttpContext.RequestServices
             .GetRequiredService<IWebHostEnvironment>()
             .IsDevelopment())
+        {
+            cookieOptions.SameSite = SameSiteMode.Strict;
             cookieOptions.Secure = false;
+        }
+
 
         Response.Cookies.Append("refreshToken", token, cookieOptions);
     }

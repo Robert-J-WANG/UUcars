@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging.Abstractions;
 using UUcars.API.DTOs.Requests;
 using UUcars.API.Entities;
@@ -262,4 +263,83 @@ public class CarServiceTests
 
         Assert.NotNull(result);
     }
+
+
+    // ===== 批量上传图片（Step 64① 新增）=====
+
+    [Fact]
+    public async Task AddImagesBatchAsync_WhenExceedsMaxImages_ShouldThrowAppException()
+    {
+        var repo = new FakeCarRepository();
+        var imageRepo = new FakeCarImageRepository();
+        repo.Seed(new Car { Id = 1, SellerId = 10, Status = CarStatus.Draft });
+
+        // 已有 8 张图
+        for (var i = 0; i < 8; i++)
+            imageRepo.Seed(new CarImage { CarId = 1, SortOrder = i });
+
+        var service = CreateService(repo, imageRepo);
+
+        // 再传 3 张，8 + 3 = 11，超过上限 10
+        var request = new CarImageBatchAddRequest
+        {
+            Files = new FakeFormFileCollection(
+                CreateFakeFormFile("a.jpg"),
+                CreateFakeFormFile("b.jpg"),
+                CreateFakeFormFile("c.jpg"))
+        };
+
+        await Assert.ThrowsAsync<AppException>(() => service.AddImagesBatchAsync(1, 10, request));
+    }
+
+    [Fact]
+    public async Task AddImagesBatchAsync_WhenNotOwner_ShouldThrowForbiddenException()
+    {
+        var repo = new FakeCarRepository();
+        var imageRepo = new FakeCarImageRepository();
+        repo.Seed(new Car { Id = 1, SellerId = 10, Status = CarStatus.Draft });
+        var service = CreateService(repo, imageRepo);
+
+        var request = new CarImageBatchAddRequest
+        {
+            Files = new FakeFormFileCollection(CreateFakeFormFile("a.jpg"))
+        };
+
+        // userId = 99 不是车主
+        await Assert.ThrowsAsync<ForbiddenException>(() => service.AddImagesBatchAsync(1, 99, request));
+    }
+
+// ===== 辅助：构造假的 IFormFile / IFormFileCollection =====
+
+    private static IFormFile CreateFakeFormFile(string fileName)
+    {
+        var content = "fake image content"u8.ToArray();
+        var stream = new MemoryStream(content);
+        return new FormFile(stream, 0, content.Length, "files", fileName)
+        {
+            Headers = new HeaderDictionary(),
+            ContentType = "image/jpeg"
+        };
+    }
+}
+
+// IFormFileCollection 的测试用实现
+// ASP.NET Core 没有提供开箱即用的空实现，包一层 List<IFormFile> 即可
+internal class FakeFormFileCollection : List<IFormFile>, IFormFileCollection
+{
+    public FakeFormFileCollection(params IFormFile[] files) : base(files)
+    {
+    }
+
+    public IFormFile? GetFile(string name)
+    {
+        return this.FirstOrDefault(f => f.Name == name);
+    }
+
+    public IReadOnlyList<IFormFile> GetFiles(string name)
+    {
+        return this.Where(f => f.Name == name).ToList();
+    }
+
+    IFormFile? IFormFileCollection.this[string name] => GetFile(name);
 }

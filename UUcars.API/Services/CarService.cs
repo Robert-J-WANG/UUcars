@@ -240,6 +240,83 @@ public class CarService
             imageId, carId, currentUserId);
     }
 
+// ✅ 新增：批量添加图片
+    public async Task<List<CarImageResponse>> AddImagesBatchAsync(
+        int carId,
+        int currentUserId,
+        CarImageBatchAddRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+        if (car == null)
+            throw new CarNotFoundException(carId);
+
+        if (car.SellerId != currentUserId)
+            throw new ForbiddenException();
+
+        if (car.Status != CarStatus.Draft)
+            throw new CarStatusException(car.Id, car.Status, CarStatus.Draft);
+
+        // 数量上限校验：一辆车最多 10 张图
+        // 在后端统一校验（而不是让前端自己算），避免前端并行上传时的竞态问题
+        const int maxImagesPerCar = 10;
+        var existingImages = await _carImageRepository.GetByCarIdAsync(carId, cancellationToken);
+        if (existingImages.Count + request.Files.Count > maxImagesPerCar)
+            throw new AppException(
+                StatusCodes.Status400BadRequest,
+                $"A car can have at most {maxImagesPerCar} images. " +
+                $"Currently has {existingImages.Count}, attempted to add {request.Files.Count}.");
+
+        // 逐一校验每个文件（大小、类型）
+        // 任何一个文件不合法，整批都拒绝，不做"部分成功"
+        foreach (var file in request.Files)
+        {
+            var (isValid, error) = FileValidator.Validate(file);
+            if (!isValid)
+                throw new AppException(StatusCodes.Status400BadRequest, error!);
+        }
+
+        // 新图片从当前最大 SortOrder 之后开始排
+        var currentMaxSortOrder = existingImages.Count > 0
+            ? existingImages.Max(i => i.SortOrder)
+            : -1;
+
+        // 逐个上传到 R2（R2/S3 协议本身不支持批量上传，仍需逐个调用）
+        var newImages = new List<CarImage>();
+        var sortOrder = currentMaxSortOrder + 1;
+
+        foreach (var file in request.Files)
+        {
+            var fileName = FileValidator.GenerateFileName(file.FileName);
+
+            string imageUrl;
+            await using (var stream = file.OpenReadStream())
+            {
+                imageUrl = await _storageService.UploadAsync(
+                    stream, fileName, file.ContentType, cancellationToken);
+            }
+
+            newImages.Add(new CarImage
+            {
+                CarId = carId,
+                ImageUrl = imageUrl,
+                SortOrder = sortOrder
+            });
+
+            sortOrder++;
+        }
+
+        // 一次性批量写入数据库（一个事务，不会出现部分成功）
+        var created = await _carImageRepository.AddRangeAsync(newImages, cancellationToken);
+
+        _logger.LogInformation(
+            "{Count} images added to car {CarId} by seller {SellerId}",
+            created.Count, carId, currentUserId);
+
+        return created.Select(MapToImageResponse).ToList();
+    }
+
 
     // ✅ 公开车辆列表：加缓存
     public async Task<PagedResponse<CarResponse>> GetPublishedCarsAsync(
