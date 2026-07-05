@@ -16,4 +16,8 @@ public interface ICarImageRepository
     // ✅ 新增：根据车辆 Id 查询该车辆的所有图片
     // 批量上传时用于计算已有数量
     Task<List<CarImage>> GetByCarIdAsync(int carId, CancellationToken cancellationToken = default);
+
+    // ✅ 新增：批量更新排序
+    Task UpdateSortOrdersAsync(
+        List<CarImage> images, CancellationToken cancellationToken = default);
 }

@@ -9275,7 +9275,9 @@ public interface ICarImageRepository
 ```csharp
 namespace UUcars.API.DTOs.Requests;
 
-// 单张图片的新排序值
+public class CarImageReorderRequest
+{
+// 单张图片的新的排序值
 public class CarImageOrderItem
 {
     public int ImageId { get; set; }
@@ -9283,93 +9285,88 @@ public class CarImageOrderItem
 }
 
 // 排序请求：一次性提交整组图片的新顺序
-public class CarImageReorderRequest
+public class CarImageReorderList
 {
     public List<CarImageOrderItem> Items { get; set; } = [];
+}
 }
 ```
 
 
 
-### 3. 后端：CarService 新增方法
+### 3. CarService 新增方法
+
+排序的 Service 方法要先过基础权限校验（车辆存在、是车主、状态是 Draft，和批量上传一样），然后是这一步特有的**IDOR 防护**：
+
+如果不检查请求里的 `ImageId` 是否真的属于这辆车，恶意用户可以在请求体里塞入别人车辆的图片 Id，后端如果直接信任并写入，就会把别人车辆的排序也改了——这是一次未经授权的跨资源修改。所以要先把这辆车真实存在的所有图片 Id 取出来做一个集合，请求里任何一个 Id 不在这个集合里，直接拒绝整个请求。
+
+校验通过后：
+
+- 才在内存里把每张图对应的 `SortOrder` 改成新值（前端指定的新数字），
+- 再调新增的 `UpdateSortOrdersAsync` 统一批量写回。
+- 最后排列一次（`OrderBy`），把数据按新的顺序返回
 
 打开 `UUcars.API/Services/CarService.cs`，在 `AddImagesBatchAsync` 之后加入：
 
 ```csharp
 // ✅ 新增：调整图片排序
-public async Task<List<CarImageResponse>> ReorderImagesAsync(
-    int carId,
+public async Task<List<CarImageResponse>> ReorderImagesAsync(int carId,
     int currentUserId,
-    CarImageReorderRequest request,
+    CarImageReorderRequest.CarImageReorderList request,
     CancellationToken cancellationToken = default)
 {
+    //基础权限校验
     var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
-
-    if (car == null)
-        throw new CarNotFoundException(carId);
-
-    if (car.SellerId != currentUserId)
-        throw new ForbiddenException();
-
-    if (car.Status != CarStatus.Draft)
-        throw new CarStatusException(car.Id, car.Status, CarStatus.Draft);
+    if (car == null) throw new CarNotFoundException(carId);
+    if (car.SellerId != currentUserId) throw new ForbiddenException();
+    if (car.Status != CarStatus.Draft) throw new CarStatusException(car.Id, car.Status, CarStatus.Draft);
 
     // 取出这辆车的所有图片，验证请求里的 ImageId 都属于这辆车
     // IDOR 防护：防止用户把别人车辆的 ImageId 塞进来
     var existingImages = await _carImageRepository.GetByCarIdAsync(carId, cancellationToken);
-    var existingImageIds = existingImages.Select(i => i.Id).ToHashSet();
-
+    var existingImageIds = existingImages.Select(i => i.Id).ToList();
     foreach (var item in request.Items)
-    {
         if (!existingImageIds.Contains(item.ImageId))
             throw new CarImageNotFoundException(item.ImageId);
-    }
 
-    // 应用新的排序值
+    // 找到图片，并改成新的排序值
     foreach (var item in request.Items)
     {
         var image = existingImages.First(i => i.Id == item.ImageId);
         image.SortOrder = item.SortOrder;
     }
 
+    // 统一批量写回
     await _carImageRepository.UpdateSortOrdersAsync(existingImages, cancellationToken);
-
     _logger.LogInformation(
         "Images reordered for car {CarId} by seller {SellerId}", carId, currentUserId);
 
-    return existingImages
-        .OrderBy(i => i.SortOrder)
-        .Select(MapToImageResponse)
-        .ToList();
+    // 把数据按新的顺序返回
+    return existingImages.OrderBy(i => i.SortOrder).Select(MapToImageResponse).ToList();
 }
 ```
 
 
 
-### 为什么要先校验 ImageId 是否属于这辆车？
+### 4. CarsController 新增接口
 
-如果不检查，恶意用户可以在请求体里塞入别人车辆的图片 Id，后端如果直接信任并写入，就会把别人车辆的排序也改了——这是一次未经授权的跨资源修改（IDOR）。所以要先把这辆车真实存在的所有图片 Id 取出来做一个集合，请求里任何一个 Id 不在这个集合里，直接拒绝整个请求。
-
-
-
-### 4. 后端：CarsController 新增接口
+排序请求是纯 JSON 数据（不含文件），所以用标准 `[FromBody]` 绑定，和批量上传的 `[FromForm]` 不同——这也是两者唯一的接口层面差异，其余风格（鉴权、限流）保持一致。
 
 打开 `UUcars.API/Controllers/CarsController.cs`，在 `AddImagesBatch` 之后加入：
 
 ```csharp
+// 新增排序接口
 // PUT /cars/{id}/images/reorder
 [HttpPut("{id:int}/images/reorder")]
 [Authorize]
 [EnableRateLimiting(RateLimitPolicies.Write)]
-public async Task<IActionResult> ReorderImages(
-    int id,
-    [FromBody] CarImageReorderRequest request,
+public async Task<IActionResult> ReorderImages(int id, [FromBody] CarImageReorderRequest request,
     CancellationToken cancellationToken)
 {
+    // 验证是否登录
     var currentUserId = _currentUserService.GetCurrentUserId();
-    if (currentUserId == null)
-        return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
-
+    if (currentUserId == null) return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+    // 是登录用户
     var images = await _carService.ReorderImagesAsync(
         id, currentUserId.Value, request, cancellationToken);
 
@@ -9377,13 +9374,9 @@ public async Task<IActionResult> ReorderImages(
 }
 ```
 
-> **为什么排序用 `[FromBody]`，批量上传用 `[FromForm]`？**
->
-> 排序只是纯 JSON 数据，不含文件，用标准 `[FromBody]` 更直接，和项目里其他纯数据提交接口（比如 `PUT /cars/{id}`）风格一致。
 
 
-
-### 5. 前端：安装依赖
+### 5. 安装拖拽库
 
 ```bash
 cd uucars-web
@@ -9393,6 +9386,8 @@ npm install @dnd-kit/core @dnd-kit/sortable @dnd-kit/utilities
 
 
 ### 6. 前端：扩展 cars.ts
+
+新增排序请求的 API 函数
 
 打开 `src/api/cars.ts`，在 `uploadImagesBatch` 之后加入：
 
@@ -9412,34 +9407,598 @@ reorderImages: async (
 
 
 
-### 7. 前端：改造 ImageUploader 组件
+### 7. 更新 ImageUploader 组件
 
-在阶段①的组件基础上叠加拖拽能力，涉及几处改动。
+拖拽这个动作，从用户角度看是连续的一气呵成：按下 → 移动 → 松开。但拆到代码实现层面，要分成三个独立的阶段：
 
-### 为什么拖拽手柄要单独绑定，而不是整张卡片都能拖？
+1. **感知阶段**：浏览器要能识别出"用户现在正在拖拽一个东西"，而不是普通的点击或者页面滚动。这要靠监听指针按下/移动/松开这类原生事件来实现，并且要有一个判断标准："移动了多少距离才算真的开始拖，而不是手抖或者正常点击"。
+2. **追踪阶段**：拖拽进行中，要实时知道"正在拖的是哪一个元素"、"当前悬停在哪一个元素附近"。这要求每一个可能被拖拽、或者可能被"拖到它上面"的元素，都提前登记进一个名册，这样拖拽过程中才能拿当前指针位置去比对，算出离哪个元素最近。
+3. **结算阶段**：松手那一刻，要根据"最初拖的是谁"和"最后停在哪"这两个信息，算出一份新的排列顺序，再把这份新顺序应用到界面（视觉更新）、以及提交给后端（持久化）。
 
-卡片上已经有一个删除按钮。如果整张卡片都能触发拖拽，浏览器无法区分用户"点击删除"和"开始拖动"这两个意图，两边的事件监听会冲突。所以要把拖拽范围收窄到一个独立的小图标（拖拽手柄）上，和删除按钮在物理位置上分开。
+批量上传阶段，`images` prop 是直接拿来渲染的，没有本地状态去"记住"一份可变的顺序。拖拽排序需要在本地立刻响应用户拖动的结果（乐观更新），所以要新增一层可变的本地状态；同时要新增一个提交新顺序给后端的接口调用；渲染层面要把"纯展示的图片方块"改造成"能被拖拽感知"的方块，并且用 dnd-kit 的容器组件包起来。
 
-### 为什么拖拽结束后要立即更新界面，不等接口返回？
+更新过程包含一下五步：① 引入本地可变顺序状态 ② 新增排序请求 ③ 引入 dnd-kit 相关 import ④ 传感器和拖拽结束回调 ⑤ 渲染层改造（包容器 + 展示项加拖拽手柄）。
 
-如果等接口调用成功之后才更新界面，用户会感觉"松手 → 卡顿 → 图片才跳到新位置"，体验割裂。松手那一刻先在本地立即把数组重排（乐观更新），把真正的网络请求放到后台执行。
+#### 7.1 新增一个本地的 `localImages` 状态
 
-### 排序失败时界面怎么处理？
+拖拽这个交互要求"手一松开，图片立刻跳到新位置"，不能等后端接口返回了才更新界面（那样会有明显卡顿）。但在批量上传阶段，`images` prop 是直接拿来渲染的 `images` 是父组件传进来的 prop，组件自己不能直接修改它。
 
-不手动写"倒回上一个顺序"的逻辑，而是让 `queryClient` 重新去后端拉一次这辆车的真实数据。因为后端此时的真实顺序并没有变（请求失败、没有写入），重新拉回来的数据自然就是拖拽之前的顺序。
+```tsx
+{images.length > 0 && (
+  <div className="flex flex-wrap gap-3">
+    {images.map((image) => (
+      <div key={image.id} className="relative">
+        <img src={image.imageUrl} alt="Car" className="h-24 w-24 rounded-lg object-cover" />
+        <button onClick={() => deleteMutation.mutate(image.id)} ...>×</button>
+      </div>
+    ))}
+  </div>
+)}
+```
 
+所以需要拷贝一份到本地 state，拖拽时先改这份本地拷贝，界面立刻响应（乐观更新）；而接口调用是异步在后台进行的。
 
+```tsx
+export default function ImageUploader({ carId, images }: ImageUploaderProps) {
+  // 已上传的图片顺序（本地副本，拖拽时先在本地更新，再异步调接口）
+  const [localImages, setLocalImages] = useState(images);
 
-替换 `src/components/ImageUploader.tsx`（在阶段①基础上，`localImages` 改为本地可变状态，新增排序 mutation 和拖拽相关的 import、传感器、回调，已上传图片的展示区域包上 `DndContext` + `SortableContext`，`UploadedImageItem` 升级为 `SortableImageItem`）：
+  // images prop 变化时（比如上传成功后 invalidateQueries 触发重新拉取），
+  // 同步更新本地已上传图片列表
+  if (images !== localImages && images.length !== localImages.length) {
+    setLocalImages(images);
+  }
+
+  // pendingFiles：本次选中、还没成功上传完的文件列表
+  // 每一项都有自己的 status，互不影响
+  const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
+  ...
+}
+```
+
+`handleFileChange` 里原来用 `images.length` 判断数量上限的地方，也要跟着改成 `localImages.length`——因为现在真正展示给用户的、代表"当前有几张图"的数据来源是 `localImages`，不是 `images`：
+
+```tsx
+
+export default function ImageUploader({ carId, images }: ImageUploaderProps) {
+  // 已上传的图片顺序（本地副本，拖拽时先在本地更新，再异步调接口）
+  const [localImages, setLocalImages] = useState(images);
+ 
+  // images prop 变化时（比如上传成功后 invalidateQueries 触发重新拉取），
+  // 同步更新本地已上传图片列表
+  if (images !== localImages && images.length !== localImages.length) {
+    setLocalImages(images);
+  }
+ 
+  ...
+ 
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    ...
+ 
+    // 数量上限：已有图片数 + 正在处理的数 + 这次新选的数，超过上限就拒绝，不发任何请求
+    const totalAfter = localImages.length + pendingFiles.length + fileArray.length;
+    if (totalAfter > MAX_IMAGES) {
+      toast.error(
+        `A car can have at most ${MAX_IMAGES} images. ` +
+          `Currently has ${localImages.length + pendingFiles.length}, ` +
+          `you selected ${fileArray.length}.`
+      );
+      if (inputRef.current) inputRef.current.value = "";
+      return;
+    }
+ 
+    ...
+  };
+    
+    ...
+}
+```
+
+#### 7.2 实现拖拽
+
+拖拽这个手势不是靠一个简单的 `onChange` 就能捕获的，浏览器原生 DOM 也不知道"图片能拖到哪"。这一步只解决"怎么让 dnd-kit 感知到用户正在拖一个东西、拖到哪了"——这一层能力全部来自 `@dnd-kit/core`，跟"排序"这个业务概念还没有关系（`@dnd-kit/core` 单独拿出来，也能用来实现"拖进垃圾桶删除"这类跟排序无关的场景）。
+
+##### 1. 拖拽感知容器
+
+`dnd-kit`提供了这个容器 `DndContext`，使用它包括需要拖动的区域，就能完成监听指针事件、维护"现在正在拖谁"这些状态。
+
+```tsx
+import { DndContext } from "@dnd-kit/core";
+
+export default function ImageUploader({ carId, images }: ImageUploaderProps) {
+  const [localImages, setLocalImages] = useState(images);
+  if (images !== localImages && images.length !== localImages.length) {
+    setLocalImages(images);
+  }
+ 
+  ...
+ 
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    ...
+  };
+    
+    ...
+    
+    {/* 已上传的图片列表：可拖拽排序 */}
+    {localImages.length > 0 && (
+      <DndContext sensors={sensors} collisionDetection={closestCenter}>
+          <div className="flex flex-wrap gap-3">
+            {images.map((image) => (
+              <div key={image.id} className="relative">
+                <img
+                  src={image.imageUrl}
+                  alt="Car"
+                  className="h-24 w-24 rounded-lg object-cover"
+                />
+                {/* 删除按钮 */}
+                <button
+                  onClick={() => deleteMutation.mutate(image.id)}
+                  disabled={deleteMutation.isPending}
+                  className="absolute -right-2 -top-2 flex h-5 w-5
+                             items-center justify-center rounded-full
+                             bg-red-500 text-xs text-white
+                             hover:bg-red-600"
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+          </div>
+      </DndContext>
+)}
+}
+```
+
+##### 2. 传感器
+
+使用感知容器包裹之后，多大的移动幅度才算真的开始拖？
+
+如果什么都不设置，`DndContext` 会对任何一点点指针位移都很敏感——用户想点卡片上的删除按钮，手指按下去哪怕只抖了 1px，也可能被误判成"在拖拽"，删除按钮的点击事件就触发不了了。
+
+因此，需要一个"传感器"去解读原始的指针事件，并且设一个位移阈值，超过这个阈值才算真的开始拖。
+
+`dnd-kit`提供了很多传感器， 比如`PointerSensor`。 这个传感器`PointerSensor` 同时兼容鼠标和触摸屏，不需要分别处理 mouse 和 touch 事件；
+
+同时，`dnd-kit`提供了设置传感器参数的hook - useSensor, 可以对单个传感器设置阈值。并且，考虑到不止有一个传感器的情况，`dnd-kit`提供了另外一个hook - useSensors， 可以把配置好的传感器组合成一个列表：
+
+```tsx
+import { PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
+
+const sensors = useSensors(
+  useSensor(PointerSensor, { activationConstraint: { distance: 8 } })
+);
+```
+
+交组合后的传感器组交给 `DndContext`：
+
+```tsx
+<DndContext sensors={sensors}>
+  {/* 可拖拽的内容 ... */}
+</DndContext>
+```
+
+##### 3. 拖拽过程中，要判断"当前离哪个元素最近"
+
+拖拽进行中，指针的位置很难精确对齐到某个元素的边界，`DndContext` 需要一个算法去判断"你现在算是悬停在哪个元素上方"，这样才能实时知道该跟谁比较、要不要让位。
+
+`closestCenter` 是最常用的一种碰撞检测算法：比较各元素中心点到指针的距离，找最近的那个。
+
+```tsx
+import { PointerSensor, useSensor, useSensors, closestCenter } from "@dnd-kit/core";
+```
+
+注入容器使用
+
+```tsx
+<DndContext sensors={sensors} collisionDetection={closestCenter}>
+  {/* 可拖拽的内容 ... */}
+</DndContext>
+```
+
+##### 4. 拖拽完成后事件触发
+
+用户松开手，这个拖拽动作就算结束了，应该触发拖拽完成事件，进行一下操作，比如后面需要做的排序。
+
+`DndContext`容器组件定义了这个是prop属性 `onDragEnd`， 用来挂载拖拽完成后执行的动作
+
+```tsx
+<DndContext
+  sensors={sensors}
+  collisionDetection={closestCenter}
+  onDragEnd={() => {
+     console.log("拖拽完成执行的内容");
+  }}
+>
+  {/* 可拖拽的内容 ... */}
+</DndContext>
+```
+
+#### 7.3 实现排序
+
+第二步做完，dnd-kit 已经能感知"东西被拖动了"，但完全不知道这组元素之间有先后顺序、拖动时其他元素该不该让位。这一步要把"排序"这个业务概念接进来——这一层能力全部来自 `@dnd-kit/sortable`，建立在第二步搭好的感知能力之上。
+
+##### 1. 排序感知容器
+
+`DndContext` 只关心"拖拽本身"，不关心"这组元素的顺序该怎么变"。要让 dnd-kit 知道这一层业务含义，需要在 `DndContext` 内部再包一层专门处理排序的容器。
+
+`dnd-kit`库的另外一个包提供了这个容器 `SortableContext`
+
+```tsx
+import { SortableContext } from "@dnd-kit/sortable";
+```
+
+这个容器组件定义了一个prop属性 - `items`, 用来记录参与排序元素的id。 
+
+```tsx
+<DndContext sensors={sensors} collisionDetection={closestCenter}>
+  <SortableContext items={localImages.map((img) => img.id)}>
+    {/* 这组要互相排序的元素 */}
+  </SortableContext>
+</DndContext>
+```
+
+`items` 期望的类型，dnd-kit 内部定义大概是这样（简化理解）：
+
+```ts
+items: (string | number)[]
+```
+
+`items` 这个 prop 本身不会自动提取 id，它只是"等着接收一个数组"，具体这个数组的内容是什么、怎么算出来的，完全是调用方的责任。 如比上面实例中我们自己通过 map 方法映射进去。
+
+##### 2. 排序时的让位方式
+
+排序时要让排序容器`SortableContext`知道"其他元素该按什么方式挪动"， 网格布局和纵向单列列表的让位方式是不一样的。
+
+`sortable`包提供了不同的让位方式:
+
+- rectSortingStrategy - 适合横向换行排列的网格布局
+- verticalListSortingStrategy - 适合纵向单列列表
+
+排序容器`SortableContext`的另外一个prop属性 - `strategy`用来设置攘外方式
+
+```tsx
+import { rectSortingStrategy } from "@dnd-kit/sortable";
+
+<DndContext sensors={sensors} collisionDetection={closestCenter}>
+  <SortableContext 
+      items={localImages.map((img) => img.id)}
+      strategy={rectSortingStrategy}
+  >
+    {/* 这组要互相排序的元素 */}
+  </SortableContext>
+</DndContext>
+```
+
+##### 3. 登记成"可排序项"
+
+`SortableContext` 只是知道"这组元素的 id 列表"，具体到每一个方块，还需要各自向它登记"我是这组里的第几个"，并且拿到"我现在该往哪挪、挪了多少"这些信息。
+
+`dnd-kit/sortable`包提供了专门的hook - `useSortable`来实现这个登记动作。
+
+```tsx
+import { useSortable } from "@dnd-kit/sortable";
+
+const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
+  useSortable({ id: image.id });
+```
+
+调用时传入这个元素自己的 id，会返回一组东西：`attributes`/`listeners`（要绑定到某个具体 DOM 元素上，这个元素才会响应拖拽手势）、`setNodeRef`（绑定到根 DOM 节点，dnd-kit 靠它计算真实位置）、`transform`/`transition`（这个元素当前该产生的位移和过渡动画）、`isDragging`（这个元素是不是正被拖拽的那一个）。
+
+`useSortable` 是个 Hook，Hook 只能在组件顶层调用，不能写在 `.map()` 回调里。原来图片方块是内联写在 `.map()` 里的普通 `<div>`，没法直接在里面调用 `useSortable`
+
+```tsx
+{/* 已上传的图片列表：可拖拽排序 */}
+  {localImages.length > 0 && (
+    <DndContext
+      sensors={sensors}
+      collisionDetection={closestCenter}
+      onDragEnd={() => {
+        console.log("拖拽完成执行的内容");
+      }}
+    >
+      <SortableContext
+        items={localImages.map((image) => image.id)}
+        strategy={rectSortingStrategy}
+      >
+        <div className="flex flex-wrap gap-3">
+          {localImages.map((image) => (
+            <div key={image.id} className="relative">
+              <img
+                src={image.imageUrl}
+                alt="Car"
+                className="h-24 w-24 rounded-lg object-cover"
+              />
+              {/* 删除按钮 */}
+              <button
+                onClick={() => deleteMutation.mutate(image.id)}
+                disabled={deleteMutation.isPending}
+                className="absolute -right-2 -top-2 flex h-5 w-5
+                       items-center justify-center rounded-full
+                       bg-red-500 text-xs text-white
+                       hover:bg-red-600"
+              >
+                ×
+              </button>
+            </div>
+          ))}
+        </div>
+      </SortableContext>
+    </DndContext>
+  )}
+```
+
+所以图片方块必须拆成一个独立组件，`.map()` 里改成调用这个组件（每次调用组件本身就是一次独立的 Hook 调用上下文，这样是合规的）
+
+```tsx
+{/* 已上传的图片列表：可拖拽排序 */}
+{localImages.length > 0 && (
+  <DndContext
+      sensors={sensors}
+      collisionDetection={closestCenter}
+      onDragEnd={() => {
+        console.log("拖拽完成执行的内容");
+      }}
+    >
+    <SortableContext
+      items={localImages.map((img) => img.id)}
+      strategy={rectSortingStrategy}
+    >
+      <div className="flex flex-wrap gap-3">
+        {localImages.map((image) => (
+          <SortableImageItem
+            key={image.id}
+            image={image}
+            onDelete={() => deleteMutation.mutate(image.id)}
+            isDeleting={
+              deleteMutation.isPending &&
+              deleteMutation.variables === image.id
+            }
+          />
+        ))}
+      </div>
+    </SortableContext>
+  </DndContext>
+)}
+```
+
+改造成独立的组件`SortableImageItem`
+
+```tsx
+import type { CarImage } from "@/types";
+
+interface SortableImageItemProps {
+  image: CarImage;
+  onDelete: () => void;
+  isDeleting: boolean;
+}
+/* -------- 已上传图片：可拖拽排序的单个图片项 ------- */
+function SortableImageItem({
+  image,
+  onDelete,
+  isDeleting,
+}: SortableImageItemProps) {
+  return (
+    <div key={image.id} className="relative">
+      <img
+        src={image.imageUrl}
+        alt="Car"
+        className="h-24 w-24 rounded-lg object-cover"
+      />
+      {/* 删除按钮 */}
+      <button
+        onClick={onDelete}
+        disabled={isDeleting}
+        className="absolute -right-2 -top-2 flex h-5 w-5
+                           items-center justify-center rounded-full
+                           bg-red-500 text-xs text-white
+                           hover:bg-red-600"
+      >
+        ×
+      </button>
+    </div>
+  );
+}
+
+export default SortableImageItem;
+
+```
+
+使用`useSortable` hook 
+
+```tsx
+import { useSortable } from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+
+/* -------- 已上传图片：可拖拽排序的单个图片项 ------- */
+function SortableImageItem({
+  image,
+  onDelete,
+  isDeleting,
+}: SortableImageItemProps) {
+  
+  // useSortable 把这个元素注册为可排序项
+  // attributes/listeners 只绑定到拖拽手柄，不绑定整个卡片
+  // 原因：整个卡片都能拖拽时，"点删除"和"开始拖拽"会冲突，浏览器无法区分意图
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: image.id });
+
+  return (
+    <div
+      ref={setNodeRef}
+      className="relative"
+      style={{
+        transform: CSS.Transform.toString(transform),
+        transition,
+        opacity: isDragging ? 0.5 : 1,
+      }}
+    >
+     ...
+     
+    </div>
+  );
+}
+
+```
+
+新增一个拖拽按钮， 独立于卡片，避免和删除按钮抢事件。`attributes`/`listeners` 只绑在拖拽手柄这个小按钮上，不绑在整张卡片——如果整张卡片都能触发拖拽，浏览器没法区分用户"点删除"和"开始拖动"这两个意图，两边的事件监听会冲突。
+
+```tsx
+...
+/* -------- 已上传图片：可拖拽排序的单个图片项 ------- */
+function SortableImageItem({
+  image,
+  onDelete,
+  isDeleting,
+}: SortableImageItemProps) {
+  ...
+  return (
+    <div
+      ref={setNodeRef}
+      className="relative"
+      style={{
+        transform: CSS.Transform.toString(transform),
+        transition,
+        opacity: isDragging ? 0.5 : 1,
+      }}
+    >
+      <img
+        src={image.imageUrl}
+        alt="Car"
+        className="h-24 w-24 rounded-lg object-cover"
+      />
+
+      {/* 删除按钮 */}
+          ...
+
+      {/* 拖拽手柄：独立于卡片，避免和删除按钮抢事件 */}
+      <button
+        {...attributes}
+        {...listeners}
+        type="button"
+        aria-label="Drag to reorder"
+        className="absolute bottom-1 right-1 flex h-5 w-5 cursor-grab
+                   items-center justify-center rounded bg-black/50 text-white
+                   active:cursor-grabbing"
+      >
+        <GripVertical className="h-3 w-3" />
+      </button>
+    </div>
+  );
+}
+
+```
+
+实际效果是：**图片已经能被拖起来，拖动过程中其他图片会让位，视觉上完全正常**。但松手之后，图片会弹回原来的位置
+
+#### 7.4 更新界面，同步后端
+
+##### 1. 在本地把新顺序算出来、立刻更新界面
+
+上一步遗留的问题是：能拖，但松手不生效。要解决它，需要两件事一起做：
+
+- 告诉 `DndContext`，松手时该调用哪个函数
+
+    这靠 `DndContext` 自己定义的 `onDragEnd` 这个 prop；这里的 `onDragEnd` 跟 `<button onClick={...}>` 里的 `onClick` 是同一类东西，是组件自己定义的。
+
+- 这个函数具体要做什么
+
+    dnd-kit 会在松手时自动带着"谁被拖了、松在哪个位置上方"（`active`/`over`）调用它，函数要根据这两个信息算出新的排列顺序，并立刻反映到界面上（乐观更新），还不涉及后端，只是在做"本地视觉响应"这件事。
+
+先把上一步已经搭好的 `DndContext` 上的`onDragEnd`传入事件处理函数
+
+```tsx
+<DndContext
+  sensors={sensors}
+  collisionDetection={closestCenter}
+  onDragEnd={handleDragEnd}
+>
+```
+
+`@dnd-kit/core` 提供了这个`handleDragEnd`需要的参数(event)的参数类型（`DragEndEvent`），直接导入使用，不然 `event.active`、`event.over` 这些字段写代码时没有提示，容易拼错字段名：
+
+```tsx
+import { type DragEndEvent } from "@dnd-kit/core";
+```
+
+完善拖拽事件处理函数的逻辑
+
+```tsx
+/* ----------- 拖拽结束：算出新顺序，本地立刻更新，异步提交后端 ---------- */
+const handleDragEnd = (event: DragEndEvent) => {
+  const { active, over } = event;
+  if (!over || active.id === over.id) return;
+
+  const oldIndex = localImages.findIndex((img) => img.id === active.id);
+  const newIndex = localImages.findIndex((img) => img.id === over.id);
+
+  // 立即更新本地顺序（视觉立即响应，不等接口返回）
+  const reordered = arrayMove(localImages, oldIndex, newIndex);
+  setLocalImages(reordered);
+
+  // 下一步会在这里补上：把 reordered 转成后端要的格式，提交给 reorderMutation
+};
+```
+
+`arrayMove` 是 dnd-kit 提供的一个纯数组工具函数，接收数组和两个下标，返回一个把元素从旧位置挪到新位置后的新数组，这一步完全在浏览器内存里完成，跟服务器没有关系。
+
+`!over` 表示松手时没有停在任何一个可排序项上方（比如拖到了容器外面），`active.id === over.id` 表示压根没有移动位置，这两种情况都不需要做任何事，直接 `return`。
+
+新增排序 mutation
+
+```tsx
+/* ----------- 排序 mutation ---------- */
+const reorderMutation = useMutation({
+  mutationFn: (items: { imageId: number; sortOrder: number }[]) =>
+    carsApi.reorderImages(carId, items),
+  onError: (error) => {
+    // 排序失败：提示用户，并让 invalidateQueries 重新拉取后端真实顺序
+    // （后端没写入成功，拉回来的就是拖拽之前的顺序，界面自动"弹回"）
+    toast.error(error.message);
+    queryClient.invalidateQueries({ queryKey: ["car", carId] });
+  },
+});
+```
+
+拖拽事件处理函数中补全后端同步逻辑
+
+```tsx
+/* ----------- 拖拽结束：算出新顺序，本地立刻更新，异步提交后端 ---------- */
+const handleDragEnd = (event: DragEndEvent) => {
+  const { active, over } = event;
+  if (!over || active.id === over.id) return;
+
+  const oldIndex = localImages.findIndex((img) => img.id === active.id);
+  const newIndex = localImages.findIndex((img) => img.id === over.id);
+
+  // 立即更新本地顺序（视觉立即响应，不等接口返回）
+  const reordered = arrayMove(localImages, oldIndex, newIndex);
+  setLocalImages(reordered);
+
+  // 按新顺序生成 SortOrder，异步提交后端
+  const items = reordered.map((img, index) => ({
+    imageId: img.id,
+    sortOrder: index,
+  }));
+  reorderMutation.mutate(items);
+};
+```
+
+完整代码如下：
 
 ```tsx
 import { carsApi } from "@/api";
 import type { CarImage } from "@/types";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { useRef, useState, useCallback } from "react";
+import { QueryClient, useMutation } from "@tanstack/react-query";
+import { useRef, useState } from "react";
 import { toast } from "sonner";
 import { Button } from "./ui/button";
-import { GripVertical, X, RotateCcw, AlertCircle } from "lucide-react";
+import { RotateCcw, AlertCircle } from "lucide-react";
 import {
   DndContext,
   closestCenter,
@@ -9451,10 +10010,9 @@ import {
 import {
   SortableContext,
   rectSortingStrategy,
-  useSortable,
   arrayMove,
 } from "@dnd-kit/sortable";
-import { CSS } from "@dnd-kit/utilities";
+import SortableImageItem from "./SortableImageItem";
 
 interface ImageUploaderProps {
   carId: number;
@@ -9463,33 +10021,98 @@ interface ImageUploaderProps {
 
 const MAX_IMAGES = 10;
 
-// 每张待上传图片的本地状态
-// 在图片真正上传到服务端之前，先在本地显示预览
+// 每个待上传文件自己的状态
+// 一个文件对应数组里的一项，互相独立，不会互相影响
 interface PendingFile {
-  id: string;          // 临时 id，用于 React key 和 dnd-kit 的 item id
+  id: string; // 临时 id，用来在数组里定位到这一项，React key 也用它
   file: File;
-  previewUrl: string;  // URL.createObjectURL 生成的本地预览地址
-  status: "pending" | "uploading" | "error";
+  previewUrl: string;
+  status: "uploading" | "error";
   error?: string;
 }
 
 export default function ImageUploader({ carId, images }: ImageUploaderProps) {
-  const queryClient = useQueryClient();
-  const inputRef = useRef<HTMLInputElement>(null);
-
   // 已上传的图片顺序（本地副本，拖拽时先在本地更新，再异步调接口）
   const [localImages, setLocalImages] = useState(images);
 
-  // 待上传的图片（本地预览状态）
-  const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
-
-  // images prop 变化时（上传成功后 queryClient.invalidateQueries 触发重新拉取），
+  // images prop 变化时（比如上传成功后 invalidateQueries 触发重新拉取），
   // 同步更新本地已上传图片列表
   if (images !== localImages && images.length !== localImages.length) {
     setLocalImages(images);
   }
 
-  /* ----- 删除已上传图片 ---- */
+  // pendingFiles：本次选中、还没成功上传完的文件列表
+  // 每一项都有自己的 status，互不影响
+  const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
+
+  const queryClient = new QueryClient();
+  // useRef 拿到 input 元素的引用，点击按钮时触发文件选择
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+
+    // FileList 转成真正的数组，才能用 map 之类的数组方法
+    const fileArray = Array.from(files);
+
+    // 数量上限：已有图片数 + 正在处理的数 + 这次新选的数，超过上限就拒绝，不发任何请求
+    const totalAfter =
+      localImages.length + pendingFiles.length + fileArray.length;
+    if (totalAfter > MAX_IMAGES) {
+      toast.error(
+        `A car can have at most ${MAX_IMAGES} images. ` +
+          `Currently has ${localImages.length + pendingFiles.length}, ` +
+          `you selected ${fileArray.length}.`,
+      );
+      if (inputRef.current) inputRef.current.value = "";
+      return;
+    }
+
+    // 每个文件包装成一个 PendingFile：各自生成本地预览、状态先标记为 uploading
+    const newPendingFiles: PendingFile[] = fileArray.map((file) => ({
+      id: `pending-${Date.now()}-${Math.random()}`,
+      file,
+      previewUrl: URL.createObjectURL(file),
+      status: "uploading",
+    }));
+
+    setPendingFiles((prev) => [...prev, ...newPendingFiles]);
+
+    // 选完立即各自开始上传，不需要再手动点确认
+    newPendingFiles.forEach((p) => uploadSingleFile(p.id, p.file));
+
+    if (inputRef.current) inputRef.current.value = "";
+  };
+
+  /* ----------- 上传单个文件（普通函数，不用 useMutation/useCallback） ---------- */
+  // 每次调用只负责这一个文件，成功了把它从 pendingFiles 里移除，
+  // 失败了只把这一项标记成 error，不影响列表里其他文件
+  const uploadSingleFile = async (pendingId: string, file: File) => {
+    try {
+      await carsApi.uploadImagesBatch(carId, [file]);
+
+      // 上传成功：从 pendingFiles 里移除这一项，并释放它的预览 URL（避免内存泄漏）
+      setPendingFiles((prev) => {
+        const target = prev.find((p) => p.id === pendingId);
+        if (target) URL.revokeObjectURL(target.previewUrl);
+        return prev.filter((p) => p.id !== pendingId);
+      });
+
+      // 让车辆详情缓存失效，图片列表会刷新
+      queryClient.invalidateQueries({ queryKey: ["car", carId] });
+    } catch (error) {
+      // 上传失败：只把这一项标记为 error，其他文件的状态不受影响
+      const message = error instanceof Error ? error.message : "Upload failed";
+      setPendingFiles((prev) =>
+        prev.map((p) =>
+          p.id === pendingId ? { ...p, status: "error", error: message } : p,
+        ),
+      );
+    }
+  };
+
+  /* ----------- 删除 mutation ---------- */
   const deleteMutation = useMutation({
     mutationFn: (imageId: number) => carsApi.deleteImage(carId, imageId),
     onSuccess: () => {
@@ -9501,90 +10124,28 @@ export default function ImageUploader({ carId, images }: ImageUploaderProps) {
     },
   });
 
-  /* ----- 排序 ---- */
+  /* ----------- 排序 mutation ---------- */
   const reorderMutation = useMutation({
     mutationFn: (items: { imageId: number; sortOrder: number }[]) =>
       carsApi.reorderImages(carId, items),
     onError: (error) => {
-      // 排序失败：提示用户并回退到服务端的真实顺序
+      // 排序失败：提示用户，并让 invalidateQueries 重新拉取后端真实顺序
+      // （后端没写入成功，拉回来的就是拖拽之前的顺序，界面自动"弹回"）
       toast.error(error.message);
       queryClient.invalidateQueries({ queryKey: ["car", carId] });
     },
   });
 
-  /* ----- 上传单张图片（每张独立调用，进度独立显示）---- */
-  const uploadSingleFile = useCallback(
-    async (pendingId: string, file: File) => {
-      setPendingFiles((prev) =>
-        prev.map((p) =>
-          p.id === pendingId ? { ...p, status: "uploading" } : p
-        )
-      );
-
-      try {
-        await carsApi.uploadImagesBatch(carId, [file]);
-
-        setPendingFiles((prev) => {
-          const removed = prev.find((p) => p.id === pendingId);
-          if (removed) URL.revokeObjectURL(removed.previewUrl);
-          return prev.filter((p) => p.id !== pendingId);
-        });
-
-        queryClient.invalidateQueries({ queryKey: ["car", carId] });
-      } catch (error) {
-        const message =
-          error instanceof Error ? error.message : "Upload failed";
-        setPendingFiles((prev) =>
-          prev.map((p) =>
-            p.id === pendingId ? { ...p, status: "error", error: message } : p
-          )
-        );
-      }
-    },
-    [carId, queryClient]
-  );
-
-  /* ----- 选择文件 ---- */
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
-    if (!files || files.length === 0) return;
-
-    const fileArray = Array.from(files);
-    const totalAfter =
-      localImages.length + pendingFiles.length + fileArray.length;
-
-    if (totalAfter > MAX_IMAGES) {
-      toast.error(
-        `A car can have at most ${MAX_IMAGES} images. ` +
-          `Currently has ${localImages.length + pendingFiles.length}, ` +
-          `you selected ${fileArray.length}.`
-      );
-      if (inputRef.current) inputRef.current.value = "";
-      return;
-    }
-
-    const newPending: PendingFile[] = fileArray.map((file) => ({
-      id: `pending-${Date.now()}-${Math.random()}`,
-      file,
-      previewUrl: URL.createObjectURL(file),
-      status: "pending",
-    }));
-
-    setPendingFiles((prev) => [...prev, ...newPending]);
-    newPending.forEach((p) => uploadSingleFile(p.id, p.file));
-
-    if (inputRef.current) inputRef.current.value = "";
-  };
-
-  /* ----- 拖拽传感器 ---- */
+  /* ----------- 拖拽传感器 ---------- */
   // PointerSensor 同时支持鼠标和触摸操作
-  // activationConstraint：8px 拖动阈值，避免普通点击被误识别为拖拽
+  // activationConstraint：8px 拖动阈值，避免普通点击（比如点删除按钮）被误判成拖拽
   const sensors = useSensors(
     useSensor(PointerSensor, {
       activationConstraint: { distance: 8 },
-    })
+    }),
   );
 
+  /* ----------- 拖拽结束：算出新顺序，本地立刻更新，异步提交后端 ---------- */
   const handleDragEnd = (event: DragEndEvent) => {
     const { active, over } = event;
     if (!over || active.id === over.id) return;
@@ -9604,24 +10165,11 @@ export default function ImageUploader({ carId, images }: ImageUploaderProps) {
     reorderMutation.mutate(items);
   };
 
-  const canAddMore =
-    localImages.length + pendingFiles.length < MAX_IMAGES;
-
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <h2
-          className="font-semibold"
-          style={{ color: "var(--color-text-primary)" }}
-        >
-          Images
-        </h2>
-        <span className="text-sm" style={{ color: "var(--color-text-muted)" }}>
-          {localImages.length + pendingFiles.length} / {MAX_IMAGES}
-        </span>
-      </div>
+      <h2 className="font-semibold">Images</h2>
 
-      {/* 已上传图片：可拖拽排序 */}
+      {/* 已上传的图片列表：可拖拽排序 */}
       {localImages.length > 0 && (
         <DndContext
           sensors={sensors}
@@ -9633,11 +10181,10 @@ export default function ImageUploader({ carId, images }: ImageUploaderProps) {
             strategy={rectSortingStrategy}
           >
             <div className="flex flex-wrap gap-3">
-              {localImages.map((image, index) => (
+              {localImages.map((image) => (
                 <SortableImageItem
                   key={image.id}
                   image={image}
-                  isCover={index === 0}
                   onDelete={() => deleteMutation.mutate(image.id)}
                   isDeleting={
                     deleteMutation.isPending &&
@@ -9650,199 +10197,75 @@ export default function ImageUploader({ carId, images }: ImageUploaderProps) {
         </DndContext>
       )}
 
-      {/* 待上传图片（本地预览 + 独立上传状态） */}
+      {/* 待上传文件：每一项独立显示上传中或失败重试，互不影响 */}
       {pendingFiles.length > 0 && (
         <div className="flex flex-wrap gap-3">
           {pendingFiles.map((pending) => (
-            <PendingImageItem
-              key={pending.id}
-              pending={pending}
-              onRetry={() => uploadSingleFile(pending.id, pending.file)}
-              onRemove={() => {
-                URL.revokeObjectURL(pending.previewUrl);
-                setPendingFiles((prev) =>
-                  prev.filter((p) => p.id !== pending.id)
-                );
-              }}
-            />
+            <div key={pending.id} className="relative">
+              <img
+                src={pending.previewUrl}
+                alt="Preview"
+                className="h-24 w-24 rounded-lg object-cover"
+              />
+
+              {/* 上传中：遮罩提示 */}
+              {pending.status === "uploading" && (
+                <div className="absolute inset-0 flex items-center justify-center rounded-lg bg-black/40">
+                  <span className="text-xs font-medium text-white">
+                    Uploading...
+                  </span>
+                </div>
+              )}
+
+              {/* 上传失败：这一项单独显示重试按钮，不影响其他项 */}
+              {pending.status === "error" && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 rounded-lg bg-black/60">
+                  <AlertCircle className="h-4 w-4 text-red-400" />
+                  <button
+                    type="button"
+                    onClick={() => uploadSingleFile(pending.id, pending.file)}
+                    className="flex items-center gap-0.5 text-[10px] font-medium text-white hover:text-red-300"
+                  >
+                    <RotateCcw className="h-2.5 w-2.5" />
+                    Retry
+                  </button>
+                </div>
+              )}
+            </div>
           ))}
         </div>
       )}
 
       {/* 选择新图片 */}
-      {canAddMore && (
-        <div className="space-y-2">
-          <input
-            ref={inputRef}
-            type="file"
-            accept="image/jpeg,image/png,image/webp"
-            multiple
-            className="hidden"
-            onChange={handleFileChange}
-          />
+      <div className="space-y-3">
+        {/* 隐藏的原生文件选择 input，multiple 允许一次选多个文件 */}
+        <input
+          ref={inputRef}
+          type="file"
+          accept="image/jpeg,image/png,image/webp"
+          multiple
+          className="hidden"
+          onChange={handleFileChange}
+        />
 
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() => inputRef.current?.click()}
-          >
-            Add Images
-          </Button>
-
-          <p
-            className="text-xs"
-            style={{ color: "var(--color-text-muted)" }}
-          >
-            JPEG, PNG or WebP · Max 5 MB per image · Up to {MAX_IMAGES} images
-            total
-            {localImages.length > 0 &&
-              " · Drag to reorder — first photo is the cover"}
-          </p>
-        </div>
-      )}
-    </div>
-  );
-}
-
-/* ============================================================ */
-/* 已上传图片：可拖拽排序的单个图片项                            */
-/* ============================================================ */
-interface SortableImageItemProps {
-  image: CarImage;
-  isCover: boolean;
-  onDelete: () => void;
-  isDeleting: boolean;
-}
-
-function SortableImageItem({
-  image,
-  isCover,
-  onDelete,
-  isDeleting,
-}: SortableImageItemProps) {
-  // useSortable 把这个元素注册为可排序项
-  // attributes/listeners 只绑定到拖拽手柄，不绑定整个卡片
-  const {
-    attributes,
-    listeners,
-    setNodeRef,
-    transform,
-    transition,
-    isDragging,
-  } = useSortable({ id: image.id });
-
-  return (
-    <div
-      ref={setNodeRef}
-      className="relative h-24 w-24 overflow-hidden"
-      style={{
-        transform: CSS.Transform.toString(transform),
-        transition,
-        opacity: isDragging ? 0.5 : 1,
-        borderRadius: "var(--radius-lg)",
-        border: isCover
-          ? "2px solid var(--color-primary)"
-          : "2px solid var(--color-border)",
-      }}
-    >
-      <img
-        src={image.imageUrl}
-        alt="Car"
-        className="h-full w-full object-cover"
-      />
-
-      {isCover && (
-        <span
-          className="absolute left-1 top-1 rounded px-1.5 py-0.5 text-[10px] font-medium text-white"
-          style={{ backgroundColor: "var(--color-primary)" }}
-        >
-          Cover
-        </span>
-      )}
-
-      {/* 拖拽手柄 */}
-      <button
-        {...attributes}
-        {...listeners}
-        type="button"
-        aria-label="Drag to reorder"
-        className="absolute bottom-1 right-1 flex h-5 w-5 cursor-grab items-center justify-center rounded text-white active:cursor-grabbing"
-        style={{ backgroundColor: "rgba(0,0,0,0.5)" }}
-      >
-        <GripVertical className="h-3 w-3" />
-      </button>
-
-      {/* 删除按钮 */}
-      <button
-        onClick={onDelete}
-        disabled={isDeleting}
-        type="button"
-        aria-label="Delete image"
-        className="absolute -right-2 -top-2 flex h-5 w-5 items-center justify-center rounded-full bg-red-500 text-white hover:bg-red-600 disabled:opacity-50"
-      >
-        <X className="h-3 w-3" />
-      </button>
-    </div>
-  );
-}
-
-/* ============================================================ */
-/* 待上传图片：本地预览 + 进度 + 错误重试                        */
-/* ============================================================ */
-interface PendingImageItemProps {
-  pending: PendingFile;
-  onRetry: () => void;
-  onRemove: () => void;
-}
-
-function PendingImageItem({ pending, onRetry, onRemove }: PendingImageItemProps) {
-  return (
-    <div
-      className="relative h-24 w-24 overflow-hidden"
-      style={{
-        borderRadius: "var(--radius-lg)",
-        border: "2px solid var(--color-border)",
-      }}
-    >
-      <img
-        src={pending.previewUrl}
-        alt="Preview"
-        className="h-full w-full object-cover"
-      />
-
-      {pending.status === "uploading" && (
-        <div className="absolute inset-0 flex items-center justify-center bg-black/40">
-          <span className="text-xs font-medium text-white">Uploading...</span>
-        </div>
-      )}
-
-      {pending.status === "error" && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-black/60">
-          <AlertCircle className="h-4 w-4 text-red-400" />
-          <button
-            type="button"
-            onClick={onRetry}
-            className="flex items-center gap-0.5 text-[10px] font-medium text-white hover:text-red-300"
-          >
-            <RotateCcw className="h-2.5 w-2.5" />
-            Retry
-          </button>
-        </div>
-      )}
-
-      {pending.status !== "uploading" && (
-        <button
-          onClick={onRemove}
+        {/* 点击这个按钮触发文件选择 */}
+        <Button
           type="button"
-          aria-label="Remove"
-          className="absolute -right-2 -top-2 flex h-5 w-5 items-center justify-center rounded-full bg-red-500 text-white hover:bg-red-600"
+          variant="outline"
+          onClick={() => inputRef.current?.click()}
         >
-          <X className="h-3 w-3" />
-        </button>
-      )}
+          Add Images
+        </Button>
+
+        <p className="text-xs text-gray-500">
+          JPEG, PNG or WebP · Max 5 MB per image · Up to {MAX_IMAGES} images
+          total
+        </p>
+      </div>
     </div>
   );
 }
+
 ```
 
 
@@ -9933,7 +10356,7 @@ public async Task ReorderImagesAsync_WithImageIdNotBelongingToCar_ShouldThrowCar
 #### 10.1 验证拖拽排序
 
 1. 把第三张图拖到第一位
-2. 视图立即响应，"Cover" 标记跟着转移
+2. 视图立即响应
 3. 刷新页面，确认顺序已经持久化
 
 #### 10.2 验证 IDOR 防护
@@ -9983,25 +10406,6 @@ dotnet test
 
 
 
-### 整体验证
-
-```bash
-dotnet build
-dotnet test
-```
-
-预期：
-
-```
-Build succeeded.
-    0 Warning(s)
-    0 Error(s)
-```
-
-四个新增测试用例（数量超限、非车主、排序正确、IDOR 防护）全部通过。
-
-
-
 ### Git 提交
 
 ```bash
@@ -10018,20 +10422,6 @@ git push origin develop
 # 删除功能分支
 git branch -d feature/v3-image-upload
 git push origin --delete feature/v3-image-upload
-```
-
-
-
-### 完成状态
-
-```
-✅ Step 64① 批量上传（后端 + 前端 + 测试 + 本地验证）
-✅ Step 64② 拖拽排序（后端 + 前端 + 测试 + 本地验证）
-✅ dotnet build + dotnet test 通过（共 4 个新测试用例）
-✅ Git commit + 合并回 develop 完成
-
-已知遗留问题（不在本次范围内）：
-- R2 上传成功但数据库写入失败时会产生孤儿文件，暂无清理机制
 ```
 
 

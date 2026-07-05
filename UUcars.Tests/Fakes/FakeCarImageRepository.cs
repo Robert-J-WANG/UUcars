@@ -54,4 +54,15 @@ public class FakeCarImageRepository : ICarImageRepository
         var images = _store.Values.Where(i => i.CarId == carId).ToList();
         return Task.FromResult(images);
     }
+
+    // ✅ 新增
+    // _store 存的是对象引用，Service 层修改了 image.SortOrder 后这里已自动同步
+    // 显式赋值一次是为了和真实 EfCarImageRepository 的调用约定保持一致
+    public Task UpdateSortOrdersAsync(
+        List<CarImage> images, CancellationToken cancellationToken = default)
+    {
+        foreach (var image in images)
+            _store[image.Id] = image;
+        return Task.CompletedTask;
+    }
 }

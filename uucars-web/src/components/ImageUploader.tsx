@@ -1,10 +1,24 @@
 import { carsApi } from "@/api";
 import type { CarImage } from "@/types";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { QueryClient, useMutation } from "@tanstack/react-query";
 import { useRef, useState } from "react";
 import { toast } from "sonner";
 import { Button } from "./ui/button";
 import { RotateCcw, AlertCircle } from "lucide-react";
+import {
+  DndContext,
+  closestCenter,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  rectSortingStrategy,
+  arrayMove,
+} from "@dnd-kit/sortable";
+import SortableImageItem from "./SortableImageItem";
 
 interface ImageUploaderProps {
   carId: number;
@@ -24,11 +38,20 @@ interface PendingFile {
 }
 
 export default function ImageUploader({ carId, images }: ImageUploaderProps) {
+  // 已上传的图片顺序（本地副本，拖拽时先在本地更新，再异步调接口）
+  const [localImages, setLocalImages] = useState(images);
+
+  // images prop 变化时（比如上传成功后 invalidateQueries 触发重新拉取），
+  // 同步更新本地已上传图片列表
+  if (images !== localImages && images.length !== localImages.length) {
+    setLocalImages(images);
+  }
+
   // pendingFiles：本次选中、还没成功上传完的文件列表
   // 每一项都有自己的 status，互不影响
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
 
-  const queryClient = useQueryClient();
+  const queryClient = new QueryClient();
   // useRef 拿到 input 元素的引用，点击按钮时触发文件选择
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -40,11 +63,12 @@ export default function ImageUploader({ carId, images }: ImageUploaderProps) {
     const fileArray = Array.from(files);
 
     // 数量上限：已有图片数 + 正在处理的数 + 这次新选的数，超过上限就拒绝，不发任何请求
-    const totalAfter = images.length + pendingFiles.length + fileArray.length;
+    const totalAfter =
+      localImages.length + pendingFiles.length + fileArray.length;
     if (totalAfter > MAX_IMAGES) {
       toast.error(
         `A car can have at most ${MAX_IMAGES} images. ` +
-          `Currently has ${images.length + pendingFiles.length}, ` +
+          `Currently has ${localImages.length + pendingFiles.length}, ` +
           `you selected ${fileArray.length}.`,
       );
       if (inputRef.current) inputRef.current.value = "";
@@ -106,34 +130,77 @@ export default function ImageUploader({ carId, images }: ImageUploaderProps) {
     },
   });
 
+  /* ----------- 排序 mutation ---------- */
+  const reorderMutation = useMutation({
+    mutationFn: (items: { imageId: number; sortOrder: number }[]) =>
+      carsApi.reorderImages(carId, items),
+    onError: (error) => {
+      // 排序失败：提示用户，并让 invalidateQueries 重新拉取后端真实顺序
+      // （后端没写入成功，拉回来的就是拖拽之前的顺序，界面自动"弹回"）
+      toast.error(error.message);
+      queryClient.invalidateQueries({ queryKey: ["car", carId] });
+    },
+  });
+
+  /* ----------- 拖拽传感器 ---------- */
+  // PointerSensor 同时支持鼠标和触摸操作
+  // activationConstraint：8px 拖动阈值，避免普通点击（比如点删除按钮）被误判成拖拽
+  const sensors = useSensors(
+    useSensor(PointerSensor, {
+      activationConstraint: { distance: 8 },
+    }),
+  );
+
+  /* ----------- 拖拽结束：算出新顺序，本地立刻更新，异步提交后端 ---------- */
+  const handleDragEnd = (event: DragEndEvent) => {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+
+    const oldIndex = localImages.findIndex((img) => img.id === active.id);
+    const newIndex = localImages.findIndex((img) => img.id === over.id);
+
+    // 立即更新本地顺序（视觉立即响应，不等接口返回）
+    const reordered = arrayMove(localImages, oldIndex, newIndex);
+    setLocalImages(reordered);
+
+    // 按新顺序生成 SortOrder，异步提交后端
+    const items = reordered.map((img, index) => ({
+      imageId: img.id,
+      sortOrder: index,
+    }));
+    reorderMutation.mutate(items);
+  };
+
   return (
     <div className="space-y-4">
       <h2 className="font-semibold">Images</h2>
 
-      {/* 已上传的图片列表 */}
-      {images.length > 0 && (
-        <div className="flex flex-wrap gap-3">
-          {images.map((image) => (
-            <div key={image.id} className="relative">
-              <img
-                src={image.imageUrl}
-                alt="Car"
-                className="h-24 w-24 rounded-lg object-cover"
-              />
-              {/* 删除按钮 */}
-              <button
-                onClick={() => deleteMutation.mutate(image.id)}
-                disabled={deleteMutation.isPending}
-                className="absolute -right-2 -top-2 flex h-5 w-5
-                           items-center justify-center rounded-full
-                           bg-red-500 text-xs text-white
-                           hover:bg-red-600"
-              >
-                ×
-              </button>
+      {/* 已上传的图片列表：可拖拽排序 */}
+      {localImages.length > 0 && (
+        <DndContext
+          sensors={sensors}
+          collisionDetection={closestCenter}
+          onDragEnd={handleDragEnd}
+        >
+          <SortableContext
+            items={localImages.map((img) => img.id)}
+            strategy={rectSortingStrategy}
+          >
+            <div className="flex flex-wrap gap-3">
+              {localImages.map((image) => (
+                <SortableImageItem
+                  key={image.id}
+                  image={image}
+                  onDelete={() => deleteMutation.mutate(image.id)}
+                  isDeleting={
+                    deleteMutation.isPending &&
+                    deleteMutation.variables === image.id
+                  }
+                />
+              ))}
             </div>
-          ))}
-        </div>
+          </SortableContext>
+        </DndContext>
       )}
 
       {/* 待上传文件：每一项独立显示上传中或失败重试，互不影响 */}

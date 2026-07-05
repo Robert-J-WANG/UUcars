@@ -95,6 +95,18 @@ export const carsApi = {
     return response.data.data!;
   },
 
+  // ✅ 新增：调整图片排序
+  reorderImages: async (
+    carId: number,
+    items: { imageId: number; sortOrder: number }[],
+  ): Promise<CarImage[]> => {
+    const response = await apiClient.put<ApiResponse<CarImage[]>>(
+      `/cars/${carId}/images/reorder`,
+      { items },
+    );
+    return response.data.data!;
+  },
+
   // 删除图片
   deleteImage: async (carId: number, imageId: number): Promise<void> => {
     await apiClient.delete(`/cars/${carId}/images/${imageId}`);

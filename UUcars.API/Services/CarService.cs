@@ -240,7 +240,7 @@ public class CarService
             imageId, carId, currentUserId);
     }
 
-// ✅ 新增：批量添加图片
+    // ✅ 新增：批量添加图片
     public async Task<List<CarImageResponse>> AddImagesBatchAsync(
         int carId,
         int currentUserId,
@@ -317,8 +317,44 @@ public class CarService
         return created.Select(MapToImageResponse).ToList();
     }
 
+    // ✅ 新增：调整图片排序
+    public async Task<List<CarImageResponse>> ReorderImagesAsync(int carId,
+        int currentUserId,
+        CarImageReorderRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        //基础权限校验
+        var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+        if (car == null) throw new CarNotFoundException(carId);
+        if (car.SellerId != currentUserId) throw new ForbiddenException();
+        if (car.Status != CarStatus.Draft) throw new CarStatusException(car.Id, car.Status, CarStatus.Draft);
 
-    // ✅ 公开车辆列表：加缓存
+        // 取出这辆车的所有图片，验证请求里的 ImageId 都属于这辆车
+        // IDOR 防护：防止用户把别人车辆的 ImageId 塞进来
+        var existingImages = await _carImageRepository.GetByCarIdAsync(carId, cancellationToken);
+        var existingImageIds = existingImages.Select(i => i.Id).ToList();
+        foreach (var item in request.Items)
+            if (!existingImageIds.Contains(item.ImageId))
+                throw new CarImageNotFoundException(item.ImageId);
+
+        // 找到图片，并改成新的排序值
+        foreach (var item in request.Items)
+        {
+            var image = existingImages.First(i => i.Id == item.ImageId);
+            image.SortOrder = item.SortOrder;
+        }
+
+        // 统一批量写回
+        await _carImageRepository.UpdateSortOrdersAsync(existingImages, cancellationToken);
+        _logger.LogInformation(
+            "Images reordered for car {CarId} by seller {SellerId}", carId, currentUserId);
+
+        // 把数据按新的顺序返回
+        return existingImages.OrderBy(i => i.SortOrder).Select(MapToImageResponse).ToList();
+    }
+
+
+// ✅ 公开车辆列表：加缓存
     public async Task<PagedResponse<CarResponse>> GetPublishedCarsAsync(
         CarQueryRequest request,
         CancellationToken cancellationToken = default)
@@ -390,9 +426,9 @@ public class CarService
         throw new CarNotFoundException(carId);
     }
 
-    // 实体 → DTO 的映射方法
-    // 注意 SellerUsername 暂时用空字符串——创建时 EF Core 不会自动加载导航属性
-    // 后续详情接口会用 Include 加载完整的 Seller 信息
+// 实体 → DTO 的映射方法
+// 注意 SellerUsername 暂时用空字符串——创建时 EF Core 不会自动加载导航属性
+// 后续详情接口会用 Include 加载完整的 Seller 信息
     internal static CarResponse MapToResponse(Car car)
     {
         return new CarResponse
@@ -425,7 +461,7 @@ public class CarService
         };
     }
 
-    // 详情实体 → DTO 的映射（包含图片列表）
+// 详情实体 → DTO 的映射（包含图片列表）
     private static CarDetailResponse MapToDetailResponse(Car car)
     {
         return new CarDetailResponse

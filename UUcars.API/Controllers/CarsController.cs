@@ -124,6 +124,24 @@ public class CarsController : ControllerBase
             ApiResponse<List<CarImageResponse>>.Ok(images, "Images added successfully."));
     }
 
+    // 新增排序接口
+    // PUT /cars/{id}/images/reorder
+    [HttpPut("{id:int}/images/reorder")]
+    [Authorize]
+    [EnableRateLimiting(RateLimitPolicies.Write)]
+    public async Task<IActionResult> ReorderImages(int id, [FromBody] CarImageReorderRequest request,
+        CancellationToken cancellationToken)
+    {
+        // 验证是否登录
+        var currentUserId = _currentUserService.GetCurrentUserId();
+        if (currentUserId == null) return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+        // 是登录用户
+        var images = await _carService.ReorderImagesAsync(
+            id, currentUserId.Value, request, cancellationToken);
+
+        return Ok(ApiResponse<List<CarImageResponse>>.Ok(images, "Images reordered successfully."));
+    }
+
     // DELETE /cars/{id}/images/{imageId}
     [HttpDelete("{id:int}/images/{imageId:int}")]
     [Authorize]

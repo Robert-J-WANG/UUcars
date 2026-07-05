@@ -53,4 +53,14 @@ public class EfCarImageRepository : ICarImageRepository
     {
         return _context.CarImages.Where(ci => ci.CarId == carId).ToListAsync(cancellationToken);
     }
+
+    // ✅ 新增：批量更新排序
+    // images 列表里每个对象的 SortOrder 已在 Service 层设置好新值
+    // UpdateRange 把每个实体标记为 Modified，SaveChangesAsync 时生成对应 UPDATE 语句
+    public async Task UpdateSortOrdersAsync(
+        List<CarImage> images, CancellationToken cancellationToken = default)
+    {
+        _context.CarImages.UpdateRange(images);
+        await _context.SaveChangesAsync(cancellationToken);
+    }
 }

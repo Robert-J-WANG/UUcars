@@ -309,6 +309,57 @@ public class CarServiceTests
         await Assert.ThrowsAsync<ForbiddenException>(() => service.AddImagesBatchAsync(1, 99, request));
     }
 
+    // ===== 图片排序（Step 64② 新增）=====
+
+    [Fact]
+    public async Task ReorderImagesAsync_WithValidImages_ShouldUpdateSortOrder()
+    {
+        var repo = new FakeCarRepository();
+        var imageRepo = new FakeCarImageRepository();
+        repo.Seed(new Car { Id = 1, SellerId = 10, Status = CarStatus.Draft });
+
+        var image1 = new CarImage { CarId = 1, SortOrder = 0 };
+        var image2 = new CarImage { CarId = 1, SortOrder = 1 };
+        imageRepo.Seed(image1);
+        imageRepo.Seed(image2);
+
+        var service = CreateService(repo, imageRepo);
+
+        // 交换两张图的顺序
+        var request = new CarImageReorderRequest
+        {
+            Items =
+            [
+                new CarImageOrderItem { ImageId = image1.Id, SortOrder = 1 },
+                new CarImageOrderItem { ImageId = image2.Id, SortOrder = 0 }
+            ]
+        };
+
+        var result = await service.ReorderImagesAsync(1, 10, request);
+
+        // image2 现在应该排第一
+        Assert.Equal(image2.Id, result[0].Id);
+        Assert.Equal(image1.Id, result[1].Id);
+    }
+
+    [Fact]
+    public async Task ReorderImagesAsync_WithImageIdNotBelongingToCar_ShouldThrowCarImageNotFoundException()
+    {
+        var repo = new FakeCarRepository();
+        var imageRepo = new FakeCarImageRepository();
+        repo.Seed(new Car { Id = 1, SellerId = 10, Status = CarStatus.Draft });
+        imageRepo.Seed(new CarImage { CarId = 1, SortOrder = 0 });
+        var service = CreateService(repo, imageRepo);
+
+        // 999 不属于这辆车
+        var request = new CarImageReorderRequest
+        {
+            Items = [new CarImageOrderItem { ImageId = 999, SortOrder = 0 }]
+        };
+
+        await Assert.ThrowsAsync<CarImageNotFoundException>(() => service.ReorderImagesAsync(1, 10, request));
+    }
+
 // ===== 辅助：构造假的 IFormFile / IFormFileCollection =====
 
     private static IFormFile CreateFakeFormFile(string fileName)
