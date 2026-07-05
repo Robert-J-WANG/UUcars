@@ -15,7 +15,7 @@ export const carsApi = {
   getPaged: async (params?: CarQueryRequest): Promise<PagedResponse<Car>> => {
     const response = await apiClient.get<ApiResponse<PagedResponse<Car>>>(
       "/cars",
-      { params }
+      { params },
     );
     return response.data.data!;
   },
@@ -28,11 +28,11 @@ export const carsApi = {
 
   // 我的车辆列表
   getMyListings: async (
-    params?: CarQueryRequest
+    params?: CarQueryRequest,
   ): Promise<PagedResponse<Car>> => {
     const response = await apiClient.get<ApiResponse<PagedResponse<Car>>>(
       "/cars/my-listings",
-      { params }
+      { params },
     );
     return response.data.data!;
   },
@@ -57,7 +57,7 @@ export const carsApi = {
   // 提交审核
   submit: async (id: number): Promise<Car> => {
     const response = await apiClient.post<ApiResponse<Car>>(
-      `/cars/${id}/submit`
+      `/cars/${id}/submit`,
     );
     return response.data.data!;
   },
@@ -66,7 +66,7 @@ export const carsApi = {
   uploadImage: async (
     carId: number,
     file: File,
-    sortOrder = 0
+    sortOrder = 0,
   ): Promise<CarImage> => {
     const formData = new FormData();
     formData.append("file", file);
@@ -74,7 +74,35 @@ export const carsApi = {
     const response = await apiClient.post<ApiResponse<CarImage>>(
       `/cars/${carId}/images`,
       formData,
-      { headers: { "Content-Type": "multipart/form-data" } }
+      { headers: { "Content-Type": "multipart/form-data" } },
+    );
+    return response.data.data!;
+  },
+
+  // ✅ 新增：批量上传图片
+  // 同一个字段名 "files" 多次 append，后端 IFormFileCollection 自动收集
+  uploadImagesBatch: async (
+    carId: number,
+    files: File[],
+  ): Promise<CarImage[]> => {
+    const formData = new FormData();
+    files.forEach((file) => formData.append("files", file));
+    const response = await apiClient.post<ApiResponse<CarImage[]>>(
+      `/cars/${carId}/images/batch`,
+      formData,
+      { headers: { "Content-Type": "multipart/form-data" } },
+    );
+    return response.data.data!;
+  },
+
+  // ✅ 新增：调整图片排序
+  reorderImages: async (
+    carId: number,
+    items: { imageId: number; sortOrder: number }[],
+  ): Promise<CarImage[]> => {
+    const response = await apiClient.put<ApiResponse<CarImage[]>>(
+      `/cars/${carId}/images/reorder`,
+      { items },
     );
     return response.data.data!;
   },

@@ -8449,6 +8449,1979 @@ git checkout develop
 
 
 
+## Step 64 · 车辆发布升级①（批量上传）
+
+### 这一步做什么
+
+V2 的图片上传体验有一个明显短板：**一次只能上传一张**。
+
+```
+当前流程：选一张 → 预览 → 点上传 → 等待 → 再选一张 → 预览 → 点上传 → 等待 → ...
+一辆车通常需要 5-10 张图，这个流程要重复很多次。
+```
+
+这一步要解决这个问题：**批量上传**，一次选多张，每张独立显示上传状态和重试按钮。
+
+**为什么批量上传需要新接口，而不是前端循环调单文件接口？**
+
+技术上前端可以写 `for` 循环逐一调 `POST /cars/{id}/images`，但有一个真实的竞态问题：
+
+```
+场景：车辆已有 8 张图，上限 10 张，用户选了 5 张并行上传
+
+并行请求A：查到当前 8 张 → 8+1=9 ≤ 10 → 允许
+并行请求B：查到当前 8 张 → 8+1=9 ≤ 10 → 允许
+并行请求C：查到当前 8 张 → 8+1=9 ≤ 10 → 允许
+并行请求D：查到当前 8 张 → 8+1=9 ≤ 10 → 允许
+并行请求E：查到当前 8 张 → 8+1=9 ≤ 10 → 允许
+
+最终：8 + 5 = 13 张，超过了上限 ❌
+```
+
+每个请求各自独立查询"当前已有多少张图"，"查询数量"和"写入数据"之间存在时间窗口，多个请求可以同时挤进这个窗口。前端循环无法解决这个问题，因为校验逻辑本来就在服务端每次单独执行。
+
+批量接口在一次请求里统一校验 `已有数量 + 本次数量 > 上限`，不存在竞态问题。 
+
+同时所有图片的数据库写入在一个事务里完成，不会出现"传了 5 张，只成功插入 3 张"的中间状态。
+
+
+
+### 1. 切出功能分支
+
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b feature/v3-image-upload
+git push -u origin feature/v3-image-upload
+```
+
+
+
+### 2. 扩展 ICarImageRepository
+
+批量上传需要两个当前仓储层没有的能力：
+
+- 查询一辆车现有的所有图片（用于计算已有数量）
+- 一次性批量插入多条图片记录（对应"一个事务、不出现部分成功"）。
+
+打开 `UUcars.API/Repositories/ICarImageRepository.cs`：
+
+```csharp
+public interface ICarImageRepository
+{
+    ...
+
+    // ✅ 新增：批量添加，一次性插入多张图片，同一个事务里完成
+    Task<List<CarImage>> AddRangeAsync(
+        List<CarImage> images, CancellationToken cancellationToken = default);
+
+    // ✅ 新增：根据车辆 Id 查询该车辆的所有图片
+    // 批量上传时用于计算已有数量
+    Task<List<CarImage>> GetByCarIdAsync(
+        int carId, CancellationToken cancellationToken = default);
+}
+```
+
+打开 `UUcars.API/Repositories/EfCarImageRepository.cs`，实现新方法：
+
+```csharp
+public class EfCarImageRepository : ICarImageRepository
+{
+    ...
+
+    // ✅ 新增：批量添加
+    // AddRange 把所有实体一次性加入追踪器，
+    // 只调用一次 SaveChangesAsync，在同一个事务里写入
+    // 要么全部成功，要么全部失败，不会出现中间状态
+    public async Task<List<CarImage>> AddRangeAsync(
+        List<CarImage> images, CancellationToken cancellationToken = default)
+    {
+        _context.CarImages.AddRange(images);
+        await _context.SaveChangesAsync(cancellationToken);
+        return images;
+    }
+
+    // ✅ 新增：查询车辆的所有图片
+    public async Task<List<CarImage>> GetByCarIdAsync(
+        int carId, CancellationToken cancellationToken = default)
+    {
+        return await _context.CarImages
+            .Where(ci => ci.CarId == carId)
+            .ToListAsync(cancellationToken);
+    }
+}
+```
+
+
+
+### 3. 新增 DTO
+
+前端要一次传多个文件，对应的 HTTP 请求是 `multipart/form-data`，里面会有多个文件字段，都用同一个字段名。ASP.NET Core 能自动把"同名的多个文件字段"收集成一个集合，接收类型是 `IFormFileCollection`。现有的单文件 DTO 装不下多个文件，需要一个新的批量请求 DTO。
+
+新建 `UUcars.API/DTOs/Requests/CarImageBatchAddRequest.cs`：
+
+```csharp
+namespace UUcars.API.DTOs.Requests;
+
+// 批量图片上传请求
+// IFormFileCollection：对应 multipart/form-data 里多个同名文件字段
+// 前端用同一个字段名（"files"）多次 append，后端自动收集成这个集合
+public class CarImageBatchAddRequest
+{
+    public IFormFileCollection Files { get; set; } = null!;
+}
+```
+
+
+
+### 4. CarService 新增方法
+
+批量上传的 Service 方法，本质上是把"要不要允许这次批量操作"和"具体怎么执行"分成两个阶段：
+
+**第一阶段：全部校验完再动手**，原因是——一旦开始往 R2 传文件，就没有回头路了（R2 没有事务回滚的概念）。所以必须先把所有可能导致失败的判断都做完，确认这批文件"值得传"之后，才真正开始传。校验分三层，顺序不能颠倒：
+
+1. **权限校验**：车辆是否存在、是否属于当前用户、状态是否是 Draft（这些和"传不传图片"无关，是最基础的前提，理应最先判断）
+2. **数量上限校验**：查一次现有图片数量，加上这次要传的数量，判断是否超过 10 张——这是阶段一要解决的核心问题（竞态防护），必须在真正上传前做
+3. **逐一校验每个文件本身**（大小、类型）：只要有一个文件不合法，整批直接拒绝，不做"部分成功"——原因是批量操作里部分成功会让用户困惑（不知道哪几张失败了），全部通过才处理是更简单可靠的设计
+
+**第二阶段：校验全部通过后，才真正执行上传和写库**，这里涉及一个容易忽略的问题——R2 和数据库是两个完全独立的外部系统，没有办法用一个事务把它们绑在一起。所以要想清楚执行顺序：
+
+- **必须先传 R2、拿到真实可访问的 URL，再拿这个 URL 去写数据库**，不能反过来。反过来的话，数据库里会先出现一条指向"实际还不存在"的 R2 地址的记录，用户此时刷新页面会看到一张加载失败的图。
+- 因为 R2 的 API 本身不支持"一次请求传多个文件"（这是对象存储协议的天然限制），所以对 R2 的调用只能是循环、逐个进行；但对数据库的写入，用 1.1 里新增的 `AddRangeAsync` 做成真正的批量（一次事务）。
+- 这个设计权衡下，如果中途 R2 上传失败（比如传到第 3 张网络断了），前面已经传成功的文件会变成"孤儿文件"（R2 上有文件、数据库没记录，因为循环还没走完 `AddRangeAsync` 根本不会被调用）。这是当前阶段接受的权衡：宁可 R2 端偶尔留下没人引用的孤儿文件，也不允许数据库记录指向一个实际不存在的文件。孤儿文件清理不在本次需求范围内，暂不处理。
+
+**上传顺序还顺带解决了排序**：新图片的 `SortOrder` 要从"现有图片的最大排序值 + 1"开始往后排，这样这批新图会接在已有图片后面，不会打乱已有顺序。
+
+打开 `UUcars.API/Services/CarService.cs`，在 `DeleteImageAsync` 之后加入：
+
+```csharp
+// ✅ 新增：批量添加图片
+public async Task<List<CarImageResponse>> AddImagesBatchAsync(
+    int carId,
+    int currentUserId,
+    CarImageBatchAddRequest request,
+    CancellationToken cancellationToken = default)
+{
+    var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+    if (car == null)
+        throw new CarNotFoundException(carId);
+
+    if (car.SellerId != currentUserId)
+        throw new ForbiddenException();
+
+    if (car.Status != CarStatus.Draft)
+        throw new CarStatusException(car.Id, car.Status, CarStatus.Draft);
+
+    // 数量上限校验：一辆车最多 10 张图
+    // 在后端统一校验，避免前端并行上传时的竞态问题
+    const int maxImagesPerCar = 10;
+    var existingImages = await _carImageRepository.GetByCarIdAsync(carId, cancellationToken);
+    if (existingImages.Count + request.Files.Count > maxImagesPerCar)
+        throw new AppException(
+            StatusCodes.Status400BadRequest,
+            $"A car can have at most {maxImagesPerCar} images. " +
+            $"Currently has {existingImages.Count}, attempted to add {request.Files.Count}.");
+
+    // 逐一校验每个文件（大小、类型）
+    // 任何一个文件不合法，整批都拒绝，不做"部分成功"
+    // 原因：批量操作里出现部分成功对用户来说很困惑，
+    // 不知道哪几张失败了，全部通过才处理是更简洁可靠的设计
+    foreach (var file in request.Files)
+    {
+        var (isValid, error) = FileValidator.Validate(file);
+        if (!isValid)
+            throw new AppException(StatusCodes.Status400BadRequest, error!);
+    }
+
+    // 新图片从当前最大 SortOrder 之后开始排
+    var currentMaxSortOrder = existingImages.Count > 0
+        ? existingImages.Max(i => i.SortOrder)
+        : -1;
+
+    // 逐个上传到 R2（R2/S3 本身不支持批量上传，仍需逐个调用）
+    // 数据库写入是批量的（AddRangeAsync 一次性提交）
+    var newImages = new List<CarImage>();
+    var sortOrder = currentMaxSortOrder + 1;
+
+    foreach (var file in request.Files)
+    {
+        var fileName = FileValidator.GenerateFileName(file.FileName);
+
+        string imageUrl;
+        await using (var stream = file.OpenReadStream())
+        {
+            imageUrl = await _storageService.UploadAsync(
+                stream, fileName, file.ContentType, cancellationToken);
+        }
+
+        newImages.Add(new CarImage
+        {
+            CarId = carId,
+            ImageUrl = imageUrl,
+            SortOrder = sortOrder
+        });
+
+        sortOrder++;
+    }
+
+    // 一次性批量写入数据库
+    var created = await _carImageRepository.AddRangeAsync(newImages, cancellationToken);
+
+    _logger.LogInformation(
+        "{Count} images added to car {CarId} by seller {SellerId}",
+        created.Count, carId, currentUserId);
+
+    return created.Select(MapToImageResponse).ToList();
+}
+```
+
+
+
+### 5. CarsController 新增接口
+
+打开 `UUcars.API/Controllers/CarsController.cs`，在现有 `AddImage` 之后加入：
+
+```csharp
+// POST /cars/{id}/images/batch
+[HttpPost("{id:int}/images/batch")]
+[Authorize]
+[EnableRateLimiting(RateLimitPolicies.Write)]
+public async Task<IActionResult> AddImagesBatch(
+    int id,
+    [FromForm] CarImageBatchAddRequest request,
+    CancellationToken cancellationToken)
+{
+    var currentUserId = _currentUserService.GetCurrentUserId();
+    if (currentUserId == null)
+        return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+    var images = await _carService.AddImagesBatchAsync(
+        id, currentUserId.Value, request, cancellationToken);
+
+    return StatusCode(StatusCodes.Status201Created,
+        ApiResponse<List<CarImageResponse>>.Ok(images, "Images added successfully."));
+}
+```
+
+> **为什么用 `[FromForm]`？**
+>
+> 这个接口要接收文件，文件只能通过 `multipart/form-data` 传输，对应 `[FromForm]`。
+
+
+
+### 6. 扩展 cars.ts
+
+前端要把用户一次选中的多个文件打包进一次请求，用同一个字段名（`files`）多次 `append`，后端的 `IFormFileCollection` 会自动收集。
+
+打开 `src/api/cars.ts`，在现有 `uploadImage` 之后加入：
+
+```typescript
+// ✅ 新增：批量上传图片
+// 同一个字段名 "files" 多次 append，后端 IFormFileCollection 自动收集
+uploadImagesBatch: async (
+  carId: number,
+  files: File[]
+): Promise<CarImage[]> => {
+  const formData = new FormData();
+  files.forEach((file) => formData.append("files", file));
+  const response = await apiClient.post<ApiResponse<CarImage[]>>(
+    `/cars/${carId}/images/batch`,
+    formData,
+    { headers: { "Content-Type": "multipart/form-data" } }
+  );
+  return response.data.data!;
+},
+```
+
+
+
+### 7. 重写 ImageUploader 组件
+
+现有 `ImageUploader.tsx` 的流程是：点击选择 → 选中一个文件 → 本地生成预览 → 用户看到预览后再点一次 "Upload" 按钮 → 调 `carsApi.uploadImage(carId, file)` 上传这一个文件。
+
+对应的状态设计也是围绕"只处理一个文件"展开的：
+
+```tsx
+const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+const [selectedFile, setSelectedFile] = useState<File | null>(null);
+```
+
+`previewUrl` 和 `selectedFile` 都是单个值，不是数组。批量场景下需要同时追踪一组文件，而不是一个。
+
+#### 7.1 状态结构从"一个文件"换成"一组文件，且每个各自独立"
+
+批量场景下，5 张图里有 1 张失败，只应该那一张显示失败，另外 4 张不受影响。这要求每个文件的状态必须分开存，不能像原来那样只有一个 `selectedFile` 变量。所以需要一个数组，数组里每一项对应一个文件，各自带自己的预览地址和上传状态。
+
+替换原来的状态为：
+
+```tsx
+interface PendingFile {
+  id: string; // 临时 id，用来在数组里定位到这一项，React key 也用它
+  file: File;
+  previewUrl: string;
+  status: "uploading" | "error";
+  error?: string;
+}
+
+const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
+```
+
+`status` 只设计成两态：`"uploading"` 和 `"error"`。批量场景下文件是"选完立即上传"，不存在"选完但还没开始传"这个中间等待状态，所以不需要一个 `"pending"` 态占位。
+
+`id` 用一个临时字符串（不是数据库 Id，因为这时候文件还没上传，数据库里根本没有这条记录），只用来在数组里找到对应的这一项，以及给 React 的 `key`。
+
+#### 7.2 input 允许一次选多个文件，并在选择时做数量拦截
+
+要支持批量，input 本身要加 `multiple`，这样`handleFileChange` 才能拿到全部选中的文件
+
+```tsx
+<input
+  ref={inputRef}
+  type="file"
+  accept="image/jpeg,image/png,image/webp"
+  multiple // 加上 multiple
+  className="hidden"
+  onChange={handleFileChange}
+/>
+```
+
+现有 `handleFileChange` 只取 `e.target.files?.[0]`，就算 input 支持多选，代码也只会处理第一个文件。
+
+```tsx
+const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const file = e.target.files?.[0];
+  if (!file) return;
+
+  if (previewUrl) {
+    URL.revokeObjectURL(previewUrl);
+  }
+
+  const url = URL.createObjectURL(file);
+  setPreviewUrl(url);
+  setSelectedFile(file);
+};
+```
+
+`handleFileChange` 要能拿到全部选中的文件，并且在选择的当下就判断"这次选的加上已有的会不会超过上限"。数量拦截放在这一步做，是因为不合格的话应该直接拒绝、不生成任何预览、不发任何请求，越早拦截越好。修改如下：
+
+定义`MAX_IMAGES` 常量， 值取 10，跟后端 `AddImagesBatchAsync` 里的上限保持一致。
+
+```tsx
+const MAX_IMAGES=10;
+```
+
+实现 `handleFileChange`选择多个文件，并做数量拦截
+
+```tsx
+const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const files = e.target.files;
+  if (!files || files.length === 0) return;
+
+  // FileList 转成真正的数组，才能用 map 之类的数组方法
+  const fileArray = Array.from(files);
+
+  // 数量上限：已有图片数 + 正在处理的数 + 这次新选的数，超过就拒绝，不发任何请求
+  const totalAfter = images.length + pendingFiles.length + fileArray.length;
+  if (totalAfter > MAX_IMAGES) {
+    toast.error(
+      `A car can have at most ${MAX_IMAGES} images. ` +
+        `Currently has ${images.length + pendingFiles.length}, ` +
+        `you selected ${fileArray.length}.`
+    );
+    if (inputRef.current) inputRef.current.value = "";
+    return;
+  }
+
+  // 后续操作
+    ...
+};
+```
+
+> `e.target.files` 拿到的是 `FileList`，不是数组，没有 `.map`，所以先用 `Array.from` 转一次。`MAX_IMAGES` 是新增的常量，值取 10，跟后端 `AddImagesBatchAsync` 里的上限保持一致。
+
+更新`pendingFiles`: 把 `fileArray` 转成 `PendingFile[]`, 每个文件包装成一个 PendingFile, 并各自生成本地预览、状态先标记为 uploading.
+
+```tsx
+// 每个文件包装成一个 PendingFile：各自生成本地预览、状态先标记为 uploading
+const newPendingFiles: PendingFile[] = fileArray.map((file) => ({
+  id: `pending-${Date.now()}-${Math.random()}`,
+  file,
+  previewUrl: URL.createObjectURL(file),
+  status: "uploading",
+}));
+
+setPendingFiles((prev) => [...prev, ...newPendingFiles]);
+```
+
+#### 7.3 上传逻辑——从"点按钮触发一次 mutation"改成"选完立即各自上传"
+
+原来的流程是"选完看预览，用户再点一次 Upload"。批量场景下，一次要处理好几个文件，让用户对着每个文件都点一次确认没有意义，所以改成"选完立即自动开始上传"。
+
+同时，因为每个文件的上传状态要单独维护（对应第二步的 `pendingFiles` 数组），原来用 `useMutation` 包一个"上传"动作的方式不太合适——`useMutation` 更适合"一个独立的动作，触发一次、看一次结果"，不太方便表达"数组里每一项各自独立在跑"这种情况。改成一个普通的 `async function`，直接操作 `pendingFiles` 数组里对应的那一项，逻辑更直接。
+
+原来的 `uploadMutation`：
+
+```tsx
+const uploadMutation = useMutation({
+  mutationFn: (file: File) => carsApi.uploadImage(carId, file),
+  onSuccess: () => {
+    toast.success("Image uploaded!");
+    setPreviewUrl(null);
+    setSelectedFile(null);
+    queryClient.invalidateQueries({ queryKey: ["car", carId] });
+  },
+  onError: (error) => {
+    toast.error(error.message);
+  },
+});
+```
+
+替换成一个普通函数：
+
+```tsx
+// 每次调用只负责一个文件，成功了把它从 pendingFiles 里移除，
+// 失败了只把这一项标记成 error，不影响列表里其他文件
+const uploadSingleFile = async (pendingId: string, file: File) => {
+  try {
+    await carsApi.uploadImagesBatch(carId, [file]);
+
+    // 上传成功：从 pendingFiles 里移除这一项，并释放它的预览 URL（避免内存泄漏）
+    setPendingFiles((prev) => {
+      const target = prev.find((p) => p.id === pendingId);
+      if (target) URL.revokeObjectURL(target.previewUrl);
+      return prev.filter((p) => p.id !== pendingId);
+    });
+
+    queryClient.invalidateQueries({ queryKey: ["car", carId] });
+  } catch (error) {
+    // 上传失败：只把这一项标记为 error，其他文件的状态不受影响
+    const message = error instanceof Error ? error.message : "Upload failed";
+    setPendingFiles((prev) =>
+      prev.map((p) =>
+        p.id === pendingId ? { ...p, status: "error", error: message } : p
+      )
+    );
+  }
+};
+```
+
+> 这里调用的是 `carsApi.uploadImagesBatch`，不是原来的 `carsApi.uploadImage`——单文件接口一次只能传一个，即使只传一张也用批量接口，这样每张图片走的都是同一套后端校验逻辑（数量上限、事务写入），不需要维护两套上传路径。
+
+回到 `handleFileChange`，第二步生成完 `newPendingFiles` 之后，紧接着要让每个文件立即开始上传：
+
+```tsx
+setPendingFiles((prev) => [...prev, ...newPendingFiles]);
+
+// 选完立即各自开始上传，不需要再手动点确认
+newPendingFiles.forEach((p) => uploadSingleFile(p.id, p.file));
+
+if (inputRef.current) inputRef.current.value = "";
+```
+
+#### 7.4 渲染部分——展示每个文件各自的状态，去掉手动确认上传的 UI
+
+原来"选择后显示预览 + 点 Upload 按钮"这段是围绕单个文件设计的，现在要展示的是一个数组，每一项要能单独显示"上传中"或"失败重试"，不需要确认按钮（因为已经自动开始上传了）。
+
+原来这一段
+
+```tsx
+{previewUrl && selectedFile && (
+  <div className="space-y-2">
+    <img src={previewUrl} alt="Preview" className="h-40 w-40 rounded-lg object-cover" />
+    <p className="text-sm text-gray-500">{selectedFile.name}</p>
+    <Button
+      type="button"
+      size="sm"
+      onClick={() => uploadMutation.mutate(selectedFile)}
+      disabled={uploadMutation.isPending}
+    >
+      {uploadMutation.isPending ? "Uploading..." : "Upload"}
+    </Button>
+  </div>
+)}
+```
+
+替换成遍历 `pendingFiles`，每一项根据 `status` 显示不同的遮罩：
+
+```tsx
+{pendingFiles.length > 0 && (
+  <div className="flex flex-wrap gap-3">
+    {pendingFiles.map((pending) => (
+      <div key={pending.id} className="relative">
+        <img
+          src={pending.previewUrl}
+          alt="Preview"
+          className="h-24 w-24 rounded-lg object-cover"
+        />
+
+        {/* 上传中：遮罩提示 */}
+        {pending.status === "uploading" && (
+          <div className="absolute inset-0 flex items-center justify-center rounded-lg bg-black/40">
+            <span className="text-xs font-medium text-white">Uploading...</span>
+          </div>
+        )}
+
+        {/* 上传失败：这一项单独显示重试按钮，不影响其他项 */}
+        {pending.status === "error" && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 rounded-lg bg-black/60">
+            <AlertCircle className="h-4 w-4 text-red-400" />
+            <button
+              type="button"
+              onClick={() => uploadSingleFile(pending.id, pending.file)}
+              className="flex items-center gap-0.5 text-[10px] font-medium text-white hover:text-red-300"
+            >
+              <RotateCcw className="h-2.5 w-2.5" />
+              Retry
+            </button>
+          </div>
+        )}
+      </div>
+    ))}
+  </div>
+)}
+```
+
+"重试"按钮点击时直接再调一次 `uploadSingleFile`，传的还是这一项自己的 `id` 和 `file`——不需要额外的重试逻辑，复用的是同一个函数。
+
+已上传图片那块（`images.map(...)`、删除按钮）不用动，批量上传不影响这部分。
+
+选择按钮的文案从 "Select Image" 改成 "Add Images"，因为现在一次可以加多张：
+
+```tsx
+<Button type="button" variant="outline" onClick={() => inputRef.current?.click()}>
+  Add Images
+</Button>
+```
+
+
+
+
+
+### 8. 补全测试 FakeCarImageRepository
+
+`ICarImageRepository` 新增了两个方法，`FakeCarImageRepository` 要同步实现，否则编译不过。
+
+完整更新 `UUcars.Tests/Fakes/FakeCarImageRepository.cs`：
+
+```csharp
+using UUcars.API.Entities;
+using UUcars.API.Repositories;
+
+namespace UUcars.Tests.Fakes;
+
+public class FakeCarImageRepository : ICarImageRepository
+{
+    ...
+
+    // ✅ 新增
+    public Task<List<CarImage>> AddRangeAsync(
+        List<CarImage> images, CancellationToken cancellationToken = default)
+    {
+        foreach (var image in images)
+        {
+            image.Id = _nextId++;
+            _store[image.Id] = image;
+        }
+        return Task.FromResult(images);
+    }
+
+    // ✅ 新增
+    public Task<List<CarImage>> GetByCarIdAsync(
+        int carId, CancellationToken cancellationToken = default)
+    {
+        var images = _store.Values.Where(i => i.CarId == carId).ToList();
+        return Task.FromResult(images);
+    }
+}
+```
+
+
+
+### 9. 新增单元测试
+
+批量上传的核心逻辑是"数量超限要拒绝"和"非车主要拒绝"，对应两个测试。测试里需要构造假的 `IFormFile`/`IFormFileCollection`——单元测试不依赖真实文件系统或网络，用内存 `MemoryStream` 包一个假文件即可；`IFormFileCollection` 没有现成的空实现，需要自己包一层。
+
+打开 `UUcars.Tests/Services/CarServiceTests.cs`，在现有测试之后加入：
+
+```csharp
+// ===== 批量上传图片（Step 64① 新增）=====
+
+[Fact]
+public async Task AddImagesBatchAsync_WhenExceedsMaxImages_ShouldThrowAppException()
+{
+    var repo = new FakeCarRepository();
+    var imageRepo = new FakeCarImageRepository();
+    repo.Seed(new Car { Id = 1, SellerId = 10, Status = CarStatus.Draft });
+
+    // 已有 8 张图
+    for (var i = 0; i < 8; i++)
+        imageRepo.Seed(new CarImage { CarId = 1, SortOrder = i });
+
+    var service = CreateService(repo, imageRepo);
+
+    // 再传 3 张，8 + 3 = 11，超过上限 10
+    var request = new CarImageBatchAddRequest
+    {
+        Files = new FakeFormFileCollection(
+            CreateFakeFormFile("a.jpg"),
+            CreateFakeFormFile("b.jpg"),
+            CreateFakeFormFile("c.jpg"))
+    };
+
+    await Assert.ThrowsAsync<AppException>(
+        () => service.AddImagesBatchAsync(1, 10, request));
+}
+
+[Fact]
+public async Task AddImagesBatchAsync_WhenNotOwner_ShouldThrowForbiddenException()
+{
+    var repo = new FakeCarRepository();
+    var imageRepo = new FakeCarImageRepository();
+    repo.Seed(new Car { Id = 1, SellerId = 10, Status = CarStatus.Draft });
+    var service = CreateService(repo, imageRepo);
+
+    var request = new CarImageBatchAddRequest
+    {
+        Files = new FakeFormFileCollection(CreateFakeFormFile("a.jpg"))
+    };
+
+    // userId = 99 不是车主
+    await Assert.ThrowsAsync<ForbiddenException>(
+        () => service.AddImagesBatchAsync(1, 99, request));
+}
+
+// ===== 辅助：构造假的 IFormFile / IFormFileCollection =====
+
+private static IFormFile CreateFakeFormFile(string fileName)
+{
+    var content = "fake image content"u8.ToArray();
+    var stream = new MemoryStream(content);
+    return new FormFile(stream, 0, content.Length, "files", fileName)
+    {
+        Headers = new HeaderDictionary(),
+        ContentType = "image/jpeg"
+    };
+}
+```
+
+在 `CarServiceTests` 类的大括号外（文件末尾）加入辅助类：
+
+```csharp
+// IFormFileCollection 的测试用实现
+// ASP.NET Core 没有提供开箱即用的空实现，包一层 List<IFormFile> 即可
+internal class FakeFormFileCollection : List<IFormFile>, IFormFileCollection
+{
+    public FakeFormFileCollection(params IFormFile[] files) : base(files) { }
+
+    public IFormFile? GetFile(string name) =>
+        this.FirstOrDefault(f => f.Name == name);
+
+    public IReadOnlyList<IFormFile> GetFiles(string name) =>
+        this.Where(f => f.Name == name).ToList();
+
+    IFormFile? IFormFileCollection.this[string name] => GetFile(name);
+}
+```
+
+文件顶部确认有以下 using：
+
+```csharp
+using Microsoft.AspNetCore.Http;
+using UUcars.API.DTOs.Requests;
+```
+
+
+
+### 10. 本地验证
+
+#### 10.1 验证批量上传 + 本地预览
+
+1. 进入 Draft 状态的车辆编辑页
+2. 点击 "Add Images"，选择 3 张图片
+3. 应该立即看到 3 张图的本地预览，并显示 "Uploading..." 遮罩
+4. 上传完成后遮罩消失，图片进入已上传区域
+5. 第一张图显示 "Cover" 标记和蓝色边框
+
+#### 10.2 验证独立失败重试
+
+1. 断网状态下选择几张图片
+2. 应该看到每张图独立显示 "Retry" 按钮（不是所有图一起失败）
+3. 恢复网络后点 "Retry"，只重传这一张
+
+#### 10.3 验证数量上限
+
+1. 已有 8 张图的车辆，选择 5 张
+2. 前端立即弹出 Toast，不发起任何请求
+3. 用 Scalar 尝试直接调 `POST /cars/{id}/images/batch` 传 5 张（已有 8 张）
+4. 后端应该返回 400
+
+
+
+### 11. 编译和测试
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+dotnet test
+```
+
+新增 2 个测试用例，预期全部通过。
+
+
+
+### Step 64① 完成状态
+
+```
+后端：
+✅ ICarImageRepository 新增 AddRangeAsync / GetByCarIdAsync
+✅ EfCarImageRepository 实现两个新方法
+✅ CarImageBatchAddRequest DTO
+✅ CarService.AddImagesBatchAsync
+   - 数量上限校验（后端统一，防并发竞态）
+   - 文件逐一校验（全部通过才处理，不做部分成功）
+   - R2 逐个上传 + 数据库批量写入（AddRangeAsync 一个事务）
+✅ POST /cars/{id}/images/batch
+
+前端：
+✅ cars.ts 新增 uploadImagesBatch
+✅ ImageUploader 新建：
+   - multiple 文件选择（<input multiple>）
+   - 本地预览（URL.createObjectURL，选完立即显示）
+   - 每张图独立上传状态（uploading / error）
+   - 失败时显示 Retry 按钮（单张独立重试，不影响其他图）
+   - 前端数量上限校验（立即提示，不发请求）
+
+测试：
+✅ FakeCarImageRepository 新增两个方法
+✅ CarServiceTests 新增 2 个用例（数量超限、非车主）
+✅ FakeFormFileCollection 辅助类
+
+✅ 本地验证通过
+✅ dotnet build + dotnet test 通过
+```
+
+
+
+## Step 64 · 车辆发布升级②（拖拽排序）
+
+### 这一步做什么
+
+批量上传解决了"一次传多张"，但新问题随之而来：封面图目前只能是"最早上传的那张"，想换封面只能删掉重传。
+
+这一步要解决这个问题：**拖拽排序**，上传后可以拖动图片调整顺序，第一张自动成为封面。
+
+
+
+### 为什么用拖拽而不是"上移/下移"按钮？
+
+"上移/下移"按钮实现更简单，但对图片这种视觉化内容，拖拽更直观——用户能直接"看着"图片移到目标位置，不需要反复点按钮试探。
+
+`@dnd-kit` 是目前 React 生态里维护最活跃、React 18+ 兼容性最好的拖拽库，相比已停止维护的 `react-beautiful-dnd` 更适合这个项目。
+
+图片列表展示时永远是按 `CarImage.SortOrder` 排序的（`ImageGallery.tsx` 和 `CarService.MapToDetailResponse` 里都是 `OrderBy(i => i.SortOrder)`）。所以"拖拽排序"归根结底就是改写每张图片对应记录的 `SortOrder` 值，拖拽本身只是前端交互，最终都要落到这个字段上。
+
+
+
+### 1. 后端：扩展 ICarImageRepository
+
+排序需要两件事：验证提交上来的图片 Id 都属于这辆车（IDOR 防护，需要查询一辆车的所有图片，这个能力已经有了——`GetByCarIdAsync`，直接复用），以及一次性把整组图片的新排序值批量写回数据库（这是新能力）。
+
+打开 `UUcars.API/Repositories/ICarImageRepository.cs`，追加一个方法：
+
+```csharp
+using UUcars.API.Entities;
+
+namespace UUcars.API.Repositories;
+
+public interface ICarImageRepository
+{
+    ...
+    // ✅ 新增：批量更新排序
+    Task UpdateSortOrdersAsync(
+        List<CarImage> images, CancellationToken cancellationToken = default);
+}
+```
+
+打开 `UUcars.API/Repositories/EfCarImageRepository.cs`，实现新方法：
+
+```csharp
+    // ✅ 新增：批量更新排序
+    // images 列表里每个对象的 SortOrder 已在 Service 层设置好新值
+    // UpdateRange 把每个实体标记为 Modified，SaveChangesAsync 时生成对应 UPDATE 语句
+    public async Task UpdateSortOrdersAsync(
+        List<CarImage> images, CancellationToken cancellationToken = default)
+    {
+        _context.CarImages.UpdateRange(images);
+        await _context.SaveChangesAsync(cancellationToken);
+    }
+```
+
+
+
+### 2. 后端：新增 DTO
+
+前端拖拽结束后，提交的不是"把 A 和 B 换一下"这种增量指令，而是这组图片当前应该是什么顺序的完整快照。这样后端不需要理解"移动"这个动作，只需要按提交的顺序整体覆盖写入。
+
+新建 `UUcars.API/DTOs/Requests/CarImageReorderRequest.cs`：
+
+```csharp
+namespace UUcars.API.DTOs.Requests;
+
+public class CarImageReorderRequest
+{
+// 单张图片的新的排序值
+public class CarImageOrderItem
+{
+    public int ImageId { get; set; }
+    public int SortOrder { get; set; }
+}
+
+// 排序请求：一次性提交整组图片的新顺序
+public class CarImageReorderList
+{
+    public List<CarImageOrderItem> Items { get; set; } = [];
+}
+}
+```
+
+
+
+### 3. CarService 新增方法
+
+排序的 Service 方法要先过基础权限校验（车辆存在、是车主、状态是 Draft，和批量上传一样），然后是这一步特有的**IDOR 防护**：
+
+如果不检查请求里的 `ImageId` 是否真的属于这辆车，恶意用户可以在请求体里塞入别人车辆的图片 Id，后端如果直接信任并写入，就会把别人车辆的排序也改了——这是一次未经授权的跨资源修改。所以要先把这辆车真实存在的所有图片 Id 取出来做一个集合，请求里任何一个 Id 不在这个集合里，直接拒绝整个请求。
+
+校验通过后：
+
+- 才在内存里把每张图对应的 `SortOrder` 改成新值（前端指定的新数字），
+- 再调新增的 `UpdateSortOrdersAsync` 统一批量写回。
+- 最后排列一次（`OrderBy`），把数据按新的顺序返回
+
+打开 `UUcars.API/Services/CarService.cs`，在 `AddImagesBatchAsync` 之后加入：
+
+```csharp
+// ✅ 新增：调整图片排序
+public async Task<List<CarImageResponse>> ReorderImagesAsync(int carId,
+    int currentUserId,
+    CarImageReorderRequest.CarImageReorderList request,
+    CancellationToken cancellationToken = default)
+{
+    //基础权限校验
+    var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+    if (car == null) throw new CarNotFoundException(carId);
+    if (car.SellerId != currentUserId) throw new ForbiddenException();
+    if (car.Status != CarStatus.Draft) throw new CarStatusException(car.Id, car.Status, CarStatus.Draft);
+
+    // 取出这辆车的所有图片，验证请求里的 ImageId 都属于这辆车
+    // IDOR 防护：防止用户把别人车辆的 ImageId 塞进来
+    var existingImages = await _carImageRepository.GetByCarIdAsync(carId, cancellationToken);
+    var existingImageIds = existingImages.Select(i => i.Id).ToList();
+    foreach (var item in request.Items)
+        if (!existingImageIds.Contains(item.ImageId))
+            throw new CarImageNotFoundException(item.ImageId);
+
+    // 找到图片，并改成新的排序值
+    foreach (var item in request.Items)
+    {
+        var image = existingImages.First(i => i.Id == item.ImageId);
+        image.SortOrder = item.SortOrder;
+    }
+
+    // 统一批量写回
+    await _carImageRepository.UpdateSortOrdersAsync(existingImages, cancellationToken);
+    _logger.LogInformation(
+        "Images reordered for car {CarId} by seller {SellerId}", carId, currentUserId);
+
+    // 把数据按新的顺序返回
+    return existingImages.OrderBy(i => i.SortOrder).Select(MapToImageResponse).ToList();
+}
+```
+
+
+
+### 4. CarsController 新增接口
+
+排序请求是纯 JSON 数据（不含文件），所以用标准 `[FromBody]` 绑定，和批量上传的 `[FromForm]` 不同——这也是两者唯一的接口层面差异，其余风格（鉴权、限流）保持一致。
+
+打开 `UUcars.API/Controllers/CarsController.cs`，在 `AddImagesBatch` 之后加入：
+
+```csharp
+// 新增排序接口
+// PUT /cars/{id}/images/reorder
+[HttpPut("{id:int}/images/reorder")]
+[Authorize]
+[EnableRateLimiting(RateLimitPolicies.Write)]
+public async Task<IActionResult> ReorderImages(int id, [FromBody] CarImageReorderRequest request,
+    CancellationToken cancellationToken)
+{
+    // 验证是否登录
+    var currentUserId = _currentUserService.GetCurrentUserId();
+    if (currentUserId == null) return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+    // 是登录用户
+    var images = await _carService.ReorderImagesAsync(
+        id, currentUserId.Value, request, cancellationToken);
+
+    return Ok(ApiResponse<List<CarImageResponse>>.Ok(images, "Images reordered successfully."));
+}
+```
+
+
+
+### 5. 安装拖拽库
+
+```bash
+cd uucars-web
+npm install @dnd-kit/core @dnd-kit/sortable @dnd-kit/utilities
+```
+
+
+
+### 6. 前端：扩展 cars.ts
+
+新增排序请求的 API 函数
+
+打开 `src/api/cars.ts`，在 `uploadImagesBatch` 之后加入：
+
+```typescript
+// ✅ 新增：调整图片排序
+reorderImages: async (
+  carId: number,
+  items: { imageId: number; sortOrder: number }[]
+): Promise<CarImage[]> => {
+  const response = await apiClient.put<ApiResponse<CarImage[]>>(
+    `/cars/${carId}/images/reorder`,
+    { items }
+  );
+  return response.data.data!;
+},
+```
+
+
+
+### 7. 更新 ImageUploader 组件
+
+拖拽这个动作，从用户角度看是连续的一气呵成：按下 → 移动 → 松开。但拆到代码实现层面，要分成三个独立的阶段：
+
+1. **感知阶段**：浏览器要能识别出"用户现在正在拖拽一个东西"，而不是普通的点击或者页面滚动。这要靠监听指针按下/移动/松开这类原生事件来实现，并且要有一个判断标准："移动了多少距离才算真的开始拖，而不是手抖或者正常点击"。
+2. **追踪阶段**：拖拽进行中，要实时知道"正在拖的是哪一个元素"、"当前悬停在哪一个元素附近"。这要求每一个可能被拖拽、或者可能被"拖到它上面"的元素，都提前登记进一个名册，这样拖拽过程中才能拿当前指针位置去比对，算出离哪个元素最近。
+3. **结算阶段**：松手那一刻，要根据"最初拖的是谁"和"最后停在哪"这两个信息，算出一份新的排列顺序，再把这份新顺序应用到界面（视觉更新）、以及提交给后端（持久化）。
+
+#### 7.1 新增一个本地的 `localImages` 状态
+
+拖拽这个交互要求"手一松开，图片立刻跳到新位置"，不能等后端接口返回了才更新界面（那样会有明显卡顿）。但在批量上传阶段，`images` prop 是直接拿来渲染的 `images` 是父组件传进来的 prop，组件自己不能直接修改它。
+
+```tsx
+{images.length > 0 && (
+  <div className="flex flex-wrap gap-3">
+    {images.map((image) => (
+      <div key={image.id} className="relative">
+        <img src={image.imageUrl} alt="Car" className="h-24 w-24 rounded-lg object-cover" />
+        <button onClick={() => deleteMutation.mutate(image.id)} ...>×</button>
+      </div>
+    ))}
+  </div>
+)}
+```
+
+所以需要拷贝一份到本地 state，拖拽时先改这份本地拷贝，界面立刻响应（乐观更新）；而接口调用是异步在后台进行的。
+
+```tsx
+export default function ImageUploader({ carId, images }: ImageUploaderProps) {
+  // 已上传的图片顺序（本地副本，拖拽时先在本地更新，再异步调接口）
+  const [localImages, setLocalImages] = useState(images);
+
+  // images prop 变化时（比如上传成功后 invalidateQueries 触发重新拉取），
+  // 同步更新本地已上传图片列表
+  if (images !== localImages && images.length !== localImages.length) {
+    setLocalImages(images);
+  }
+
+  // pendingFiles：本次选中、还没成功上传完的文件列表
+  // 每一项都有自己的 status，互不影响
+  const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
+  ...
+}
+```
+
+`handleFileChange` 里原来用 `images.length` 判断数量上限的地方，也要跟着改成 `localImages.length`——因为现在真正展示给用户的、代表"当前有几张图"的数据来源是 `localImages`，不是 `images`：
+
+```tsx
+
+export default function ImageUploader({ carId, images }: ImageUploaderProps) {
+  // 已上传的图片顺序（本地副本，拖拽时先在本地更新，再异步调接口）
+  const [localImages, setLocalImages] = useState(images);
+ 
+  // images prop 变化时（比如上传成功后 invalidateQueries 触发重新拉取），
+  // 同步更新本地已上传图片列表
+  if (images !== localImages && images.length !== localImages.length) {
+    setLocalImages(images);
+  }
+ 
+  ...
+ 
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    ...
+ 
+    // 数量上限：已有图片数 + 正在处理的数 + 这次新选的数，超过上限就拒绝，不发任何请求
+    const totalAfter = localImages.length + pendingFiles.length + fileArray.length;
+    if (totalAfter > MAX_IMAGES) {
+      toast.error(
+        `A car can have at most ${MAX_IMAGES} images. ` +
+          `Currently has ${localImages.length + pendingFiles.length}, ` +
+          `you selected ${fileArray.length}.`
+      );
+      if (inputRef.current) inputRef.current.value = "";
+      return;
+    }
+ 
+    ...
+  };
+    
+    ...
+}
+```
+
+#### 7.2 实现拖拽
+
+拖拽这个手势不是靠一个简单的 `onChange` 就能捕获的，浏览器原生 DOM 也不知道"图片能拖到哪"。这一步只解决"怎么让 dnd-kit 感知到用户正在拖一个东西、拖到哪了"——这一层能力全部来自 `@dnd-kit/core`，跟"排序"这个业务概念还没有关系（`@dnd-kit/core` 单独拿出来，也能用来实现"拖进垃圾桶删除"这类跟排序无关的场景）。
+
+##### 1. 拖拽感知容器
+
+`dnd-kit`提供了这个容器 `DndContext`，使用它包括需要拖动的区域，就能完成监听指针事件、维护"现在正在拖谁"这些状态。
+
+```tsx
+import { DndContext } from "@dnd-kit/core";
+
+export default function ImageUploader({ carId, images }: ImageUploaderProps) {
+  const [localImages, setLocalImages] = useState(images);
+  if (images !== localImages && images.length !== localImages.length) {
+    setLocalImages(images);
+  }
+ 
+  ...
+ 
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    ...
+  };
+    
+    ...
+    
+    {/* 已上传的图片列表：可拖拽排序 */}
+    {localImages.length > 0 && (
+      <DndContext sensors={sensors} collisionDetection={closestCenter}>
+          <div className="flex flex-wrap gap-3">
+            {images.map((image) => (
+              <div key={image.id} className="relative">
+                <img
+                  src={image.imageUrl}
+                  alt="Car"
+                  className="h-24 w-24 rounded-lg object-cover"
+                />
+                {/* 删除按钮 */}
+                <button
+                  onClick={() => deleteMutation.mutate(image.id)}
+                  disabled={deleteMutation.isPending}
+                  className="absolute -right-2 -top-2 flex h-5 w-5
+                             items-center justify-center rounded-full
+                             bg-red-500 text-xs text-white
+                             hover:bg-red-600"
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+          </div>
+      </DndContext>
+)}
+}
+```
+
+##### 2. 传感器
+
+使用感知容器包裹之后，多大的移动幅度才算真的开始拖？
+
+如果什么都不设置，`DndContext` 会对任何一点点指针位移都很敏感——用户想点卡片上的删除按钮，手指按下去哪怕只抖了 1px，也可能被误判成"在拖拽"，删除按钮的点击事件就触发不了了。
+
+因此，需要一个"传感器"去解读原始的指针事件，并且设一个位移阈值，超过这个阈值才算真的开始拖。
+
+`dnd-kit`提供了很多传感器， 比如`PointerSensor`。 这个传感器`PointerSensor` 同时兼容鼠标和触摸屏，不需要分别处理 mouse 和 touch 事件；
+
+同时，`dnd-kit`提供了设置传感器参数的hook - useSensor, 可以对单个传感器设置阈值。并且，考虑到不止有一个传感器的情况，`dnd-kit`提供了另外一个hook - useSensors， 可以把配置好的传感器组合成一个列表：
+
+```tsx
+import { PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
+
+const sensors = useSensors(
+  useSensor(PointerSensor, { activationConstraint: { distance: 8 } })
+);
+```
+
+交组合后的传感器组交给 `DndContext`：
+
+```tsx
+<DndContext sensors={sensors}>
+  {/* 可拖拽的内容 ... */}
+</DndContext>
+```
+
+##### 3. 拖拽过程中，要判断"当前离哪个元素最近"
+
+拖拽进行中，指针的位置很难精确对齐到某个元素的边界，`DndContext` 需要一个算法去判断"你现在算是悬停在哪个元素上方"，这样才能实时知道该跟谁比较、要不要让位。
+
+`closestCenter` 是最常用的一种碰撞检测算法：比较各元素中心点到指针的距离，找最近的那个。
+
+```tsx
+import { PointerSensor, useSensor, useSensors, closestCenter } from "@dnd-kit/core";
+```
+
+注入容器使用
+
+```tsx
+<DndContext sensors={sensors} collisionDetection={closestCenter}>
+  {/* 可拖拽的内容 ... */}
+</DndContext>
+```
+
+##### 4. 拖拽完成后事件触发
+
+用户松开手，这个拖拽动作就算结束了，应该触发拖拽完成事件，进行一下操作，比如后面需要做的排序。
+
+`DndContext`容器组件定义了这个是prop属性 `onDragEnd`， 用来挂载拖拽完成后执行的动作
+
+```tsx
+<DndContext
+  sensors={sensors}
+  collisionDetection={closestCenter}
+  onDragEnd={() => {
+     console.log("拖拽完成执行的内容");
+  }}
+>
+  {/* 可拖拽的内容 ... */}
+</DndContext>
+```
+
+#### 7.3 实现排序
+
+第二步做完，dnd-kit 已经能感知"东西被拖动了"，但完全不知道这组元素之间有先后顺序、拖动时其他元素该不该让位。这一步要把"排序"这个业务概念接进来——这一层能力全部来自 `@dnd-kit/sortable`，建立在第二步搭好的感知能力之上。
+
+##### 1. 排序感知容器
+
+`DndContext` 只关心"拖拽本身"，不关心"这组元素的顺序该怎么变"。要让 dnd-kit 知道这一层业务含义，需要在 `DndContext` 内部再包一层专门处理排序的容器。
+
+`dnd-kit`库的另外一个包提供了这个容器 `SortableContext`
+
+```tsx
+import { SortableContext } from "@dnd-kit/sortable";
+```
+
+这个容器组件定义了一个prop属性 - `items`, 用来记录参与排序元素的id。 
+
+```tsx
+<DndContext sensors={sensors} collisionDetection={closestCenter}>
+  <SortableContext items={localImages.map((img) => img.id)}>
+    {/* 这组要互相排序的元素 */}
+  </SortableContext>
+</DndContext>
+```
+
+`items` 期望的类型，dnd-kit 内部定义大概是这样（简化理解）：
+
+```ts
+items: (string | number)[]
+```
+
+`items` 这个 prop 本身不会自动提取 id，它只是"等着接收一个数组"，具体这个数组的内容是什么、怎么算出来的，完全是调用方的责任。 如比上面实例中我们自己通过 map 方法映射进去。
+
+##### 2. 排序时的让位方式
+
+排序时要让排序容器`SortableContext`知道"其他元素该按什么方式挪动"， 网格布局和纵向单列列表的让位方式是不一样的。
+
+`sortable`包提供了不同的让位方式:
+
+- rectSortingStrategy - 适合横向换行排列的网格布局
+- verticalListSortingStrategy - 适合纵向单列列表
+
+排序容器`SortableContext`的另外一个prop属性 - `strategy`用来设置攘外方式
+
+```tsx
+import { rectSortingStrategy } from "@dnd-kit/sortable";
+
+<DndContext sensors={sensors} collisionDetection={closestCenter}>
+  <SortableContext 
+      items={localImages.map((img) => img.id)}
+      strategy={rectSortingStrategy}
+  >
+    {/* 这组要互相排序的元素 */}
+  </SortableContext>
+</DndContext>
+```
+
+##### 3. 登记成"可排序项"
+
+`SortableContext` 只是知道"这组元素的 id 列表"，具体到每一个方块，还需要各自向它登记"我是这组里的第几个"，并且拿到"我现在该往哪挪、挪了多少"这些信息。
+
+`dnd-kit/sortable`包提供了专门的hook - `useSortable`来实现这个登记动作。
+
+```tsx
+import { useSortable } from "@dnd-kit/sortable";
+
+const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
+  useSortable({ id: image.id });
+```
+
+调用时传入这个元素自己的 id，会返回一组东西：`attributes`/`listeners`（要绑定到某个具体 DOM 元素上，这个元素才会响应拖拽手势）、`setNodeRef`（绑定到根 DOM 节点，dnd-kit 靠它计算真实位置）、`transform`/`transition`（这个元素当前该产生的位移和过渡动画）、`isDragging`（这个元素是不是正被拖拽的那一个）。
+
+`useSortable` 是个 Hook，Hook 只能在组件顶层调用，不能写在 `.map()` 回调里。原来图片方块是内联写在 `.map()` 里的普通 `<div>`，没法直接在里面调用 `useSortable`
+
+```tsx
+{/* 已上传的图片列表：可拖拽排序 */}
+  {localImages.length > 0 && (
+    <DndContext
+      sensors={sensors}
+      collisionDetection={closestCenter}
+      onDragEnd={() => {
+        console.log("拖拽完成执行的内容");
+      }}
+    >
+      <SortableContext
+        items={localImages.map((image) => image.id)}
+        strategy={rectSortingStrategy}
+      >
+        <div className="flex flex-wrap gap-3">
+          {localImages.map((image) => (
+            <div key={image.id} className="relative">
+              <img
+                src={image.imageUrl}
+                alt="Car"
+                className="h-24 w-24 rounded-lg object-cover"
+              />
+              {/* 删除按钮 */}
+              <button
+                onClick={() => deleteMutation.mutate(image.id)}
+                disabled={deleteMutation.isPending}
+                className="absolute -right-2 -top-2 flex h-5 w-5
+                       items-center justify-center rounded-full
+                       bg-red-500 text-xs text-white
+                       hover:bg-red-600"
+              >
+                ×
+              </button>
+            </div>
+          ))}
+        </div>
+      </SortableContext>
+    </DndContext>
+  )}
+```
+
+所以图片方块必须拆成一个独立组件，`.map()` 里改成调用这个组件（每次调用组件本身就是一次独立的 Hook 调用上下文，这样是合规的）
+
+```tsx
+{/* 已上传的图片列表：可拖拽排序 */}
+{localImages.length > 0 && (
+  <DndContext
+      sensors={sensors}
+      collisionDetection={closestCenter}
+      onDragEnd={() => {
+        console.log("拖拽完成执行的内容");
+      }}
+    >
+    <SortableContext
+      items={localImages.map((img) => img.id)}
+      strategy={rectSortingStrategy}
+    >
+      <div className="flex flex-wrap gap-3">
+        {localImages.map((image) => (
+          <SortableImageItem
+            key={image.id}
+            image={image}
+            onDelete={() => deleteMutation.mutate(image.id)}
+            isDeleting={
+              deleteMutation.isPending &&
+              deleteMutation.variables === image.id
+            }
+          />
+        ))}
+      </div>
+    </SortableContext>
+  </DndContext>
+)}
+```
+
+改造成独立的组件`SortableImageItem`
+
+```tsx
+import type { CarImage } from "@/types";
+
+interface SortableImageItemProps {
+  image: CarImage;
+  onDelete: () => void;
+  isDeleting: boolean;
+}
+/* -------- 已上传图片：可拖拽排序的单个图片项 ------- */
+function SortableImageItem({
+  image,
+  onDelete,
+  isDeleting,
+}: SortableImageItemProps) {
+  return (
+    <div key={image.id} className="relative">
+      <img
+        src={image.imageUrl}
+        alt="Car"
+        className="h-24 w-24 rounded-lg object-cover"
+      />
+      {/* 删除按钮 */}
+      <button
+        onClick={onDelete}
+        disabled={isDeleting}
+        className="absolute -right-2 -top-2 flex h-5 w-5
+                           items-center justify-center rounded-full
+                           bg-red-500 text-xs text-white
+                           hover:bg-red-600"
+      >
+        ×
+      </button>
+    </div>
+  );
+}
+
+export default SortableImageItem;
+
+```
+
+使用`useSortable` hook 
+
+```tsx
+import { useSortable } from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+
+/* -------- 已上传图片：可拖拽排序的单个图片项 ------- */
+function SortableImageItem({
+  image,
+  onDelete,
+  isDeleting,
+}: SortableImageItemProps) {
+  
+  // useSortable 把这个元素注册为可排序项
+  // attributes/listeners 只绑定到拖拽手柄，不绑定整个卡片
+  // 原因：整个卡片都能拖拽时，"点删除"和"开始拖拽"会冲突，浏览器无法区分意图
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: image.id });
+
+  return (
+    <div
+      ref={setNodeRef}
+      className="relative"
+      style={{
+        transform: CSS.Transform.toString(transform),
+        transition,
+        opacity: isDragging ? 0.5 : 1,
+      }}
+    >
+     ...
+     
+    </div>
+  );
+}
+
+```
+
+新增一个拖拽按钮， 独立于卡片，避免和删除按钮抢事件。`attributes`/`listeners` 只绑在拖拽手柄这个小按钮上，不绑在整张卡片——如果整张卡片都能触发拖拽，浏览器没法区分用户"点删除"和"开始拖动"这两个意图，两边的事件监听会冲突。
+
+```tsx
+...
+/* -------- 已上传图片：可拖拽排序的单个图片项 ------- */
+function SortableImageItem({
+  image,
+  onDelete,
+  isDeleting,
+}: SortableImageItemProps) {
+  ...
+  return (
+    <div
+      ref={setNodeRef}
+      className="relative"
+      style={{
+        transform: CSS.Transform.toString(transform),
+        transition,
+        opacity: isDragging ? 0.5 : 1,
+      }}
+    >
+      <img
+        src={image.imageUrl}
+        alt="Car"
+        className="h-24 w-24 rounded-lg object-cover"
+      />
+
+      {/* 删除按钮 */}
+          ...
+
+      {/* 拖拽手柄：独立于卡片，避免和删除按钮抢事件 */}
+      <button
+        {...attributes}
+        {...listeners}
+        type="button"
+        aria-label="Drag to reorder"
+        className="absolute bottom-1 right-1 flex h-5 w-5 cursor-grab
+                   items-center justify-center rounded bg-black/50 text-white
+                   active:cursor-grabbing"
+      >
+        <GripVertical className="h-3 w-3" />
+      </button>
+    </div>
+  );
+}
+
+```
+
+实际效果是：**图片已经能被拖起来，拖动过程中其他图片会让位，视觉上完全正常**。但松手之后，图片会弹回原来的位置
+
+#### 7.4 更新界面，同步后端
+
+##### 1. 在本地把新顺序算出来、立刻更新界面
+
+上一步遗留的问题是：能拖，但松手不生效。要解决它，需要两件事一起做：
+
+- 告诉 `DndContext`，松手时该调用哪个函数
+
+    这靠 `DndContext` 自己定义的 `onDragEnd` 这个 prop；这里的 `onDragEnd` 跟 `<button onClick={...}>` 里的 `onClick` 是同一类东西，是组件自己定义的。
+
+- 这个函数具体要做什么
+
+    dnd-kit 会在松手时自动带着"谁被拖了、松在哪个位置上方"（`active`/`over`）调用它，函数要根据这两个信息算出新的排列顺序，并立刻反映到界面上（乐观更新），还不涉及后端，只是在做"本地视觉响应"这件事。
+
+先把上一步已经搭好的 `DndContext` 上的`onDragEnd`传入事件处理函数
+
+```tsx
+<DndContext
+  sensors={sensors}
+  collisionDetection={closestCenter}
+  onDragEnd={handleDragEnd}
+>
+```
+
+`@dnd-kit/core` 提供了这个`handleDragEnd`需要的参数(event)的参数类型（`DragEndEvent`），直接导入使用，不然 `event.active`、`event.over` 这些字段写代码时没有提示，容易拼错字段名：
+
+```tsx
+import { type DragEndEvent } from "@dnd-kit/core";
+```
+
+完善拖拽事件处理函数的逻辑
+
+```tsx
+/* ----------- 拖拽结束：算出新顺序，本地立刻更新，异步提交后端 ---------- */
+const handleDragEnd = (event: DragEndEvent) => {
+  const { active, over } = event;
+  if (!over || active.id === over.id) return;
+
+  const oldIndex = localImages.findIndex((img) => img.id === active.id);
+  const newIndex = localImages.findIndex((img) => img.id === over.id);
+
+  // 立即更新本地顺序（视觉立即响应，不等接口返回）
+  const reordered = arrayMove(localImages, oldIndex, newIndex);
+  setLocalImages(reordered);
+
+  // 下一步会在这里补上：把 reordered 转成后端要的格式，提交给 reorderMutation
+};
+```
+
+`arrayMove` 是 dnd-kit 提供的一个纯数组工具函数，接收数组和两个下标，返回一个把元素从旧位置挪到新位置后的新数组，这一步完全在浏览器内存里完成，跟服务器没有关系。
+
+`!over` 表示松手时没有停在任何一个可排序项上方（比如拖到了容器外面），`active.id === over.id` 表示压根没有移动位置，这两种情况都不需要做任何事，直接 `return`。
+
+新增排序 mutation
+
+```tsx
+/* ----------- 排序 mutation ---------- */
+const reorderMutation = useMutation({
+  mutationFn: (items: { imageId: number; sortOrder: number }[]) =>
+    carsApi.reorderImages(carId, items),
+  onError: (error) => {
+    // 排序失败：提示用户，并让 invalidateQueries 重新拉取后端真实顺序
+    // （后端没写入成功，拉回来的就是拖拽之前的顺序，界面自动"弹回"）
+    toast.error(error.message);
+    queryClient.invalidateQueries({ queryKey: ["car", carId] });
+  },
+});
+```
+
+拖拽事件处理函数中补全后端同步逻辑
+
+```tsx
+/* ----------- 拖拽结束：算出新顺序，本地立刻更新，异步提交后端 ---------- */
+const handleDragEnd = (event: DragEndEvent) => {
+  const { active, over } = event;
+  if (!over || active.id === over.id) return;
+
+  const oldIndex = localImages.findIndex((img) => img.id === active.id);
+  const newIndex = localImages.findIndex((img) => img.id === over.id);
+
+  // 立即更新本地顺序（视觉立即响应，不等接口返回）
+  const reordered = arrayMove(localImages, oldIndex, newIndex);
+  setLocalImages(reordered);
+
+  // 按新顺序生成 SortOrder，异步提交后端
+  const items = reordered.map((img, index) => ({
+    imageId: img.id,
+    sortOrder: index,
+  }));
+  reorderMutation.mutate(items);
+};
+```
+
+完整代码如下：
+
+```tsx
+import { carsApi } from "@/api";
+import type { CarImage } from "@/types";
+import { QueryClient, useMutation } from "@tanstack/react-query";
+import { useRef, useState } from "react";
+import { toast } from "sonner";
+import { Button } from "./ui/button";
+import { RotateCcw, AlertCircle } from "lucide-react";
+import {
+  DndContext,
+  closestCenter,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  rectSortingStrategy,
+  arrayMove,
+} from "@dnd-kit/sortable";
+import SortableImageItem from "./SortableImageItem";
+
+interface ImageUploaderProps {
+  carId: number;
+  images: CarImage[];
+}
+
+const MAX_IMAGES = 10;
+
+// 每个待上传文件自己的状态
+// 一个文件对应数组里的一项，互相独立，不会互相影响
+interface PendingFile {
+  id: string; // 临时 id，用来在数组里定位到这一项，React key 也用它
+  file: File;
+  previewUrl: string;
+  status: "uploading" | "error";
+  error?: string;
+}
+
+export default function ImageUploader({ carId, images }: ImageUploaderProps) {
+  // 已上传的图片顺序（本地副本，拖拽时先在本地更新，再异步调接口）
+  const [localImages, setLocalImages] = useState(images);
+
+  // images prop 变化时（比如上传成功后 invalidateQueries 触发重新拉取），
+  // 同步更新本地已上传图片列表
+  if (images !== localImages && images.length !== localImages.length) {
+    setLocalImages(images);
+  }
+
+  // pendingFiles：本次选中、还没成功上传完的文件列表
+  // 每一项都有自己的 status，互不影响
+  const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
+
+  const queryClient = new QueryClient();
+  // useRef 拿到 input 元素的引用，点击按钮时触发文件选择
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+
+    // FileList 转成真正的数组，才能用 map 之类的数组方法
+    const fileArray = Array.from(files);
+
+    // 数量上限：已有图片数 + 正在处理的数 + 这次新选的数，超过上限就拒绝，不发任何请求
+    const totalAfter =
+      localImages.length + pendingFiles.length + fileArray.length;
+    if (totalAfter > MAX_IMAGES) {
+      toast.error(
+        `A car can have at most ${MAX_IMAGES} images. ` +
+          `Currently has ${localImages.length + pendingFiles.length}, ` +
+          `you selected ${fileArray.length}.`,
+      );
+      if (inputRef.current) inputRef.current.value = "";
+      return;
+    }
+
+    // 每个文件包装成一个 PendingFile：各自生成本地预览、状态先标记为 uploading
+    const newPendingFiles: PendingFile[] = fileArray.map((file) => ({
+      id: `pending-${Date.now()}-${Math.random()}`,
+      file,
+      previewUrl: URL.createObjectURL(file),
+      status: "uploading",
+    }));
+
+    setPendingFiles((prev) => [...prev, ...newPendingFiles]);
+
+    // 选完立即各自开始上传，不需要再手动点确认
+    newPendingFiles.forEach((p) => uploadSingleFile(p.id, p.file));
+
+    if (inputRef.current) inputRef.current.value = "";
+  };
+
+  /* ----------- 上传单个文件（普通函数，不用 useMutation/useCallback） ---------- */
+  // 每次调用只负责这一个文件，成功了把它从 pendingFiles 里移除，
+  // 失败了只把这一项标记成 error，不影响列表里其他文件
+  const uploadSingleFile = async (pendingId: string, file: File) => {
+    try {
+      await carsApi.uploadImagesBatch(carId, [file]);
+
+      // 上传成功：从 pendingFiles 里移除这一项，并释放它的预览 URL（避免内存泄漏）
+      setPendingFiles((prev) => {
+        const target = prev.find((p) => p.id === pendingId);
+        if (target) URL.revokeObjectURL(target.previewUrl);
+        return prev.filter((p) => p.id !== pendingId);
+      });
+
+      // 让车辆详情缓存失效，图片列表会刷新
+      queryClient.invalidateQueries({ queryKey: ["car", carId] });
+    } catch (error) {
+      // 上传失败：只把这一项标记为 error，其他文件的状态不受影响
+      const message = error instanceof Error ? error.message : "Upload failed";
+      setPendingFiles((prev) =>
+        prev.map((p) =>
+          p.id === pendingId ? { ...p, status: "error", error: message } : p,
+        ),
+      );
+    }
+  };
+
+  /* ----------- 删除 mutation ---------- */
+  const deleteMutation = useMutation({
+    mutationFn: (imageId: number) => carsApi.deleteImage(carId, imageId),
+    onSuccess: () => {
+      toast.success("Image deleted.");
+      queryClient.invalidateQueries({ queryKey: ["car", carId] });
+    },
+    onError: (error) => {
+      toast.error(error.message);
+    },
+  });
+
+  /* ----------- 排序 mutation ---------- */
+  const reorderMutation = useMutation({
+    mutationFn: (items: { imageId: number; sortOrder: number }[]) =>
+      carsApi.reorderImages(carId, items),
+    onError: (error) => {
+      // 排序失败：提示用户，并让 invalidateQueries 重新拉取后端真实顺序
+      // （后端没写入成功，拉回来的就是拖拽之前的顺序，界面自动"弹回"）
+      toast.error(error.message);
+      queryClient.invalidateQueries({ queryKey: ["car", carId] });
+    },
+  });
+
+  /* ----------- 拖拽传感器 ---------- */
+  // PointerSensor 同时支持鼠标和触摸操作
+  // activationConstraint：8px 拖动阈值，避免普通点击（比如点删除按钮）被误判成拖拽
+  const sensors = useSensors(
+    useSensor(PointerSensor, {
+      activationConstraint: { distance: 8 },
+    }),
+  );
+
+  /* ----------- 拖拽结束：算出新顺序，本地立刻更新，异步提交后端 ---------- */
+  const handleDragEnd = (event: DragEndEvent) => {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+
+    const oldIndex = localImages.findIndex((img) => img.id === active.id);
+    const newIndex = localImages.findIndex((img) => img.id === over.id);
+
+    // 立即更新本地顺序（视觉立即响应，不等接口返回）
+    const reordered = arrayMove(localImages, oldIndex, newIndex);
+    setLocalImages(reordered);
+
+    // 按新顺序生成 SortOrder，异步提交后端
+    const items = reordered.map((img, index) => ({
+      imageId: img.id,
+      sortOrder: index,
+    }));
+    reorderMutation.mutate(items);
+  };
+
+  return (
+    <div className="space-y-4">
+      <h2 className="font-semibold">Images</h2>
+
+      {/* 已上传的图片列表：可拖拽排序 */}
+      {localImages.length > 0 && (
+        <DndContext
+          sensors={sensors}
+          collisionDetection={closestCenter}
+          onDragEnd={handleDragEnd}
+        >
+          <SortableContext
+            items={localImages.map((img) => img.id)}
+            strategy={rectSortingStrategy}
+          >
+            <div className="flex flex-wrap gap-3">
+              {localImages.map((image) => (
+                <SortableImageItem
+                  key={image.id}
+                  image={image}
+                  onDelete={() => deleteMutation.mutate(image.id)}
+                  isDeleting={
+                    deleteMutation.isPending &&
+                    deleteMutation.variables === image.id
+                  }
+                />
+              ))}
+            </div>
+          </SortableContext>
+        </DndContext>
+      )}
+
+      {/* 待上传文件：每一项独立显示上传中或失败重试，互不影响 */}
+      {pendingFiles.length > 0 && (
+        <div className="flex flex-wrap gap-3">
+          {pendingFiles.map((pending) => (
+            <div key={pending.id} className="relative">
+              <img
+                src={pending.previewUrl}
+                alt="Preview"
+                className="h-24 w-24 rounded-lg object-cover"
+              />
+
+              {/* 上传中：遮罩提示 */}
+              {pending.status === "uploading" && (
+                <div className="absolute inset-0 flex items-center justify-center rounded-lg bg-black/40">
+                  <span className="text-xs font-medium text-white">
+                    Uploading...
+                  </span>
+                </div>
+              )}
+
+              {/* 上传失败：这一项单独显示重试按钮，不影响其他项 */}
+              {pending.status === "error" && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 rounded-lg bg-black/60">
+                  <AlertCircle className="h-4 w-4 text-red-400" />
+                  <button
+                    type="button"
+                    onClick={() => uploadSingleFile(pending.id, pending.file)}
+                    className="flex items-center gap-0.5 text-[10px] font-medium text-white hover:text-red-300"
+                  >
+                    <RotateCcw className="h-2.5 w-2.5" />
+                    Retry
+                  </button>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* 选择新图片 */}
+      <div className="space-y-3">
+        {/* 隐藏的原生文件选择 input，multiple 允许一次选多个文件 */}
+        <input
+          ref={inputRef}
+          type="file"
+          accept="image/jpeg,image/png,image/webp"
+          multiple
+          className="hidden"
+          onChange={handleFileChange}
+        />
+
+        {/* 点击这个按钮触发文件选择 */}
+        <Button
+          type="button"
+          variant="outline"
+          onClick={() => inputRef.current?.click()}
+        >
+          Add Images
+        </Button>
+
+        <p className="text-xs text-gray-500">
+          JPEG, PNG or WebP · Max 5 MB per image · Up to {MAX_IMAGES} images
+          total
+        </p>
+      </div>
+    </div>
+  );
+}
+
+```
+
+
+
+### 8. 测试：补全 FakeCarImageRepository
+
+`ICarImageRepository` 新增了 `UpdateSortOrdersAsync`，`FakeCarImageRepository` 要同步实现：
+
+```csharp
+    // ✅ 新增
+    // _store 存的是对象引用，Service 层修改了 image.SortOrder 后这里已自动同步
+    // 显式赋值一次是为了和真实 EfCarImageRepository 的调用约定保持一致
+    public Task UpdateSortOrdersAsync(
+        List<CarImage> images, CancellationToken cancellationToken = default)
+    {
+        foreach (var image in images)
+            _store[image.Id] = image;
+        return Task.CompletedTask;
+    }
+```
+
+
+
+### 9. 测试：后端单元测试
+
+排序阶段核心逻辑是"正确应用新顺序"和"IDOR 防护"，对应两个测试。
+
+打开 `UUcars.Tests/Services/CarServiceTests.cs`，追加：
+
+```csharp
+// ===== 图片排序（Step 64② 新增）=====
+
+[Fact]
+public async Task ReorderImagesAsync_WithValidImages_ShouldUpdateSortOrder()
+{
+    var repo = new FakeCarRepository();
+    var imageRepo = new FakeCarImageRepository();
+    repo.Seed(new Car { Id = 1, SellerId = 10, Status = CarStatus.Draft });
+
+    var image1 = new CarImage { CarId = 1, SortOrder = 0 };
+    var image2 = new CarImage { CarId = 1, SortOrder = 1 };
+    imageRepo.Seed(image1);
+    imageRepo.Seed(image2);
+
+    var service = CreateService(repo, imageRepo);
+
+    // 交换两张图的顺序
+    var request = new CarImageReorderRequest
+    {
+        Items =
+        [
+            new CarImageOrderItem { ImageId = image1.Id, SortOrder = 1 },
+            new CarImageOrderItem { ImageId = image2.Id, SortOrder = 0 }
+        ]
+    };
+
+    var result = await service.ReorderImagesAsync(1, 10, request);
+
+    // image2 现在应该排第一
+    Assert.Equal(image2.Id, result[0].Id);
+    Assert.Equal(image1.Id, result[1].Id);
+}
+
+[Fact]
+public async Task ReorderImagesAsync_WithImageIdNotBelongingToCar_ShouldThrowCarImageNotFoundException()
+{
+    var repo = new FakeCarRepository();
+    var imageRepo = new FakeCarImageRepository();
+    repo.Seed(new Car { Id = 1, SellerId = 10, Status = CarStatus.Draft });
+    imageRepo.Seed(new CarImage { CarId = 1, SortOrder = 0 });
+    var service = CreateService(repo, imageRepo);
+
+    // 999 不属于这辆车
+    var request = new CarImageReorderRequest
+    {
+        Items = [new CarImageOrderItem { ImageId = 999, SortOrder = 0 }]
+    };
+
+    await Assert.ThrowsAsync<CarImageNotFoundException>(
+        () => service.ReorderImagesAsync(1, 10, request));
+}
+```
+
+
+
+### 10. 本地验证
+
+#### 10.1 验证拖拽排序
+
+1. 把第三张图拖到第一位
+2. 视图立即响应
+3. 刷新页面，确认顺序已经持久化
+
+#### 10.2 验证 IDOR 防护
+
+用 Scalar 构造排序请求，`items` 里放不属于这辆车的 `imageId`， 应该收到 404，不会意外修改其他图片。
+
+
+
+### 11. 编译和测试
+
+```bash
+dotnet build
+dotnet test
+```
+
+新增 2 个测试用例（加上阶段①的 2 个，共 4 个），预期全部通过。
+
+
+
+### Step 64② 完成状态
+
+```
+后端：
+✅ ICarImageRepository 新增 UpdateSortOrdersAsync
+✅ EfCarImageRepository 实现新方法
+✅ CarImageReorderRequest / CarImageOrderItem DTO
+✅ CarService.ReorderImagesAsync
+   - IDOR 防护（验证 ImageId 归属当前车辆）
+   - 批量更新 SortOrder
+✅ PUT /cars/{id}/images/reorder
+
+前端：
+✅ @dnd-kit/core + @dnd-kit/sortable + @dnd-kit/utilities 安装
+✅ cars.ts 新增 reorderImages
+✅ ImageUploader 扩展：
+   - 拖拽排序（视图立即响应，接口异步同步）
+   - 独立拖拽手柄（避免和删除按钮冲突）
+   - 排序失败时自动回退到服务端真实顺序
+
+测试：
+✅ FakeCarImageRepository 补齐 UpdateSortOrdersAsync
+✅ CarServiceTests 新增 2 个用例（排序正确、IDOR 防护）
+
+✅ 本地验证通过
+✅ dotnet build + dotnet test 通过
+```
+
+
+
+### Git 提交
+
+```bash
+git add .
+git commit -m "feat: batch image upload with preview, progress, retry and drag-drop reorder"
+git push origin feature/v3-image-upload
+
+# 合并回 develop
+git checkout develop
+git merge --no-ff feature/v3-image-upload \
+  -m "merge: feature/v3-image-upload into develop"
+git push origin develop
+
+# 删除功能分支
+git branch -d feature/v3-image-upload
+git push origin --delete feature/v3-image-upload
+```
+
+
+
 ## fixed Issues 
 
 ### Fix 1. 并发 Refresh Token 请求竞态条件（Refresh Token Rotation Race Condition）
