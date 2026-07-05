@@ -9990,7 +9990,7 @@ const handleDragEnd = (event: DragEndEvent) => {
 ```tsx
 import { carsApi } from "@/api";
 import type { CarImage } from "@/types";
-import { QueryClient, useMutation } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useRef, useState } from "react";
 import { toast } from "sonner";
 import { Button } from "./ui/button";
@@ -10041,7 +10041,7 @@ export default function ImageUploader({ carId, images }: ImageUploaderProps) {
   // 每一项都有自己的 status，互不影响
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
 
-  const queryClient = new QueryClient();
+  const queryClient = useQueryClient();
   // useRef 拿到 input 元素的引用，点击按钮时触发文件选择
   const inputRef = useRef<HTMLInputElement>(null);
 
