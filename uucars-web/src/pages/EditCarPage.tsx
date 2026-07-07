@@ -82,6 +82,9 @@ export default function EditCarPage() {
         </Button>
       </div>
 
+      {/* 图片上传 */}
+      <ImageUploader carId={carId} images={car.images} />
+
       {/* 车辆信息表单，defaultValues 填入已有数据 */}
       <CarForm
         defaultValues={{
@@ -97,9 +100,6 @@ export default function EditCarPage() {
         isSubmitting={updateMutation.isPending}
         submitLabel="Save Changes"
       />
-
-      {/* 图片上传 */}
-      <ImageUploader carId={carId} images={car.images} />
     </div>
   );
 }

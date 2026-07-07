@@ -6626,7 +6626,7 @@ dotnet test
 
 
 
-#### 15. Git 提交
+### 15. Git 提交
 
 ```bash
 git add .
@@ -6646,7 +6646,7 @@ git push origin --delete feature/v3-refresh-token
 
 
 
-#### Step 61 完成状态
+### Step 61 完成状态
 
 ```
 知识点：
@@ -9767,7 +9767,7 @@ interface SortableImageItemProps {
   onDelete: () => void;
   isDeleting: boolean;
 }
-/* -- 已上传图片：可拖拽排序的单个图片项 - */
+/* -------- 已上传图片：可拖拽排序的单个图片项 ------- */
 function SortableImageItem({
   image,
   onDelete,
@@ -9805,7 +9805,7 @@ export default SortableImageItem;
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 
-/* -- 已上传图片：可拖拽排序的单个图片项 - */
+/* -------- 已上传图片：可拖拽排序的单个图片项 ------- */
 function SortableImageItem({
   image,
   onDelete,
@@ -9846,7 +9846,7 @@ function SortableImageItem({
 
 ```tsx
 ...
-/* -- 已上传图片：可拖拽排序的单个图片项 - */
+/* -------- 已上传图片：可拖拽排序的单个图片项 ------- */
 function SortableImageItem({
   image,
   onDelete,
@@ -9925,7 +9925,7 @@ import { type DragEndEvent } from "@dnd-kit/core";
 完善拖拽事件处理函数的逻辑
 
 ```tsx
-/* ----- 拖拽结束：算出新顺序，本地立刻更新，异步提交后端 ---- */
+/* ----------- 拖拽结束：算出新顺序，本地立刻更新，异步提交后端 ---------- */
 const handleDragEnd = (event: DragEndEvent) => {
   const { active, over } = event;
   if (!over || active.id === over.id) return;
@@ -9948,7 +9948,7 @@ const handleDragEnd = (event: DragEndEvent) => {
 新增排序 mutation
 
 ```tsx
-/* ----- 排序 mutation ---- */
+/* ----------- 排序 mutation ---------- */
 const reorderMutation = useMutation({
   mutationFn: (items: { imageId: number; sortOrder: number }[]) =>
     carsApi.reorderImages(carId, items),
@@ -9964,7 +9964,7 @@ const reorderMutation = useMutation({
 拖拽事件处理函数中补全后端同步逻辑
 
 ```tsx
-/* ----- 拖拽结束：算出新顺序，本地立刻更新，异步提交后端 ---- */
+/* ----------- 拖拽结束：算出新顺序，本地立刻更新，异步提交后端 ---------- */
 const handleDragEnd = (event: DragEndEvent) => {
   const { active, over } = event;
   if (!over || active.id === over.id) return;
@@ -10081,7 +10081,7 @@ export default function ImageUploader({ carId, images }: ImageUploaderProps) {
     if (inputRef.current) inputRef.current.value = "";
   };
 
-  /* ----- 上传单个文件（普通函数，不用 useMutation/useCallback） ---- */
+  /* ----------- 上传单个文件（普通函数，不用 useMutation/useCallback） ---------- */
   // 每次调用只负责这一个文件，成功了把它从 pendingFiles 里移除，
   // 失败了只把这一项标记成 error，不影响列表里其他文件
   const uploadSingleFile = async (pendingId: string, file: File) => {
@@ -10108,7 +10108,7 @@ export default function ImageUploader({ carId, images }: ImageUploaderProps) {
     }
   };
 
-  /* ----- 删除 mutation ---- */
+  /* ----------- 删除 mutation ---------- */
   const deleteMutation = useMutation({
     mutationFn: (imageId: number) => carsApi.deleteImage(carId, imageId),
     onSuccess: () => {
@@ -10120,7 +10120,7 @@ export default function ImageUploader({ carId, images }: ImageUploaderProps) {
     },
   });
 
-  /* ----- 排序 mutation ---- */
+  /* ----------- 排序 mutation ---------- */
   const reorderMutation = useMutation({
     mutationFn: (items: { imageId: number; sortOrder: number }[]) =>
       carsApi.reorderImages(carId, items),
@@ -10132,7 +10132,7 @@ export default function ImageUploader({ carId, images }: ImageUploaderProps) {
     },
   });
 
-  /* ----- 拖拽传感器 ---- */
+  /* ----------- 拖拽传感器 ---------- */
   // PointerSensor 同时支持鼠标和触摸操作
   // activationConstraint：8px 拖动阈值，避免普通点击（比如点删除按钮）被误判成拖拽
   const sensors = useSensors(
@@ -10141,7 +10141,7 @@ export default function ImageUploader({ carId, images }: ImageUploaderProps) {
     }),
   );
 
-  /* ----- 拖拽结束：算出新顺序，本地立刻更新，异步提交后端 ---- */
+  /* ----------- 拖拽结束：算出新顺序，本地立刻更新，异步提交后端 ---------- */
   const handleDragEnd = (event: DragEndEvent) => {
     const { active, over } = event;
     if (!over || active.id === over.id) return;
@@ -10693,128 +10693,378 @@ git checkout develop
 
 
 
-### Fix3：车辆发布体验优化（图片预上传 + 拖拽交互 + 添加按钮布局）
+### Fix3：图片上传组件体验优化
 
 #### 1. 切出 fix 分支
 
 ```bash
 git checkout develop
-git pull origin develop
-git checkout -b fix/listing-flow-ux-improvements
-git push -u origin fix/listing-flow-ux-improvements
-
-git checkout develop
-git pull origin develop
+git pull origin develop	
 git checkout -b fix/ImageUploader-ux-improvements
 git push -u origin fix/ImageUploader-ux-improvements
 ```
 
 #### 2.  问题描述
 
-创建车辆阶段有3个地方需要优化：
+图片上传组件的拖拽和删除各占一小块固定区域，操作不直观。`SortableImageItem` 中拖拽手柄是右下角一个独立小图标，而删除按钮是右上角另一个独立小图标，用户必须精确点在对应的小区域内才能触发操作。不如那种"整卡片可拖、悬浮才显示反馈、删除区域自动隔离"的模式直观。
 
-- 创建车辆阶段无法预先选图片:
-
-    当前流程：`CreateCarPage` 只有 `CarForm`，用户填完信息点 `Create Draft` 后，`carsApi.create` 成功才跳转到 `EditCarPage`，图片必须等跳转过去之后才能添加。用户体验上应该允许"填资料的同时就能选好图片"，不需要先创建、再跳页面、再选图。
-
-- 拖拽和删除各占一小块固定区域，操作不直观:
-
-    `SortableImageItem` 现状：拖拽手柄是右下角一个独立小图标，删除按钮是右上角另一个独立小图标，用户必须精确点在对应的小区域内才能触发操作，不如那种"整卡片可拖、悬浮才显示反馈、删除区域自动隔离"的模式直观。
-
-- "Add Images" 是网格下方独立按钮，不是网格内的方块:
-
-    图片网格和"Add Images"按钮是视觉上分离的两段，按钮是标准横向按钮，不是跟图片同尺寸、排在网格末尾的方块，和"添加照片"方块体验有差距。
+同时，添加图片按钮 `Add Images`是网格下方独立按钮，不是网格内的方块, 这导致 **图片网格和`Add Images`按钮是视觉上分离的两段**。按钮是标准横向按钮，不是跟图片同尺寸、排在网格末尾的方块，这种设计和"添加照片"方块体验相比有差距。
 
 #### 3. 根本原因
 
-这3个问题存在的根本原因是：
+根本原因是：现有设计靠"手柄和删除按钮物理位置分开"来避免两者抢事件，这是可行但不够友好的规避方式；没有用到 dnd-kit `activationConstraint`（8px 位移阈值）本身已经具备的"单纯点击不触发拖拽"能力，也没有给删除按钮做事件隔离。
 
-- 对于创建车辆无法上传并预览车辆图片来说：
-
-    `CarImage` 在数据库里通过 `CarId` 外键归属于一辆具体的车（`AddImagesBatchAsync` 第一步就是 `_carRepository.GetByIdAsync(carId, ...)`，车不存在直接 404）。这意味着图片必须挂在一个**已存在**的 `carId` 上，而 `CreateCarPage` 阶段车辆还没创建，天然不具备这个前提——这是接口设计带来的硬约束，不是代码疏漏。
-
-- 对于拖拽区域不直观的原因
-
-    现有设计靠"手柄和删除按钮物理位置分开"来避免两者抢事件，这是可行但不够友好的规避方式；没有用到 dnd-kit `activationConstraint`（8px 位移阈值）本身已经具备的"单纯点击不触发拖拽"能力，也没有给删除按钮做事件隔离。
-
-- 对应添加图片功能按钮的问题
-
-    三块内容（已上传图片、待上传预览、添加按钮）原本写成了三个独立的 `<div>`，天然不在同一个 flex 布局里，所以"添加"没法自然排进网格序列的最后一项。
+而对应添加图片功能按钮的设计， 三块内容（已上传图片、待上传预览、添加按钮）原本写成了三个独立的 `<div>`，天然不在同一个 flex 布局里，所以"添加"没法自然排进网格序列的最后一项。
 
 #### 4. 解决方案
 
-针对3个问题，逐步进行修改。
+要实现整卡片可拖，删除按钮完全隔离拖拽感知，不再靠"手柄和删除按钮物理位置分开"这种规避方式，而是让整个卡片都能响应拖拽手势，删除按钮自己拦截事件、确保永远不会被误判成拖拽起点。
 
-##### 4.1 创建车辆阶段优化预先选图片
+**优化 `SortableImageItem`组件：**
 
-不改后端任何接口，前端在 `CreateCarPage` 里让用户"先选图片、暂存在本地、不真正上传"，等 `carsApi.create` 真正成功拿到 `car.id` 之后，紧接着调用已有的 `carsApi.uploadImagesBatch(car.id, files)` 把暂存的文件批量传上去；如果图片上传失败，不影响创建结果，依然跳转 `EditCarPage`，让用户在编辑页重新添加。
+- `{...attributes} {...listeners}` 从手柄按钮挪到整个卡片
+- 拖拽手柄整个去掉， 不再需要一个独立的小手柄，整张卡片本身就是拖拽触发区
 
-1. 需要新增哪些状态？
+```tsx
+import type { CarImage } from "@/types";
+import { useSortable } from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 
-    `CreateCarPage` 现状完全没有跟图片相关的状态。要让用户"先选图片、暂存本地、提交时才真正上传"，需要一个新的本地状态数组，装"已选中但还没上传"的文件。
+interface SortableImageItemProps {
+  image: CarImage;
+  onDelete: () => void;
+  isDeleting: boolean;
+}
+/* -------- 已上传图片：可拖拽排序的单个图片项 ------- */
+function SortableImageItem({
+  image,
+  onDelete,
+  isDeleting,
+}: SortableImageItemProps) {
+  // useSortable 把这个元素注册为可排序项
+  // attributes/listeners 绑在整个卡片上（不再是独立手柄）：
+  // 单纯点击（没有产生 8px 位移，见 ImageUploader 里的 activationConstraint）
+  // 不会触发拖拽，配合删除按钮自己拦截事件（见下面），足以区分"点删除"和"开始拖拽"
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: image.id });
 
-    这里跟 `ImageUploader` 里的 `PendingFile` 不同——`PendingFile` 需要 `status: "uploading" | "error"`，是因为那边选完立即发请求；这里选完**完全不发请求**，只是本地暂存，所以不需要状态字段，只需要文件本身和预览地址：
+  return (
+    <div
+      ref={setNodeRef}
+      className="relative"
+      {...attributes}
+      {...listeners}
+      style={{
+        transform: CSS.Transform.toString(transform),
+        transition,
+        opacity: isDragging ? 0.5 : 1,
+      }}
+    >
+      <img
+        src={image.imageUrl}
+        alt="Car"
+        className="h-24 w-24 rounded-lg object-cover"
+      />
 
-    ```tsx
-    const MAX_IMAGES = 10; // 与后端 AddImagesBatchAsync 的上限保持一致
-    
-    // 创建阶段本地暂存的图片：车辆还不存在，不能真正上传，
-    // 只在本地生成预览，等提交成功拿到 carId 才批量上传
-    interface LocalImage {
-      id: string;
-      file: File;
-      previewUrl: string;
-    }
-    ```
+      {/* 删除按钮 */}
+      <button
+        onClick={onDelete}
+        disabled={isDeleting}
+        className="absolute -right-2 -top-2 flex h-5 w-5
+                           items-center justify-center rounded-full
+                           bg-red-500 text-xs text-white
+                           hover:bg-red-600"
+      >
+        ×
+      </button>
+    </div>
+  );
+}
 
-    对应组件内部新增状态：
+export default SortableImageItem;
 
-    ```tsx
-    ...
-    
-    const MAX_IMAGES = 10; // 与后端 AddImagesBatchAsync 的上限保持一致
-    
-    // 创建阶段本地暂存的图片：车辆还不存在，不能真正上传，
-    // 只在本地生成预览，等提交成功拿到 carId 才批量上传
-    interface LocalImage {
-      id: string; // 临时 id，用于 React key 和移除定位
-      file: File;
-      previewUrl: string;
-    }
-    
-    export default function CreateCarPage() {
-    
-      // 本地暂存的图片（车辆还不存在，不能真正上传）
-      const [localImages, setLocalImages] = useState<LocalImage[]>([]);
-    
+```
+
+**图片删除图标阻止冒泡**：
+
+给删除按钮加 `onPointerDown={(e) => e.stopPropagation()}`，这样按下删除按钮的这个动作，根本不会冒泡到外层触发拖拽感知，不管按下去之后手指有没有轻微移动，都不会被误判成拖拽起点。同时删除按钮显式加了 `cursor-pointer`，覆盖父级 `cursor-grab` 的光标样式，鼠标移到删除图标上会正确切回普通指针
+
+```tsx
+function SortableImageItem({
+  image,
+  onDelete,
+  isDeleting,
+}: SortableImageItemProps) {
+  ...
+
+  return (
+    <div
+      ref={setNodeRef}
+      className="relative"
+      {...attributes}
+      {...listeners}
+      style={{
+        transform: CSS.Transform.toString(transform),
+        transition,
+        opacity: isDragging ? 0.5 : 1,
+      }}
+    >
       ...
-    
-      return (
-        ...
-      );
-    }
-    
-    ```
 
-2. 编写选择文件（图片）的逻辑`handleFileChange`, 跟 `ImageUploader` 里的逻辑几乎一样。 用户选中多个文件后，只做本地预览和数量拦截，不调用任何上传接口。
+      {/* 删除按钮：onPointerDown 阻止冒泡，保证按下这个按钮永远不会被
+          外层的拖拽感知捕获，不管按下后有没有轻微位移 */}
+      <button
+        onClick={onDelete}
+        onPointerDown={(e) => {e.stopPropagation()}}
+        disabled={isDeleting}
+        className="absolute -right-2 -top-2 flex h-5 w-5
+                           items-center justify-center rounded-full
+                           bg-red-500 text-xs text-white
+                           hover:bg-red-600 cursor-pointer"
+      >
+        ×
+      </button>
+    </div>
+  );
+}
+```
 
-    ```tsx
-    ```
+**新增悬浮遮罩**:
 
-    
+ 使用Tailwind 的 `group`/`group-hover`， 这样鼠标移入卡片时才显现半透明遮罩，提示"这里可以拖动"；`pointer-events-none` 保证这层遮罩不会挡住下面删除按钮的点击。
 
-3. 放大法
+```tsx
+function SortableImageItem({
+  image,
+  onDelete,
+  isDeleting,
+}: SortableImageItemProps) {
+  ...
+  return (
+    <div
+      ref={setNodeRef}
+      className="group relative cursor-move active:cursor-grabbing"
+      {...attributes}
+      {...listeners}
+      style={{
+        transform: CSS.Transform.toString(transform),
+        transition,
+        opacity: isDragging ? 0.5 : 1,
+      }}
+    >
+      <img
+        src={image.imageUrl}
+        alt="Car"
+        className="h-24 w-24 rounded-lg object-cover"
+      />
 
+      {/* 悬浮遮罩：只在鼠标移入时显现，提示"这里可以拖动"；
+          pointer-events-none 避免挡住下面删除按钮的点击 */}
+      <div className="pointer-events-none absolute inset-0 rounded-lg bg-black/0 transition-colors group-hover:bg-black/20" />
 
+      {/* 删除按钮 */}
+      ...
+    </div>
+  );
+}
+```
 
+**添加图片按钮 `Add Images`的布局优化：**
 
+优化`ImageUploader`组件， 把原来三个独立区块（已上传图片网格、待上传预览网格、按钮区块）合并成一个 `flex flex-wrap` 容器， 这样三个功能快在同一行横向依次显示
 
-##### 4.2 拖拽区域优化
+```tsx
+...
 
-`{...attributes} {...listeners}` 从独立的手柄按钮挪到整个卡片的外层 `div` 上，删掉了 `GripVertical` 手柄，同时删除按钮加 `onPointerDown={(e) => e.stopPropagation()}`，确保按下删除按钮的这个动作永远不会被外层的拖拽感知捕获到，不管按下去之后手指有没有轻微移动，都不会误触发拖拽。删除按钮同时显式加了 `cursor-pointer`，覆盖父级 `cursor-grab` 的光标样式，鼠标移到删除图标上会正确切回普通指针。新增一层 `pointer-events-none` 的半透明遮罩，配合 Tailwind 的 `group`/`group-hover`，鼠标移入卡片时才显现。
+export default function ImageUploader({ carId, images }: ImageUploaderProps) {
+  ...
 
-##### 4.3 "Add Images"功能优化
+  return (
+    <div className="space-y-4">
+      <h2 className="font-semibold">Images</h2>
+          
+      {/* 图片网格：已上传图片（可拖拽排序）+ 待上传预览 + 末尾的"添加"方块，统一放在同一行 */}
+      <DndContext
+        sensors={sensors}
+        collisionDetection={closestCenter}
+        onDragEnd={handleDragEnd}
+      >
+        <SortableContext
+          items={localImages.map((img) => img.id)}
+          strategy={rectSortingStrategy}
+        >
+          <div className="flex flex-wrap gap-3">
+              
+            {/* 已上传的图片列表：可拖拽排序 */}
+            {localImages.map((image) => (
+              <SortableImageItem
+                key={image.id}
+                image={image}
+                onDelete={() => deleteMutation.mutate(image.id)}
+                isDeleting={
+                  deleteMutation.isPending &&
+                  deleteMutation.variables === image.id
+                }
+              />
+            ))}
 
-把原来三个独立区块（已上传图片网格、待上传预览网格、按钮区块）合并成一个 `flex flex-wrap` 容器。新增一个 `h-24 w-24` 虚线边框方块（`Plus` 图标 + "Add" 文字），用 `canAddMore` 控制显隐，作为整个 `.map()` 序列里的最后一项。
+            {/* 待上传文件：每一项独立显示上传中或失败重试，互不影响 */}
+            {pendingFiles.map((pending) => (
+              <div key={pending.id} className="relative">
+                <img
+                  src={pending.previewUrl}
+                  alt="Preview"
+                  className="h-24 w-24 rounded-lg object-cover"
+                />
+
+                ...
+              </div>
+            ))}
+
+            {/* 选择新图片：上传图片按钮 */}
+            <div className="space-y-3">
+              ...
+            </div>
+          </div>
+        </SortableContext>
+      </DndContext>
+    </div>
+  );
+}
+```
+
+`DndContext`/`SortableContext` 现在包住整个网格（不只是已上传图片那部分）。 这不影响拖拽逻辑，因为 dnd-kit 只会追踪调用了 `useSortable` 的元素，待上传预览和添加图片本身没有调用这个 Hook，混在同一个容器里不会被误判成可拖拽项。
+
+**改造添加图片按钮：**
+
+新增一个 `h-24 w-24` 虚线边框方块（`Plus` 图标 + "Add" 文字），用 `canAddMore` 控制显隐，作为整个 `.map()` 序列里的最后一项。
+
+```tsx
+...
+
+export default function ImageUploader({ carId, images }: ImageUploaderProps) {
+  ...
+
+  // 已有图片 + 待上传数量是否已达上限，达到就不再显示"添加"方块
+  const canAddMore = localImages.length + pendingFiles.length < MAX_IMAGES;
+
+  return (
+    <div className="space-y-4">
+      <h2 className="font-semibold">Images</h2>
+          
+      {/* 图片网格：已上传图片（可拖拽排序）+ 待上传预览 + 末尾的"添加"方块，统一放在同一行 */}
+      <DndContext
+        sensors={sensors}
+        collisionDetection={closestCenter}
+        onDragEnd={handleDragEnd}
+      >
+        <SortableContext
+          items={localImages.map((img) => img.id)}
+          strategy={rectSortingStrategy}
+        >
+          <div className="flex flex-wrap gap-3">
+            {/* 已上传的图片列表：可拖拽排序 */}
+              
+            ...
+
+            {/* 待上传文件：每一项独立显示上传中或失败重试，互不影响 */}
+
+            ...
+
+            {/* 添加图片：跟图片同尺寸的方块，始终排在网格最后一个 */}
+            {canAddMore && (
+              <button
+                type="button"
+                onClick={() => inputRef.current?.click()}
+                className="flex h-24 w-24 flex-col items-center justify-center gap-1 rounded-lg border-2 border-dashed border-gray-300 text-gray-400 transition-colors hover:border-gray-400 hover:text-gray-500"
+              >
+                <Plus className="h-5 w-5" />
+                <span className="text-[10px]">Add</span>
+              </button>
+            )}
+          </div>
+        </SortableContext>
+      </DndContext>
+
+      {/* 隐藏的原生文件选择 input，multiple 允许一次选多个文件 */}
+      <input
+        ref={inputRef}
+        type="file"
+        accept="image/jpeg,image/png,image/webp"
+        multiple
+        className="hidden"
+        onChange={handleFileChange}
+      />
+      <p className="text-xs text-gray-500">
+        JPEG, PNG or WebP · Max 5 MB per image · Up to {MAX_IMAGES} images total
+      </p>
+    </div>
+  );
+}
+
+```
+
+**格外的一个小改动**：
+
+现在的 `Edit Car`页面中，"文本表单 + Save Changes 按钮"在上面、"Images + Add Images 按钮"在下面，非常自然地会以为"是不是要先点 Save Changes，图片才会跟着车辆信息一起保存"。而实际上，`Save Changes` 只负责保存**文本字段**（Title/Brand/Model 这些），跟图片完全无关——图片是选中即上传、每张独立立刻持久化的，不需要点 `Save Changes` 才生效。
+
+这个纯粹由布局顺序制造出来的误导需要优化一下：把 `Images` 区块整体挪到 `CarForm` 上面。
+
+```tsx
+export default function EditCarPage() {
+  ...
+
+  return (
+    <div className="mx-auto max-w-2xl space-y-8">
+      <div className="flex items-center justify-between">
+        <h1 className="text-2xl font-bold">Edit Car</h1>
+        {/* 提交审核按钮 */}
+        <Button
+          onClick={() => submitMutation.mutate()}
+          disabled={submitMutation.isPending}
+        >
+          {submitMutation.isPending ? "Submitting..." : "Submit for Review"}
+        </Button>
+      </div>
+
+      {/* 图片上传 */}
+      <ImageUploader carId={carId} images={car.images} />
+
+      {/* 车辆信息表单，defaultValues 填入已有数据 */}
+      ...
+    </div>
+  );
+}
+
+```
 
 #### 5. 测试并合并分支
+
+修改完成之后:
+
+- 拖拽手柄移除，整个卡片能实现拖拽
+- 添加图片按钮和图片卡片外形一致，并并列展示
+- 车辆编辑页面的图片区域移到`CarForm`之前
+
+合并分支
+
+```bash
+git add .
+git commit -m "fix: improve ImageUploader UX"
+git push origin fix/ImageUploader-ux-improvements
+
+git checkout develop
+git merge --no-ff fix/ImageUploader-ux-improvements \
+  -m "merge: fix/ImageUploader-ux-improvements into develop"
+git push origin develop
+
+git branch -d fix/ImageUploader-ux-improvements
+git push origin --delete fix/ImageUploader-ux-improvements
+```
+
