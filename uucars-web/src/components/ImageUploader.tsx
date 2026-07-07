@@ -3,8 +3,7 @@ import type { CarImage } from "@/types";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useRef, useState } from "react";
 import { toast } from "sonner";
-import { Button } from "./ui/button";
-import { RotateCcw, AlertCircle } from "lucide-react";
+import { RotateCcw, AlertCircle, Plus } from "lucide-react";
 import {
   DndContext,
   closestCenter,
@@ -171,103 +170,99 @@ export default function ImageUploader({ carId, images }: ImageUploaderProps) {
     reorderMutation.mutate(items);
   };
 
+  // 已有图片 + 待上传数量是否已达上限，达到就不再显示"添加"方块
+  const canAddMore = localImages.length + pendingFiles.length < MAX_IMAGES;
+
   return (
     <div className="space-y-4">
       <h2 className="font-semibold">Images</h2>
-
-      {/* 已上传的图片列表：可拖拽排序 */}
-      {localImages.length > 0 && (
-        <DndContext
-          sensors={sensors}
-          collisionDetection={closestCenter}
-          onDragEnd={handleDragEnd}
+      {/* 图片网格：已上传图片（可拖拽排序）+ 待上传预览 + 末尾的"添加"方块，统一放在同一行 */}
+      <DndContext
+        sensors={sensors}
+        collisionDetection={closestCenter}
+        onDragEnd={handleDragEnd}
+      >
+        <SortableContext
+          items={localImages.map((img) => img.id)}
+          strategy={rectSortingStrategy}
         >
-          <SortableContext
-            items={localImages.map((img) => img.id)}
-            strategy={rectSortingStrategy}
-          >
-            <div className="flex flex-wrap gap-3">
-              {localImages.map((image) => (
-                <SortableImageItem
-                  key={image.id}
-                  image={image}
-                  onDelete={() => deleteMutation.mutate(image.id)}
-                  isDeleting={
-                    deleteMutation.isPending &&
-                    deleteMutation.variables === image.id
-                  }
-                />
-              ))}
-            </div>
-          </SortableContext>
-        </DndContext>
-      )}
-
-      {/* 待上传文件：每一项独立显示上传中或失败重试，互不影响 */}
-      {pendingFiles.length > 0 && (
-        <div className="flex flex-wrap gap-3">
-          {pendingFiles.map((pending) => (
-            <div key={pending.id} className="relative">
-              <img
-                src={pending.previewUrl}
-                alt="Preview"
-                className="h-24 w-24 rounded-lg object-cover"
+          <div className="flex flex-wrap gap-3">
+            {/* 已上传的图片列表：可拖拽排序 */}
+            {localImages.map((image) => (
+              <SortableImageItem
+                key={image.id}
+                image={image}
+                onDelete={() => deleteMutation.mutate(image.id)}
+                isDeleting={
+                  deleteMutation.isPending &&
+                  deleteMutation.variables === image.id
+                }
               />
+            ))}
 
-              {/* 上传中：遮罩提示 */}
-              {pending.status === "uploading" && (
-                <div className="absolute inset-0 flex items-center justify-center rounded-lg bg-black/40">
-                  <span className="text-xs font-medium text-white">
-                    Uploading...
-                  </span>
-                </div>
-              )}
+            {/* 待上传文件：每一项独立显示上传中或失败重试，互不影响 */}
 
-              {/* 上传失败：这一项单独显示重试按钮，不影响其他项 */}
-              {pending.status === "error" && (
-                <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 rounded-lg bg-black/60">
-                  <AlertCircle className="h-4 w-4 text-red-400" />
-                  <button
-                    type="button"
-                    onClick={() => uploadSingleFile(pending.id, pending.file)}
-                    className="flex items-center gap-0.5 text-[10px] font-medium text-white hover:text-red-300"
-                  >
-                    <RotateCcw className="h-2.5 w-2.5" />
-                    Retry
-                  </button>
-                </div>
-              )}
-            </div>
-          ))}
-        </div>
-      )}
+            {pendingFiles.map((pending) => (
+              <div key={pending.id} className="relative">
+                <img
+                  src={pending.previewUrl}
+                  alt="Preview"
+                  className="h-24 w-24 rounded-lg object-cover"
+                />
 
-      {/* 选择新图片 */}
-      <div className="space-y-3">
-        {/* 隐藏的原生文件选择 input，multiple 允许一次选多个文件 */}
-        <input
-          ref={inputRef}
-          type="file"
-          accept="image/jpeg,image/png,image/webp"
-          multiple
-          className="hidden"
-          onChange={handleFileChange}
-        />
+                {/* 上传中：遮罩提示 */}
+                {pending.status === "uploading" && (
+                  <div className="absolute inset-0 flex items-center justify-center rounded-lg bg-black/40">
+                    <span className="text-xs font-medium text-white">
+                      Uploading...
+                    </span>
+                  </div>
+                )}
 
-        {/* 点击这个按钮触发文件选择 */}
-        <Button
-          type="button"
-          variant="outline"
-          onClick={() => inputRef.current?.click()}
-        >
-          Add Images
-        </Button>
+                {/* 上传失败：这一项单独显示重试按钮，不影响其他项 */}
+                {pending.status === "error" && (
+                  <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 rounded-lg bg-black/60">
+                    <AlertCircle className="h-4 w-4 text-red-400" />
+                    <button
+                      type="button"
+                      onClick={() => uploadSingleFile(pending.id, pending.file)}
+                      className="flex items-center gap-0.5 text-[10px] font-medium text-white hover:text-red-300"
+                    >
+                      <RotateCcw className="h-2.5 w-2.5" />
+                      Retry
+                    </button>
+                  </div>
+                )}
+              </div>
+            ))}
 
-        <p className="text-xs text-gray-500">
-          JPEG, PNG or WebP · Max 5 MB per image · Up to {MAX_IMAGES} images
-          total
-        </p>
-      </div>
+            {/* 添加图片：跟图片同尺寸的方块，始终排在网格最后一个 */}
+            {canAddMore && (
+              <button
+                type="button"
+                onClick={() => inputRef.current?.click()}
+                className="flex h-24 w-24 flex-col items-center justify-center gap-1 rounded-lg border-2 border-dashed border-gray-300 text-gray-400 transition-colors hover:border-gray-400 hover:text-gray-500"
+              >
+                <Plus className="h-5 w-5" />
+                <span className="text-[10px]">Add</span>
+              </button>
+            )}
+          </div>
+        </SortableContext>
+      </DndContext>
+
+      {/* 隐藏的原生文件选择 input，multiple 允许一次选多个文件 */}
+      <input
+        ref={inputRef}
+        type="file"
+        accept="image/jpeg,image/png,image/webp"
+        multiple
+        className="hidden"
+        onChange={handleFileChange}
+      />
+      <p className="text-xs text-gray-500">
+        JPEG, PNG or WebP · Max 5 MB per image · Up to {MAX_IMAGES} images total
+      </p>
     </div>
   );
 }
