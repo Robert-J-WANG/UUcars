@@ -19,5 +19,5 @@ logs/
 *.log
 
 # macOS
-.DS_Store.env
+.DS_Store
 .env
