@@ -1,9 +1,16 @@
-import type { CarImage } from "@/types";
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 
+// 只依赖"展示 + 拖拽 + 删除"真正需要的字段，不绑定具体是
+// 已持久化的 CarImage，还是本地文件生成的预览对象——
+// CarImage 结构上天然满足这个形状，可以直接传入，不需要改 ImageUploader
+export interface ImageLike {
+  id: string | number;
+  imageUrl: string;
+}
+
 interface SortableImageItemProps {
-  image: CarImage;
+  image: ImageLike;
   onDelete: () => void;
   isDeleting: boolean;
 }

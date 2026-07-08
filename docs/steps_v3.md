@@ -11068,3 +11068,429 @@ git branch -d fix/ImageUploader-ux-improvements
 git push origin --delete fix/ImageUploader-ux-improvements
 ```
 
+
+
+### Fix4：车辆发布体验优化（图片预上传）
+
+#### 1. 切出 fix 分支
+
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b fix/add-images-when-create-car
+git push -u origin fix/add-images-when-create-car
+```
+
+#### 2. 问题描述
+
+创建车辆阶段无法预先选图片，当前流程：
+
+CreateCarPage 只有 CarForm，用户填完信息点 Create Draft 后，carsApi.create 成功才跳转到 EditCarPage，图片必须等跳转过去之后才能添加。用户体验上应该允许"填资料的同时就能选好图片"，不需要先创建、再跳页面、再选图。
+
+#### 3. 根本原因
+
+CarImage 在数据库里通过 CarId 外键归属于一辆具体的车（AddImagesBatchAsync 第一步就是 _carRepository.GetByIdAsync(carId, ...)，车不存在直接 404）。这意味着图片必须挂在一个已存在的 carId 上，而 CreateCarPage 阶段车辆还没创建，天然不具备这个前提。
+
+#### 4. 解决方案
+
+不改后端任何接口，前端在 CreateCarPage 里让用户"先选图片、暂存在本地、不真正上传"，等 carsApi.create 真正成功拿到 car.id 之后，紧接着调用已有的 carsApi.uploadImagesBatch(car.id, files) 把暂存的文件批量传上去；如果图片上传失败，不影响创建结果，依然跳转 EditCarPage，让用户在编辑页重新添加。
+
+**新增本地状态数组**：
+
+`CreateCarPage` 现状完全没有跟图片相关的状态。要让用户"先选图片、暂存本地、提交时才真正上传"，需要一个新的本地状态数组，装"已选中但还没上传"的文件。 这里跟 ImageUploader 里的 PendingFile 不同——PendingFile 需要 status: "uploading" | "error"，是因为那边选完立即发请求；这里选完完全不发请求，只是本地暂存，所以不需要状态字段，只需要文件本身和预览地址： 
+
+```tsx
+// 创建阶段本地暂存的图片：车辆还不存在，不能真正上传，
+// 只在本地生成预览，等提交成功拿到 carId 才批量上传
+interface LocalImage {
+  id: string;
+  file: File;
+  previewUrl: string;
+}
+
+export default function CreateCarPage() {
+ ...
+}
+
+```
+
+对应组件内部新增状态： 
+
+```tsx
+export default function CreateCarPage() {
+  // 本地暂存的图片（车辆还不存在，不能真正上传）
+  const [localImages, setLocalImages] = useState<LocalImage[]>([]);
+  ...
+}
+```
+
+如果我们有了本地暂存的图片数据，需要渲染这部分数据， 这部分数据渲染的功能，我们创建一个独立的组件`ImagePicker`, 并把数据和更新数据的操作传递过去, 这样根据本地不同的数据，就能渲染出不同的车辆图片。
+
+```tsx
+export default function CreateCarPage() {
+  // 本地暂存的图片（车辆还不存在，不能真正上传）
+  const [localImages, setLocalImages] = useState<LocalImage[]>([]);
+
+  ...
+
+  return (
+    <div className="mx-auto max-w-2xl space-y-6">
+      <h1 className="text-2xl font-bold">List Your Car</h1>
+          
+      {/* image selector */}
+      <ImagePicker images={localImages} onChange={setLocalImages} />
+
+      <CarForm
+        onSubmit={handleSubmit}
+        isSubmitting={createMutation.isPending}
+        submitLabel="Create Draft"
+      />
+    </div>
+  );
+}
+```
+
+**创建图片本地选择器组件`ImagePicker`**
+
+和`ImageUploader`不同，`ImagePicker`内部**完全不需要**任何网络请求:
+
+- 没有 `carsApi` 导入
+- 没有 `useMutation`
+- 没有 `useQueryClient`
+
+但需要选择、删除、拖拽这三件事， 他们全部只是纯数组操作。同时`ImagePicker` 只负责"展示 + 触发变化",不自己拥有状态,这是标准的**受控组件**模式,跟 `CarForm` 的 `onSubmit`/`defaultValues` 是同一个思路。
+
+```tsx
+interface ImagePickerProps {
+  // 受控组件：状态由父组件持有，这里只负责展示和触发变化
+  images: LocalImage[];
+  onChange: (images: LocalImage[]) => void;
+}
+
+export default function ImagePicker({ images, onChange }: ImagePickerProps) {
+ 
+
+  /* --------------- 选择 --------------- */
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    ...
+    onChange(...);
+  };
+  /* --------------- 删除 --------------- */
+  // 纯本地数组操作，没有对应的后端记录，不发请求
+  const handleDelete = (id: string) => {
+    ...
+    onChange(...);
+  };
+
+  /* --------------- 拖拽 --------------- */
+  // 拖拽结束：纯本地重排，没有已持久化的 SortOrder 需要同步给后端
+  const handleDragEnd = (event: DragEndEvent) => {
+    ...
+    onChange(...);
+  };
+
+  const canAddMore = images.length < MAX_IMAGES;
+
+  return (
+    <div className="space-y-2">
+      ...
+    </div>
+  );
+}
+
+```
+
+完善选择+删除+拖拽逻辑，渲染数据（复用可拖拽卡`SortableImageItem`)
+
+```tsx
+import { useRef } from "react";
+import { toast } from "sonner";
+import { Plus } from "lucide-react";
+import {
+  DndContext,
+  closestCenter,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  rectSortingStrategy,
+  arrayMove,
+} from "@dnd-kit/sortable";
+import SortableImageItem from "./SortableImageItem";
+import type { LocalImage } from "@/pages/CreateCarPage";
+
+const MAX_IMAGES = 10; // 与后端 AddImagesBatchAsync 的上限保持一致
+
+interface ImagePickerProps {
+  // 受控组件：状态由父组件持有，这里只负责展示和触发变化
+  images: LocalImage[];
+  onChange: (images: LocalImage[]) => void;
+}
+
+export default function ImagePicker({ images, onChange }: ImagePickerProps) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  const sensors = useSensors(
+    useSensor(PointerSensor, {
+      activationConstraint: { distance: 8 },
+    }),
+  );
+  const canAddMore = images.length < MAX_IMAGES;
+
+  /* --------------- 选择 --------------- */
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+
+    const fileArray = Array.from(files);
+
+    // 数量上限：只在本地拦截，此时没有 carId，无法调后端校验
+    if (images.length + fileArray.length > MAX_IMAGES) {
+      toast.error(
+        `A car can have at most ${MAX_IMAGES} images. ` +
+          `Currently selected ${images.length}, ` +
+          `you selected ${fileArray.length} more.`,
+      );
+      if (inputRef.current) inputRef.current.value = "";
+      return;
+    }
+
+    const newImages: LocalImage[] = fileArray.map((file) => ({
+      id: `local-${Date.now()}-${Math.random()}`,
+      file,
+      previewUrl: URL.createObjectURL(file),
+    }));
+
+    onChange([...images, ...newImages]);
+
+    if (inputRef.current) inputRef.current.value = "";
+  };
+  /* --------------- 删除 --------------- */
+  // 纯本地数组操作，没有对应的后端记录，不发请求
+  const handleDelete = (id: string) => {
+    const target = images.find((img) => img.id === id);
+    if (target) URL.revokeObjectURL(target.previewUrl);
+    onChange(images.filter((img) => img.id !== id));
+  };
+
+  /* --------------- 拖拽 --------------- */
+  // 拖拽结束：纯本地重排，没有已持久化的 SortOrder 需要同步给后端
+  const handleDragEnd = (event: DragEndEvent) => {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+
+    const oldIndex = images.findIndex((img) => img.id === active.id);
+    const newIndex = images.findIndex((img) => img.id === over.id);
+
+    onChange(arrayMove(images, oldIndex, newIndex));
+  };
+
+  return (
+    <div className="space-y-2">
+      <h2 className="font-semibold">Images</h2>
+      <DndContext
+        sensors={sensors}
+        collisionDetection={closestCenter}
+        onDragEnd={handleDragEnd}
+      >
+        <SortableContext
+          items={images.map((img) => img.id)}
+          strategy={rectSortingStrategy}
+        >
+          <div className="flex flex-wrap gap-3">
+            {images.map((img) => (
+              <SortableImageItem
+                key={img.id}
+                image={{ id: img.id, imageUrl: img.previewUrl }}
+                onDelete={() => handleDelete(img.id)}
+                isDeleting={false}
+              />
+            ))}
+
+            {/* 添加图片：跟图片同尺寸的方块，始终排在最后一个 */}
+            {canAddMore && (
+              <button
+                type="button"
+                onClick={() => inputRef.current?.click()}
+                className="flex h-24 w-24 flex-col items-center justify-center gap-1
+                           rounded-lg border-2 border-dashed border-gray-300
+                           text-gray-400 transition-colors
+                           hover:border-gray-400 hover:text-gray-500"
+              >
+                <Plus className="h-5 w-5" />
+                <span className="text-[10px]">Add</span>
+              </button>
+            )}
+          </div>
+        </SortableContext>
+      </DndContext>
+          
+	  {/* 隐藏的原生文件选择 input，multiple 允许一次选多个文件 */}
+      <input
+        ref={inputRef}
+        type="file"
+        accept="image/jpeg,image/png,image/webp"
+        multiple
+        className="hidden"
+        onChange={handleFileChange}
+      />
+      <p className="text-xs text-gray-500">
+        JPEG, PNG or WebP · Max 5 MB per image · Up to {MAX_IMAGES} images total
+      </p>
+    </div>
+  );
+}
+```
+
+注意：复用`SortableImageItem` 会有类型不匹配
+
+`SortableImageItem` 现在的 prop 类型是 `image: CarImage`,而本地暂存的文件对象长得不一样(`id` 是字符串、字段叫 `previewUrl` 不是 `imageUrl`)。
+
+需要把 `SortableImageItem` 依赖的类型**收窄成它真正需要的最小形状**——它其实只用到 `id` 和 `imageUrl` 两个字段,不需要整个 `CarImage`。这样两边都能类型安全地复用同一个展示组件。
+
+```tsx
+// 只依赖"展示 + 拖拽 + 删除"真正需要的字段，不绑定具体是
+// 已持久化的 CarImage，还是本地文件生成的预览对象——
+// CarImage 结构上天然满足这个形状，可以直接传入，不需要改 ImageUploader
+export interface ImageLike {
+  id: string | number;
+  imageUrl: string;
+}
+
+interface SortableImageItemProps {
+  image: ImageLike;
+  onDelete: () => void;
+  isDeleting: boolean;
+}
+/* -------- 已上传图片：可拖拽排序的单个图片项 ------- */
+function SortableImageItem() {
+ ...
+}
+```
+
+**重写表单提交逻辑**
+
+之前的提交逻辑不包含上传图片的部分，使用`useMutation`合理，现在的提交动作是"创建车辆 → 上传图片 → 跳转"三步连续的流程，`useMutation` 的 `isPending` 只反映 `mutationFn` 本身（原来的 `carsApi.create`）有没有完成——`create` 请求一返回，`isPending` 立刻变回 `false`，哪怕紧接着的图片上传还没做完，按钮会提前恢复可点击状态，用户可能在图片还在传的时候又点一次提交。因此，我们选择**手写一个 `async` 函数配合自己的 `isSubmitting` 状态更直接**。
+
+之前的逻辑：
+
+```tsx
+const createMutation = useMutation({
+  mutationFn: (values: CarFormValues) => carsApi.create(values),
+  onSuccess: (car) => {
+    toast.success("Draft created!");
+    navigate(`/cars/${car.id}/edit`);
+  },
+  onError: (error) => {
+    toast.error(error.message);
+  },
+});
+
+const handleSubmit = async (values: CarFormValues) => {
+  createMutation.mutate(values);
+};
+```
+
+修改提交逻辑
+
+```tsx
+import { useNavigate } from "react-router-dom";
+import { toast } from "sonner";
+import { carsApi } from "@/api";
+import CarForm from "@/components/CarForm";
+import type { CarFormValues } from "@/components/CarForm";
+import { useState } from "react";
+import ImagePicker from "@/components/ImagePicker";
+
+// 车辆创建前本地暂存的图片：还没有 carId，不会真正上传，
+// 只在本地生成预览、支持删除和拖拽排序；真正的上传由父组件
+// 在拿到 carId 之后调用 carsApi.uploadImagesBatch 完成
+export interface LocalImage {
+  id: string;
+  file: File;
+  previewUrl: string;
+}
+
+export default function CreateCarPage() {
+  const navigate = useNavigate();
+
+  // 本地暂存的图片：车辆还不存在，选择、删除、排序都只发生在本地，
+  // 全部逻辑交给 ImageSelector，这里只持有状态，提交时读出来用
+  const [localImages, setLocalImages] = useState<LocalImage[]>([]);
+  // 提交状态：涵盖"创建车辆 + 上传图片"整个过程，不只是创建这一步
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const handleSubmit = async (values: CarFormValues) => {
+    setIsSubmitting(true);
+    try {
+      // 第一步：创建车辆，拿到真实的 carId
+      const car = await carsApi.create(values);
+      toast.success("Draft created!");
+
+      // 第二步：如果用户选过图片，用刚拿到的 carId 批量上传
+      if (localImages.length > 0) {
+        try {
+          await carsApi.uploadImagesBatch(
+            car.id,
+            localImages.map((img) => img.file),
+          );
+        } catch {
+          // 图片上传失败不影响车辆已创建这个事实，只提示用户去编辑页补传
+          toast.error(
+            "Draft created, but images failed to upload. You can add them on the next page.",
+          );
+        }
+      }
+
+      // 第三步：跳转编辑页（车辆一定已存在，图片传没传成功都可以在这里补）
+      navigate(`/cars/${car.id}/edit`);
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "Failed to create draft.",
+      );
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="mx-auto max-w-2xl space-y-6">
+      <h1 className="text-2xl font-bold">List Your Car</h1>
+
+      <ImagePicker images={localImages} onChange={setLocalImages} />
+
+      <CarForm
+        onSubmit={handleSubmit}
+        isSubmitting={isSubmitting}
+        submitLabel="Create Draft"
+      />
+    </div>
+  );
+}
+
+```
+
+#### 5. 测试并合并分支
+
+修改之后，创建车辆草稿时，能批量上传图片（预览+拖拽排序+删除）
+
+合并分支
+
+```tsx
+git add .
+git commit -m "fix: improve car listing UX, add images"
+git push origin fix/add-images-when-create-car
+
+git checkout develop
+git merge --no-ff fix/add-images-when-create-car \
+  -m "merge: fix/add-images-when-create-car into develop"
+git push origin develop
+
+git branch -d fix/add-images-when-create-car
+git push origin --delete fix/add-images-when-create-car
+```
+
+
+
