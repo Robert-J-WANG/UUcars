@@ -9767,7 +9767,7 @@ interface SortableImageItemProps {
   onDelete: () => void;
   isDeleting: boolean;
 }
-/* -------- 已上传图片：可拖拽排序的单个图片项 ------- */
+/* -- 已上传图片：可拖拽排序的单个图片项 - */
 function SortableImageItem({
   image,
   onDelete,
@@ -9805,7 +9805,7 @@ export default SortableImageItem;
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 
-/* -------- 已上传图片：可拖拽排序的单个图片项 ------- */
+/* -- 已上传图片：可拖拽排序的单个图片项 - */
 function SortableImageItem({
   image,
   onDelete,
@@ -9846,7 +9846,7 @@ function SortableImageItem({
 
 ```tsx
 ...
-/* -------- 已上传图片：可拖拽排序的单个图片项 ------- */
+/* -- 已上传图片：可拖拽排序的单个图片项 - */
 function SortableImageItem({
   image,
   onDelete,
@@ -9925,7 +9925,7 @@ import { type DragEndEvent } from "@dnd-kit/core";
 完善拖拽事件处理函数的逻辑
 
 ```tsx
-/* ----------- 拖拽结束：算出新顺序，本地立刻更新，异步提交后端 ---------- */
+/* ----- 拖拽结束：算出新顺序，本地立刻更新，异步提交后端 ---- */
 const handleDragEnd = (event: DragEndEvent) => {
   const { active, over } = event;
   if (!over || active.id === over.id) return;
@@ -9948,7 +9948,7 @@ const handleDragEnd = (event: DragEndEvent) => {
 新增排序 mutation
 
 ```tsx
-/* ----------- 排序 mutation ---------- */
+/* ----- 排序 mutation ---- */
 const reorderMutation = useMutation({
   mutationFn: (items: { imageId: number; sortOrder: number }[]) =>
     carsApi.reorderImages(carId, items),
@@ -9964,7 +9964,7 @@ const reorderMutation = useMutation({
 拖拽事件处理函数中补全后端同步逻辑
 
 ```tsx
-/* ----------- 拖拽结束：算出新顺序，本地立刻更新，异步提交后端 ---------- */
+/* ----- 拖拽结束：算出新顺序，本地立刻更新，异步提交后端 ---- */
 const handleDragEnd = (event: DragEndEvent) => {
   const { active, over } = event;
   if (!over || active.id === over.id) return;
@@ -10081,7 +10081,7 @@ export default function ImageUploader({ carId, images }: ImageUploaderProps) {
     if (inputRef.current) inputRef.current.value = "";
   };
 
-  /* ----------- 上传单个文件（普通函数，不用 useMutation/useCallback） ---------- */
+  /* ----- 上传单个文件（普通函数，不用 useMutation/useCallback） ---- */
   // 每次调用只负责这一个文件，成功了把它从 pendingFiles 里移除，
   // 失败了只把这一项标记成 error，不影响列表里其他文件
   const uploadSingleFile = async (pendingId: string, file: File) => {
@@ -10108,7 +10108,7 @@ export default function ImageUploader({ carId, images }: ImageUploaderProps) {
     }
   };
 
-  /* ----------- 删除 mutation ---------- */
+  /* ----- 删除 mutation ---- */
   const deleteMutation = useMutation({
     mutationFn: (imageId: number) => carsApi.deleteImage(carId, imageId),
     onSuccess: () => {
@@ -10120,7 +10120,7 @@ export default function ImageUploader({ carId, images }: ImageUploaderProps) {
     },
   });
 
-  /* ----------- 排序 mutation ---------- */
+  /* ----- 排序 mutation ---- */
   const reorderMutation = useMutation({
     mutationFn: (items: { imageId: number; sortOrder: number }[]) =>
       carsApi.reorderImages(carId, items),
@@ -10132,7 +10132,7 @@ export default function ImageUploader({ carId, images }: ImageUploaderProps) {
     },
   });
 
-  /* ----------- 拖拽传感器 ---------- */
+  /* ----- 拖拽传感器 ---- */
   // PointerSensor 同时支持鼠标和触摸操作
   // activationConstraint：8px 拖动阈值，避免普通点击（比如点删除按钮）被误判成拖拽
   const sensors = useSensors(
@@ -10141,7 +10141,7 @@ export default function ImageUploader({ carId, images }: ImageUploaderProps) {
     }),
   );
 
-  /* ----------- 拖拽结束：算出新顺序，本地立刻更新，异步提交后端 ---------- */
+  /* ----- 拖拽结束：算出新顺序，本地立刻更新，异步提交后端 ---- */
   const handleDragEnd = (event: DragEndEvent) => {
     const { active, over } = event;
     if (!over || active.id === over.id) return;
@@ -10418,6 +10418,631 @@ git push origin develop
 # 删除功能分支
 git branch -d feature/v3-image-upload
 git push origin --delete feature/v3-image-upload
+```
+
+
+
+## Step 65 · 草稿自动保存 + ErrorBoundary
+
+### 这一步做什么
+
+Step 64 解决了图片上传体验。这一步继续完善车辆发布流程里的另外2个问题：
+
+1. 填写表单途中意外关闭页面，内容全部丢失，没有本地草稿备份
+2. 任何页面组件崩溃都会导致整页白屏，用户完全不知道发生了什么
+
+
+
+### 1. 切出功能分支
+
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b feature/v3-draft-autosave-errorboundary
+git push -u origin feature/v3-draft-autosave-errorboundary
+```
+
+
+
+### 2. 草稿如何本地备份？
+
+卖家花了几分钟写好车辆信息，不小心关掉标签页，导致内容全部丢失，没有任何恢复方式。
+
+解决方案：用 `localStorage` 做本地草稿自动保存，下次进入页面时提示恢复。总体的思路是：
+
+1. 内容变化时，自动写入 localStorage
+2. 进入页面时，检测有没有未保存的草稿
+3. 提交成功后，清楚草稿
+
+RHF（react-hook-form） 的 `useForm`hook 提供了`watch(callback)` 方法可以订阅表单值的变化， 并可以把值通过callback回传出来，自行处理：
+
+```tsx
+// 用来订阅表单所有字段的变化
+const {watch } = useForm<T>({});
+
+useEffect(() => {
+    const subscription = watch(
+      // 自定义的回调函数，用来处理变化后的表单数据
+     // 每次任何字段变化都会触发，values 是所有字段的当前值
+      (values) => {
+        console.log(values);
+        localStorage.setItem("draftKey", JSON.stringify(values));
+      },
+    );
+    return () => subscription.unsubscribe();
+  }, [watch]);
+```
+
+这样每次按键都写一次表单数据到 `localStorage`里，但是过于频繁。使用**Debounce（防抖）** 解决这个问题：用户停止输入 2 秒后才真正写入：
+
+```bash
+用户按键 → 重置计时器（2秒）
+  → 2秒内又按键 → 重置计时器
+  → 2秒内无操作 → 计时器到期 → 执行写入 localStorage
+```
+
+```tsx
+// 内容变化时：2 秒 debounce 自动保存
+const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+useEffect(() => {2
+  const subscription = watch((values) => {
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => {
+      console.log(values);
+      localStorage.setItem("draftKey", JSON.stringify(values));
+    }, 2000);
+  });
+  return () => {
+    subscription.unsubscribe();
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+  };
+}, [watch, draftKey]);
+```
+
+
+
+### 3. 本地草稿的检查和数据回填
+
+用户重新打开发布页面（或者刷新页面），如果 `localStorage` 里存着上一次没提交完的内容，应该提示"要不要恢复"，而不是默默丢弃或者默默覆盖。
+
+RHF 的`useForm` 提供一个方法`reset(values)`， 能把数据**重新填回表单**，即调用后表单会用传入的值重新渲染所有字段
+
+```tsx
+// 用来给表单所有字段的reset数据
+const {reset } = useForm<T>({});
+
+ useEffect(() => {
+    const savedValues = localStorage.getItem("draftKey")!;
+    const parsedValues = JSON.parse(savedValues) as CarFormValues;
+    reset(parsedValues);
+  }, [reset]);
+```
+
+
+
+### 4. 更新 CarForm：加入草稿自动保存
+
+`CarForm` 同时被 `CreateCarPage`（发布新车）和 `EditCarPage`（编辑已有车）使用， 需要用不同的 key 存草稿（避免两个场景互相覆盖），所以新增一个 `draftKey` prop。
+
+```tsx
+// 改之后
+interface CarFormProps {
+  defaultValues?: CarFormValues;
+  onSubmit: (values: CarFormValues) => Promise<void>;
+  isSubmitting: boolean;
+  submitLabel: string;
+  // ✅ 新增：由调用方传入，格式如 "car-draft-new" 或 "car-draft-5"
+  draftKey: string; 
+}
+```
+
+#### 4.1 保存草稿
+
+解构出 `watch`方法，把表单数据写入`localStorage`, 并使用定时器实现防抖
+
+```tsx
+...
+export default function CarForm({
+  defaultValues,
+  onSubmit,
+  isSubmitting,
+  submitLabel,
+  draftKey,
+}: CarFormProps) {
+    
+  const {
+    register,
+    handleSubmit,
+    // 用来订阅表单所有字段的变化
+    watch,
+    formState: { errors },
+  } = useForm<CarFormValues>({
+    resolver: zodResolver(carSchema),
+    defaultValues,
+  });
+
+  /* -------------- 保存草稿 -------------- */
+  // 内容变化时：2 秒 debounce 自动保存
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    const subscription = watch((values) => {
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = setTimeout(() => {
+        localStorage.setItem(draftKey, JSON.stringify(values));
+      }, 2000);
+    });
+    return () => {
+      subscription.unsubscribe();
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    };
+  }, [watch, draftKey]);
+
+  return (
+    <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+      ...
+    </form>
+  );
+}
+
+```
+
+#### 4.2 检查本地操作，回填表格
+
+解构出 `reset`方法， 检查本地草稿并回填表单数据：这个检测逻辑只应该在组件**第一次挂载**时跑一次，不能每次重新渲染都弹一次提示。用一个 `useRef` 做"是否已经检查过"的标记，比用 `useState` 更合适，因为这个标记本身不需要触发重新渲染，只是一个纯粹的"跑没跑过"的flag
+
+```tsx
+...
+export default function CarForm({
+  defaultValues,
+  onSubmit,
+  isSubmitting,
+  submitLabel,
+  draftKey,
+}: CarFormProps) {
+    
+  const {
+    register,
+    handleSubmit,
+    // 用来订阅表单所有字段的变化
+    watch,
+    // 用于把恢复的草稿数据重新填回表单
+    reset,
+    formState: { errors },
+  } = useForm<CarFormValues>({
+    resolver: zodResolver(carSchema),
+    defaultValues,
+  });
+
+  /* -------------- 保存草稿 -------------- */
+  ...
+
+  /* ------------- 草稿数据回填 ------------- */
+  // 进入页面时：检查是否有未保存的草稿
+  const draftRestoredRef = useRef(false);
+
+  useEffect(() => {
+    if (draftRestoredRef.current) return; // 只在初次渲染时执行一次
+    draftRestoredRef.current = true;
+
+    const saved = localStorage.getItem(draftKey);
+    if (!saved) return;
+
+    try {
+      const parsed = JSON.parse(saved) as CarFormValues;
+      // setTimeout(300ms)：等 Toaster 完成挂载再调用 toast()，
+      // 否则组件刚挂载时 Toaster 可能还没准备好，Toast 不会显示
+      setTimeout(() => {
+        toast("Unsaved draft found.", {
+          description: "Do you want to restore your previous draft?",
+          action: {
+            label: "Restore",
+            onClick: () => {
+              reset(parsed);
+              toast.success("Draft restored.");
+            },
+          },
+          cancel: {
+            label: "Discard",
+            onClick: () => localStorage.removeItem(draftKey),
+          },
+          duration: 10000, // 给用户足够时间决定
+        });
+      }, 300);
+    } catch {
+      // JSON 解析失败（数据损坏），静默清除
+      localStorage.removeItem(draftKey);
+    }
+  }, [draftKey, reset]);
+
+
+  return (
+    <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+      ...
+    </form>
+  );
+}
+
+```
+
+#### 4.3 提交成功后，清除草稿
+
+如果用户已经成功提交了表单，`localStorage` 里那份草稿就变成了"过时数据"。下次用户再打开这个页面（比如又想新建一辆车），不应该被提示"要不要恢复"一份其实早就已经提交过的内容。
+
+提交完成后，需要立刻手动清清除， 新建提交成功的后的函数 `handleFormSubmit`， 包装之前的 事件函数`onSubmit`
+
+```tsx
+const handleFormSubmit = async (values: CarFormValues) => {
+   //提交表单数据
+  await onSubmit(values);
+  // 手动清除草稿
+  localStorage.removeItem(draftKey);
+};
+```
+
+`form` 标签上的提交处理函数换成这个包装过的版本：
+
+```tsx
+// 改之前
+<form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+
+// 改之后
+<form onSubmit={handleSubmit(handleFormSubmit)} className="space-y-4">
+```
+
+
+
+### 5. 更新 CreateCarPage 和 EditCarPage：传入 draftKey
+
+`CarForm` 新增了必传 prop `draftKey`，两个调用方需要同步更新。
+
+打开 `src/pages/CreateCarPage.tsx`，找到 `<CarForm>`，加入 `draftKey`：
+
+```tsx
+<CarForm
+  onSubmit={handleSubmit}
+  isSubmitting={createMutation.isPending}
+  submitLabel="Create Draft"
+  draftKey="car-draft-new"  // ✅ 新增
+/>
+```
+
+打开 `src/pages/EditCarPage.tsx`，找到 `<CarForm>`，加入 `draftKey`：
+
+```tsx
+<CarForm
+  defaultValues={{ ... }}
+  onSubmit={handleSubmit}
+  isSubmitting={updateMutation.isPending}
+  submitLabel="Save Changes"
+  draftKey={`car-draft-${carId}`}  // ✅ 新增：每辆车独立的 key
+/>
+```
+
+
+
+### 6. 组件崩溃导致整页白屏
+
+如果任何页面组件的渲染函数抛出异常，React 会卸载整个组件树，页面变成空白。用户不知道发生了什么，也没有任何恢复的方式。
+
+针对这种状况，React 提供了 **ErrorBoundary** 机制：当子组件在渲染阶段抛出错误时，ErrorBoundary 捕获这个错误并渲染一个备用 UI，而不是让整个页面崩溃。
+
+但它的捕获范围是有限的：
+
+```
+✅ 能捕获：子组件渲染阶段（render）抛出的错误
+
+❌ 不能捕获：事件处理器里的错误（onClick 等）→ 用 try/catch
+❌ 不能捕获：异步代码里的错误（Promise.reject 等）→ 用 try/catch
+❌ 不能捕获：ErrorBoundary 自身的错误
+```
+
+ErrorBoundary 和 `try/catch` 不是替代关系，而是互补关系：
+
+- ErrorBoundary 处理"组件渲染崩溃"
+- `try/catch` 处理"业务逻辑执行失败"
+
+
+
+### 7. 实现ErrorBoundary
+
+原生的 ErrorBoundary 必须用 React 类组件实现，用 `react-error-boundary` 这个库把它封装成函数组件的形式
+
+#### 7.1 安装库
+
+```bash
+npm install react-error-boundary
+```
+
+#### 7.2 新建组件
+
+新建 `src/components/ErrorBoundary.tsx`：
+
+```tsx
+import {
+  ErrorBoundary as ReactErrorBoundary,
+  type FallbackProps,
+} from "react-error-boundary";
+import { Button } from "./ui/button";
+
+function ErrorFallback({ error, resetErrorBoundary }: FallbackProps) {
+  return (
+    <div
+      className="flex min-h-50 flex-col items-center justify-center gap-4 rounded-xl border p-8 text-center"
+      style={{
+        borderColor: "var(--color-border)",
+        backgroundColor: "var(--color-surface)",
+      }}
+    >
+      <p
+        className="text-lg font-semibold"
+        style={{ color: "var(--color-text-primary)" }}
+      >
+        Something went wrong
+      </p>
+      {/* 只在开发环境显示具体错误信息，方便调试。
+          生产环境不暴露内部实现细节，避免给攻击者提供信息。 */}
+      {import.meta.env.DEV && (
+        <p
+          className="max-w-md text-xs"
+          style={{ color: "var(--color-danger)" }}
+        >
+          {error instanceof Error ? error.message : "Unknown error"}
+        </p>
+      )}
+      <Button variant="outline" onClick={resetErrorBoundary}>
+        Try again
+      </Button>
+    </div>
+  );
+}
+
+export default function ErrorBoundary({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  return (
+    <ReactErrorBoundary FallbackComponent={ErrorFallback}>
+      {children}
+    </ReactErrorBoundary>
+  );
+}
+
+```
+
+#### 7.3 使用 ErrorBoundary
+
+在哪里用 ErrorBoundary 是一个设计决策：
+
+```
+一个全局 ErrorBoundary 包裹整个应用：
+  某页面崩溃 → 整个页面（含导航栏）变成错误 UI → 用户无法导航到其他页面
+
+每个页面单独用 ErrorBoundary 包裹：
+  某页面崩溃 → 只有该页面内容区域显示错误 UI → 导航栏正常 → 用户可以去其他页面
+```
+
+显然每个页面单独包裹的体验更好。
+
+写一个小的辅助函数，避免每个路由都重复写 `<ErrorBoundary><SomePage /></ErrorBoundary>` 这种样板代码：
+
+```tsx
+import ErrorBoundary from "@/components/ErrorBoundary";
+
+// 辅助函数：减少重复的 <ErrorBoundary><Page /></ErrorBoundary> 写法
+// 等价于 <ErrorBoundary><SomePage /></ErrorBoundary>
+const withEB = (element: React.ReactNode) => (
+  <ErrorBoundary>{element}</ErrorBoundary>
+);
+```
+
+用 `withEB()` 包裹所有页面的 `element`（`Layout`、`ProtectedRoute`、`AdminRoute` 这类路由守卫/布局组件本身不包——它们崩溃属于另一个更严重的问题，不该被当作"页面级"错误处理）：
+
+```tsx
+// src/router.tsx
+import { createBrowserRouter } from "react-router-dom";
+import ProtectedRoute from "@/components/ProtectedRoute";
+import AdminRoute from "@/components/AdminRoute";
+
+// 认证页面
+import LoginPage from "@/pages/LoginPage";
+import RegisterPage from "@/pages/RegisterPage";
+import VerifyEmailPage from "@/pages/VerifyEmailPage";
+import ForgotPasswordPage from "@/pages/ForgotPasswordPage";
+import ResetPasswordPage from "@/pages/ResetPasswordPage";
+
+// 公开页面
+import HomePage from "@/pages/HomePage";
+import CarDetailPage from "@/pages/CarDetailPage";
+import NotFoundPage from "@/pages/NotFoundPage";
+
+// 需要登录的页面
+import CreateCarPage from "@/pages/CreateCarPage";
+import EditCarPage from "@/pages/EditCarPage";
+import ProfilePage from "@/pages/ProfilePage";
+import MyListingsPage from "@/pages/MyListingsPage";
+import MyFavoritesPage from "@/pages/MyFavoritesPage";
+import MyPurchasesPage from "@/pages/MyPurchasesPage";
+import MySalesPage from "@/pages/MySalesPage";
+
+// Admin 页面
+import AdminPage from "@/pages/AdminPage";
+import AdminPendingPage from "@/pages/AdminPendingPage";
+import Layout from "./components/Layout";
+
+import ErrorBoundary from "@/components/ErrorBoundary";
+
+// 辅助函数：减少重复的 <ErrorBoundary><Page /></ErrorBoundary> 写法
+// 等价于 <ErrorBoundary><SomePage /></ErrorBoundary>
+const withEB = (element: React.ReactNode) => (
+  <ErrorBoundary>{element}</ErrorBoundary>
+);
+
+export const router = createBrowserRouter([
+  // =============================================
+  // 认证页面：不需要导航栏（全屏居中布局）
+  // =============================================
+  { path: "/login", element: withEB(<LoginPage />) },
+  { path: "/register", element: withEB(<RegisterPage />) },
+  { path: "/verify-email", element: withEB(<VerifyEmailPage />) },
+  { path: "/forgot-password", element: withEB(<ForgotPasswordPage />) },
+  { path: "/reset-password", element: withEB(<ResetPasswordPage />) },
+
+  // =============================================
+  // 有导航栏的页面：都放在 Layout 里
+  // =============================================
+  {
+    element: <Layout />,
+    children: [
+      // =============================================
+      // 公开路由（无需登录）
+      // =============================================
+      { path: "/", element: withEB(<HomePage />) },
+      { path: "/cars/:id", element: withEB(<CarDetailPage />) },
+
+      // =============================================
+      // 受保护路由（需要登录）
+      // 用 ProtectedRoute 作为父路由
+      // children 里的页面只有登录后才能访问
+      // =============================================
+      {
+        element: <ProtectedRoute />,
+        children: [
+          { path: "/cars/new", element: withEB(<CreateCarPage />) },
+          { path: "/cars/:id/edit", element: withEB(<EditCarPage />) },
+
+          // 个人中心：嵌套路由
+          // ProfilePage 里用 Outlet 渲染子路由内容
+          // 访问 /profile 时渲染 ProfilePage + MyListingsPage（默认子路由）
+          {
+            path: "/profile",
+            element: withEB(<ProfilePage />),
+            children: [
+              { index: true, element: withEB(<MyListingsPage />) },
+              { path: "listings", element: withEB(<MyListingsPage />) },
+              { path: "favorites", element: withEB(<MyFavoritesPage />) },
+              { path: "purchases", element: withEB(<MyPurchasesPage />) },
+              { path: "sales", element: withEB(<MySalesPage />) },
+            ],
+          },
+        ],
+      },
+
+      // =============================================
+      // Admin 路由（需要 Admin 角色）
+      // =============================================
+      {
+        element: <AdminRoute />,
+        children: [
+          {
+            path: "/admin",
+            element: withEB(<AdminPage />),
+            children: [
+              { index: true, element: withEB(<AdminPendingPage />) },
+              { path: "pending", element: withEB(<AdminPendingPage />) },
+            ],
+          },
+        ],
+      },
+    ],
+  },
+
+  // 404
+  { path: "/404", element: withEB(<NotFoundPage />) },
+  { path: "*", element: withEB(<NotFoundPage />) },
+]);
+```
+
+
+
+### 8. 本地验证
+
+#### 8.1 保存草稿
+
+1. 进入创建车辆页，填写部分内容
+2. 等待 2 秒（DevTools → Application → Local Storage 确认出现 `car-draft-new`）
+3. 刷新页面，出现 Toast 提示"Unsaved draft found"
+4. 点击 "Restore"：表单恢复填写的内容 ✅
+5. 正常填写并提交，检查 Local Storage 确认草稿已被清除 ✅
+6. 重新进入页面，不再出现 Toast 提示 ✅
+
+#### 8.2 ErrorBoundary
+
+1. 临时在 
+
+    ```
+    CarDetailPage.tsx
+    ```
+
+     的 return 语句第一行加入：
+
+    ```tsx
+    throw new Error("Test ErrorBoundary");
+    ```
+
+2. 进入任意车辆详情页
+
+3. 显示 "Something went wrong" + 错误信息（开发环境）+ "Try again" 按钮，**不是白屏** ✅
+
+4. 导航栏正常，可以点击导航到其他页面 ✅
+
+5. **验证完成后移除这行测试代码**
+
+
+
+### 编译
+
+```bash
+dotnet build
+cd uucars-web && npm run build
+```
+
+
+
+### Git 提交
+
+```bash
+git add .
+git commit -m "feat: draft autosave and ErrorBoundary"
+git push origin feature/v3-draft-autosave-errorboundary
+
+git checkout develop
+git merge --no-ff feature/v3-draft-autosave-errorboundary \
+  -m "merge: feature/v3-draft-autosave-errorboundary into develop"
+git push origin develop
+
+git branch -d feature/v3-draft-autosave-errorboundary
+git push origin --delete feature/v3-draft-autosave-errorboundary
+```
+
+
+
+### Step 65 完成状态
+
+```
+
+
+草稿本地备份
+✅ 理解：watch 订阅表单变化 + debounce 防止频繁写入
+✅ 理解：为什么用 useRef 而不是 useState 存"是否已检查过""计时器引用"
+✅ 实现：进入页面检查草稿，Toast 提示恢复/丢弃（setTimeout 等 Toaster 挂载）
+✅ 实现：内容变化 2 秒 debounce 自动保存到 localStorage
+✅ 实现：提交成功后清除草稿（handleFormSubmit）
+✅ 实现：CarForm 新增 draftKey prop，两个调用页面各自传入独立 key
+✅ 本地验证通过
+
+组件崩溃导致整页白屏
+✅ 理解：ErrorBoundary 能捕获什么/不能捕获什么，与 try/catch 的职责划分
+✅ 理解：全局包裹 vs 页面级包裹的体验差异，选择页面级
+✅ 安装：react-error-boundary
+✅ 实现：ErrorBoundary 组件（开发环境显示错误详情，生产环境只显示通用提示）
+✅ 实现：router.tsx 用 withEB() 包裹所有页面
+✅ 本地验证通过
+
+✅ dotnet build + npm run build 通过
+✅ Git commit + 合并回 develop 完成
 ```
 
 
@@ -10735,7 +11360,7 @@ interface SortableImageItemProps {
   onDelete: () => void;
   isDeleting: boolean;
 }
-/* -------- 已上传图片：可拖拽排序的单个图片项 ------- */
+/* -- 已上传图片：可拖拽排序的单个图片项 - */
 function SortableImageItem({
   image,
   onDelete,
@@ -11170,19 +11795,19 @@ interface ImagePickerProps {
 export default function ImagePicker({ images, onChange }: ImagePickerProps) {
  
 
-  /* --------------- 选择 --------------- */
+  /* --- 选择 --- */
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     ...
     onChange(...);
   };
-  /* --------------- 删除 --------------- */
+  /* --- 删除 --- */
   // 纯本地数组操作，没有对应的后端记录，不发请求
   const handleDelete = (id: string) => {
     ...
     onChange(...);
   };
 
-  /* --------------- 拖拽 --------------- */
+  /* --- 拖拽 --- */
   // 拖拽结束：纯本地重排，没有已持久化的 SortOrder 需要同步给后端
   const handleDragEnd = (event: DragEndEvent) => {
     ...
@@ -11239,7 +11864,7 @@ export default function ImagePicker({ images, onChange }: ImagePickerProps) {
   );
   const canAddMore = images.length < MAX_IMAGES;
 
-  /* --------------- 选择 --------------- */
+  /* --- 选择 --- */
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files || files.length === 0) return;
@@ -11267,7 +11892,7 @@ export default function ImagePicker({ images, onChange }: ImagePickerProps) {
 
     if (inputRef.current) inputRef.current.value = "";
   };
-  /* --------------- 删除 --------------- */
+  /* --- 删除 --- */
   // 纯本地数组操作，没有对应的后端记录，不发请求
   const handleDelete = (id: string) => {
     const target = images.find((img) => img.id === id);
@@ -11275,7 +11900,7 @@ export default function ImagePicker({ images, onChange }: ImagePickerProps) {
     onChange(images.filter((img) => img.id !== id));
   };
 
-  /* --------------- 拖拽 --------------- */
+  /* --- 拖拽 --- */
   // 拖拽结束：纯本地重排，没有已持久化的 SortOrder 需要同步给后端
   const handleDragEnd = (event: DragEndEvent) => {
     const { active, over } = event;
@@ -11364,7 +11989,7 @@ interface SortableImageItemProps {
   onDelete: () => void;
   isDeleting: boolean;
 }
-/* -------- 已上传图片：可拖拽排序的单个图片项 ------- */
+/* -- 已上传图片：可拖拽排序的单个图片项 - */
 function SortableImageItem() {
  ...
 }

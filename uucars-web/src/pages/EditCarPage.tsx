@@ -99,6 +99,7 @@ export default function EditCarPage() {
         onSubmit={handleSubmit}
         isSubmitting={updateMutation.isPending}
         submitLabel="Save Changes"
+        draftKey={`car-draft-${carId}`} // ✅ 新增：每辆车独立的 key
       />
     </div>
   );

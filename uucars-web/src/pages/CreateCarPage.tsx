@@ -67,6 +67,7 @@ export default function CreateCarPage() {
         onSubmit={handleSubmit}
         isSubmitting={isSubmitting}
         submitLabel="Create Draft"
+        draftKey="car-draft-new" // ✅ 新增
       />
     </div>
   );
