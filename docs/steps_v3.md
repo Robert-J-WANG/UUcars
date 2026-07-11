@@ -10562,7 +10562,7 @@ export default function CarForm({
     defaultValues,
   });
 
-  /* -------------- 保存草稿 -------------- */
+  /* -- 保存草稿 -- */
   // 内容变化时：2 秒 debounce 自动保存
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -10615,10 +10615,10 @@ export default function CarForm({
     defaultValues,
   });
 
-  /* -------------- 保存草稿 -------------- */
+  /* -- 保存草稿 -- */
   ...
 
-  /* ------------- 草稿数据回填 ------------- */
+  /* - 草稿数据回填 - */
   // 进入页面时：检查是否有未保存的草稿
   const draftRestoredRef = useRef(false);
 
@@ -11042,6 +11042,527 @@ git push origin --delete feature/v3-draft-autosave-errorboundary
 ✅ 本地验证通过
 
 ✅ dotnet build + npm run build 通过
+✅ Git commit + 合并回 develop 完成
+```
+
+
+
+## Step 66 · TanStack Query 进阶（乐观更新）
+
+### 这一步做什么
+
+打开车辆详情页，点击 "♡ Save Car" 按钮，会发生这样的事：
+
+```
+用户点击 → 按钮变成 "Saving..."（等待中）→ API 响应回来 → UI 更新
+```
+
+这个等待过程用户是能感知到的。对于收藏这种"轻操作"，等待感会让交互显得迟钝。
+
+现在看看 `CarDetailPage.tsx` 里当前的收藏 mutation：
+
+```tsx
+const favoriteMutation = useMutation({
+  mutationFn: () => favoritesApi.add(carId),
+  onSuccess: () => {
+    toast.success("Added to favorites!");
+    queryClient.invalidateQueries({ queryKey: ["favorites"] });
+  },
+  onError: (error) => toast.error(error.message),
+});
+```
+
+流程是：发起请求 → 等响应 → 成功了才更新 UI。
+
+**乐观更新（Optimistic Update）** 把这个流程反过来：先假设操作会成功，立即更新 UI，API 在后台执行，如果失败了再把 UI 回滚回去。
+
+TanStack Query 的 `useMutation` 提供了三个关键回调来实现乐观更新：
+
+```
+onMutate：在 API 请求发出之前触发
+  → 立即更新本地缓存（UI 立即响应）
+  → 保存当前状态的快照（失败时用来回滚）
+
+onError：API 请求失败时触发
+  → 用快照恢复之前的状态（回滚）
+
+onSettled：无论成功还是失败，最终都触发
+  → 调 invalidateQueries 从服务端重新拉取真实数据
+  → 确保本地缓存和服务端最终一致
+```
+
+为什么 `onSettled` 里用 `invalidateQueries` 而不是 `setQueryData`？
+
+```
+setQueryData：直接把指定数据写进缓存（不发请求）
+  适合：已经知道操作后的完整新数据（比如创建后服务端返回了新对象）
+
+invalidateQueries：把缓存标记为"过期"，触发重新请求
+  适合：不知道操作后服务端的完整状态（收藏操作服务端可能有额外逻辑）
+```
+
+乐观更新的场景里，`onMutate` 用 `setQueryData` 做即时 UI 响应， `onSettled` 用 `invalidateQueries` 做最终一致性保证，两者结合使用。
+
+
+
+### 1. 切出功能分支
+
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b feature/v3-optimistic-favorite
+git push -u origin feature/v3-optimistic-favorite
+```
+
+
+
+### 2. 当前的收藏数据结构
+
+`CarDetailPage.tsx` 里请求车辆详情的 query key 是：
+
+```tsx
+queryKey: ["car", carId]
+```
+
+`MyFavoritesPage.tsx` 里请求收藏列表的 query key 是：
+
+```tsx
+queryKey: ["favorites", { page, pageSize: PAGE_SIZE }]
+```
+
+**收藏操作影响两个缓存：**
+
+1. `["favorites", ...]`：收藏列表，收藏/取消收藏后列表内容变化
+2. `["car", carId]`：车辆详情，当前页面显示的数据
+
+但 `CarDetailPage.tsx`里，收藏这块只有一个 `favoriteMutation`，调用的是 `favoritesApi.add(carId)`，按钮状态只依赖 `favoriteMutation.isPending`——**没有任何地方在追踪"当前用户到底收藏没收藏这辆车"这件事**。这带来两个问题：
+
+1. **只能加，不能取消**——现在压根没有"已收藏"这个状态可以让按钮切换成"取消收藏"，收藏这个动作只支持一个方向
+2. **就算加了这个状态，刷新页面也会丢**——`CarDetail`/`Car` 类型里没有 `isFavorited` 这样的字段，`favoritesApi` 也没有一个"查单个"的接口，只有 `getMyFavorites` 这种分页列表
+
+两个问题的根子是同一个：**前端完全没有一个可信的地方，能告诉它"这个用户到底收藏没收藏这辆车"**。要做乐观更新，先得把这个信息来源补上，不然"乐观更新"这个动作连一个起点都没有。
+
+因此，我们要新增一个查询接口 `GET /favorites/{carId}`，跟现有的 `POST /favorites/{carId}`、`DELETE /favorites/{carId}` 是同一个资源路径，风格一致。这个接口只在 `FavoritesController`/`FavoriteService` 里加，不需要碰 `CarService`——车辆和收藏是两个独立的领域，让 `CarService` 知道收藏的存在会造成不必要的耦合。
+
+
+
+### 3. 后端新增查询收藏状态的接口
+
+修改`FavoriteService.cs`，新增一个方法
+
+```tsx
+// 判断用户是否收藏了某辆车
+public async Task<bool> IsFavoritedAsync(int userId, int carId, CancellationToken cancellationToken = default)
+{
+    var favorite = await _favoriteRepository.GetAsync(userId, carId, cancellationToken);
+    return favorite != null;
+}
+```
+
+修改`FavoritesController.cs`, 新增一个接口
+
+```tsx
+// GET /favorites/{carId}
+// 查询当前用户是否已收藏这辆车，用于详情页正确初始化收藏按钮的状态
+[HttpGet("{carId:int}")]
+public async Task<IActionResult> CheckFavorite(int carId, CancellationToken cancellationToken)
+{
+    var userId = _currentUserService.GetCurrentUserId();
+    if (userId == null)
+        return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+    var isFavorite = await _favoriteService.IsFavoritedAsync(userId.Value, carId, cancellationToken);
+
+    return Ok(ApiResponse<bool>.Ok(isFavorite, "Favorite status retrieved."));
+}
+```
+
+在 `AddFavorite` 和 `RemoveFavorite` 之后、`GetMyFavorites` 之前，加入。
+
+`GET /favorites/{carId}`（带 `:int` 约束）和现有的 `GET /favorites`（不带参数，查列表）路由不冲突，ASP.NET Core 能正确区分这两种不同形状的路由。
+
+
+
+### 4. 前端 `favoritesApi `新增 `check` 方法
+
+打开 `favoritesApi` 所在文件，在 `add`/`remove`/`getMyFavorites` 之后加入：
+
+```tsx
+// ✅ 新增：查询当前用户是否已收藏某辆车
+check: async (carId: number): Promise<boolean> => {
+  const response = await apiClient.get<ApiResponse<boolean>>(`/favorites/${carId}`);
+  return response.data.data!;
+},
+```
+
+
+
+### 5. 更新 CarDetailPage：实现乐观更新
+
+#### 5.1 新增 查询收藏状态 和 本地收藏状态
+
+要让按钮一开始就显示正确的收藏状态，需要先查一次服务器；要让点击按钮时能立刻响应（不等 API 返回），又需要一个能被立刻改写的本地状态。
+
+这是两件不同的事，分别用两个东西来管：
+
+本地收藏状态：
+
+```tsx
+// 本地收藏状态：控制按钮显示什么、点击时立即切换成什么
+const [isFavorited, setIsFavorited] = useState(false);
+```
+
+初始值先给 false，等上面这个查询有结果了，再用下面的 useEffect 同步成真实值.
+
+查询收藏状态:
+
+```tsx
+// 查询当前用户是否已收藏这辆车（未登录用户不需要查）
+const { data: fetchedIsFavorited, isLoading: isCheckingFavorite } = useQuery({
+  queryKey: ["favorite", carId],
+  queryFn: () => favoritesApi.check(carId),
+  enabled: !isNaN(carId) && isAuthenticated(),
+});
+
+```
+
+#### 5.2 把查询结果同步到本地状态
+
+`useState` 的初始值只在组件第一次渲染时生效，而查询是异步的——组件第一次渲染时，查询结果还没回来。要等结果到达之后，再手动同步：
+
+```tsx
+// 服务器的值到达之后，才知道真实的收藏状态，这时候才同步进本地 state
+useEffect(() => {
+  if (isFavoritedFromServer !== undefined) {
+    setIsFavorited(isFavoritedFromServer);
+  }
+}, [isFavoritedFromServer]);
+```
+
+同步完成之后，`isFavorited` 就是"界面当前显示什么"的唯一依据，不再跟随查询结果联动——之后的变化全部交给用户的点击操作驱动。
+
+#### 5.3 把 favoriteMutation 改为双向切换的乐观更新版本
+
+现在按钮需要支持"收藏"和"取消收藏"两个方向，`mutationFn` 需要知道"这次点击到底要切换成哪个状态"。
+
+因此，把添加收藏和取消收藏的``mutation`分开，这样能让每个 `mutationFn` 保持"一个函数只做一件事， 比如：
+
+```tsx
+  /* ── 添加收藏 mutation ── */
+  const addFavoriteMutation = useMutation({
+    mutationFn: () => favoritesApi.add(carId),
+    onSuccess: () => {
+      toast.success("Added to favorites!");
+      queryClient.invalidateQueries({ queryKey: ["favorites"] });
+    },
+    onError: (error) => toast.error(error.message),
+  });
+
+
+  /* ── 取消收藏 mutation ── */
+  const removeFavoriteMutation = useMutation({
+    mutationFn: () => favoritesApi.remove(carId),
+    onSuccess: () => {
+      toast.success("Removed from favorites.");
+      queryClient.invalidateQueries({ queryKey: ["favorites"] });
+    },
+    onError: (error) => toast.error(error.message),
+  });
+
+```
+
+加入乐观更新逻辑：
+
+```tsx
+  /* ── 添加收藏 mutation ── */
+  const addFavoriteMutation = useMutation({
+    mutationFn: () => favoritesApi.add(carId),
+      
+    // onMutate：请求发出之前立即执行
+    onMutate: async () => {
+      // 取消正在进行的 favorites 查询
+      // 原因：如果有正在飞行的 invalidateQuery 请求，
+      // 它的响应可能会覆盖我们即将做的乐观更新，造成状态混乱
+      await queryClient.cancelQueries({ queryKey: ["favorites"] });
+      // 保存操作之前的收藏列表的快照（第一页，万一 API 失败用来回滚）  
+      const FavoritesBeforeThisAction = queryClient.getQueryData([
+        "favorites",
+        { page: 1, pageSize: 10 },
+      ]);
+      // 记录操作之前的按钮状态，失败时回滚成这个，而不是简单地都回滚成 false
+      const isFavoritedBeforeThisAction = isFavorited;
+      // 立即切换到目标状态（不等 API 响应）
+      setIsFavorited(true);
+      return { FavoritesBeforeThisAction, isFavoritedBeforeThisAction };
+    },
+    onSuccess: () => toast.success("Added to favorites!"),
+    // onError：API 失败时，用快照把状态回滚
+    onError: (error, _vars, context) => {
+      toast.error(error.message);
+      if (context) setIsFavorited(context.isFavoritedBeforeThisAction);
+      if (context?.FavoritesBeforeThisAction) {
+        queryClient.setQueryData(
+          ["favorites", { page: 1, pageSize: 10 }],
+          context.FavoritesBeforeThisAction,
+        );
+      }
+    },
+    // onSettled：无论成功还是失败，最终触发
+    // 重新拉取服务端真实数据，确保最终一致性
+    // 两个缓存都要失效：列表页（favorites）和这个页面自己刚查过的单个状态（favorite）
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ["favorites"] });
+      queryClient.invalidateQueries({ queryKey: ["favorite", carId] });
+    },
+  });
+
+  /* ── 取消收藏 mutation ── */
+  const removeFavoriteMutation = useMutation({
+    mutationFn: () => favoritesApi.remove(carId),
+    onMutate: async () => {
+      await queryClient.cancelQueries({ queryKey: ["favorites"] });
+      const FavoritesBeforeThisAction = queryClient.getQueryData([
+        "favorites",
+        { page: 1, pageSize: 10 },
+      ]);
+      const isFavoritedBeforeThisAction = isFavorited;
+      setIsFavorited(false);
+      return { FavoritesBeforeThisAction, isFavoritedBeforeThisAction };
+    },
+    onSuccess: () => toast.success("Removed from favorites."),
+    onError: (error, _vars, context) => {
+      toast.error(error.message);
+      if (context) setIsFavorited(context.isFavoritedBeforeThisAction);
+      if (context?.FavoritesBeforeThisAction) {
+        queryClient.setQueryData(
+          ["favorites", { page: 1, pageSize: 10 }],
+          context.FavoritesBeforeThisAction,
+        );
+      }
+    },
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ["favorites"] });
+      queryClient.invalidateQueries({ queryKey: ["favorite", carId] });
+    },
+  });
+```
+
+#### 5.4 更新收藏按钮的 UI
+
+```tsx
+{canBuy && (
+  <div className="flex flex-col gap-6">
+    <Button
+      variant="outline"
+      className="w-full gap-2"
+      onClick={() =>
+      isFavorited
+        ? removeFavoriteMutation.mutate()
+        : addFavoriteMutation.mutate()
+    	}
+      disabled={
+      addFavoriteMutation.isPending ||
+      removeFavoriteMutation.isPending ||
+      isCheckingFavorite
+    	}
+    >
+      {isFavorited ? "♥ Saved" : "♡ Save Car"}
+    </Button>
+    <Button className="w-full" onClick={() => setDialogOpen(true)}>
+      Buy Now
+    </Button>
+  </div>
+)}
+```
+
+#### 5.5 优化mutation
+
+我们上面的两个mutation（addFavoriteMutation和removeFavoriteMutation）内部的乐观更新逻辑有大量相同的部分，因此我们可以抽取并封装成几个辅助方法，这样便于统一维护。
+
+```tsx
+// 收藏列表缓存的 query key，快照/回滚/失效三处都要用到，
+// 抽成一个常量，避免手写三遍容易打错、以后改动漏改
+const FAVORITES_LIST_KEY = ["favorites", { page: 1, pageSize: 10 }];
+
+// onMutate 的公共逻辑：接收"这次要切换成什么状态"，返回一个可以直接赋给 onMutate 的函数
+const handleOnMutate = (targetState: boolean) => async () => {
+await queryClient.cancelQueries({ queryKey: ["favorites"] });
+
+const FavoritesBeforeThisAction =
+  queryClient.getQueryData(FAVORITES_LIST_KEY);
+const isFavoritedBeforeThisAction = isFavorited;
+
+setIsFavorited(targetState);
+
+return { FavoritesBeforeThisAction, isFavoritedBeforeThisAction };
+};
+
+// onError 的公共逻辑：两个方向完全一样，直接复用
+const handleFavoriteError = (
+error: Error,
+context:
+  | {
+      FavoritesBeforeThisAction: unknown;
+      isFavoritedBeforeThisAction: boolean;
+    }
+  | undefined,
+) => {
+toast.error(error.message);
+if (context) setIsFavorited(context.isFavoritedBeforeThisAction);
+if (context?.FavoritesBeforeThisAction) {
+  queryClient.setQueryData(
+    FAVORITES_LIST_KEY,
+    context.FavoritesBeforeThisAction,
+  );
+}
+};
+
+// onSettled 的公共逻辑：两个方向完全一样
+const invalidateFavoriteQueries = () => {
+queryClient.invalidateQueries({ queryKey: ["favorites"] });
+queryClient.invalidateQueries({ queryKey: ["favorite", carId] });
+};
+
+```
+
+这样添加收藏和取消收藏的mutation可以简化为：
+
+```tsx
+/* ── 添加收藏 mutation ── */
+const addFavoriteMutation = useMutation({
+    mutationFn: () => favoritesApi.add(carId),
+    onMutate: handleOnMutate(true),
+    onSuccess: () => toast.success("Added to favorites!"),
+    onError: (error, _vars, context) => handleFavoriteError(error, context),
+    onSettled: () => invalidateFavoriteQueries,
+});
+
+/* ── 取消收藏 mutation ── */
+const removeFavoriteMutation = useMutation({
+    mutationFn: () => favoritesApi.remove(carId),
+    onMutate: handleOnMutate(false),
+    onSuccess: () => toast.success("Removed from favorites."),
+    onError: (error, _vars, context) => handleFavoriteError(error, context),
+    onSettled: () => invalidateFavoriteQueries,
+});
+```
+
+
+
+### 6. 本地验证
+
+#### 6.1 验证收藏状态正确初始化
+
+1. 用非车主账号登录，进入一辆之前已经收藏过的车辆详情页
+2. 按钮应该直接显示 "♥ Saved"（不是从 "♡ Save Car" 开始）
+3. 进入一辆没收藏过的车辆详情页，按钮显示 "♡ Save Car"
+
+#### 6.2 验证乐观更新的即时响应
+
+1. 进入一辆没收藏过的车辆详情页
+2. 点击 "♡ Save Car"
+3. 按钮**立即**变成 "♥ Saved"，不需要等待 API 响应
+4. API 成功后弹出 "Added to favorites!" 的 Toast
+5. 进入 My Favorites 页，确认收藏已保存
+
+#### 6.3 验证双向切换
+
+1. 在同一个详情页，再点一次 "♥ Saved"
+2. 按钮**立即**变回 "♡ Save Car"
+3. API 成功后弹出 "Removed from favorites." 的 Toast
+4. 进入 My Favorites 页，确认这辆车已经不在列表里
+
+#### 6.4 验证失败回滚
+
+模拟 API 失败（临时在 `favoritesApi.add`/`favoritesApi.remove` 里 throw 一个错误，或者断网）：
+
+1. 点击按钮
+2. 按钮**立即**切换到目标状态（乐观更新）
+3. API 失败，按钮**自动回滚**回操作之前的状态
+4. 弹出错误 Toast
+
+验证完成后还原临时加的 throw。
+
+
+
+### 7. 理解 useInfiniteQuery（知识点说明）
+
+可以用 `useInfiniteQuery` 实现无限滚动，但在 UUcars 里不适合实现：
+
+这里作为知识点简要说明：
+
+```
+分页（Pagination）vs 无限滚动（Infinite Scroll）的选择：
+
+分页适合：
+  - 用户需要知道自己在第几页（"第3页 / 共10页"）
+  - 用户需要跳到特定页
+  - 内容是结构化的"商品/车辆/搜索结果"
+  - 用户会分享或回退到特定页
+  → UUcars 车辆列表 ✅
+
+无限滚动适合：
+  - 内容是连续消费的 Feed 流
+  - 用户不关心"在第几条"
+  - 社交媒体、新闻流、图片瀑布流
+  → 不适合 UUcars
+
+useInfiniteQuery 的核心概念（了解即可）：
+  - getNextPageParam：从上一页的响应里提取下一页的参数
+  - fetchNextPage：手动触发加载下一页
+  - hasNextPage：是否还有更多数据
+  - data.pages：所有已加载页的数组（每次加载都追加，不替换）
+```
+
+
+
+### 8. Git 提交
+
+```bash
+git add .
+git commit -m "feat: optimistic bidirectional favorite toggle with correct initial state"
+git push origin feature/v3-optimistic-favorite
+
+# 合并回 develop
+git checkout develop
+git merge --no-ff feature/v3-optimistic-favorite \
+  -m "merge: feature/v3-optimistic-favorite into develop"
+git push origin develop
+
+# 删除功能分支
+git branch -d feature/v3-optimistic-favorite
+git push origin --delete feature/v3-optimistic-favorite
+```
+
+
+
+### Step 66 完成状态
+
+```
+知识点：
+✅ 理解乐观更新的三个回调（onMutate / onError / onSettled）及其执行时机
+✅ 理解 onMutate 里 cancelQueries 的必要性（防止飞行中的请求覆盖乐观状态）
+✅ 理解 setQueryData vs invalidateQueries 的选择依据
+✅ 理解为什么"目标状态"要作为参数传入 mutate，而不是在回调里现读组件 state（避免读到过时值）
+✅ 理解为什么需要"服务器状态"和"本地显示状态"两个变量，用 useEffect 把前者同步给后者
+✅ 理解无限滚动 vs 分页的适用场景，以及为什么 UUcars 保持分页
+
+后端：
+✅ FavoriteService 新增 GetFavoriteAsync（透传 GetAsync，不额外包一层转换）
+✅ FavoritesController 新增 GET /favorites/{carId}
+
+前端：
+✅ favoritesApi 新增 check 方法
+✅ CarDetailPage 新增查询：useQuery(["favorite", carId]) 获取真实收藏状态
+✅ CarDetailPage 新增 isFavorited 本地状态，通过 useEffect 与查询结果同步
+✅ favoriteMutation 改为双向切换（分割成2个独立的mutation）：
+   - mutationFn 根据传入的目标状态决定调用 add 还是 remove
+   - onMutate：cancelQueries + 保存快照（含操作前的按钮状态）+ 立即切换状态
+   - onError：回滚到操作前的状态 + 回滚缓存快照
+   - onSettled：同时让 favorites 列表和 favorite 单个状态缓存失效
+✅ 收藏按钮 UI：♡ Save Car ⇄ ♥ Saved，可来回切换，不再永久禁用
+
+✅ 本地验证：正确初始化 + 即时响应 + 双向切换 + 失败回滚
 ✅ Git commit + 合并回 develop 完成
 ```
 

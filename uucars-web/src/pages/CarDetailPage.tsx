@@ -5,7 +5,7 @@ import { carsApi, favoritesApi, ordersApi } from "@/api";
 import { useAuthStore } from "@/stores/authStore";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Dialog,
   DialogContent,
@@ -25,6 +25,9 @@ export default function CarDetailPage() {
   const navigate = useNavigate();
   const location = useLocation();
 
+  // 本地收藏状态：控制按钮显示什么、点击时立即切换成什么
+  const [isFavorited, setIsFavorited] = useState(false);
+
   /* ── 请求车辆详情 ── */
   const {
     data: car,
@@ -36,14 +39,81 @@ export default function CarDetailPage() {
     enabled: !isNaN(carId),
   });
 
-  /* ── 收藏 mutation ── */
-  const favoriteMutation = useMutation({
+  // 查询当前用户是否已收藏这辆车（未登录用户不需要查）
+  const { data: fetchedIsFavorited, isLoading: isCheckingFavorite } = useQuery({
+    queryKey: ["favorite", carId],
+    queryFn: () => favoritesApi.check(carId),
+    enabled: !isNaN(carId) && isAuthenticated(),
+  });
+
+  // 服务器的值到达之后，才知道真实的收藏状态，这时候才同步进本地 state
+  useEffect(() => {
+    if (fetchedIsFavorited !== undefined) {
+      setIsFavorited(fetchedIsFavorited);
+    }
+  }, [fetchedIsFavorited]);
+
+  /* ------------- 乐观更新部分 ------------- */
+
+  // 收藏列表缓存的 query key，快照/回滚/失效三处都要用到，
+  // 抽成一个常量，避免手写三遍容易打错、以后改动漏改
+  const FAVORITES_LIST_KEY = ["favorites", { page: 1, pageSize: 10 }];
+
+  // onMutate 的公共逻辑：接收"这次要切换成什么状态"，返回一个可以直接赋给 onMutate 的函数
+  const handleOnMutate = (targetState: boolean) => async () => {
+    await queryClient.cancelQueries({ queryKey: ["favorites"] });
+
+    const FavoritesBeforeThisAction =
+      queryClient.getQueryData(FAVORITES_LIST_KEY);
+    const isFavoritedBeforeThisAction = isFavorited;
+
+    setIsFavorited(targetState);
+
+    return { FavoritesBeforeThisAction, isFavoritedBeforeThisAction };
+  };
+
+  // onError 的公共逻辑：两个方向完全一样，直接复用
+  const handleFavoriteError = (
+    error: Error,
+    context:
+      | {
+          FavoritesBeforeThisAction: unknown;
+          isFavoritedBeforeThisAction: boolean;
+        }
+      | undefined,
+  ) => {
+    toast.error(error.message);
+    if (context) setIsFavorited(context.isFavoritedBeforeThisAction);
+    if (context?.FavoritesBeforeThisAction) {
+      queryClient.setQueryData(
+        FAVORITES_LIST_KEY,
+        context.FavoritesBeforeThisAction,
+      );
+    }
+  };
+
+  // onSettled 的公共逻辑：两个方向完全一样
+  const invalidateFavoriteQueries = () => {
+    queryClient.invalidateQueries({ queryKey: ["favorites"] });
+    queryClient.invalidateQueries({ queryKey: ["favorite", carId] });
+  };
+
+  /* ── 添加收藏 mutation ── */
+  const addFavoriteMutation = useMutation({
     mutationFn: () => favoritesApi.add(carId),
-    onSuccess: () => {
-      toast.success("Added to favorites!");
-      queryClient.invalidateQueries({ queryKey: ["favorites"] });
-    },
-    onError: (error) => toast.error(error.message),
+    onMutate: handleOnMutate(true),
+    onSuccess: () => toast.success("Added to favorites!"),
+    onError: (error, _vars, context) => handleFavoriteError(error, context),
+    onSettled: () => invalidateFavoriteQueries,
+  });
+
+  /* ── 取消收藏 mutation ── */
+  const removeFavoriteMutation = useMutation({
+    mutationFn: () => favoritesApi.remove(carId),
+    onMutate: handleOnMutate(false),
+    onSuccess: () => toast.success("Removed from favorites."),
+    onError: (error, _vars, context) => handleFavoriteError(error, context),
+    onSettled: () => invalidateFavoriteQueries,
   });
 
   /* ── 下单 mutation ── */
@@ -252,10 +322,18 @@ export default function CarDetailPage() {
                   <Button
                     variant="outline"
                     className="w-full gap-2"
-                    onClick={() => favoriteMutation.mutate()}
-                    disabled={favoriteMutation.isPending}
+                    onClick={() =>
+                      isFavorited
+                        ? removeFavoriteMutation.mutate()
+                        : addFavoriteMutation.mutate()
+                    }
+                    disabled={
+                      addFavoriteMutation.isPending ||
+                      removeFavoriteMutation.isPending ||
+                      isCheckingFavorite
+                    }
                   >
-                    {favoriteMutation.isPending ? "♡ Saving..." : "♡ Save Car"}
+                    {isFavorited ? "♥ Saved" : "♡ Save Car"}
                   </Button>
                   <Button
                     className="w-full"
