@@ -70,7 +70,7 @@ export default function EditCarPage() {
   }
 
   return (
-    <div className="mx-auto max-w-2xl space-y-8">
+    <div className="mx-auto max-w-3xl space-y-8">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold">Edit Car</h1>
         {/* 提交审核按钮 */}

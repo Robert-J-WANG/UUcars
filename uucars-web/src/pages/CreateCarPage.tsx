@@ -58,7 +58,7 @@ export default function CreateCarPage() {
   };
 
   return (
-    <div className="mx-auto max-w-2xl space-y-6">
+    <div className="mx-auto max-w-3xl space-y-6">
       <h1 className="text-2xl font-bold">List Your Car</h1>
 
       <ImagePicker images={localImages} onChange={setLocalImages} />

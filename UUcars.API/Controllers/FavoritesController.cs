@@ -25,6 +25,20 @@ public class FavoritesController : ControllerBase
         _currentUserService = currentUserService;
     }
 
+    // GET /favorites/{carId}
+    // 查询当前用户是否已收藏这辆车，用于详情页正确初始化收藏按钮的状态
+    [HttpGet("{carId:int}")]
+    public async Task<IActionResult> CheckFavorite(int carId, CancellationToken cancellationToken)
+    {
+        var userId = _currentUserService.GetCurrentUserId();
+        if (userId == null)
+            return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+        var isFavorite = await _favoriteService.IsFavoritedAsync(userId.Value, carId, cancellationToken);
+
+        return Ok(ApiResponse<bool>.Ok(isFavorite, "Favorite status retrieved."));
+    }
+
     // POST /favorites/{carId}
     [HttpPost("{carId:int}")]
     // 限流
