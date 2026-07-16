@@ -3,7 +3,6 @@ import { useQuery } from "@tanstack/react-query";
 import { carsApi } from "@/api";
 import CarCard from "@/components/CarCard";
 import CarCardSkeleton from "@/components/CarCardSkeleton";
-import { Button } from "@/components/ui/button";
 import { useSearchParams } from "react-router-dom";
 import CarFilters from "@/components/CarFilters";
 import useDebounce from "@/hooks/useDebounce";
@@ -12,6 +11,7 @@ import EmptyState from "@/components/EmptyState";
 import HeroBanner from "@/components/HeroBanner";
 import LatestCarousel from "@/components/LatestCarousel";
 import SellerBanner from "@/components/SellerBanner";
+import Pagination from "@/components/Pagination";
 
 const PAGE_SIZE = 6;
 
@@ -21,11 +21,17 @@ export default function HomePage() {
   const brand = searchParams.get("brand") ?? "";
   const minPrice = searchParams.get("minPrice") ?? "";
   const maxPrice = searchParams.get("maxPrice") ?? "";
+  //读取 年份URL 参数
+  const minYear = searchParams.get("minYear") ?? "";
+  const maxYear = searchParams.get("maxYear") ?? "";
   const page = Number(searchParams.get("page") ?? "1");
 
-  const debouncedBrand = useDebounce(brand, 500);
+  const debouncedBrand = useDebounce(brand, 800);
   const debouncedMinPrice = useDebounce(minPrice, 800);
   const debouncedMaxPrice = useDebounce(maxPrice, 800);
+  // 年份防抖
+  const debouncedMinYear = useDebounce(minYear, 800);
+  const debouncedMaxYear = useDebounce(maxYear, 800);
 
   const { data, isLoading, error } = useQuery({
     queryKey: [
@@ -36,6 +42,8 @@ export default function HomePage() {
         brand: debouncedBrand,
         minPrice: debouncedMinPrice,
         maxPrice: debouncedMaxPrice,
+        minYear: debouncedMinYear, // ✅ 新增
+        maxYear: debouncedMaxYear, // ✅ 新增
       },
     ],
     queryFn: () =>
@@ -45,15 +53,13 @@ export default function HomePage() {
         brand: debouncedBrand || undefined,
         minPrice: debouncedMinPrice ? Number(debouncedMinPrice) : undefined,
         maxPrice: debouncedMaxPrice ? Number(debouncedMaxPrice) : undefined,
+        minYear: debouncedMinYear ? Number(debouncedMinYear) : undefined, // ✅ 新增
+        maxYear: debouncedMaxYear ? Number(debouncedMaxYear) : undefined, // ✅ 新增
       }),
   });
 
-  const handlePageChange = (newPage: number) => {
-    const current = Object.fromEntries(searchParams.entries());
-    setSearchParams({ ...current, page: String(newPage) });
-  };
-
-  const isHomepage = !brand && !minPrice && !maxPrice && page === 1;
+  const isHomepage =
+    !brand && !minPrice && !maxPrice && !minYear && !maxYear && page === 1;
 
   if (error) {
     return (
@@ -103,7 +109,14 @@ export default function HomePage() {
             ? Array.from({ length: PAGE_SIZE }).map((_, i) => (
                 <CarCardSkeleton key={i} />
               ))
-            : data?.items.map((car) => <CarCard key={car.id} car={car} />)}
+            : // 改之后
+              data?.items.map((car) => (
+                <CarCard
+                  key={car.id}
+                  car={car}
+                  highlightKeyword={debouncedBrand || undefined}
+                />
+              ))}
         </div>
 
         {/* 空状态 */}
@@ -118,32 +131,7 @@ export default function HomePage() {
         )}
 
         {/* 分页 */}
-        {data && data.totalPages > 1 && (
-          <div className="flex items-center justify-center gap-3">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => handlePageChange(page - 1)}
-              disabled={page === 1}
-            >
-              ← Previous
-            </Button>
-            <span
-              className="text-sm"
-              style={{ color: "var(--color-text-secondary)" }}
-            >
-              {page} / {data.totalPages}
-            </span>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => handlePageChange(page + 1)}
-              disabled={page === data.totalPages}
-            >
-              Next →
-            </Button>
-          </div>
-        )}
+        <Pagination totalPages={data?.totalPages ?? 0} />
       </div>
     </div>
   );

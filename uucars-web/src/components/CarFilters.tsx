@@ -12,6 +12,10 @@ function CarFilters() {
   const minPrice = searchParams.get("minPrice") ?? "";
   const maxPrice = searchParams.get("maxPrice") ?? "";
 
+  // 新增年份
+  const minYear = searchParams.get("minYear") ?? "";
+  const maxYear = searchParams.get("maxYear") ?? "";
+
   const updateFilter = (key: string, value: string) => {
     const current = Object.fromEntries(searchParams.entries());
     if (value) {
@@ -25,7 +29,8 @@ function CarFilters() {
 
   const clearFilters = () => setSearchParams({});
 
-  const hasFilters = brand || minPrice || maxPrice;
+  // 加入 year
+  const hasFilters = brand || minPrice || maxPrice || minYear || maxYear;
 
   return (
     // 横向布局：所有过滤项一行排列，小屏时自动换行
@@ -86,6 +91,43 @@ function CarFilters() {
           type="number"
           value={maxPrice}
           onChange={(e) => updateFilter("maxPrice", e.target.value)}
+        />
+      </div>
+
+      {/* 新增年份过滤 */}
+      {/* 最小年份 */}
+      <div className="flex flex-col gap-1 min-w-[100px] flex-1">
+        <Label
+          htmlFor="minYear"
+          className="text-xs"
+          style={{ color: "var(--color-text-secondary)" }}
+        >
+          Min Year
+        </Label>
+        <Input
+          id="minYear"
+          placeholder="e.g. 2015"
+          type="number"
+          value={minYear}
+          onChange={(e) => updateFilter("minYear", e.target.value)}
+        />
+      </div>
+
+      {/* 最大年份 */}
+      <div className="flex flex-col gap-1 min-w-[100px] flex-1">
+        <Label
+          htmlFor="maxYear"
+          className="text-xs"
+          style={{ color: "var(--color-text-secondary)" }}
+        >
+          Max Year
+        </Label>
+        <Input
+          id="maxYear"
+          placeholder="e.g. 2023"
+          type="number"
+          value={maxYear}
+          onChange={(e) => updateFilter("maxYear", e.target.value)}
         />
       </div>
 

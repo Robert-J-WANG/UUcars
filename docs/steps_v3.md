@@ -11568,6 +11568,439 @@ git push origin --delete feature/v3-optimistic-favorite
 
 
 
+## Step 67 · 搜索体验优化
+
+### 这一步做什么
+
+V2 的搜索过滤有两个遗留问题：
+
+**Year（年份）筛选 UI 缺失**：
+
+后端 `CarQueryRequest` 已经有 `MinYear`/`MaxYear` 参数，但前端 `CarFilters` 组件里没有对应的输入框，这个能力完全没有暴露给用户。
+
+当前的`CarFilters.tsx`只有有三个过滤器：Brand、Min Price、Max Price。它们都通过 `updateFilter` 函数同步到 URL 参数：
+
+```tsx
+const updateFilter = (key: string, value: string) => {
+  const current = Object.fromEntries(searchParams.entries());
+  if (value) {
+    current[key] = value;
+  } else {
+    delete current[key]; // 空字符串不写入 URL
+  }
+  delete current["page"]; // 过滤条件变化时重置页码到第1页
+  setSearchParams(current);
+};
+```
+
+这个函数的设计是通用的——任何字符串 key/value 都能处理。Year 筛选完全可以复用这个模式，只需要加两个输入框。
+
+`HomePage.tsx` 目前读取 URL 参数并传给 `carsApi.getPaged`：
+
+```tsx
+const brand = searchParams.get("brand") ?? "";
+const minPrice = searchParams.get("minPrice") ?? "";
+const maxPrice = searchParams.get("maxPrice") ?? "";
+```
+
+这样只需要补上 `minYear`/`maxYear` 的读取和传参。
+
+**搜索词没有高亮**
+
+用户在 Brand 输入框里搜"BMW"，过滤后列表里每辆车都和"BMW"相关， 但用户看着 `CarCard` 上的标题和品牌，无法直观感知"这里匹配了"。
+
+搜索词高亮的实现思路：
+
+```
+原始字符串："2020 BMW 3 Series"
+搜索词："BMW"
+
+按搜索词分割：["2020 ", "BMW", " 3 Series"]
+把匹配部分用 <mark> 包裹：
+  → "2020 " + <mark>BMW</mark> + " 3 Series"
+```
+
+用 JavaScript 的 `RegExp` + `String.split` 实现，不需要引入任何额外的库。
+
+这两个问题都在 `CarFilters.tsx` 和 `CarCard.tsx` 这两个文件里解决，改动集中、范围清晰。
+
+
+
+### 1. 切出功能分支
+
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b feature/v3-search-ux
+git push -u origin feature/v3-search-ux
+```
+
+
+
+### 2. 更新 CarFilters：加入 Year 筛选输入框
+
+打开 `src/components/CarFilters.tsx`。
+
+**从 URL 参数里读取 minYear/maxYear**
+
+```tsx
+// 在现有的三个变量之后加入
+const minYear = searchParams.get("minYear") ?? "";
+const maxYear = searchParams.get("maxYear") ?? "";
+```
+
+**更新 hasFilters 判断**
+
+```tsx
+// 改之前
+const hasFilters = brand || minPrice || maxPrice;
+
+// 改之后
+const hasFilters = brand || minPrice || maxPrice || minYear || maxYear;
+```
+
+**在 Max Price 输入框之后、Clear 按钮之前，加入两个 Year 输入框**
+
+```tsx
+{/* 最小年份 */}
+<div className="flex flex-col gap-1 min-w-[100px] flex-1">
+  <Label
+    htmlFor="minYear"
+    className="text-xs"
+    style={{ color: "var(--color-text-secondary)" }}
+  >
+    Min Year
+  </Label>
+  <Input
+    id="minYear"
+    placeholder="e.g. 2015"
+    type="number"
+    value={minYear}
+    onChange={(e) => updateFilter("minYear", e.target.value)}
+  />
+</div>
+
+{/* 最大年份 */}
+<div className="flex flex-col gap-1 min-w-[100px] flex-1">
+  <Label
+    htmlFor="maxYear"
+    className="text-xs"
+    style={{ color: "var(--color-text-secondary)" }}
+  >
+    Max Year
+  </Label>
+  <Input
+    id="maxYear"
+    placeholder="e.g. 2023"
+    type="number"
+    value={maxYear}
+    onChange={(e) => updateFilter("maxYear", e.target.value)}
+  />
+</div>
+```
+
+
+
+### 3. 更新 HomePage：读取 Year 参数并传给 API
+
+打开 `src/pages/HomePage.tsx`。
+
+**读取 URL 参数**
+
+```tsx
+// 在现有的 brand/minPrice/maxPrice 之后加入
+const minYear = searchParams.get("minYear") ?? "";
+const maxYear = searchParams.get("maxYear") ?? "";
+```
+
+**加入 debounce**
+
+```tsx
+// 在现有的 debouncedMinPrice/debouncedMaxPrice 之后加入
+const debouncedMinYear = useDebounce(minYear, 800);
+const debouncedMaxYear = useDebounce(maxYear, 800);
+```
+
+**加入 queryKey**
+
+```tsx
+queryKey: [
+  "cars",
+  {
+    page,
+    pageSize: PAGE_SIZE,
+    brand: debouncedBrand,
+    minPrice: debouncedMinPrice,
+    maxPrice: debouncedMaxPrice,
+    minYear: debouncedMinYear,   // ✅ 新增
+    maxYear: debouncedMaxYear,   // ✅ 新增
+  },
+],
+```
+
+**加入 queryFn 的传参**
+
+```tsx
+queryFn: () =>
+  carsApi.getPaged({
+    page,
+    pageSize: PAGE_SIZE,
+    brand: debouncedBrand || undefined,
+    minPrice: debouncedMinPrice ? Number(debouncedMinPrice) : undefined,
+    maxPrice: debouncedMaxPrice ? Number(debouncedMaxPrice) : undefined,
+    minYear: debouncedMinYear ? Number(debouncedMinYear) : undefined,   // ✅ 新增
+    maxYear: debouncedMaxYear ? Number(debouncedMaxYear) : undefined,   // ✅ 新增
+  }),
+```
+
+更新 isHomepage 判断**
+
+```tsx
+// 改之前
+const isHomepage = !brand && !minPrice && !maxPrice && page === 1;
+
+// 改之后
+const isHomepage = !brand && !minPrice && !maxPrice && !minYear && !maxYear && page === 1;
+```
+
+
+
+### 4. 验证 Year 筛选
+
+```bash
+npm run dev
+```
+
+1. 首页过滤区域出现 Min Year 和 Max Year 两个输入框
+2. 输入 `2018` 和 `2022`，URL 变成 `?minYear=2018&maxYear=2022`
+3. 车辆列表只显示 2018-2022 年之间的车辆
+4. 点击 Clear 按钮，Year 参数从 URL 里消失，列表恢复全部
+5. 刷新页面，Year 过滤条件从 URL 恢复，列表仍然正确过滤
+
+
+
+### 5. 新建 highlight 工具函数
+
+现在完善了搜索选项，但是搜索词没有高亮。 高亮逻辑会在多个地方用到，抽成独立的工具函数。
+
+新建 `src/lib/highlight.tsx`：
+
+```tsx
+// 把字符串里匹配 keyword 的部分用 <mark> 包裹
+// 返回 React 节点数组（因为包含了 JSX 元素）
+export function highlight(
+  text: string,
+  keyword: string
+): React.ReactNode {
+  if (!keyword.trim()) return text;
+
+  // 'gi' 标志：g = 全局匹配（不只匹配第一个），i = 不区分大小写
+  const regex = new RegExp(`(${escapeRegex(keyword)})`, "gi");
+  const parts = text.split(regex);
+
+  return parts.map((part, i) =>
+    // test 返回 true 说明这个 part 是匹配到的词
+    regex.test(part) ? (
+      <mark
+        key={i}
+        style={{
+          backgroundColor: "var(--color-warning-light)",
+          color: "var(--color-text-primary)",
+        }}
+      >
+        {part}
+      </mark>
+    ) : (
+      part
+    )
+  );
+}
+
+// 对用户输入做转义，避免正则特殊字符（. * + ? 等）引发意外匹配
+// 例如用户搜 "3.5"，不转义的话 "." 会匹配任意字符
+function escapeRegex(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+```
+
+> **为什么文件扩展名是 `.tsx` 而不是 `.ts`？**
+>
+> `highlight` 函数返回值里包含 JSX（`<mark>` 元素）， TypeScript 文件（`.ts`）不支持 JSX 语法，必须用 `.tsx`。
+
+
+
+### 6. 更新 CarCard：接收并应用搜索词高亮
+
+`CarCard` 目前只接收 `car` 这一个 prop。要实现高亮，需要让它知道当前的搜索词。
+
+打开 `src/components/CarCard.tsx`。
+
+**更新 props 接口，加入可选的 `highlightKeyword`**
+
+```tsx
+// 改之前
+interface CarCardProps {
+  car: Car;
+}
+
+// 改之后
+interface CarCardProps {
+  car: Car;
+  highlightKeyword?: string; // 可选：当前搜索词，有值时高亮匹配部分
+}
+```
+
+**函数签名解构新增 prop**
+
+```tsx
+// 改之前
+export default function CarCard({ car }: CarCardProps) {
+
+// 改之后
+export default function CarCard({ car, highlightKeyword }: CarCardProps) {
+```
+
+**Brand 和 Title 应用高亮**
+
+找到 Brand 标签的地方：
+
+```tsx
+import { highlight } from "@/lib/highlight";
+
+// 改之前
+<Badge variant="accent" className="text-xs">
+  {car.brand}
+</Badge>
+
+// 改之后
+<Badge variant="accent" className="text-xs">
+  {highlightKeyword ? highlight(car.brand, highlightKeyword) : car.brand}
+</Badge>
+```
+
+找到 Title 的地方：
+
+```tsx
+// 改之前
+<h3 ...>
+  {car.title}
+</h3>
+
+// 改之后
+<h3 ...>
+  {highlightKeyword ? highlight(car.title, highlightKeyword) : car.title}
+</h3>
+```
+
+
+
+### 7. 更新 HomePage：把搜索词传给 CarCard
+
+打开 `src/pages/HomePage.tsx`，找到渲染 `CarCard` 的地方：
+
+```tsx
+// 改之前
+data?.items.map((car) => <CarCard key={car.id} car={car} />)
+
+// 改之后
+data?.items.map((car) => (
+  <CarCard
+    key={car.id}
+    car={car}
+    highlightKeyword={debouncedBrand || undefined}
+    // 使用 debouncedBrand 而不是 brand 的原因：
+    // brand 是用户正在输入的实时值，可能是未完成的半截词（比如"BM"）
+    // debouncedBrand 是防抖后的稳定值，和实际发出的 API 请求保持一致
+    // 高亮应该和查询结果对应，用 debouncedBrand 更准确
+  />
+))
+```
+
+
+
+### 8. 验证高亮效果
+
+1. 在首页 Brand 输入框输入"Toyota"
+2. 等待防抖触发（500ms），列表刷新
+3. 每张卡片的 Brand 标签和 Title 里，"Toyota"应该被黄色背景高亮显示
+4. 大小写不敏感：输入"toyota"，"Toyota"也被高亮 ✅
+5. 清除搜索词，高亮消失，恢复正常显示 ✅
+
+
+
+### 本地验证清单
+
+### Year 筛选
+
+- [ ] Min Year / Max Year 输入框正常显示
+- [ ] 输入年份后列表正确过滤
+- [ ] 过滤参数同步到 URL
+- [ ] 刷新页面后参数从 URL 恢复，过滤条件生效
+- [ ] Clear 按钮清除 Year 参数
+- [ ] 分享 URL 给他人打开，过滤条件正确还原
+
+### 搜索词高亮
+
+- [ ] 搜索 Brand 后，CarCard 里匹配的文字被高亮
+- [ ] 大小写不敏感
+- [ ] 清除搜索词后高亮消失
+- [ ] 没有搜索词时 CarCard 显示正常，无异常
+
+
+
+### 9. 编译
+
+```bash
+npm run build
+```
+
+
+
+### 10. Git 提交
+
+```bash
+git add .
+git commit -m "feat: year filter UI, search keyword highlight, and URL sync"
+git push origin feature/v3-search-ux
+
+# 合并回 develop
+git checkout develop
+git merge --no-ff feature/v3-search-ux \
+  -m "merge: feature/v3-search-ux into develop"
+git push origin develop
+
+# 删除功能分支
+git branch -d feature/v3-search-ux
+git push origin --delete feature/v3-search-ux
+```
+
+
+
+### Step 67 完成状态
+
+```
+问题一：Year 筛选 UI 缺失
+✅ CarFilters 新增 Min Year / Max Year 输入框（复用现有 updateFilter 模式）
+✅ HomePage 读取 minYear/maxYear URL 参数，加入 debounce
+✅ queryKey 和 queryFn 传参同步更新
+✅ isHomepage 判断补全 minYear/maxYear 条件
+✅ 过滤条件和 URL 双向同步（修改→URL，刷新→从 URL 恢复）
+
+问题二：搜索词没有高亮
+✅ 理解：RegExp + String.split 分割 + map 渲染 <mark> 的高亮原理
+✅ 理解：为什么需要 escapeRegex（防止用户输入的特殊字符破坏正则）
+✅ 理解：为什么用 debouncedBrand 而不是 brand 做高亮（和查询结果保持一致）
+✅ highlight 工具函数（src/lib/highlight.tsx）
+✅ CarCard 新增可选 highlightKeyword prop，Brand 和 Title 应用高亮
+✅ HomePage 把 debouncedBrand 传给 CarCard
+
+✅ 本地验证通过
+✅ npm run build 通过
+✅ Git commit + 合并回 develop 完成
+```
+
+
+
 ## fixed Issues 
 
 ### Fix 1. 并发 Refresh Token 请求竞态条件（Refresh Token Rotation Race Condition）
