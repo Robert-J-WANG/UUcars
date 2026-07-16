@@ -12001,6 +12001,740 @@ git push origin --delete feature/v3-search-ux
 
 
 
+## Step 68 · React Testing Library 前端单元测试
+
+### 这一步做什么
+
+V1/V2 只有后端测试（xUnit + Testcontainers）。前端完全没有测试覆盖， 意味着任何一次组件改动、依赖升级、重构，都无法自动验证有没有破坏。现有功能，只能靠手动点一遍界面。
+
+这一步要解决的问题：给前端建立一套自动化验证机制。
+
+主要内容都围绕如下几点开展：
+
+- **用什么工具跑测试**（Vitest）
+- **用什么工具操作组件**（RTL）
+- **遇到不该真实执行的代码怎么办**（Mock）
+
+
+
+### 1. 切出功能分支
+
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b feature/v3-frontend-tests
+git push -u origin feature/v3-frontend-tests
+```
+
+
+
+### 2. 测试运行器 - Vitest
+
+写好的测试代码，谁来执行？谁来判断通过还是失败？谁来汇总"3 个通过， 1 个失败"这种报告？
+
+这就是**测试运行器（test runner）**要做的事：发现测试文件、执行里面 的代码、收集断言结果、输出报告。前端项目里常见的测试运行器有 Jest、 Vitest。项目用 Vite 构建，Vitest 是 Vite 官方生态的测试运行器， 配置方式跟 Vite 本身共享一套配置文件，兼容性最好，所以选它。
+
+#### 2.1 安装需要的库
+
+```bash
+npm install -D vitest jsdom
+```
+
+- `vitest`：测试运行器本身，提供 `describe`/`it`/`expect` 这些写测试 用的函数，以及命令行执行能力。
+- `jsdom`：测试代码是在 Node.js 环境里跑的，Node 里没有 `document`、 `window` 这些浏览器对象。`jsdom` 是一个用 JS 实现的"假浏览器"， 让 Node 环境里也能创建 DOM、查询元素、触发事件，测试组件渲染 才有地方可以渲染。
+
+#### 2.2 配置 vite.config.ts
+
+Vitest 直接复用 Vite 的配置文件，只需要在里面加一个 `test` 字段。
+
+当前的 `vite.config.ts`：
+
+```ts
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
+import path from "path";
+
+export default defineConfig({
+  plugins: [react(), tailwindcss()],
+  resolve: {
+    alias: {
+      "@": path.resolve(__dirname, "./src"),
+    },
+  },
+});
+```
+
+加入 `test` 配置：
+
+```ts
+import { defineConfig } from "vitest/config";
+import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
+import path from "path";
+
+export default defineConfig({
+  plugins: [react(), tailwindcss()],
+  resolve: {
+    alias: {
+      "@": path.resolve(__dirname, "./src"),
+    },
+  },
+  // ✅ 新增：vitest 配置
+  test: {
+    // environment: "jsdom" 告诉 vitest 用 jsdom 模拟浏览器环境
+    // 不设置的话默认是 "node"，没有 document/window，组件渲染会直接报错
+    environment: "jsdom",
+    // globals: true 允许测试文件里直接用 describe/it/expect
+    // 不用每个文件手动 import { describe, it, expect } from "vitest"
+    globals: true,
+  },
+});
+
+```
+
+>注意：`defineConfig`的导入方法换成`import { defineConfig } from "vitest/config"`： 
+>
+>`vitest/config` 导出的 `defineConfig` 是 Vite 原版的一个包装版本，它把 `test` 字段的类型声明合并进了 `UserConfigExport` 类型里，其余用法（`plugins`、`resolve` 等）完全兼容，不需要改任何其他代码。
+
+
+
+#### 2.3 让 TypeScript 认识这些全局函数
+
+`globals: true` 只是运行时生效，TypeScript 编译时还是不认识 `describe`/`it`/`expect`，需要在 `tsconfig.json`（或 `tsconfig.app.json`） 的 `compilerOptions` 里声明类型来源：
+
+```json
+{
+  "compilerOptions": {
+    "types": ["vitest/globals"]
+  }
+}
+```
+
+#### 2.4 配置一个可以运行的命令
+
+`package.json` 的 `scripts` 里加：
+
+```json
+{
+  "scripts": {
+    "test": "vitest"
+  }
+}
+```
+
+#### 2.5 验证：先跑一个最简单的测试，确认工具链本身没问题
+
+在真正的组件测试之前，先写一个不涉及 React、不涉及 RTL 的 纯逻辑测试，确认 Vitest 配置本身是通的：
+
+新建 `src/test/sanity.test.ts`：
+
+```ts
+describe("环境验证", () => {
+  it("1 + 1 应该等于 2", () => {
+    expect(1 + 1).toBe(2);
+  });
+});
+```
+
+运行：
+
+```bash
+npm test
+```
+
+看到这个测试通过，说明 Vitest + jsdom 的基础环境是通的。这个文件 只是验证用的，确认后可以删掉。
+
+
+
+### 3. 测试时渲染并操作 React 组件 - RTL
+
+Vitest 只负责"运行测试代码、判断断言真假"，它不知道怎么渲染一个 React 组件，也不知道怎么模拟"点击按钮""在输入框打字"这些操作。
+
+**React Testing Library（RTL）** 就是解决这个问题的库：它提供 `render()` 把 React 组件渲染进 jsdom 创建的虚拟 DOM 里，还提供一整套 "查找元素"的方法（比如 `getByText`、`getByRole`），以及配套的 `user-event` 库来模拟真实用户操作（点击、输入、勾选）。
+
+#### 3.1 RTL 的核心设计哲学
+
+RTL 和早期的 Enzyme 这类工具最大的区别是：**RTL 刻意不让访问 组件内部的 state、props、实例方法**。它只允许像真实用户一样， 通过"看到的文字""能操作的按钮""填写的表单"来定位和验证界面。
+
+为什么要这样限制？因为测试内部实现细节会导致两种问题同时发生：
+
+- 假阳性：重构组件内部实现（比如把 `useState` 换成 `useReducer`）， 测试挂了，但用户实际体验没有任何变化——浪费时间去"修"一个根本 没坏的东西。
+- 假阴性（更危险）：如果测试只检查了"内部 state 是 true"，却没检查 这个状态对应的内容是否真的出现在页面上，那么哪怕 CSS 出问题导致 内容视觉上不可见，只要 state 还是 true，测试照样通过——而用户看到 的是一个坏掉的界面。
+
+因此，RTL 强迫只能用用户能感知的方式去验证，从根源上避免这两种问题。
+
+#### 3.2 安装需要的库
+
+```bash
+npm install -D @testing-library/react @testing-library/user-event @testing-library/jest-dom
+```
+
+- `@testing-library/react`：提供 `render`、`screen`、各种 `getBy*` 查询方法
+- `@testing-library/user-event`：提供更接近真实浏览器行为的用户操作 模拟
+- `@testing-library/jest-dom`：给 `expect()` 扩展一批断言方法，比如 `toBeInTheDocument()`、`toHaveAttribute()`，不装这个包这些断言方法 不存在。
+
+#### 3.3 让扩展断言生效
+
+`jest-dom` 的扩展断言需要在每个测试文件执行前导入一次。手动在每个 文件顶部写 `import "@testing-library/jest-dom"` 太麻烦，用 Vitest 的 `setupFiles` 统一处理：
+
+新建 `src/test/setup.ts`：
+
+```ts
+import "@testing-library/jest-dom";
+```
+
+回到 `vite.config.ts`，在 `test` 里加一行：
+
+```ts
+test: {
+  environment: "jsdom",
+  setupFiles: ["./src/test/setup.ts"], // ✅ 新增
+  globals: true,
+},
+```
+
+`tsconfig.json` 的 `types` 也补上：
+
+```json
+{
+  "compilerOptions": {
+    "types": ["vitest/globals", "@testing-library/jest-dom"]
+  }
+}
+```
+
+#### 3.4 查询方法怎么选：优先级列表
+
+RTL 提供很多种 `getBy*` 方法，用哪个不是随意的，官方给出了明确的 优先级排序，从高到低：
+
+```
+1. getByRole            —— 最优先，模拟屏幕阅读器/用户感知方式
+2. getByLabelText        —— 表单场景，通过 label 找输入框
+3. getByPlaceholderText
+4. getByText             —— 通过可见文字定位
+5. getByDisplayValue
+6. getByAltText
+7. getByTitle
+8. getByTestId           —— 最后手段，不是禁用项
+```
+
+`getByTestId` 依赖手动加在 DOM 上的 `data-testid` 属性，这个属性 用户根本看不到、感知不到，跟真实使用场景完全脱节，所以排在最后。 但当一个元素确实没有可访问的 role、没有文字内容（比如一个纯装饰性 的 loading spinner），前面几种都用不上时，`getByTestId` 就是合理的 兜底选择。
+
+#### 3.5 第一个组件测试实例
+
+选 `CarCard` 作为第一个测试对象，因为它是最简单的纯展示组件： 接收一个 `car` 对象渲染出来，不涉及任何 API 调用、不涉及 store， 不需要用到 Mock，正好用来练习 RTL 的基本用法。
+
+`CarCard` 内部用了 `<Link>`（跳转到车辆详情页），而 `<Link>` 必须 在路由上下文里才能渲染，所以测试时需要用 `MemoryRouter` 包一层—— 这是 react-router 提供的**真实路由实现**，只是把路由状态放在内存里， 不依赖真实浏览器地址栏，跟"伪造""替换"没有关系，所以这里不算 Mock。
+
+新建 `src/test/components/CarCard.test.tsx`：
+
+```tsx
+import { render, screen } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
+import CarCard from "@/components/CarCard";
+import type { Car } from "@/types";
+
+// 测试用的假车辆数据
+// 只填测试需要验证的字段，其余用合理的默认值
+const mockCar: Car = {
+  id: 1,
+  title: "2020 Toyota Corolla - Low Mileage",
+  brand: "Toyota",
+  model: "Corolla",
+  year: 2020,
+  price: 18000,
+  mileage: 35000,
+  status: "Published",
+  sellerId: 10,
+  sellerUsername: "seller1",
+  createdAt: "2024-01-01T00:00:00Z",
+  updatedAt: "2024-01-01T00:00:00Z",
+};
+
+const renderCard = (props?: Partial<Parameters<typeof CarCard>[0]>) =>
+  render(
+    <MemoryRouter>
+      <CarCard car={mockCar} {...props} />
+    </MemoryRouter>,
+  );
+
+describe("CarCard", () => {
+  it("应该正确渲染车辆的品牌、价格和里程", () => {
+    renderCard();
+
+    // getByText：找到包含这段文字的元素
+    // 用用户实际看到的文字来定位，而不是 class 名
+    expect(screen.getByText("Toyota")).toBeInTheDocument();
+    expect(screen.getByText("$18,000")).toBeInTheDocument();
+    expect(screen.getByText("35,000 km")).toBeInTheDocument();
+  });
+
+  it("没有图片时应该显示占位图标", () => {
+    renderCard();
+
+    // getByRole("img") 找的是可访问树里 role 为 img 的元素
+    // 它的 name 来自 alt 属性
+    // 没有 coverImageUrl 时组件应该渲染占位 SVG 而不是 <img>
+    // 用 queryByRole（找不到时返回 null，不报错）断言它不存在
+    expect(
+      screen.queryByRole("img", { name: /corolla/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("有图片时应该正确渲染图片", () => {
+    const carWithImage = {
+      ...mockCar,
+      coverImageUrl: "https://example.com/car.jpg",
+    };
+    render(
+      <MemoryRouter>
+        <CarCard car={carWithImage} />
+      </MemoryRouter>,
+    );
+
+    const img = screen.getByRole("img", { name: /corolla/i });
+    expect(img).toBeInTheDocument();
+    expect(img).toHaveAttribute("src", "https://example.com/car.jpg");
+  });
+
+  it("有搜索词时应该高亮匹配的品牌文字", () => {
+    renderCard({ highlightKeyword: "Toyota" });
+
+    // highlight 函数会把 "Toyota" 包裹在 <mark> 标签里
+    // <mark> 元素在 DOM 里仍然包含文字 "Toyota"，getByText 依然能找到它
+    const searchTexts = screen.getAllByText("Toyota");
+    expect(searchTexts.some((el) => el.tagName === "MARK")).toBe(true);
+  });
+});
+
+```
+
+运行确认通过：
+
+```bash
+npm test
+```
+
+
+
+### 4. 模拟用户操作——`userEvent` vs `fireEvent`
+
+`CarCard` 测试只涉及渲染后的静态断言，没有用户交互。但接下来要测的 `LoginPage` 需要模拟"输入邮箱""点击提交"这类操作，这时候需要选择触发方式。
+
+RTL 生态里有两种触发事件的方式：
+
+```
+fireEvent.click(button)
+  → 直接在 DOM 上触发一个 click 事件
+  → 跳过了浏览器真实的事件序列（真实点击其实是
+     focus → mousedown → mouseup → click 这一串）
+
+userEvent.click(button)
+  → 来自 @testing-library/user-event 包
+  → 完整模拟真实用户操作会触发的所有底层事件
+  → 更接近真实浏览器行为，能测出只在完整事件序列下才会
+     暴露的问题（比如某个 onBlur 校验逻辑）
+```
+
+**因此，我们使用用 `userEvent`，不用 `fireEvent`。** 
+
+
+
+### 5. 遇到不该真实执行的代码——认识 Mock
+
+以`LoginPage` 组件的测试为例。要测的场景包括"提交成功"和"提交失败"。但测试运行时， 如果真的去调用登录 API：
+
+- 会真的发一个 HTTP 请求出去，测试环境不一定有后端可连，测试会变慢、 变得不稳定（今天数据库有这条数据，明天可能没有）。
+- 登录成功后 `LoginPage` 会调用 `useAuthStore` 的 `setAuth`，这个函数 内部会写 `localStorage`——测试环境里不应该真的产生这种副作用，而且 没法控制"我现在就是要测登录失败的场景"这种特定状态。
+
+**Mock（模拟）** 就是解决这个问题的手段：把某个模块的真实实现， 替换成一个完全可控的假实现。测试时不再依赖真实网络、真实 store， 而是自己决定"这次调用返回什么""这次调用抛出什么错误"。
+
+#### 5.1 Mock 的边界：什么该 Mock，什么不该
+
+```
+✅ 应该 Mock：
+  - API 调用（不能在测试里真正发 HTTP 请求）
+  - Zustand store（隔离测试，控制初始状态，避免真实写 localStorage）
+  - 路由 hook（useNavigate/useLocation，测试环境没有真实浏览器历史栈）
+
+❌ 不应该 Mock：
+  - React 组件本身的渲染逻辑
+  - Zod 验证（这是业务逻辑，Mock 掉就等于没测这部分逻辑）
+  - RHF 表单行为（同样是业务逻辑，必须真实测试）
+```
+
+判断标准很简单：**如果 Mock 掉的是"会产生外部副作用或依赖外部环境 的东西"，就该 Mock；如果 Mock 掉的是"你正想验证对不对的业务逻辑 本身"，就不该 Mock**——Mock 了业务逻辑，测试就只是在验证"我 mock 的假数据符合预期"，没有验证任何真实代码。
+
+#### 5.2 `vi.mock` 怎么用
+
+Vitest 提供 `vi.mock()` 来替换一个模块的导出内容：
+
+```ts
+vi.mock("@/api", () => ({
+  authApi: {
+    login: vi.fn(),
+  },
+}));
+```
+
+这行代码告诉 Vitest：这个测试文件里任何地方 `import { authApi } from "@/api"`，都不要真正加载那个文件，而是返回我这里提供的假对象。
+
+`vi.fn()` 创建一个"可追踪的假函数"——本身默认什么也不做、返回 `undefined`，但可以事后指定它的返回值（`mockResolvedValueOnce`、 `mockReturnValue`），也可以检查它有没有被调用过、调用时传了什么参数 （`toHaveBeenCalledWith`）。
+
+有一个重要的执行时机问题：`vi.mock()` 会被 Vitest **提升 （hoist）到文件最顶部**，比文件里所有的 `const`/`let` 声明都先执行。 正常情况下如果在 `vi.mock` 的工厂函数里引用一个外部变量，会因为 提升导致"变量还没初始化就被访问"而报错。但 Vitest 对**以 `mock` 开头命名的变量**做了特殊放行，允许提前引用。因此，测试 代码里的变量（比如 `mockNavigate`、`mockSetAuth` ）都必须用 `mock` 前缀命名。这不是随意的命名习惯，换成别的名字（比如 `navigateSpy`）会直接报错。
+
+> 注意：项目里 store 的消费方式，决定了怎么 Mock 它
+>
+> `LoginPage` 里这样用 `useAuthStore`：
+>
+> ```tsx
+> const { setAuth } = useAuthStore();
+> ```
+>
+> 这是不带 selector、调用时直接解构整个返回对象的写法（项目里所有 组件都是这个写法）。所以 Mock 时可以让 `useAuthStore` 无论被怎么 调用，都固定返回同一个对象，不需要处理传参：
+>
+> ```ts
+> vi.mock("@/stores/authStore", () => ({
+>   useAuthStore: vi.fn(() => ({
+>     setAuth: vi.fn(),
+>   })),
+> }));
+> ```
+>
+> （题外话，跟测试无关：这种不带 selector 的写法会让组件订阅 store 里所有字段的变化，只要 store 里任何一个字段更新，用这种写法的组件 都会重新渲染。以后如果 store 里字段变多，可能需要评估要不要改成 带 selector 的写法来减少不必要的渲染，但这不是现在要处理的问题。）
+
+#### 5.3 写 LoginPage 测试
+
+`LoginPage`组件里有个bug需要修复一下：
+
+需要在 `<form>` 标签上加 `noValidate`，把浏览器原生校验彻底关掉，让 Zod + RHF 完全接管校验逻辑：
+
+```tsx
+<form onSubmit={handleSubmit(onSubmit)} noValidate className="space-y-5">
+```
+
+这不只是为了让测试通过，**这是使用 React Hook Form 时的标准做法**：只要输入框用了 `type="email"`、`type="number"` 之类带原生校验规则的类型，且打算完全用 RHF/Zod 自己的校验和错误提示 UI，就应该给 `<form>` 加 `noValidate`。不加的话，真实用户在某些浏览器里点提交时，可能会先看到浏览器自带的原生校验气泡提示，而不是精心设计的错误提示样式，跟自定义 UI 冲突。
+
+新建 `src/test/pages/LoginPage.test.tsx`：
+
+```tsx
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { MemoryRouter } from "react-router-dom";
+import LoginPage from "@/pages/LoginPage";
+
+// Mock 路由 hook（LoginPage 里用了 useNavigate 和 useLocation）
+// vi.importActual 保留 react-router-dom 里其他真实导出（比如 MemoryRouter 本身）
+// 只替换 useNavigate/useLocation 这两个 hook
+const mockNavigate = vi.fn();
+vi.mock("react-router-dom", async () => {
+  const actual = await vi.importActual("react-router-dom");
+  return {
+    ...actual,
+    useNavigate: () => mockNavigate,
+    useLocation: () => ({ state: null, pathname: "/login" }),
+  };
+});
+
+// Mock authApi：避免真实发 HTTP 请求
+vi.mock("@/api", () => ({
+  authApi: {
+    login: vi.fn(),
+  },
+}));
+
+// Mock authStore：避免真实写 localStorage
+const mockSetAuth = vi.fn();
+vi.mock("@/stores/authStore", () => ({
+  useAuthStore: vi.fn(() => ({
+    setAuth: mockSetAuth,
+  })),
+}));
+
+const renderLoginPage = () =>
+  render(
+    <MemoryRouter>
+      <LoginPage />
+    </MemoryRouter>
+  );
+
+describe("LoginPage", () => {
+  beforeEach(() => {
+    // 每个测试前清除所有 mock 的调用记录
+    // 避免上一个测试用例的调用历史影响下一个（比如上一个测试
+    // 断言过 login 被调用一次，这个记录不清除会累加到下一个测试里）
+    vi.clearAllMocks();
+  });
+
+  it("空表单提交时应该显示验证错误", async () => {
+    renderLoginPage();
+    const user = userEvent.setup();
+
+    // 直接点提交，不填任何内容
+    await user.click(screen.getByRole("button", { name: /sign in/i }));
+
+    // RHF + Zod 验证失败，应该显示错误提示
+    // 这里必须用 waitFor：Zod resolver 内部走的是 Promise 链，
+    // 即使校验规则本身是同步判断（比如 min(1)），从触发校验到
+    // 错误信息真正写回 DOM 之间仍然隔着至少一个微任务队列的延迟，
+    // 直接同步断言会因为 DOM 还没更新而失败
+    await waitFor(() => {
+      expect(screen.getByText(/password is required/i)).toBeInTheDocument();
+    });
+  });
+
+  it("输入无效邮箱格式时应该显示格式错误", async () => {
+    renderLoginPage();
+    const user = userEvent.setup();
+
+    await user.type(screen.getByLabelText(/email/i), "not-an-email");
+    await user.click(screen.getByRole("button", { name: /sign in/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/invalid email/i)).toBeInTheDocument();
+    });
+  });
+
+  it("填写正确后点击提交应该调用 authApi.login", async () => {
+    // 让 Mock 的 login 函数这一次返回一个成功结果
+    const { authApi } = await import("@/api");
+    vi.mocked(authApi.login).mockResolvedValueOnce({
+      token: "fake-token",
+      user: { id: 1, username: "testuser", email: "test@example.com", role: "User" },
+    } as never);
+
+    renderLoginPage();
+    const user = userEvent.setup();
+
+    await user.type(screen.getByLabelText(/email/i), "test@example.com");
+    await user.type(screen.getByLabelText(/password/i), "password123");
+    await user.click(screen.getByRole("button", { name: /sign in/i }));
+
+    await waitFor(() => {
+      // 验证 login 确实被调用，且传了正确的参数
+      expect(authApi.login).toHaveBeenCalledWith({
+        email: "test@example.com",
+        password: "password123",
+      });
+    });
+  });
+
+  it("API 返回错误时应该显示服务端错误信息", async () => {
+    const { authApi } = await import("@/api");
+    // 让 Mock 的 login 函数这一次抛出一个错误，模拟服务端返回失败
+    vi.mocked(authApi.login).mockRejectedValueOnce(
+      new Error("Invalid email or password")
+    );
+
+    renderLoginPage();
+    const user = userEvent.setup();
+
+    await user.type(screen.getByLabelText(/email/i), "test@example.com");
+    await user.type(screen.getByLabelText(/password/i), "wrongpassword");
+    await user.click(screen.getByRole("button", { name: /sign in/i }));
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(/invalid email or password/i)
+      ).toBeInTheDocument();
+    });
+  });
+});
+```
+
+运行：
+
+```bash
+npm test
+```
+
+
+
+### 6. 同一个 Mock 在不同测试里需要不同状态
+
+以`ProtectedRoute` 为例， 它的行为是：已登录就渲染子页面，没登录就跳转到 `/login`。
+
+如何控制"是否已登录"的状态？这依赖 `useAuthStore` 里的 `isAuthenticated()`。
+
+问题是 `vi.mock` 写在文件顶部，对整个文件的所有测试用例生效一次。 但"未登录"和"已登录"是两个测试用例，需要 `isAuthenticated()` 在 不同测试里返回不同的值。
+
+解决方式：Mock 时不直接写死返回值，而是让它返回一个独立声明的 `vi.fn()`，测试运行时再用 `mockReturnValue()` 动态指定这次要返回 什么：
+
+```ts
+const mockIsAuthenticated = vi.fn();
+vi.mock("@/stores/authStore", () => ({
+  useAuthStore: vi.fn(() => ({
+    isAuthenticated: mockIsAuthenticated,
+  })),
+}));
+
+// 测试里再决定这次返回什么
+mockIsAuthenticated.mockReturnValue(false); // 模拟未登录
+mockIsAuthenticated.mockReturnValue(true);  // 模拟已登录
+```
+
+写 ProtectedRoute 测试
+
+新建 `src/test/components/ProtectedRoute.test.tsx`：
+
+```tsx
+import { render, screen } from "@testing-library/react";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
+import ProtectedRoute from "@/components/ProtectedRoute";
+
+const mockIsAuthenticated = vi.fn();
+vi.mock("@/stores/authStore", () => ({
+  useAuthStore: vi.fn(() => ({
+    isAuthenticated: mockIsAuthenticated,
+  })),
+}));
+
+// 辅助：渲染一个包含 ProtectedRoute 的路由结构
+// initialEntries 模拟初始 URL，ProtectedRoute 包裹一个假的受保护页面
+const renderWithRoute = (initialPath: string) =>
+  render(
+    <MemoryRouter initialEntries={[initialPath]}>
+      <Routes>
+        <Route path="/login" element={<div>Login Page</div>} />
+        <Route element={<ProtectedRoute />}>
+          <Route path="/protected" element={<div>Protected Content</div>} />
+        </Route>
+      </Routes>
+    </MemoryRouter>
+  );
+
+describe("ProtectedRoute", () => {
+  it("未登录时应该重定向到登录页", () => {
+    mockIsAuthenticated.mockReturnValue(false);
+
+    renderWithRoute("/protected");
+
+    expect(screen.getByText("Login Page")).toBeInTheDocument();
+    expect(screen.queryByText("Protected Content")).not.toBeInTheDocument();
+  });
+
+  it("已登录时应该渲染受保护的页面内容", () => {
+    mockIsAuthenticated.mockReturnValue(true);
+
+    renderWithRoute("/protected");
+
+    expect(screen.getByText("Protected Content")).toBeInTheDocument();
+    expect(screen.queryByText("Login Page")).not.toBeInTheDocument();
+  });
+});
+```
+
+运行：
+
+```bash
+npm test
+```
+
+
+
+### 7. 覆盖率报告
+
+现在有了三个组件的测试，但项目里远不止这三个组件。与其凭感觉猜 "是不是测得差不多了"，不如让工具直接告诉哪些文件、哪些代码分支完全没被任何测试执行过。这就是覆盖率（coverage）报告要做的事。
+
+Vitest 本身不内置覆盖率统计能力，需要单独装一个 provider：
+
+```bash
+npm install -D @vitest/coverage-v8
+```
+
+不装这个包直接跑覆盖率命令，会在运行时直接报错提示缺少依赖。
+
+加运行脚本
+
+`package.json` 的 `scripts` 补上：
+
+```json
+{
+  "scripts": {
+    "test": "vitest",
+    "test:coverage": "vitest --coverage"
+  }
+}
+```
+
+运行覆盖率报告：
+
+```bash
+npm run test:coverage
+```
+
+终端会显示每个文件的覆盖率百分比，同时生成 `coverage/` 目录。 这一步不是为了追求某个百分比数字达标，而是让你看到**哪些代码路径 还没被覆盖**，为后续要不要继续补测试提供依据。
+
+
+
+### 8. 本地验证
+
+```bash
+npm test
+```
+
+三个测试文件应该全部通过（绿色）：
+
+```
+✓ src/test/components/CarCard.test.tsx (4)
+✓ src/test/pages/LoginPage.test.tsx (4)
+✓ src/test/components/ProtectedRoute.test.tsx (2)
+```
+
+
+
+### 9. Git 提交
+
+```bash
+git add .
+git commit -m "test: setup vitest + RTL, add tests for CarCard, LoginPage, ProtectedRoute"
+git push -u origin feature/v3-frontend-tests
+
+# 合并回 develop
+git checkout develop
+git merge --no-ff feature/v3-frontend-tests \
+  -m "merge: feature/v3-frontend-tests into develop"
+git push origin develop
+
+# 删除功能分支
+git branch -d feature/v3-frontend-tests
+git push origin --delete feature/v3-frontend-tests
+```
+
+
+
+### Step 68 完成状态
+
+```
+概念理解：
+✅ Vitest 是什么——测试运行器，负责发现/执行测试、汇总结果
+✅ jsdom 是什么——用 JS 模拟浏览器 DOM，让 Node 环境能渲染组件
+✅ RTL 是什么——渲染组件 + 提供用户视角的查询方法，禁止访问组件内部实现
+✅ 查询优先级：getByRole > getByLabelText > ... > getByTestId（最后手段）
+✅ userEvent vs fireEvent：userEvent 模拟完整真实事件序列，优先使用
+✅ Mock 是什么——把有外部副作用/依赖外部环境的模块替换成可控假实现
+✅ Mock 边界：API/Store/路由 hook 该 Mock，业务逻辑（Zod/RHF）不该 Mock
+✅ vi.mock 会被提升到文件顶部，mock 前缀命名是 Vitest 对此的特殊放行规则
+✅ vi.mocked().mockReturnValue：同一 Mock 在不同测试用例间切换返回值
+
+环境搭建（按需逐步安装，非一次性装全）：
+✅ vitest + jsdom（跑通最基础的 sanity test）
+✅ @testing-library/react + user-event + jest-dom（测 CarCard）
+✅ @vitest/coverage-v8（跑覆盖率报告）
+✅ vite.config.ts / tsconfig.json / package.json 逐步补齐对应配置
+
+测试覆盖：
+✅ CarCard：渲染车辆信息、无图片占位、有图片渲染、highlight 高亮
+✅ LoginPage：空表单验证、无效邮箱格式、正确提交调用 API、API 错误显示
+✅ ProtectedRoute：未登录重定向、已登录正常渲染
+
+✅ npm test 全部通过
+✅ Git commit + 合并回 develop 完成
+```
+
+
+
 ## fixed Issues 
 
 ### Fix 1. 并发 Refresh Token 请求竞态条件（Refresh Token Rotation Race Condition）
