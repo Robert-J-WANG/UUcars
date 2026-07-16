@@ -137,7 +137,11 @@ export default function LoginPage() {
             boxShadow: "var(--shadow-lg)",
           }}
         >
-          <form onSubmit={handleSubmit(onSubmit)} className="space-y-5">
+          <form
+            onSubmit={handleSubmit(onSubmit)}
+            noValidate
+            className="space-y-5"
+          >
             {/* 服务端错误 */}
             {serverError && (
               <div
