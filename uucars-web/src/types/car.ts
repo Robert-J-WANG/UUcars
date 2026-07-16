@@ -22,7 +22,7 @@ export interface Car {
   year: number;
   price: number;
   mileage: number;
-  description: string | null;
+  description?: string;
   status: CarStatus;
   sellerId: number;
   sellerUsername: string;
