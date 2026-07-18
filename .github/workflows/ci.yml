@@ -126,3 +126,40 @@ jobs:
           resourceGroup: uucars-rg
           containerAppName: uucars-api
           imageToDeploy: ghcr.io/robert-j-wang/uucars-api:latest
+          
+          
+  e2e:
+    name: E2E Tests (Playwright)
+    runs-on: ubuntu-latest
+    needs: [ test, build-and-push ]
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: cd uucars-web && npm ci
+
+      - name: Install Playwright browsers
+        run: cd uucars-web && npx playwright install --with-deps chromium
+
+      # TODO: 生产项目里这里应该连 Staging 环境（前后端已部署）运行
+      # 而不是在 CI 里临时启动服务——启动服务需要数据库、环境变量、Migration 等
+      # 当前跳过实际运行，只保留 job 结构
+      - name: Run E2E tests (skipped - needs Staging environment)
+        run: echo "E2E tests would run against Staging environment here"
+
+      - name: Upload test artifacts on failure
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-screenshots
+          path: uucars-web/test-results/
+          retention-days: 7        
+          
+          

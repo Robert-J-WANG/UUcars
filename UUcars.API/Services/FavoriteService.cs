@@ -104,4 +104,11 @@ public class FavoriteService
 
         return PagedResponse<FavoriteResponse>.Create(items, totalCount, page, pageSize);
     }
+
+    // 判断用户是否收藏了某辆车
+    public async Task<bool> IsFavoritedAsync(int userId, int carId, CancellationToken cancellationToken = default)
+    {
+        var favorite = await _favoriteRepository.GetAsync(userId, carId, cancellationToken);
+        return favorite != null;
+    }
 }

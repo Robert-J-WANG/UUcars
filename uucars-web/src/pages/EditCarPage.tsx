@@ -70,7 +70,7 @@ export default function EditCarPage() {
   }
 
   return (
-    <div className="mx-auto max-w-2xl space-y-8">
+    <div className="mx-auto max-w-3xl space-y-8">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold">Edit Car</h1>
         {/* 提交审核按钮 */}
@@ -81,6 +81,9 @@ export default function EditCarPage() {
           {submitMutation.isPending ? "Submitting..." : "Submit for Review"}
         </Button>
       </div>
+
+      {/* 图片上传 */}
+      <ImageUploader carId={carId} images={car.images} />
 
       {/* 车辆信息表单，defaultValues 填入已有数据 */}
       <CarForm
@@ -96,10 +99,8 @@ export default function EditCarPage() {
         onSubmit={handleSubmit}
         isSubmitting={updateMutation.isPending}
         submitLabel="Save Changes"
+        draftKey={`car-draft-${carId}`} // ✅ 新增：每辆车独立的 key
       />
-
-      {/* 图片上传 */}
-      <ImageUploader carId={carId} images={car.images} />
     </div>
   );
 }

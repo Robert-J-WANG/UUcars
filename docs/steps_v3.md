@@ -6626,7 +6626,7 @@ dotnet test
 
 
 
-#### 15. Git 提交
+### 15. Git 提交
 
 ```bash
 git add .
@@ -6646,7 +6646,7 @@ git push origin --delete feature/v3-refresh-token
 
 
 
-#### Step 61 完成状态
+### Step 61 完成状态
 
 ```
 知识点：
@@ -8449,6 +8449,5235 @@ git checkout develop
 
 
 
+## Step 64 · 车辆发布升级①（批量上传）
+
+### 这一步做什么
+
+V2 的图片上传体验有一个明显短板：**一次只能上传一张**。
+
+```
+当前流程：选一张 → 预览 → 点上传 → 等待 → 再选一张 → 预览 → 点上传 → 等待 → ...
+一辆车通常需要 5-10 张图，这个流程要重复很多次。
+```
+
+这一步要解决这个问题：**批量上传**，一次选多张，每张独立显示上传状态和重试按钮。
+
+**为什么批量上传需要新接口，而不是前端循环调单文件接口？**
+
+技术上前端可以写 `for` 循环逐一调 `POST /cars/{id}/images`，但有一个真实的竞态问题：
+
+```
+场景：车辆已有 8 张图，上限 10 张，用户选了 5 张并行上传
+
+并行请求A：查到当前 8 张 → 8+1=9 ≤ 10 → 允许
+并行请求B：查到当前 8 张 → 8+1=9 ≤ 10 → 允许
+并行请求C：查到当前 8 张 → 8+1=9 ≤ 10 → 允许
+并行请求D：查到当前 8 张 → 8+1=9 ≤ 10 → 允许
+并行请求E：查到当前 8 张 → 8+1=9 ≤ 10 → 允许
+
+最终：8 + 5 = 13 张，超过了上限 ❌
+```
+
+每个请求各自独立查询"当前已有多少张图"，"查询数量"和"写入数据"之间存在时间窗口，多个请求可以同时挤进这个窗口。前端循环无法解决这个问题，因为校验逻辑本来就在服务端每次单独执行。
+
+批量接口在一次请求里统一校验 `已有数量 + 本次数量 > 上限`，不存在竞态问题。 
+
+同时所有图片的数据库写入在一个事务里完成，不会出现"传了 5 张，只成功插入 3 张"的中间状态。
+
+
+
+### 1. 切出功能分支
+
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b feature/v3-image-upload
+git push -u origin feature/v3-image-upload
+```
+
+
+
+### 2. 扩展 ICarImageRepository
+
+批量上传需要两个当前仓储层没有的能力：
+
+- 查询一辆车现有的所有图片（用于计算已有数量）
+- 一次性批量插入多条图片记录（对应"一个事务、不出现部分成功"）。
+
+打开 `UUcars.API/Repositories/ICarImageRepository.cs`：
+
+```csharp
+public interface ICarImageRepository
+{
+    ...
+
+    // ✅ 新增：批量添加，一次性插入多张图片，同一个事务里完成
+    Task<List<CarImage>> AddRangeAsync(
+        List<CarImage> images, CancellationToken cancellationToken = default);
+
+    // ✅ 新增：根据车辆 Id 查询该车辆的所有图片
+    // 批量上传时用于计算已有数量
+    Task<List<CarImage>> GetByCarIdAsync(
+        int carId, CancellationToken cancellationToken = default);
+}
+```
+
+打开 `UUcars.API/Repositories/EfCarImageRepository.cs`，实现新方法：
+
+```csharp
+public class EfCarImageRepository : ICarImageRepository
+{
+    ...
+
+    // ✅ 新增：批量添加
+    // AddRange 把所有实体一次性加入追踪器，
+    // 只调用一次 SaveChangesAsync，在同一个事务里写入
+    // 要么全部成功，要么全部失败，不会出现中间状态
+    public async Task<List<CarImage>> AddRangeAsync(
+        List<CarImage> images, CancellationToken cancellationToken = default)
+    {
+        _context.CarImages.AddRange(images);
+        await _context.SaveChangesAsync(cancellationToken);
+        return images;
+    }
+
+    // ✅ 新增：查询车辆的所有图片
+    public async Task<List<CarImage>> GetByCarIdAsync(
+        int carId, CancellationToken cancellationToken = default)
+    {
+        return await _context.CarImages
+            .Where(ci => ci.CarId == carId)
+            .ToListAsync(cancellationToken);
+    }
+}
+```
+
+
+
+### 3. 新增 DTO
+
+前端要一次传多个文件，对应的 HTTP 请求是 `multipart/form-data`，里面会有多个文件字段，都用同一个字段名。ASP.NET Core 能自动把"同名的多个文件字段"收集成一个集合，接收类型是 `IFormFileCollection`。现有的单文件 DTO 装不下多个文件，需要一个新的批量请求 DTO。
+
+新建 `UUcars.API/DTOs/Requests/CarImageBatchAddRequest.cs`：
+
+```csharp
+namespace UUcars.API.DTOs.Requests;
+
+// 批量图片上传请求
+// IFormFileCollection：对应 multipart/form-data 里多个同名文件字段
+// 前端用同一个字段名（"files"）多次 append，后端自动收集成这个集合
+public class CarImageBatchAddRequest
+{
+    public IFormFileCollection Files { get; set; } = null!;
+}
+```
+
+
+
+### 4. CarService 新增方法
+
+批量上传的 Service 方法，本质上是把"要不要允许这次批量操作"和"具体怎么执行"分成两个阶段：
+
+**第一阶段：全部校验完再动手**，原因是——一旦开始往 R2 传文件，就没有回头路了（R2 没有事务回滚的概念）。所以必须先把所有可能导致失败的判断都做完，确认这批文件"值得传"之后，才真正开始传。校验分三层，顺序不能颠倒：
+
+1. **权限校验**：车辆是否存在、是否属于当前用户、状态是否是 Draft（这些和"传不传图片"无关，是最基础的前提，理应最先判断）
+2. **数量上限校验**：查一次现有图片数量，加上这次要传的数量，判断是否超过 10 张——这是阶段一要解决的核心问题（竞态防护），必须在真正上传前做
+3. **逐一校验每个文件本身**（大小、类型）：只要有一个文件不合法，整批直接拒绝，不做"部分成功"——原因是批量操作里部分成功会让用户困惑（不知道哪几张失败了），全部通过才处理是更简单可靠的设计
+
+**第二阶段：校验全部通过后，才真正执行上传和写库**，这里涉及一个容易忽略的问题——R2 和数据库是两个完全独立的外部系统，没有办法用一个事务把它们绑在一起。所以要想清楚执行顺序：
+
+- **必须先传 R2、拿到真实可访问的 URL，再拿这个 URL 去写数据库**，不能反过来。反过来的话，数据库里会先出现一条指向"实际还不存在"的 R2 地址的记录，用户此时刷新页面会看到一张加载失败的图。
+- 因为 R2 的 API 本身不支持"一次请求传多个文件"（这是对象存储协议的天然限制），所以对 R2 的调用只能是循环、逐个进行；但对数据库的写入，用 1.1 里新增的 `AddRangeAsync` 做成真正的批量（一次事务）。
+- 这个设计权衡下，如果中途 R2 上传失败（比如传到第 3 张网络断了），前面已经传成功的文件会变成"孤儿文件"（R2 上有文件、数据库没记录，因为循环还没走完 `AddRangeAsync` 根本不会被调用）。这是当前阶段接受的权衡：宁可 R2 端偶尔留下没人引用的孤儿文件，也不允许数据库记录指向一个实际不存在的文件。孤儿文件清理不在本次需求范围内，暂不处理。
+
+**上传顺序还顺带解决了排序**：新图片的 `SortOrder` 要从"现有图片的最大排序值 + 1"开始往后排，这样这批新图会接在已有图片后面，不会打乱已有顺序。
+
+打开 `UUcars.API/Services/CarService.cs`，在 `DeleteImageAsync` 之后加入：
+
+```csharp
+// ✅ 新增：批量添加图片
+public async Task<List<CarImageResponse>> AddImagesBatchAsync(
+    int carId,
+    int currentUserId,
+    CarImageBatchAddRequest request,
+    CancellationToken cancellationToken = default)
+{
+    var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+    if (car == null)
+        throw new CarNotFoundException(carId);
+
+    if (car.SellerId != currentUserId)
+        throw new ForbiddenException();
+
+    if (car.Status != CarStatus.Draft)
+        throw new CarStatusException(car.Id, car.Status, CarStatus.Draft);
+
+    // 数量上限校验：一辆车最多 10 张图
+    // 在后端统一校验，避免前端并行上传时的竞态问题
+    const int maxImagesPerCar = 10;
+    var existingImages = await _carImageRepository.GetByCarIdAsync(carId, cancellationToken);
+    if (existingImages.Count + request.Files.Count > maxImagesPerCar)
+        throw new AppException(
+            StatusCodes.Status400BadRequest,
+            $"A car can have at most {maxImagesPerCar} images. " +
+            $"Currently has {existingImages.Count}, attempted to add {request.Files.Count}.");
+
+    // 逐一校验每个文件（大小、类型）
+    // 任何一个文件不合法，整批都拒绝，不做"部分成功"
+    // 原因：批量操作里出现部分成功对用户来说很困惑，
+    // 不知道哪几张失败了，全部通过才处理是更简洁可靠的设计
+    foreach (var file in request.Files)
+    {
+        var (isValid, error) = FileValidator.Validate(file);
+        if (!isValid)
+            throw new AppException(StatusCodes.Status400BadRequest, error!);
+    }
+
+    // 新图片从当前最大 SortOrder 之后开始排
+    var currentMaxSortOrder = existingImages.Count > 0
+        ? existingImages.Max(i => i.SortOrder)
+        : -1;
+
+    // 逐个上传到 R2（R2/S3 本身不支持批量上传，仍需逐个调用）
+    // 数据库写入是批量的（AddRangeAsync 一次性提交）
+    var newImages = new List<CarImage>();
+    var sortOrder = currentMaxSortOrder + 1;
+
+    foreach (var file in request.Files)
+    {
+        var fileName = FileValidator.GenerateFileName(file.FileName);
+
+        string imageUrl;
+        await using (var stream = file.OpenReadStream())
+        {
+            imageUrl = await _storageService.UploadAsync(
+                stream, fileName, file.ContentType, cancellationToken);
+        }
+
+        newImages.Add(new CarImage
+        {
+            CarId = carId,
+            ImageUrl = imageUrl,
+            SortOrder = sortOrder
+        });
+
+        sortOrder++;
+    }
+
+    // 一次性批量写入数据库
+    var created = await _carImageRepository.AddRangeAsync(newImages, cancellationToken);
+
+    _logger.LogInformation(
+        "{Count} images added to car {CarId} by seller {SellerId}",
+        created.Count, carId, currentUserId);
+
+    return created.Select(MapToImageResponse).ToList();
+}
+```
+
+
+
+### 5. CarsController 新增接口
+
+打开 `UUcars.API/Controllers/CarsController.cs`，在现有 `AddImage` 之后加入：
+
+```csharp
+// POST /cars/{id}/images/batch
+[HttpPost("{id:int}/images/batch")]
+[Authorize]
+[EnableRateLimiting(RateLimitPolicies.Write)]
+public async Task<IActionResult> AddImagesBatch(
+    int id,
+    [FromForm] CarImageBatchAddRequest request,
+    CancellationToken cancellationToken)
+{
+    var currentUserId = _currentUserService.GetCurrentUserId();
+    if (currentUserId == null)
+        return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+    var images = await _carService.AddImagesBatchAsync(
+        id, currentUserId.Value, request, cancellationToken);
+
+    return StatusCode(StatusCodes.Status201Created,
+        ApiResponse<List<CarImageResponse>>.Ok(images, "Images added successfully."));
+}
+```
+
+> **为什么用 `[FromForm]`？**
+>
+> 这个接口要接收文件，文件只能通过 `multipart/form-data` 传输，对应 `[FromForm]`。
+
+
+
+### 6. 扩展 cars.ts
+
+前端要把用户一次选中的多个文件打包进一次请求，用同一个字段名（`files`）多次 `append`，后端的 `IFormFileCollection` 会自动收集。
+
+打开 `src/api/cars.ts`，在现有 `uploadImage` 之后加入：
+
+```typescript
+// ✅ 新增：批量上传图片
+// 同一个字段名 "files" 多次 append，后端 IFormFileCollection 自动收集
+uploadImagesBatch: async (
+  carId: number,
+  files: File[]
+): Promise<CarImage[]> => {
+  const formData = new FormData();
+  files.forEach((file) => formData.append("files", file));
+  const response = await apiClient.post<ApiResponse<CarImage[]>>(
+    `/cars/${carId}/images/batch`,
+    formData,
+    { headers: { "Content-Type": "multipart/form-data" } }
+  );
+  return response.data.data!;
+},
+```
+
+
+
+### 7. 重写 ImageUploader 组件
+
+现有 `ImageUploader.tsx` 的流程是：点击选择 → 选中一个文件 → 本地生成预览 → 用户看到预览后再点一次 "Upload" 按钮 → 调 `carsApi.uploadImage(carId, file)` 上传这一个文件。
+
+对应的状态设计也是围绕"只处理一个文件"展开的：
+
+```tsx
+const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+const [selectedFile, setSelectedFile] = useState<File | null>(null);
+```
+
+`previewUrl` 和 `selectedFile` 都是单个值，不是数组。批量场景下需要同时追踪一组文件，而不是一个。
+
+#### 7.1 状态结构从"一个文件"换成"一组文件，且每个各自独立"
+
+批量场景下，5 张图里有 1 张失败，只应该那一张显示失败，另外 4 张不受影响。这要求每个文件的状态必须分开存，不能像原来那样只有一个 `selectedFile` 变量。所以需要一个数组，数组里每一项对应一个文件，各自带自己的预览地址和上传状态。
+
+替换原来的状态为：
+
+```tsx
+interface PendingFile {
+  id: string; // 临时 id，用来在数组里定位到这一项，React key 也用它
+  file: File;
+  previewUrl: string;
+  status: "uploading" | "error";
+  error?: string;
+}
+
+const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
+```
+
+`status` 只设计成两态：`"uploading"` 和 `"error"`。批量场景下文件是"选完立即上传"，不存在"选完但还没开始传"这个中间等待状态，所以不需要一个 `"pending"` 态占位。
+
+`id` 用一个临时字符串（不是数据库 Id，因为这时候文件还没上传，数据库里根本没有这条记录），只用来在数组里找到对应的这一项，以及给 React 的 `key`。
+
+#### 7.2 input 允许一次选多个文件，并在选择时做数量拦截
+
+要支持批量，input 本身要加 `multiple`，这样`handleFileChange` 才能拿到全部选中的文件
+
+```tsx
+<input
+  ref={inputRef}
+  type="file"
+  accept="image/jpeg,image/png,image/webp"
+  multiple // 加上 multiple
+  className="hidden"
+  onChange={handleFileChange}
+/>
+```
+
+现有 `handleFileChange` 只取 `e.target.files?.[0]`，就算 input 支持多选，代码也只会处理第一个文件。
+
+```tsx
+const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const file = e.target.files?.[0];
+  if (!file) return;
+
+  if (previewUrl) {
+    URL.revokeObjectURL(previewUrl);
+  }
+
+  const url = URL.createObjectURL(file);
+  setPreviewUrl(url);
+  setSelectedFile(file);
+};
+```
+
+`handleFileChange` 要能拿到全部选中的文件，并且在选择的当下就判断"这次选的加上已有的会不会超过上限"。数量拦截放在这一步做，是因为不合格的话应该直接拒绝、不生成任何预览、不发任何请求，越早拦截越好。修改如下：
+
+定义`MAX_IMAGES` 常量， 值取 10，跟后端 `AddImagesBatchAsync` 里的上限保持一致。
+
+```tsx
+const MAX_IMAGES=10;
+```
+
+实现 `handleFileChange`选择多个文件，并做数量拦截
+
+```tsx
+const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const files = e.target.files;
+  if (!files || files.length === 0) return;
+
+  // FileList 转成真正的数组，才能用 map 之类的数组方法
+  const fileArray = Array.from(files);
+
+  // 数量上限：已有图片数 + 正在处理的数 + 这次新选的数，超过就拒绝，不发任何请求
+  const totalAfter = images.length + pendingFiles.length + fileArray.length;
+  if (totalAfter > MAX_IMAGES) {
+    toast.error(
+      `A car can have at most ${MAX_IMAGES} images. ` +
+        `Currently has ${images.length + pendingFiles.length}, ` +
+        `you selected ${fileArray.length}.`
+    );
+    if (inputRef.current) inputRef.current.value = "";
+    return;
+  }
+
+  // 后续操作
+    ...
+};
+```
+
+> `e.target.files` 拿到的是 `FileList`，不是数组，没有 `.map`，所以先用 `Array.from` 转一次。`MAX_IMAGES` 是新增的常量，值取 10，跟后端 `AddImagesBatchAsync` 里的上限保持一致。
+
+更新`pendingFiles`: 把 `fileArray` 转成 `PendingFile[]`, 每个文件包装成一个 PendingFile, 并各自生成本地预览、状态先标记为 uploading.
+
+```tsx
+// 每个文件包装成一个 PendingFile：各自生成本地预览、状态先标记为 uploading
+const newPendingFiles: PendingFile[] = fileArray.map((file) => ({
+  id: `pending-${Date.now()}-${Math.random()}`,
+  file,
+  previewUrl: URL.createObjectURL(file),
+  status: "uploading",
+}));
+
+setPendingFiles((prev) => [...prev, ...newPendingFiles]);
+```
+
+#### 7.3 上传逻辑——从"点按钮触发一次 mutation"改成"选完立即各自上传"
+
+原来的流程是"选完看预览，用户再点一次 Upload"。批量场景下，一次要处理好几个文件，让用户对着每个文件都点一次确认没有意义，所以改成"选完立即自动开始上传"。
+
+同时，因为每个文件的上传状态要单独维护（对应第二步的 `pendingFiles` 数组），原来用 `useMutation` 包一个"上传"动作的方式不太合适——`useMutation` 更适合"一个独立的动作，触发一次、看一次结果"，不太方便表达"数组里每一项各自独立在跑"这种情况。改成一个普通的 `async function`，直接操作 `pendingFiles` 数组里对应的那一项，逻辑更直接。
+
+原来的 `uploadMutation`：
+
+```tsx
+const uploadMutation = useMutation({
+  mutationFn: (file: File) => carsApi.uploadImage(carId, file),
+  onSuccess: () => {
+    toast.success("Image uploaded!");
+    setPreviewUrl(null);
+    setSelectedFile(null);
+    queryClient.invalidateQueries({ queryKey: ["car", carId] });
+  },
+  onError: (error) => {
+    toast.error(error.message);
+  },
+});
+```
+
+替换成一个普通函数：
+
+```tsx
+// 每次调用只负责一个文件，成功了把它从 pendingFiles 里移除，
+// 失败了只把这一项标记成 error，不影响列表里其他文件
+const uploadSingleFile = async (pendingId: string, file: File) => {
+  try {
+    await carsApi.uploadImagesBatch(carId, [file]);
+
+    // 上传成功：从 pendingFiles 里移除这一项，并释放它的预览 URL（避免内存泄漏）
+    setPendingFiles((prev) => {
+      const target = prev.find((p) => p.id === pendingId);
+      if (target) URL.revokeObjectURL(target.previewUrl);
+      return prev.filter((p) => p.id !== pendingId);
+    });
+
+    queryClient.invalidateQueries({ queryKey: ["car", carId] });
+  } catch (error) {
+    // 上传失败：只把这一项标记为 error，其他文件的状态不受影响
+    const message = error instanceof Error ? error.message : "Upload failed";
+    setPendingFiles((prev) =>
+      prev.map((p) =>
+        p.id === pendingId ? { ...p, status: "error", error: message } : p
+      )
+    );
+  }
+};
+```
+
+> 这里调用的是 `carsApi.uploadImagesBatch`，不是原来的 `carsApi.uploadImage`——单文件接口一次只能传一个，即使只传一张也用批量接口，这样每张图片走的都是同一套后端校验逻辑（数量上限、事务写入），不需要维护两套上传路径。
+
+回到 `handleFileChange`，第二步生成完 `newPendingFiles` 之后，紧接着要让每个文件立即开始上传：
+
+```tsx
+setPendingFiles((prev) => [...prev, ...newPendingFiles]);
+
+// 选完立即各自开始上传，不需要再手动点确认
+newPendingFiles.forEach((p) => uploadSingleFile(p.id, p.file));
+
+if (inputRef.current) inputRef.current.value = "";
+```
+
+#### 7.4 渲染部分——展示每个文件各自的状态，去掉手动确认上传的 UI
+
+原来"选择后显示预览 + 点 Upload 按钮"这段是围绕单个文件设计的，现在要展示的是一个数组，每一项要能单独显示"上传中"或"失败重试"，不需要确认按钮（因为已经自动开始上传了）。
+
+原来这一段
+
+```tsx
+{previewUrl && selectedFile && (
+  <div className="space-y-2">
+    <img src={previewUrl} alt="Preview" className="h-40 w-40 rounded-lg object-cover" />
+    <p className="text-sm text-gray-500">{selectedFile.name}</p>
+    <Button
+      type="button"
+      size="sm"
+      onClick={() => uploadMutation.mutate(selectedFile)}
+      disabled={uploadMutation.isPending}
+    >
+      {uploadMutation.isPending ? "Uploading..." : "Upload"}
+    </Button>
+  </div>
+)}
+```
+
+替换成遍历 `pendingFiles`，每一项根据 `status` 显示不同的遮罩：
+
+```tsx
+{pendingFiles.length > 0 && (
+  <div className="flex flex-wrap gap-3">
+    {pendingFiles.map((pending) => (
+      <div key={pending.id} className="relative">
+        <img
+          src={pending.previewUrl}
+          alt="Preview"
+          className="h-24 w-24 rounded-lg object-cover"
+        />
+
+        {/* 上传中：遮罩提示 */}
+        {pending.status === "uploading" && (
+          <div className="absolute inset-0 flex items-center justify-center rounded-lg bg-black/40">
+            <span className="text-xs font-medium text-white">Uploading...</span>
+          </div>
+        )}
+
+        {/* 上传失败：这一项单独显示重试按钮，不影响其他项 */}
+        {pending.status === "error" && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 rounded-lg bg-black/60">
+            <AlertCircle className="h-4 w-4 text-red-400" />
+            <button
+              type="button"
+              onClick={() => uploadSingleFile(pending.id, pending.file)}
+              className="flex items-center gap-0.5 text-[10px] font-medium text-white hover:text-red-300"
+            >
+              <RotateCcw className="h-2.5 w-2.5" />
+              Retry
+            </button>
+          </div>
+        )}
+      </div>
+    ))}
+  </div>
+)}
+```
+
+"重试"按钮点击时直接再调一次 `uploadSingleFile`，传的还是这一项自己的 `id` 和 `file`——不需要额外的重试逻辑，复用的是同一个函数。
+
+已上传图片那块（`images.map(...)`、删除按钮）不用动，批量上传不影响这部分。
+
+选择按钮的文案从 "Select Image" 改成 "Add Images"，因为现在一次可以加多张：
+
+```tsx
+<Button type="button" variant="outline" onClick={() => inputRef.current?.click()}>
+  Add Images
+</Button>
+```
+
+
+
+
+
+### 8. 补全测试 FakeCarImageRepository
+
+`ICarImageRepository` 新增了两个方法，`FakeCarImageRepository` 要同步实现，否则编译不过。
+
+完整更新 `UUcars.Tests/Fakes/FakeCarImageRepository.cs`：
+
+```csharp
+using UUcars.API.Entities;
+using UUcars.API.Repositories;
+
+namespace UUcars.Tests.Fakes;
+
+public class FakeCarImageRepository : ICarImageRepository
+{
+    ...
+
+    // ✅ 新增
+    public Task<List<CarImage>> AddRangeAsync(
+        List<CarImage> images, CancellationToken cancellationToken = default)
+    {
+        foreach (var image in images)
+        {
+            image.Id = _nextId++;
+            _store[image.Id] = image;
+        }
+        return Task.FromResult(images);
+    }
+
+    // ✅ 新增
+    public Task<List<CarImage>> GetByCarIdAsync(
+        int carId, CancellationToken cancellationToken = default)
+    {
+        var images = _store.Values.Where(i => i.CarId == carId).ToList();
+        return Task.FromResult(images);
+    }
+}
+```
+
+
+
+### 9. 新增单元测试
+
+批量上传的核心逻辑是"数量超限要拒绝"和"非车主要拒绝"，对应两个测试。测试里需要构造假的 `IFormFile`/`IFormFileCollection`——单元测试不依赖真实文件系统或网络，用内存 `MemoryStream` 包一个假文件即可；`IFormFileCollection` 没有现成的空实现，需要自己包一层。
+
+打开 `UUcars.Tests/Services/CarServiceTests.cs`，在现有测试之后加入：
+
+```csharp
+// ===== 批量上传图片（Step 64① 新增）=====
+
+[Fact]
+public async Task AddImagesBatchAsync_WhenExceedsMaxImages_ShouldThrowAppException()
+{
+    var repo = new FakeCarRepository();
+    var imageRepo = new FakeCarImageRepository();
+    repo.Seed(new Car { Id = 1, SellerId = 10, Status = CarStatus.Draft });
+
+    // 已有 8 张图
+    for (var i = 0; i < 8; i++)
+        imageRepo.Seed(new CarImage { CarId = 1, SortOrder = i });
+
+    var service = CreateService(repo, imageRepo);
+
+    // 再传 3 张，8 + 3 = 11，超过上限 10
+    var request = new CarImageBatchAddRequest
+    {
+        Files = new FakeFormFileCollection(
+            CreateFakeFormFile("a.jpg"),
+            CreateFakeFormFile("b.jpg"),
+            CreateFakeFormFile("c.jpg"))
+    };
+
+    await Assert.ThrowsAsync<AppException>(
+        () => service.AddImagesBatchAsync(1, 10, request));
+}
+
+[Fact]
+public async Task AddImagesBatchAsync_WhenNotOwner_ShouldThrowForbiddenException()
+{
+    var repo = new FakeCarRepository();
+    var imageRepo = new FakeCarImageRepository();
+    repo.Seed(new Car { Id = 1, SellerId = 10, Status = CarStatus.Draft });
+    var service = CreateService(repo, imageRepo);
+
+    var request = new CarImageBatchAddRequest
+    {
+        Files = new FakeFormFileCollection(CreateFakeFormFile("a.jpg"))
+    };
+
+    // userId = 99 不是车主
+    await Assert.ThrowsAsync<ForbiddenException>(
+        () => service.AddImagesBatchAsync(1, 99, request));
+}
+
+// ===== 辅助：构造假的 IFormFile / IFormFileCollection =====
+
+private static IFormFile CreateFakeFormFile(string fileName)
+{
+    var content = "fake image content"u8.ToArray();
+    var stream = new MemoryStream(content);
+    return new FormFile(stream, 0, content.Length, "files", fileName)
+    {
+        Headers = new HeaderDictionary(),
+        ContentType = "image/jpeg"
+    };
+}
+```
+
+在 `CarServiceTests` 类的大括号外（文件末尾）加入辅助类：
+
+```csharp
+// IFormFileCollection 的测试用实现
+// ASP.NET Core 没有提供开箱即用的空实现，包一层 List<IFormFile> 即可
+internal class FakeFormFileCollection : List<IFormFile>, IFormFileCollection
+{
+    public FakeFormFileCollection(params IFormFile[] files) : base(files) { }
+
+    public IFormFile? GetFile(string name) =>
+        this.FirstOrDefault(f => f.Name == name);
+
+    public IReadOnlyList<IFormFile> GetFiles(string name) =>
+        this.Where(f => f.Name == name).ToList();
+
+    IFormFile? IFormFileCollection.this[string name] => GetFile(name);
+}
+```
+
+文件顶部确认有以下 using：
+
+```csharp
+using Microsoft.AspNetCore.Http;
+using UUcars.API.DTOs.Requests;
+```
+
+
+
+### 10. 本地验证
+
+#### 10.1 验证批量上传 + 本地预览
+
+1. 进入 Draft 状态的车辆编辑页
+2. 点击 "Add Images"，选择 3 张图片
+3. 应该立即看到 3 张图的本地预览，并显示 "Uploading..." 遮罩
+4. 上传完成后遮罩消失，图片进入已上传区域
+5. 第一张图显示 "Cover" 标记和蓝色边框
+
+#### 10.2 验证独立失败重试
+
+1. 断网状态下选择几张图片
+2. 应该看到每张图独立显示 "Retry" 按钮（不是所有图一起失败）
+3. 恢复网络后点 "Retry"，只重传这一张
+
+#### 10.3 验证数量上限
+
+1. 已有 8 张图的车辆，选择 5 张
+2. 前端立即弹出 Toast，不发起任何请求
+3. 用 Scalar 尝试直接调 `POST /cars/{id}/images/batch` 传 5 张（已有 8 张）
+4. 后端应该返回 400
+
+
+
+### 11. 编译和测试
+
+```bash
+dotnet build
+```
+
+预期：
+
+```
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+dotnet test
+```
+
+新增 2 个测试用例，预期全部通过。
+
+
+
+### Step 64① 完成状态
+
+```
+后端：
+✅ ICarImageRepository 新增 AddRangeAsync / GetByCarIdAsync
+✅ EfCarImageRepository 实现两个新方法
+✅ CarImageBatchAddRequest DTO
+✅ CarService.AddImagesBatchAsync
+   - 数量上限校验（后端统一，防并发竞态）
+   - 文件逐一校验（全部通过才处理，不做部分成功）
+   - R2 逐个上传 + 数据库批量写入（AddRangeAsync 一个事务）
+✅ POST /cars/{id}/images/batch
+
+前端：
+✅ cars.ts 新增 uploadImagesBatch
+✅ ImageUploader 新建：
+   - multiple 文件选择（<input multiple>）
+   - 本地预览（URL.createObjectURL，选完立即显示）
+   - 每张图独立上传状态（uploading / error）
+   - 失败时显示 Retry 按钮（单张独立重试，不影响其他图）
+   - 前端数量上限校验（立即提示，不发请求）
+
+测试：
+✅ FakeCarImageRepository 新增两个方法
+✅ CarServiceTests 新增 2 个用例（数量超限、非车主）
+✅ FakeFormFileCollection 辅助类
+
+✅ 本地验证通过
+✅ dotnet build + dotnet test 通过
+```
+
+
+
+## Step 64 · 车辆发布升级②（拖拽排序）
+
+### 这一步做什么
+
+批量上传解决了"一次传多张"，但新问题随之而来：封面图目前只能是"最早上传的那张"，想换封面只能删掉重传。
+
+这一步要解决这个问题：**拖拽排序**，上传后可以拖动图片调整顺序，第一张自动成为封面。
+
+
+
+### 为什么用拖拽而不是"上移/下移"按钮？
+
+"上移/下移"按钮实现更简单，但对图片这种视觉化内容，拖拽更直观——用户能直接"看着"图片移到目标位置，不需要反复点按钮试探。
+
+`@dnd-kit` 是目前 React 生态里维护最活跃、React 18+ 兼容性最好的拖拽库，相比已停止维护的 `react-beautiful-dnd` 更适合这个项目。
+
+图片列表展示时永远是按 `CarImage.SortOrder` 排序的（`ImageGallery.tsx` 和 `CarService.MapToDetailResponse` 里都是 `OrderBy(i => i.SortOrder)`）。所以"拖拽排序"归根结底就是改写每张图片对应记录的 `SortOrder` 值，拖拽本身只是前端交互，最终都要落到这个字段上。
+
+
+
+### 1. 后端：扩展 ICarImageRepository
+
+排序需要两件事：验证提交上来的图片 Id 都属于这辆车（IDOR 防护，需要查询一辆车的所有图片，这个能力已经有了——`GetByCarIdAsync`，直接复用），以及一次性把整组图片的新排序值批量写回数据库（这是新能力）。
+
+打开 `UUcars.API/Repositories/ICarImageRepository.cs`，追加一个方法：
+
+```csharp
+using UUcars.API.Entities;
+
+namespace UUcars.API.Repositories;
+
+public interface ICarImageRepository
+{
+    ...
+    // ✅ 新增：批量更新排序
+    Task UpdateSortOrdersAsync(
+        List<CarImage> images, CancellationToken cancellationToken = default);
+}
+```
+
+打开 `UUcars.API/Repositories/EfCarImageRepository.cs`，实现新方法：
+
+```csharp
+    // ✅ 新增：批量更新排序
+    // images 列表里每个对象的 SortOrder 已在 Service 层设置好新值
+    // UpdateRange 把每个实体标记为 Modified，SaveChangesAsync 时生成对应 UPDATE 语句
+    public async Task UpdateSortOrdersAsync(
+        List<CarImage> images, CancellationToken cancellationToken = default)
+    {
+        _context.CarImages.UpdateRange(images);
+        await _context.SaveChangesAsync(cancellationToken);
+    }
+```
+
+
+
+### 2. 后端：新增 DTO
+
+前端拖拽结束后，提交的不是"把 A 和 B 换一下"这种增量指令，而是这组图片当前应该是什么顺序的完整快照。这样后端不需要理解"移动"这个动作，只需要按提交的顺序整体覆盖写入。
+
+新建 `UUcars.API/DTOs/Requests/CarImageReorderRequest.cs`：
+
+```csharp
+namespace UUcars.API.DTOs.Requests;
+
+public class CarImageReorderRequest
+{
+// 单张图片的新的排序值
+public class CarImageOrderItem
+{
+    public int ImageId { get; set; }
+    public int SortOrder { get; set; }
+}
+
+// 排序请求：一次性提交整组图片的新顺序
+public class CarImageReorderList
+{
+    public List<CarImageOrderItem> Items { get; set; } = [];
+}
+}
+```
+
+
+
+### 3. CarService 新增方法
+
+排序的 Service 方法要先过基础权限校验（车辆存在、是车主、状态是 Draft，和批量上传一样），然后是这一步特有的**IDOR 防护**：
+
+如果不检查请求里的 `ImageId` 是否真的属于这辆车，恶意用户可以在请求体里塞入别人车辆的图片 Id，后端如果直接信任并写入，就会把别人车辆的排序也改了——这是一次未经授权的跨资源修改。所以要先把这辆车真实存在的所有图片 Id 取出来做一个集合，请求里任何一个 Id 不在这个集合里，直接拒绝整个请求。
+
+校验通过后：
+
+- 才在内存里把每张图对应的 `SortOrder` 改成新值（前端指定的新数字），
+- 再调新增的 `UpdateSortOrdersAsync` 统一批量写回。
+- 最后排列一次（`OrderBy`），把数据按新的顺序返回
+
+打开 `UUcars.API/Services/CarService.cs`，在 `AddImagesBatchAsync` 之后加入：
+
+```csharp
+// ✅ 新增：调整图片排序
+public async Task<List<CarImageResponse>> ReorderImagesAsync(int carId,
+    int currentUserId,
+    CarImageReorderRequest.CarImageReorderList request,
+    CancellationToken cancellationToken = default)
+{
+    //基础权限校验
+    var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+    if (car == null) throw new CarNotFoundException(carId);
+    if (car.SellerId != currentUserId) throw new ForbiddenException();
+    if (car.Status != CarStatus.Draft) throw new CarStatusException(car.Id, car.Status, CarStatus.Draft);
+
+    // 取出这辆车的所有图片，验证请求里的 ImageId 都属于这辆车
+    // IDOR 防护：防止用户把别人车辆的 ImageId 塞进来
+    var existingImages = await _carImageRepository.GetByCarIdAsync(carId, cancellationToken);
+    var existingImageIds = existingImages.Select(i => i.Id).ToList();
+    foreach (var item in request.Items)
+        if (!existingImageIds.Contains(item.ImageId))
+            throw new CarImageNotFoundException(item.ImageId);
+
+    // 找到图片，并改成新的排序值
+    foreach (var item in request.Items)
+    {
+        var image = existingImages.First(i => i.Id == item.ImageId);
+        image.SortOrder = item.SortOrder;
+    }
+
+    // 统一批量写回
+    await _carImageRepository.UpdateSortOrdersAsync(existingImages, cancellationToken);
+    _logger.LogInformation(
+        "Images reordered for car {CarId} by seller {SellerId}", carId, currentUserId);
+
+    // 把数据按新的顺序返回
+    return existingImages.OrderBy(i => i.SortOrder).Select(MapToImageResponse).ToList();
+}
+```
+
+
+
+### 4. CarsController 新增接口
+
+排序请求是纯 JSON 数据（不含文件），所以用标准 `[FromBody]` 绑定，和批量上传的 `[FromForm]` 不同——这也是两者唯一的接口层面差异，其余风格（鉴权、限流）保持一致。
+
+打开 `UUcars.API/Controllers/CarsController.cs`，在 `AddImagesBatch` 之后加入：
+
+```csharp
+// 新增排序接口
+// PUT /cars/{id}/images/reorder
+[HttpPut("{id:int}/images/reorder")]
+[Authorize]
+[EnableRateLimiting(RateLimitPolicies.Write)]
+public async Task<IActionResult> ReorderImages(int id, [FromBody] CarImageReorderRequest request,
+    CancellationToken cancellationToken)
+{
+    // 验证是否登录
+    var currentUserId = _currentUserService.GetCurrentUserId();
+    if (currentUserId == null) return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+    // 是登录用户
+    var images = await _carService.ReorderImagesAsync(
+        id, currentUserId.Value, request, cancellationToken);
+
+    return Ok(ApiResponse<List<CarImageResponse>>.Ok(images, "Images reordered successfully."));
+}
+```
+
+
+
+### 5. 安装拖拽库
+
+```bash
+cd uucars-web
+npm install @dnd-kit/core @dnd-kit/sortable @dnd-kit/utilities
+```
+
+
+
+### 6. 前端：扩展 cars.ts
+
+新增排序请求的 API 函数
+
+打开 `src/api/cars.ts`，在 `uploadImagesBatch` 之后加入：
+
+```typescript
+// ✅ 新增：调整图片排序
+reorderImages: async (
+  carId: number,
+  items: { imageId: number; sortOrder: number }[]
+): Promise<CarImage[]> => {
+  const response = await apiClient.put<ApiResponse<CarImage[]>>(
+    `/cars/${carId}/images/reorder`,
+    { items }
+  );
+  return response.data.data!;
+},
+```
+
+
+
+### 7. 更新 ImageUploader 组件
+
+拖拽这个动作，从用户角度看是连续的一气呵成：按下 → 移动 → 松开。但拆到代码实现层面，要分成三个独立的阶段：
+
+1. **感知阶段**：浏览器要能识别出"用户现在正在拖拽一个东西"，而不是普通的点击或者页面滚动。这要靠监听指针按下/移动/松开这类原生事件来实现，并且要有一个判断标准："移动了多少距离才算真的开始拖，而不是手抖或者正常点击"。
+2. **追踪阶段**：拖拽进行中，要实时知道"正在拖的是哪一个元素"、"当前悬停在哪一个元素附近"。这要求每一个可能被拖拽、或者可能被"拖到它上面"的元素，都提前登记进一个名册，这样拖拽过程中才能拿当前指针位置去比对，算出离哪个元素最近。
+3. **结算阶段**：松手那一刻，要根据"最初拖的是谁"和"最后停在哪"这两个信息，算出一份新的排列顺序，再把这份新顺序应用到界面（视觉更新）、以及提交给后端（持久化）。
+
+#### 7.1 新增一个本地的 `localImages` 状态
+
+拖拽这个交互要求"手一松开，图片立刻跳到新位置"，不能等后端接口返回了才更新界面（那样会有明显卡顿）。但在批量上传阶段，`images` prop 是直接拿来渲染的 `images` 是父组件传进来的 prop，组件自己不能直接修改它。
+
+```tsx
+{images.length > 0 && (
+  <div className="flex flex-wrap gap-3">
+    {images.map((image) => (
+      <div key={image.id} className="relative">
+        <img src={image.imageUrl} alt="Car" className="h-24 w-24 rounded-lg object-cover" />
+        <button onClick={() => deleteMutation.mutate(image.id)} ...>×</button>
+      </div>
+    ))}
+  </div>
+)}
+```
+
+所以需要拷贝一份到本地 state，拖拽时先改这份本地拷贝，界面立刻响应（乐观更新）；而接口调用是异步在后台进行的。
+
+```tsx
+export default function ImageUploader({ carId, images }: ImageUploaderProps) {
+  // 已上传的图片顺序（本地副本，拖拽时先在本地更新，再异步调接口）
+  const [localImages, setLocalImages] = useState(images);
+
+  // images prop 变化时（比如上传成功后 invalidateQueries 触发重新拉取），
+  // 同步更新本地已上传图片列表
+  if (images !== localImages && images.length !== localImages.length) {
+    setLocalImages(images);
+  }
+
+  // pendingFiles：本次选中、还没成功上传完的文件列表
+  // 每一项都有自己的 status，互不影响
+  const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
+  ...
+}
+```
+
+`handleFileChange` 里原来用 `images.length` 判断数量上限的地方，也要跟着改成 `localImages.length`——因为现在真正展示给用户的、代表"当前有几张图"的数据来源是 `localImages`，不是 `images`：
+
+```tsx
+
+export default function ImageUploader({ carId, images }: ImageUploaderProps) {
+  // 已上传的图片顺序（本地副本，拖拽时先在本地更新，再异步调接口）
+  const [localImages, setLocalImages] = useState(images);
+ 
+  // images prop 变化时（比如上传成功后 invalidateQueries 触发重新拉取），
+  // 同步更新本地已上传图片列表
+  if (images !== localImages && images.length !== localImages.length) {
+    setLocalImages(images);
+  }
+ 
+  ...
+ 
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    ...
+ 
+    // 数量上限：已有图片数 + 正在处理的数 + 这次新选的数，超过上限就拒绝，不发任何请求
+    const totalAfter = localImages.length + pendingFiles.length + fileArray.length;
+    if (totalAfter > MAX_IMAGES) {
+      toast.error(
+        `A car can have at most ${MAX_IMAGES} images. ` +
+          `Currently has ${localImages.length + pendingFiles.length}, ` +
+          `you selected ${fileArray.length}.`
+      );
+      if (inputRef.current) inputRef.current.value = "";
+      return;
+    }
+ 
+    ...
+  };
+    
+    ...
+}
+```
+
+#### 7.2 实现拖拽
+
+拖拽这个手势不是靠一个简单的 `onChange` 就能捕获的，浏览器原生 DOM 也不知道"图片能拖到哪"。这一步只解决"怎么让 dnd-kit 感知到用户正在拖一个东西、拖到哪了"——这一层能力全部来自 `@dnd-kit/core`，跟"排序"这个业务概念还没有关系（`@dnd-kit/core` 单独拿出来，也能用来实现"拖进垃圾桶删除"这类跟排序无关的场景）。
+
+##### 1. 拖拽感知容器
+
+`dnd-kit`提供了这个容器 `DndContext`，使用它包括需要拖动的区域，就能完成监听指针事件、维护"现在正在拖谁"这些状态。
+
+```tsx
+import { DndContext } from "@dnd-kit/core";
+
+export default function ImageUploader({ carId, images }: ImageUploaderProps) {
+  const [localImages, setLocalImages] = useState(images);
+  if (images !== localImages && images.length !== localImages.length) {
+    setLocalImages(images);
+  }
+ 
+  ...
+ 
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    ...
+  };
+    
+    ...
+    
+    {/* 已上传的图片列表：可拖拽排序 */}
+    {localImages.length > 0 && (
+      <DndContext sensors={sensors} collisionDetection={closestCenter}>
+          <div className="flex flex-wrap gap-3">
+            {images.map((image) => (
+              <div key={image.id} className="relative">
+                <img
+                  src={image.imageUrl}
+                  alt="Car"
+                  className="h-24 w-24 rounded-lg object-cover"
+                />
+                {/* 删除按钮 */}
+                <button
+                  onClick={() => deleteMutation.mutate(image.id)}
+                  disabled={deleteMutation.isPending}
+                  className="absolute -right-2 -top-2 flex h-5 w-5
+                             items-center justify-center rounded-full
+                             bg-red-500 text-xs text-white
+                             hover:bg-red-600"
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+          </div>
+      </DndContext>
+)}
+}
+```
+
+##### 2. 传感器
+
+使用感知容器包裹之后，多大的移动幅度才算真的开始拖？
+
+如果什么都不设置，`DndContext` 会对任何一点点指针位移都很敏感——用户想点卡片上的删除按钮，手指按下去哪怕只抖了 1px，也可能被误判成"在拖拽"，删除按钮的点击事件就触发不了了。
+
+因此，需要一个"传感器"去解读原始的指针事件，并且设一个位移阈值，超过这个阈值才算真的开始拖。
+
+`dnd-kit`提供了很多传感器， 比如`PointerSensor`。 这个传感器`PointerSensor` 同时兼容鼠标和触摸屏，不需要分别处理 mouse 和 touch 事件；
+
+同时，`dnd-kit`提供了设置传感器参数的hook - useSensor, 可以对单个传感器设置阈值。并且，考虑到不止有一个传感器的情况，`dnd-kit`提供了另外一个hook - useSensors， 可以把配置好的传感器组合成一个列表：
+
+```tsx
+import { PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
+
+const sensors = useSensors(
+  useSensor(PointerSensor, { activationConstraint: { distance: 8 } })
+);
+```
+
+交组合后的传感器组交给 `DndContext`：
+
+```tsx
+<DndContext sensors={sensors}>
+  {/* 可拖拽的内容 ... */}
+</DndContext>
+```
+
+##### 3. 拖拽过程中，要判断"当前离哪个元素最近"
+
+拖拽进行中，指针的位置很难精确对齐到某个元素的边界，`DndContext` 需要一个算法去判断"你现在算是悬停在哪个元素上方"，这样才能实时知道该跟谁比较、要不要让位。
+
+`closestCenter` 是最常用的一种碰撞检测算法：比较各元素中心点到指针的距离，找最近的那个。
+
+```tsx
+import { PointerSensor, useSensor, useSensors, closestCenter } from "@dnd-kit/core";
+```
+
+注入容器使用
+
+```tsx
+<DndContext sensors={sensors} collisionDetection={closestCenter}>
+  {/* 可拖拽的内容 ... */}
+</DndContext>
+```
+
+##### 4. 拖拽完成后事件触发
+
+用户松开手，这个拖拽动作就算结束了，应该触发拖拽完成事件，进行一下操作，比如后面需要做的排序。
+
+`DndContext`容器组件定义了这个是prop属性 `onDragEnd`， 用来挂载拖拽完成后执行的动作
+
+```tsx
+<DndContext
+  sensors={sensors}
+  collisionDetection={closestCenter}
+  onDragEnd={() => {
+     console.log("拖拽完成执行的内容");
+  }}
+>
+  {/* 可拖拽的内容 ... */}
+</DndContext>
+```
+
+#### 7.3 实现排序
+
+第二步做完，dnd-kit 已经能感知"东西被拖动了"，但完全不知道这组元素之间有先后顺序、拖动时其他元素该不该让位。这一步要把"排序"这个业务概念接进来——这一层能力全部来自 `@dnd-kit/sortable`，建立在第二步搭好的感知能力之上。
+
+##### 1. 排序感知容器
+
+`DndContext` 只关心"拖拽本身"，不关心"这组元素的顺序该怎么变"。要让 dnd-kit 知道这一层业务含义，需要在 `DndContext` 内部再包一层专门处理排序的容器。
+
+`dnd-kit`库的另外一个包提供了这个容器 `SortableContext`
+
+```tsx
+import { SortableContext } from "@dnd-kit/sortable";
+```
+
+这个容器组件定义了一个prop属性 - `items`, 用来记录参与排序元素的id。 
+
+```tsx
+<DndContext sensors={sensors} collisionDetection={closestCenter}>
+  <SortableContext items={localImages.map((img) => img.id)}>
+    {/* 这组要互相排序的元素 */}
+  </SortableContext>
+</DndContext>
+```
+
+`items` 期望的类型，dnd-kit 内部定义大概是这样（简化理解）：
+
+```ts
+items: (string | number)[]
+```
+
+`items` 这个 prop 本身不会自动提取 id，它只是"等着接收一个数组"，具体这个数组的内容是什么、怎么算出来的，完全是调用方的责任。 如比上面实例中我们自己通过 map 方法映射进去。
+
+##### 2. 排序时的让位方式
+
+排序时要让排序容器`SortableContext`知道"其他元素该按什么方式挪动"， 网格布局和纵向单列列表的让位方式是不一样的。
+
+`sortable`包提供了不同的让位方式:
+
+- rectSortingStrategy - 适合横向换行排列的网格布局
+- verticalListSortingStrategy - 适合纵向单列列表
+
+排序容器`SortableContext`的另外一个prop属性 - `strategy`用来设置攘外方式
+
+```tsx
+import { rectSortingStrategy } from "@dnd-kit/sortable";
+
+<DndContext sensors={sensors} collisionDetection={closestCenter}>
+  <SortableContext 
+      items={localImages.map((img) => img.id)}
+      strategy={rectSortingStrategy}
+  >
+    {/* 这组要互相排序的元素 */}
+  </SortableContext>
+</DndContext>
+```
+
+##### 3. 登记成"可排序项"
+
+`SortableContext` 只是知道"这组元素的 id 列表"，具体到每一个方块，还需要各自向它登记"我是这组里的第几个"，并且拿到"我现在该往哪挪、挪了多少"这些信息。
+
+`dnd-kit/sortable`包提供了专门的hook - `useSortable`来实现这个登记动作。
+
+```tsx
+import { useSortable } from "@dnd-kit/sortable";
+
+const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
+  useSortable({ id: image.id });
+```
+
+调用时传入这个元素自己的 id，会返回一组东西：`attributes`/`listeners`（要绑定到某个具体 DOM 元素上，这个元素才会响应拖拽手势）、`setNodeRef`（绑定到根 DOM 节点，dnd-kit 靠它计算真实位置）、`transform`/`transition`（这个元素当前该产生的位移和过渡动画）、`isDragging`（这个元素是不是正被拖拽的那一个）。
+
+`useSortable` 是个 Hook，Hook 只能在组件顶层调用，不能写在 `.map()` 回调里。原来图片方块是内联写在 `.map()` 里的普通 `<div>`，没法直接在里面调用 `useSortable`
+
+```tsx
+{/* 已上传的图片列表：可拖拽排序 */}
+  {localImages.length > 0 && (
+    <DndContext
+      sensors={sensors}
+      collisionDetection={closestCenter}
+      onDragEnd={() => {
+        console.log("拖拽完成执行的内容");
+      }}
+    >
+      <SortableContext
+        items={localImages.map((image) => image.id)}
+        strategy={rectSortingStrategy}
+      >
+        <div className="flex flex-wrap gap-3">
+          {localImages.map((image) => (
+            <div key={image.id} className="relative">
+              <img
+                src={image.imageUrl}
+                alt="Car"
+                className="h-24 w-24 rounded-lg object-cover"
+              />
+              {/* 删除按钮 */}
+              <button
+                onClick={() => deleteMutation.mutate(image.id)}
+                disabled={deleteMutation.isPending}
+                className="absolute -right-2 -top-2 flex h-5 w-5
+                       items-center justify-center rounded-full
+                       bg-red-500 text-xs text-white
+                       hover:bg-red-600"
+              >
+                ×
+              </button>
+            </div>
+          ))}
+        </div>
+      </SortableContext>
+    </DndContext>
+  )}
+```
+
+所以图片方块必须拆成一个独立组件，`.map()` 里改成调用这个组件（每次调用组件本身就是一次独立的 Hook 调用上下文，这样是合规的）
+
+```tsx
+{/* 已上传的图片列表：可拖拽排序 */}
+{localImages.length > 0 && (
+  <DndContext
+      sensors={sensors}
+      collisionDetection={closestCenter}
+      onDragEnd={() => {
+        console.log("拖拽完成执行的内容");
+      }}
+    >
+    <SortableContext
+      items={localImages.map((img) => img.id)}
+      strategy={rectSortingStrategy}
+    >
+      <div className="flex flex-wrap gap-3">
+        {localImages.map((image) => (
+          <SortableImageItem
+            key={image.id}
+            image={image}
+            onDelete={() => deleteMutation.mutate(image.id)}
+            isDeleting={
+              deleteMutation.isPending &&
+              deleteMutation.variables === image.id
+            }
+          />
+        ))}
+      </div>
+    </SortableContext>
+  </DndContext>
+)}
+```
+
+改造成独立的组件`SortableImageItem`
+
+```tsx
+import type { CarImage } from "@/types";
+
+interface SortableImageItemProps {
+  image: CarImage;
+  onDelete: () => void;
+  isDeleting: boolean;
+}
+/* -- 已上传图片：可拖拽排序的单个图片项 - */
+function SortableImageItem({
+  image,
+  onDelete,
+  isDeleting,
+}: SortableImageItemProps) {
+  return (
+    <div key={image.id} className="relative">
+      <img
+        src={image.imageUrl}
+        alt="Car"
+        className="h-24 w-24 rounded-lg object-cover"
+      />
+      {/* 删除按钮 */}
+      <button
+        onClick={onDelete}
+        disabled={isDeleting}
+        className="absolute -right-2 -top-2 flex h-5 w-5
+                           items-center justify-center rounded-full
+                           bg-red-500 text-xs text-white
+                           hover:bg-red-600"
+      >
+        ×
+      </button>
+    </div>
+  );
+}
+
+export default SortableImageItem;
+
+```
+
+使用`useSortable` hook 
+
+```tsx
+import { useSortable } from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+
+/* -- 已上传图片：可拖拽排序的单个图片项 - */
+function SortableImageItem({
+  image,
+  onDelete,
+  isDeleting,
+}: SortableImageItemProps) {
+  
+  // useSortable 把这个元素注册为可排序项
+  // attributes/listeners 只绑定到拖拽手柄，不绑定整个卡片
+  // 原因：整个卡片都能拖拽时，"点删除"和"开始拖拽"会冲突，浏览器无法区分意图
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: image.id });
+
+  return (
+    <div
+      ref={setNodeRef}
+      className="relative"
+      style={{
+        transform: CSS.Transform.toString(transform),
+        transition,
+        opacity: isDragging ? 0.5 : 1,
+      }}
+    >
+     ...
+     
+    </div>
+  );
+}
+
+```
+
+新增一个拖拽按钮， 独立于卡片，避免和删除按钮抢事件。`attributes`/`listeners` 只绑在拖拽手柄这个小按钮上，不绑在整张卡片——如果整张卡片都能触发拖拽，浏览器没法区分用户"点删除"和"开始拖动"这两个意图，两边的事件监听会冲突。
+
+```tsx
+...
+/* -- 已上传图片：可拖拽排序的单个图片项 - */
+function SortableImageItem({
+  image,
+  onDelete,
+  isDeleting,
+}: SortableImageItemProps) {
+  ...
+  return (
+    <div
+      ref={setNodeRef}
+      className="relative"
+      style={{
+        transform: CSS.Transform.toString(transform),
+        transition,
+        opacity: isDragging ? 0.5 : 1,
+      }}
+    >
+      <img
+        src={image.imageUrl}
+        alt="Car"
+        className="h-24 w-24 rounded-lg object-cover"
+      />
+
+      {/* 删除按钮 */}
+          ...
+
+      {/* 拖拽手柄：独立于卡片，避免和删除按钮抢事件 */}
+      <button
+        {...attributes}
+        {...listeners}
+        type="button"
+        aria-label="Drag to reorder"
+        className="absolute bottom-1 right-1 flex h-5 w-5 cursor-grab
+                   items-center justify-center rounded bg-black/50 text-white
+                   active:cursor-grabbing"
+      >
+        <GripVertical className="h-3 w-3" />
+      </button>
+    </div>
+  );
+}
+
+```
+
+实际效果是：**图片已经能被拖起来，拖动过程中其他图片会让位，视觉上完全正常**。但松手之后，图片会弹回原来的位置
+
+#### 7.4 更新界面，同步后端
+
+##### 1. 在本地把新顺序算出来、立刻更新界面
+
+上一步遗留的问题是：能拖，但松手不生效。要解决它，需要两件事一起做：
+
+- 告诉 `DndContext`，松手时该调用哪个函数
+
+    这靠 `DndContext` 自己定义的 `onDragEnd` 这个 prop；这里的 `onDragEnd` 跟 `<button onClick={...}>` 里的 `onClick` 是同一类东西，是组件自己定义的。
+
+- 这个函数具体要做什么
+
+    dnd-kit 会在松手时自动带着"谁被拖了、松在哪个位置上方"（`active`/`over`）调用它，函数要根据这两个信息算出新的排列顺序，并立刻反映到界面上（乐观更新），还不涉及后端，只是在做"本地视觉响应"这件事。
+
+先把上一步已经搭好的 `DndContext` 上的`onDragEnd`传入事件处理函数
+
+```tsx
+<DndContext
+  sensors={sensors}
+  collisionDetection={closestCenter}
+  onDragEnd={handleDragEnd}
+>
+```
+
+`@dnd-kit/core` 提供了这个`handleDragEnd`需要的参数(event)的参数类型（`DragEndEvent`），直接导入使用，不然 `event.active`、`event.over` 这些字段写代码时没有提示，容易拼错字段名：
+
+```tsx
+import { type DragEndEvent } from "@dnd-kit/core";
+```
+
+完善拖拽事件处理函数的逻辑
+
+```tsx
+/* ----- 拖拽结束：算出新顺序，本地立刻更新，异步提交后端 ---- */
+const handleDragEnd = (event: DragEndEvent) => {
+  const { active, over } = event;
+  if (!over || active.id === over.id) return;
+
+  const oldIndex = localImages.findIndex((img) => img.id === active.id);
+  const newIndex = localImages.findIndex((img) => img.id === over.id);
+
+  // 立即更新本地顺序（视觉立即响应，不等接口返回）
+  const reordered = arrayMove(localImages, oldIndex, newIndex);
+  setLocalImages(reordered);
+
+  // 下一步会在这里补上：把 reordered 转成后端要的格式，提交给 reorderMutation
+};
+```
+
+`arrayMove` 是 dnd-kit 提供的一个纯数组工具函数，接收数组和两个下标，返回一个把元素从旧位置挪到新位置后的新数组，这一步完全在浏览器内存里完成，跟服务器没有关系。
+
+`!over` 表示松手时没有停在任何一个可排序项上方（比如拖到了容器外面），`active.id === over.id` 表示压根没有移动位置，这两种情况都不需要做任何事，直接 `return`。
+
+新增排序 mutation
+
+```tsx
+/* ----- 排序 mutation ---- */
+const reorderMutation = useMutation({
+  mutationFn: (items: { imageId: number; sortOrder: number }[]) =>
+    carsApi.reorderImages(carId, items),
+  onError: (error) => {
+    // 排序失败：提示用户，并让 invalidateQueries 重新拉取后端真实顺序
+    // （后端没写入成功，拉回来的就是拖拽之前的顺序，界面自动"弹回"）
+    toast.error(error.message);
+    queryClient.invalidateQueries({ queryKey: ["car", carId] });
+  },
+});
+```
+
+拖拽事件处理函数中补全后端同步逻辑
+
+```tsx
+/* ----- 拖拽结束：算出新顺序，本地立刻更新，异步提交后端 ---- */
+const handleDragEnd = (event: DragEndEvent) => {
+  const { active, over } = event;
+  if (!over || active.id === over.id) return;
+
+  const oldIndex = localImages.findIndex((img) => img.id === active.id);
+  const newIndex = localImages.findIndex((img) => img.id === over.id);
+
+  // 立即更新本地顺序（视觉立即响应，不等接口返回）
+  const reordered = arrayMove(localImages, oldIndex, newIndex);
+  setLocalImages(reordered);
+
+  // 按新顺序生成 SortOrder，异步提交后端
+  const items = reordered.map((img, index) => ({
+    imageId: img.id,
+    sortOrder: index,
+  }));
+  reorderMutation.mutate(items);
+};
+```
+
+完整代码如下：
+
+```tsx
+import { carsApi } from "@/api";
+import type { CarImage } from "@/types";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useRef, useState } from "react";
+import { toast } from "sonner";
+import { Button } from "./ui/button";
+import { RotateCcw, AlertCircle } from "lucide-react";
+import {
+  DndContext,
+  closestCenter,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  rectSortingStrategy,
+  arrayMove,
+} from "@dnd-kit/sortable";
+import SortableImageItem from "./SortableImageItem";
+
+interface ImageUploaderProps {
+  carId: number;
+  images: CarImage[];
+}
+
+const MAX_IMAGES = 10;
+
+// 每个待上传文件自己的状态
+// 一个文件对应数组里的一项，互相独立，不会互相影响
+interface PendingFile {
+  id: string; // 临时 id，用来在数组里定位到这一项，React key 也用它
+  file: File;
+  previewUrl: string;
+  status: "uploading" | "error";
+  error?: string;
+}
+
+export default function ImageUploader({ carId, images }: ImageUploaderProps) {
+  // 已上传的图片顺序（本地副本，拖拽时先在本地更新，再异步调接口）
+  const [localImages, setLocalImages] = useState(images);
+
+  // images prop 变化时（比如上传成功后 invalidateQueries 触发重新拉取），
+  // 同步更新本地已上传图片列表
+  if (images !== localImages && images.length !== localImages.length) {
+    setLocalImages(images);
+  }
+
+  // pendingFiles：本次选中、还没成功上传完的文件列表
+  // 每一项都有自己的 status，互不影响
+  const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
+
+  const queryClient = useQueryClient();
+  // useRef 拿到 input 元素的引用，点击按钮时触发文件选择
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+
+    // FileList 转成真正的数组，才能用 map 之类的数组方法
+    const fileArray = Array.from(files);
+
+    // 数量上限：已有图片数 + 正在处理的数 + 这次新选的数，超过上限就拒绝，不发任何请求
+    const totalAfter =
+      localImages.length + pendingFiles.length + fileArray.length;
+    if (totalAfter > MAX_IMAGES) {
+      toast.error(
+        `A car can have at most ${MAX_IMAGES} images. ` +
+          `Currently has ${localImages.length + pendingFiles.length}, ` +
+          `you selected ${fileArray.length}.`,
+      );
+      if (inputRef.current) inputRef.current.value = "";
+      return;
+    }
+
+    // 每个文件包装成一个 PendingFile：各自生成本地预览、状态先标记为 uploading
+    const newPendingFiles: PendingFile[] = fileArray.map((file) => ({
+      id: `pending-${Date.now()}-${Math.random()}`,
+      file,
+      previewUrl: URL.createObjectURL(file),
+      status: "uploading",
+    }));
+
+    setPendingFiles((prev) => [...prev, ...newPendingFiles]);
+
+    // 选完立即各自开始上传，不需要再手动点确认
+    newPendingFiles.forEach((p) => uploadSingleFile(p.id, p.file));
+
+    if (inputRef.current) inputRef.current.value = "";
+  };
+
+  /* ----- 上传单个文件（普通函数，不用 useMutation/useCallback） ---- */
+  // 每次调用只负责这一个文件，成功了把它从 pendingFiles 里移除，
+  // 失败了只把这一项标记成 error，不影响列表里其他文件
+  const uploadSingleFile = async (pendingId: string, file: File) => {
+    try {
+      await carsApi.uploadImagesBatch(carId, [file]);
+
+      // 上传成功：从 pendingFiles 里移除这一项，并释放它的预览 URL（避免内存泄漏）
+      setPendingFiles((prev) => {
+        const target = prev.find((p) => p.id === pendingId);
+        if (target) URL.revokeObjectURL(target.previewUrl);
+        return prev.filter((p) => p.id !== pendingId);
+      });
+
+      // 让车辆详情缓存失效，图片列表会刷新
+      queryClient.invalidateQueries({ queryKey: ["car", carId] });
+    } catch (error) {
+      // 上传失败：只把这一项标记为 error，其他文件的状态不受影响
+      const message = error instanceof Error ? error.message : "Upload failed";
+      setPendingFiles((prev) =>
+        prev.map((p) =>
+          p.id === pendingId ? { ...p, status: "error", error: message } : p,
+        ),
+      );
+    }
+  };
+
+  /* ----- 删除 mutation ---- */
+  const deleteMutation = useMutation({
+    mutationFn: (imageId: number) => carsApi.deleteImage(carId, imageId),
+    onSuccess: () => {
+      toast.success("Image deleted.");
+      queryClient.invalidateQueries({ queryKey: ["car", carId] });
+    },
+    onError: (error) => {
+      toast.error(error.message);
+    },
+  });
+
+  /* ----- 排序 mutation ---- */
+  const reorderMutation = useMutation({
+    mutationFn: (items: { imageId: number; sortOrder: number }[]) =>
+      carsApi.reorderImages(carId, items),
+    onError: (error) => {
+      // 排序失败：提示用户，并让 invalidateQueries 重新拉取后端真实顺序
+      // （后端没写入成功，拉回来的就是拖拽之前的顺序，界面自动"弹回"）
+      toast.error(error.message);
+      queryClient.invalidateQueries({ queryKey: ["car", carId] });
+    },
+  });
+
+  /* ----- 拖拽传感器 ---- */
+  // PointerSensor 同时支持鼠标和触摸操作
+  // activationConstraint：8px 拖动阈值，避免普通点击（比如点删除按钮）被误判成拖拽
+  const sensors = useSensors(
+    useSensor(PointerSensor, {
+      activationConstraint: { distance: 8 },
+    }),
+  );
+
+  /* ----- 拖拽结束：算出新顺序，本地立刻更新，异步提交后端 ---- */
+  const handleDragEnd = (event: DragEndEvent) => {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+
+    const oldIndex = localImages.findIndex((img) => img.id === active.id);
+    const newIndex = localImages.findIndex((img) => img.id === over.id);
+
+    // 立即更新本地顺序（视觉立即响应，不等接口返回）
+    const reordered = arrayMove(localImages, oldIndex, newIndex);
+    setLocalImages(reordered);
+
+    // 按新顺序生成 SortOrder，异步提交后端
+    const items = reordered.map((img, index) => ({
+      imageId: img.id,
+      sortOrder: index,
+    }));
+    reorderMutation.mutate(items);
+  };
+
+  return (
+    <div className="space-y-4">
+      <h2 className="font-semibold">Images</h2>
+
+      {/* 已上传的图片列表：可拖拽排序 */}
+      {localImages.length > 0 && (
+        <DndContext
+          sensors={sensors}
+          collisionDetection={closestCenter}
+          onDragEnd={handleDragEnd}
+        >
+          <SortableContext
+            items={localImages.map((img) => img.id)}
+            strategy={rectSortingStrategy}
+          >
+            <div className="flex flex-wrap gap-3">
+              {localImages.map((image) => (
+                <SortableImageItem
+                  key={image.id}
+                  image={image}
+                  onDelete={() => deleteMutation.mutate(image.id)}
+                  isDeleting={
+                    deleteMutation.isPending &&
+                    deleteMutation.variables === image.id
+                  }
+                />
+              ))}
+            </div>
+          </SortableContext>
+        </DndContext>
+      )}
+
+      {/* 待上传文件：每一项独立显示上传中或失败重试，互不影响 */}
+      {pendingFiles.length > 0 && (
+        <div className="flex flex-wrap gap-3">
+          {pendingFiles.map((pending) => (
+            <div key={pending.id} className="relative">
+              <img
+                src={pending.previewUrl}
+                alt="Preview"
+                className="h-24 w-24 rounded-lg object-cover"
+              />
+
+              {/* 上传中：遮罩提示 */}
+              {pending.status === "uploading" && (
+                <div className="absolute inset-0 flex items-center justify-center rounded-lg bg-black/40">
+                  <span className="text-xs font-medium text-white">
+                    Uploading...
+                  </span>
+                </div>
+              )}
+
+              {/* 上传失败：这一项单独显示重试按钮，不影响其他项 */}
+              {pending.status === "error" && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 rounded-lg bg-black/60">
+                  <AlertCircle className="h-4 w-4 text-red-400" />
+                  <button
+                    type="button"
+                    onClick={() => uploadSingleFile(pending.id, pending.file)}
+                    className="flex items-center gap-0.5 text-[10px] font-medium text-white hover:text-red-300"
+                  >
+                    <RotateCcw className="h-2.5 w-2.5" />
+                    Retry
+                  </button>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* 选择新图片 */}
+      <div className="space-y-3">
+        {/* 隐藏的原生文件选择 input，multiple 允许一次选多个文件 */}
+        <input
+          ref={inputRef}
+          type="file"
+          accept="image/jpeg,image/png,image/webp"
+          multiple
+          className="hidden"
+          onChange={handleFileChange}
+        />
+
+        {/* 点击这个按钮触发文件选择 */}
+        <Button
+          type="button"
+          variant="outline"
+          onClick={() => inputRef.current?.click()}
+        >
+          Add Images
+        </Button>
+
+        <p className="text-xs text-gray-500">
+          JPEG, PNG or WebP · Max 5 MB per image · Up to {MAX_IMAGES} images
+          total
+        </p>
+      </div>
+    </div>
+  );
+}
+
+```
+
+
+
+### 8. 测试：补全 FakeCarImageRepository
+
+`ICarImageRepository` 新增了 `UpdateSortOrdersAsync`，`FakeCarImageRepository` 要同步实现：
+
+```csharp
+    // ✅ 新增
+    // _store 存的是对象引用，Service 层修改了 image.SortOrder 后这里已自动同步
+    // 显式赋值一次是为了和真实 EfCarImageRepository 的调用约定保持一致
+    public Task UpdateSortOrdersAsync(
+        List<CarImage> images, CancellationToken cancellationToken = default)
+    {
+        foreach (var image in images)
+            _store[image.Id] = image;
+        return Task.CompletedTask;
+    }
+```
+
+
+
+### 9. 测试：后端单元测试
+
+排序阶段核心逻辑是"正确应用新顺序"和"IDOR 防护"，对应两个测试。
+
+打开 `UUcars.Tests/Services/CarServiceTests.cs`，追加：
+
+```csharp
+// ===== 图片排序（Step 64② 新增）=====
+
+[Fact]
+public async Task ReorderImagesAsync_WithValidImages_ShouldUpdateSortOrder()
+{
+    var repo = new FakeCarRepository();
+    var imageRepo = new FakeCarImageRepository();
+    repo.Seed(new Car { Id = 1, SellerId = 10, Status = CarStatus.Draft });
+
+    var image1 = new CarImage { CarId = 1, SortOrder = 0 };
+    var image2 = new CarImage { CarId = 1, SortOrder = 1 };
+    imageRepo.Seed(image1);
+    imageRepo.Seed(image2);
+
+    var service = CreateService(repo, imageRepo);
+
+    // 交换两张图的顺序
+    var request = new CarImageReorderRequest
+    {
+        Items =
+        [
+            new CarImageOrderItem { ImageId = image1.Id, SortOrder = 1 },
+            new CarImageOrderItem { ImageId = image2.Id, SortOrder = 0 }
+        ]
+    };
+
+    var result = await service.ReorderImagesAsync(1, 10, request);
+
+    // image2 现在应该排第一
+    Assert.Equal(image2.Id, result[0].Id);
+    Assert.Equal(image1.Id, result[1].Id);
+}
+
+[Fact]
+public async Task ReorderImagesAsync_WithImageIdNotBelongingToCar_ShouldThrowCarImageNotFoundException()
+{
+    var repo = new FakeCarRepository();
+    var imageRepo = new FakeCarImageRepository();
+    repo.Seed(new Car { Id = 1, SellerId = 10, Status = CarStatus.Draft });
+    imageRepo.Seed(new CarImage { CarId = 1, SortOrder = 0 });
+    var service = CreateService(repo, imageRepo);
+
+    // 999 不属于这辆车
+    var request = new CarImageReorderRequest
+    {
+        Items = [new CarImageOrderItem { ImageId = 999, SortOrder = 0 }]
+    };
+
+    await Assert.ThrowsAsync<CarImageNotFoundException>(
+        () => service.ReorderImagesAsync(1, 10, request));
+}
+```
+
+
+
+### 10. 本地验证
+
+#### 10.1 验证拖拽排序
+
+1. 把第三张图拖到第一位
+2. 视图立即响应
+3. 刷新页面，确认顺序已经持久化
+
+#### 10.2 验证 IDOR 防护
+
+用 Scalar 构造排序请求，`items` 里放不属于这辆车的 `imageId`， 应该收到 404，不会意外修改其他图片。
+
+
+
+### 11. 编译和测试
+
+```bash
+dotnet build
+dotnet test
+```
+
+新增 2 个测试用例（加上阶段①的 2 个，共 4 个），预期全部通过。
+
+
+
+### Step 64② 完成状态
+
+```
+后端：
+✅ ICarImageRepository 新增 UpdateSortOrdersAsync
+✅ EfCarImageRepository 实现新方法
+✅ CarImageReorderRequest / CarImageOrderItem DTO
+✅ CarService.ReorderImagesAsync
+   - IDOR 防护（验证 ImageId 归属当前车辆）
+   - 批量更新 SortOrder
+✅ PUT /cars/{id}/images/reorder
+
+前端：
+✅ @dnd-kit/core + @dnd-kit/sortable + @dnd-kit/utilities 安装
+✅ cars.ts 新增 reorderImages
+✅ ImageUploader 扩展：
+   - 拖拽排序（视图立即响应，接口异步同步）
+   - 独立拖拽手柄（避免和删除按钮冲突）
+   - 排序失败时自动回退到服务端真实顺序
+
+测试：
+✅ FakeCarImageRepository 补齐 UpdateSortOrdersAsync
+✅ CarServiceTests 新增 2 个用例（排序正确、IDOR 防护）
+
+✅ 本地验证通过
+✅ dotnet build + dotnet test 通过
+```
+
+
+
+### Git 提交
+
+```bash
+git add .
+git commit -m "feat: batch image upload with preview, progress, retry and drag-drop reorder"
+git push origin feature/v3-image-upload
+
+# 合并回 develop
+git checkout develop
+git merge --no-ff feature/v3-image-upload \
+  -m "merge: feature/v3-image-upload into develop"
+git push origin develop
+
+# 删除功能分支
+git branch -d feature/v3-image-upload
+git push origin --delete feature/v3-image-upload
+```
+
+
+
+## Step 65 · 草稿自动保存 + ErrorBoundary
+
+### 这一步做什么
+
+Step 64 解决了图片上传体验。这一步继续完善车辆发布流程里的另外2个问题：
+
+1. 填写表单途中意外关闭页面，内容全部丢失，没有本地草稿备份
+2. 任何页面组件崩溃都会导致整页白屏，用户完全不知道发生了什么
+
+
+
+### 1. 切出功能分支
+
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b feature/v3-draft-autosave-errorboundary
+git push -u origin feature/v3-draft-autosave-errorboundary
+```
+
+
+
+### 2. 草稿如何本地备份？
+
+卖家花了几分钟写好车辆信息，不小心关掉标签页，导致内容全部丢失，没有任何恢复方式。
+
+解决方案：用 `localStorage` 做本地草稿自动保存，下次进入页面时提示恢复。总体的思路是：
+
+1. 内容变化时，自动写入 localStorage
+2. 进入页面时，检测有没有未保存的草稿
+3. 提交成功后，清楚草稿
+
+RHF（react-hook-form） 的 `useForm`hook 提供了`watch(callback)` 方法可以订阅表单值的变化， 并可以把值通过callback回传出来，自行处理：
+
+```tsx
+// 用来订阅表单所有字段的变化
+const {watch } = useForm<T>({});
+
+useEffect(() => {
+    const subscription = watch(
+      // 自定义的回调函数，用来处理变化后的表单数据
+     // 每次任何字段变化都会触发，values 是所有字段的当前值
+      (values) => {
+        console.log(values);
+        localStorage.setItem("draftKey", JSON.stringify(values));
+      },
+    );
+    return () => subscription.unsubscribe();
+  }, [watch]);
+```
+
+这样每次按键都写一次表单数据到 `localStorage`里，但是过于频繁。使用**Debounce（防抖）** 解决这个问题：用户停止输入 2 秒后才真正写入：
+
+```bash
+用户按键 → 重置计时器（2秒）
+  → 2秒内又按键 → 重置计时器
+  → 2秒内无操作 → 计时器到期 → 执行写入 localStorage
+```
+
+```tsx
+// 内容变化时：2 秒 debounce 自动保存
+const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+useEffect(() => {2
+  const subscription = watch((values) => {
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => {
+      console.log(values);
+      localStorage.setItem("draftKey", JSON.stringify(values));
+    }, 2000);
+  });
+  return () => {
+    subscription.unsubscribe();
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+  };
+}, [watch, draftKey]);
+```
+
+
+
+### 3. 本地草稿的检查和数据回填
+
+用户重新打开发布页面（或者刷新页面），如果 `localStorage` 里存着上一次没提交完的内容，应该提示"要不要恢复"，而不是默默丢弃或者默默覆盖。
+
+RHF 的`useForm` 提供一个方法`reset(values)`， 能把数据**重新填回表单**，即调用后表单会用传入的值重新渲染所有字段
+
+```tsx
+// 用来给表单所有字段的reset数据
+const {reset } = useForm<T>({});
+
+ useEffect(() => {
+    const savedValues = localStorage.getItem("draftKey")!;
+    const parsedValues = JSON.parse(savedValues) as CarFormValues;
+    reset(parsedValues);
+  }, [reset]);
+```
+
+
+
+### 4. 更新 CarForm：加入草稿自动保存
+
+`CarForm` 同时被 `CreateCarPage`（发布新车）和 `EditCarPage`（编辑已有车）使用， 需要用不同的 key 存草稿（避免两个场景互相覆盖），所以新增一个 `draftKey` prop。
+
+```tsx
+// 改之后
+interface CarFormProps {
+  defaultValues?: CarFormValues;
+  onSubmit: (values: CarFormValues) => Promise<void>;
+  isSubmitting: boolean;
+  submitLabel: string;
+  // ✅ 新增：由调用方传入，格式如 "car-draft-new" 或 "car-draft-5"
+  draftKey: string; 
+}
+```
+
+#### 4.1 保存草稿
+
+解构出 `watch`方法，把表单数据写入`localStorage`, 并使用定时器实现防抖
+
+```tsx
+...
+export default function CarForm({
+  defaultValues,
+  onSubmit,
+  isSubmitting,
+  submitLabel,
+  draftKey,
+}: CarFormProps) {
+    
+  const {
+    register,
+    handleSubmit,
+    // 用来订阅表单所有字段的变化
+    watch,
+    formState: { errors },
+  } = useForm<CarFormValues>({
+    resolver: zodResolver(carSchema),
+    defaultValues,
+  });
+
+  /* -- 保存草稿 -- */
+  // 内容变化时：2 秒 debounce 自动保存
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    const subscription = watch((values) => {
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = setTimeout(() => {
+        localStorage.setItem(draftKey, JSON.stringify(values));
+      }, 2000);
+    });
+    return () => {
+      subscription.unsubscribe();
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    };
+  }, [watch, draftKey]);
+
+  return (
+    <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+      ...
+    </form>
+  );
+}
+
+```
+
+#### 4.2 检查本地操作，回填表格
+
+解构出 `reset`方法， 检查本地草稿并回填表单数据：这个检测逻辑只应该在组件**第一次挂载**时跑一次，不能每次重新渲染都弹一次提示。用一个 `useRef` 做"是否已经检查过"的标记，比用 `useState` 更合适，因为这个标记本身不需要触发重新渲染，只是一个纯粹的"跑没跑过"的flag
+
+```tsx
+...
+export default function CarForm({
+  defaultValues,
+  onSubmit,
+  isSubmitting,
+  submitLabel,
+  draftKey,
+}: CarFormProps) {
+    
+  const {
+    register,
+    handleSubmit,
+    // 用来订阅表单所有字段的变化
+    watch,
+    // 用于把恢复的草稿数据重新填回表单
+    reset,
+    formState: { errors },
+  } = useForm<CarFormValues>({
+    resolver: zodResolver(carSchema),
+    defaultValues,
+  });
+
+  /* -- 保存草稿 -- */
+  ...
+
+  /* - 草稿数据回填 - */
+  // 进入页面时：检查是否有未保存的草稿
+  const draftRestoredRef = useRef(false);
+
+  useEffect(() => {
+    if (draftRestoredRef.current) return; // 只在初次渲染时执行一次
+    draftRestoredRef.current = true;
+
+    const saved = localStorage.getItem(draftKey);
+    if (!saved) return;
+
+    try {
+      const parsed = JSON.parse(saved) as CarFormValues;
+      // setTimeout(300ms)：等 Toaster 完成挂载再调用 toast()，
+      // 否则组件刚挂载时 Toaster 可能还没准备好，Toast 不会显示
+      setTimeout(() => {
+        toast("Unsaved draft found.", {
+          description: "Do you want to restore your previous draft?",
+          action: {
+            label: "Restore",
+            onClick: () => {
+              reset(parsed);
+              toast.success("Draft restored.");
+            },
+          },
+          cancel: {
+            label: "Discard",
+            onClick: () => localStorage.removeItem(draftKey),
+          },
+          duration: 10000, // 给用户足够时间决定
+        });
+      }, 300);
+    } catch {
+      // JSON 解析失败（数据损坏），静默清除
+      localStorage.removeItem(draftKey);
+    }
+  }, [draftKey, reset]);
+
+
+  return (
+    <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+      ...
+    </form>
+  );
+}
+
+```
+
+#### 4.3 提交成功后，清除草稿
+
+如果用户已经成功提交了表单，`localStorage` 里那份草稿就变成了"过时数据"。下次用户再打开这个页面（比如又想新建一辆车），不应该被提示"要不要恢复"一份其实早就已经提交过的内容。
+
+提交完成后，需要立刻手动清清除， 新建提交成功的后的函数 `handleFormSubmit`， 包装之前的 事件函数`onSubmit`
+
+```tsx
+const handleFormSubmit = async (values: CarFormValues) => {
+   //提交表单数据
+  await onSubmit(values);
+  // 手动清除草稿
+  localStorage.removeItem(draftKey);
+};
+```
+
+`form` 标签上的提交处理函数换成这个包装过的版本：
+
+```tsx
+// 改之前
+<form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+
+// 改之后
+<form onSubmit={handleSubmit(handleFormSubmit)} className="space-y-4">
+```
+
+
+
+### 5. 更新 CreateCarPage 和 EditCarPage：传入 draftKey
+
+`CarForm` 新增了必传 prop `draftKey`，两个调用方需要同步更新。
+
+打开 `src/pages/CreateCarPage.tsx`，找到 `<CarForm>`，加入 `draftKey`：
+
+```tsx
+<CarForm
+  onSubmit={handleSubmit}
+  isSubmitting={createMutation.isPending}
+  submitLabel="Create Draft"
+  draftKey="car-draft-new"  // ✅ 新增
+/>
+```
+
+打开 `src/pages/EditCarPage.tsx`，找到 `<CarForm>`，加入 `draftKey`：
+
+```tsx
+<CarForm
+  defaultValues={{ ... }}
+  onSubmit={handleSubmit}
+  isSubmitting={updateMutation.isPending}
+  submitLabel="Save Changes"
+  draftKey={`car-draft-${carId}`}  // ✅ 新增：每辆车独立的 key
+/>
+```
+
+
+
+### 6. 组件崩溃导致整页白屏
+
+如果任何页面组件的渲染函数抛出异常，React 会卸载整个组件树，页面变成空白。用户不知道发生了什么，也没有任何恢复的方式。
+
+针对这种状况，React 提供了 **ErrorBoundary** 机制：当子组件在渲染阶段抛出错误时，ErrorBoundary 捕获这个错误并渲染一个备用 UI，而不是让整个页面崩溃。
+
+但它的捕获范围是有限的：
+
+```
+✅ 能捕获：子组件渲染阶段（render）抛出的错误
+
+❌ 不能捕获：事件处理器里的错误（onClick 等）→ 用 try/catch
+❌ 不能捕获：异步代码里的错误（Promise.reject 等）→ 用 try/catch
+❌ 不能捕获：ErrorBoundary 自身的错误
+```
+
+ErrorBoundary 和 `try/catch` 不是替代关系，而是互补关系：
+
+- ErrorBoundary 处理"组件渲染崩溃"
+- `try/catch` 处理"业务逻辑执行失败"
+
+
+
+### 7. 实现ErrorBoundary
+
+原生的 ErrorBoundary 必须用 React 类组件实现，用 `react-error-boundary` 这个库把它封装成函数组件的形式
+
+#### 7.1 安装库
+
+```bash
+npm install react-error-boundary
+```
+
+#### 7.2 新建组件
+
+新建 `src/components/ErrorBoundary.tsx`：
+
+```tsx
+import {
+  ErrorBoundary as ReactErrorBoundary,
+  type FallbackProps,
+} from "react-error-boundary";
+import { Button } from "./ui/button";
+
+function ErrorFallback({ error, resetErrorBoundary }: FallbackProps) {
+  return (
+    <div
+      className="flex min-h-50 flex-col items-center justify-center gap-4 rounded-xl border p-8 text-center"
+      style={{
+        borderColor: "var(--color-border)",
+        backgroundColor: "var(--color-surface)",
+      }}
+    >
+      <p
+        className="text-lg font-semibold"
+        style={{ color: "var(--color-text-primary)" }}
+      >
+        Something went wrong
+      </p>
+      {/* 只在开发环境显示具体错误信息，方便调试。
+          生产环境不暴露内部实现细节，避免给攻击者提供信息。 */}
+      {import.meta.env.DEV && (
+        <p
+          className="max-w-md text-xs"
+          style={{ color: "var(--color-danger)" }}
+        >
+          {error instanceof Error ? error.message : "Unknown error"}
+        </p>
+      )}
+      <Button variant="outline" onClick={resetErrorBoundary}>
+        Try again
+      </Button>
+    </div>
+  );
+}
+
+export default function ErrorBoundary({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  return (
+    <ReactErrorBoundary FallbackComponent={ErrorFallback}>
+      {children}
+    </ReactErrorBoundary>
+  );
+}
+
+```
+
+#### 7.3 使用 ErrorBoundary
+
+在哪里用 ErrorBoundary 是一个设计决策：
+
+```
+一个全局 ErrorBoundary 包裹整个应用：
+  某页面崩溃 → 整个页面（含导航栏）变成错误 UI → 用户无法导航到其他页面
+
+每个页面单独用 ErrorBoundary 包裹：
+  某页面崩溃 → 只有该页面内容区域显示错误 UI → 导航栏正常 → 用户可以去其他页面
+```
+
+显然每个页面单独包裹的体验更好。
+
+写一个小的辅助函数，避免每个路由都重复写 `<ErrorBoundary><SomePage /></ErrorBoundary>` 这种样板代码：
+
+```tsx
+import ErrorBoundary from "@/components/ErrorBoundary";
+
+// 辅助函数：减少重复的 <ErrorBoundary><Page /></ErrorBoundary> 写法
+// 等价于 <ErrorBoundary><SomePage /></ErrorBoundary>
+const withEB = (element: React.ReactNode) => (
+  <ErrorBoundary>{element}</ErrorBoundary>
+);
+```
+
+用 `withEB()` 包裹所有页面的 `element`（`Layout`、`ProtectedRoute`、`AdminRoute` 这类路由守卫/布局组件本身不包——它们崩溃属于另一个更严重的问题，不该被当作"页面级"错误处理）：
+
+```tsx
+// src/router.tsx
+import { createBrowserRouter } from "react-router-dom";
+import ProtectedRoute from "@/components/ProtectedRoute";
+import AdminRoute from "@/components/AdminRoute";
+
+// 认证页面
+import LoginPage from "@/pages/LoginPage";
+import RegisterPage from "@/pages/RegisterPage";
+import VerifyEmailPage from "@/pages/VerifyEmailPage";
+import ForgotPasswordPage from "@/pages/ForgotPasswordPage";
+import ResetPasswordPage from "@/pages/ResetPasswordPage";
+
+// 公开页面
+import HomePage from "@/pages/HomePage";
+import CarDetailPage from "@/pages/CarDetailPage";
+import NotFoundPage from "@/pages/NotFoundPage";
+
+// 需要登录的页面
+import CreateCarPage from "@/pages/CreateCarPage";
+import EditCarPage from "@/pages/EditCarPage";
+import ProfilePage from "@/pages/ProfilePage";
+import MyListingsPage from "@/pages/MyListingsPage";
+import MyFavoritesPage from "@/pages/MyFavoritesPage";
+import MyPurchasesPage from "@/pages/MyPurchasesPage";
+import MySalesPage from "@/pages/MySalesPage";
+
+// Admin 页面
+import AdminPage from "@/pages/AdminPage";
+import AdminPendingPage from "@/pages/AdminPendingPage";
+import Layout from "./components/Layout";
+
+import ErrorBoundary from "@/components/ErrorBoundary";
+
+// 辅助函数：减少重复的 <ErrorBoundary><Page /></ErrorBoundary> 写法
+// 等价于 <ErrorBoundary><SomePage /></ErrorBoundary>
+const withEB = (element: React.ReactNode) => (
+  <ErrorBoundary>{element}</ErrorBoundary>
+);
+
+export const router = createBrowserRouter([
+  // =============================================
+  // 认证页面：不需要导航栏（全屏居中布局）
+  // =============================================
+  { path: "/login", element: withEB(<LoginPage />) },
+  { path: "/register", element: withEB(<RegisterPage />) },
+  { path: "/verify-email", element: withEB(<VerifyEmailPage />) },
+  { path: "/forgot-password", element: withEB(<ForgotPasswordPage />) },
+  { path: "/reset-password", element: withEB(<ResetPasswordPage />) },
+
+  // =============================================
+  // 有导航栏的页面：都放在 Layout 里
+  // =============================================
+  {
+    element: <Layout />,
+    children: [
+      // =============================================
+      // 公开路由（无需登录）
+      // =============================================
+      { path: "/", element: withEB(<HomePage />) },
+      { path: "/cars/:id", element: withEB(<CarDetailPage />) },
+
+      // =============================================
+      // 受保护路由（需要登录）
+      // 用 ProtectedRoute 作为父路由
+      // children 里的页面只有登录后才能访问
+      // =============================================
+      {
+        element: <ProtectedRoute />,
+        children: [
+          { path: "/cars/new", element: withEB(<CreateCarPage />) },
+          { path: "/cars/:id/edit", element: withEB(<EditCarPage />) },
+
+          // 个人中心：嵌套路由
+          // ProfilePage 里用 Outlet 渲染子路由内容
+          // 访问 /profile 时渲染 ProfilePage + MyListingsPage（默认子路由）
+          {
+            path: "/profile",
+            element: withEB(<ProfilePage />),
+            children: [
+              { index: true, element: withEB(<MyListingsPage />) },
+              { path: "listings", element: withEB(<MyListingsPage />) },
+              { path: "favorites", element: withEB(<MyFavoritesPage />) },
+              { path: "purchases", element: withEB(<MyPurchasesPage />) },
+              { path: "sales", element: withEB(<MySalesPage />) },
+            ],
+          },
+        ],
+      },
+
+      // =============================================
+      // Admin 路由（需要 Admin 角色）
+      // =============================================
+      {
+        element: <AdminRoute />,
+        children: [
+          {
+            path: "/admin",
+            element: withEB(<AdminPage />),
+            children: [
+              { index: true, element: withEB(<AdminPendingPage />) },
+              { path: "pending", element: withEB(<AdminPendingPage />) },
+            ],
+          },
+        ],
+      },
+    ],
+  },
+
+  // 404
+  { path: "/404", element: withEB(<NotFoundPage />) },
+  { path: "*", element: withEB(<NotFoundPage />) },
+]);
+```
+
+
+
+### 8. 本地验证
+
+#### 8.1 保存草稿
+
+1. 进入创建车辆页，填写部分内容
+2. 等待 2 秒（DevTools → Application → Local Storage 确认出现 `car-draft-new`）
+3. 刷新页面，出现 Toast 提示"Unsaved draft found"
+4. 点击 "Restore"：表单恢复填写的内容 ✅
+5. 正常填写并提交，检查 Local Storage 确认草稿已被清除 ✅
+6. 重新进入页面，不再出现 Toast 提示 ✅
+
+#### 8.2 ErrorBoundary
+
+1. 临时在 
+
+    ```
+    CarDetailPage.tsx
+    ```
+
+     的 return 语句第一行加入：
+
+    ```tsx
+    throw new Error("Test ErrorBoundary");
+    ```
+
+2. 进入任意车辆详情页
+
+3. 显示 "Something went wrong" + 错误信息（开发环境）+ "Try again" 按钮，**不是白屏** ✅
+
+4. 导航栏正常，可以点击导航到其他页面 ✅
+
+5. **验证完成后移除这行测试代码**
+
+
+
+### 编译
+
+```bash
+dotnet build
+cd uucars-web && npm run build
+```
+
+
+
+### Git 提交
+
+```bash
+git add .
+git commit -m "feat: draft autosave and ErrorBoundary"
+git push origin feature/v3-draft-autosave-errorboundary
+
+git checkout develop
+git merge --no-ff feature/v3-draft-autosave-errorboundary \
+  -m "merge: feature/v3-draft-autosave-errorboundary into develop"
+git push origin develop
+
+git branch -d feature/v3-draft-autosave-errorboundary
+git push origin --delete feature/v3-draft-autosave-errorboundary
+```
+
+
+
+### Step 65 完成状态
+
+```
+
+
+草稿本地备份
+✅ 理解：watch 订阅表单变化 + debounce 防止频繁写入
+✅ 理解：为什么用 useRef 而不是 useState 存"是否已检查过""计时器引用"
+✅ 实现：进入页面检查草稿，Toast 提示恢复/丢弃（setTimeout 等 Toaster 挂载）
+✅ 实现：内容变化 2 秒 debounce 自动保存到 localStorage
+✅ 实现：提交成功后清除草稿（handleFormSubmit）
+✅ 实现：CarForm 新增 draftKey prop，两个调用页面各自传入独立 key
+✅ 本地验证通过
+
+组件崩溃导致整页白屏
+✅ 理解：ErrorBoundary 能捕获什么/不能捕获什么，与 try/catch 的职责划分
+✅ 理解：全局包裹 vs 页面级包裹的体验差异，选择页面级
+✅ 安装：react-error-boundary
+✅ 实现：ErrorBoundary 组件（开发环境显示错误详情，生产环境只显示通用提示）
+✅ 实现：router.tsx 用 withEB() 包裹所有页面
+✅ 本地验证通过
+
+✅ dotnet build + npm run build 通过
+✅ Git commit + 合并回 develop 完成
+```
+
+
+
+## Step 66 · TanStack Query 进阶（乐观更新）
+
+### 这一步做什么
+
+打开车辆详情页，点击 "♡ Save Car" 按钮，会发生这样的事：
+
+```
+用户点击 → 按钮变成 "Saving..."（等待中）→ API 响应回来 → UI 更新
+```
+
+这个等待过程用户是能感知到的。对于收藏这种"轻操作"，等待感会让交互显得迟钝。
+
+现在看看 `CarDetailPage.tsx` 里当前的收藏 mutation：
+
+```tsx
+const favoriteMutation = useMutation({
+  mutationFn: () => favoritesApi.add(carId),
+  onSuccess: () => {
+    toast.success("Added to favorites!");
+    queryClient.invalidateQueries({ queryKey: ["favorites"] });
+  },
+  onError: (error) => toast.error(error.message),
+});
+```
+
+流程是：发起请求 → 等响应 → 成功了才更新 UI。
+
+**乐观更新（Optimistic Update）** 把这个流程反过来：先假设操作会成功，立即更新 UI，API 在后台执行，如果失败了再把 UI 回滚回去。
+
+TanStack Query 的 `useMutation` 提供了三个关键回调来实现乐观更新：
+
+```
+onMutate：在 API 请求发出之前触发
+  → 立即更新本地缓存（UI 立即响应）
+  → 保存当前状态的快照（失败时用来回滚）
+
+onError：API 请求失败时触发
+  → 用快照恢复之前的状态（回滚）
+
+onSettled：无论成功还是失败，最终都触发
+  → 调 invalidateQueries 从服务端重新拉取真实数据
+  → 确保本地缓存和服务端最终一致
+```
+
+为什么 `onSettled` 里用 `invalidateQueries` 而不是 `setQueryData`？
+
+```
+setQueryData：直接把指定数据写进缓存（不发请求）
+  适合：已经知道操作后的完整新数据（比如创建后服务端返回了新对象）
+
+invalidateQueries：把缓存标记为"过期"，触发重新请求
+  适合：不知道操作后服务端的完整状态（收藏操作服务端可能有额外逻辑）
+```
+
+乐观更新的场景里，`onMutate` 用 `setQueryData` 做即时 UI 响应， `onSettled` 用 `invalidateQueries` 做最终一致性保证，两者结合使用。
+
+
+
+### 1. 切出功能分支
+
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b feature/v3-optimistic-favorite
+git push -u origin feature/v3-optimistic-favorite
+```
+
+
+
+### 2. 当前的收藏数据结构
+
+`CarDetailPage.tsx` 里请求车辆详情的 query key 是：
+
+```tsx
+queryKey: ["car", carId]
+```
+
+`MyFavoritesPage.tsx` 里请求收藏列表的 query key 是：
+
+```tsx
+queryKey: ["favorites", { page, pageSize: PAGE_SIZE }]
+```
+
+**收藏操作影响两个缓存：**
+
+1. `["favorites", ...]`：收藏列表，收藏/取消收藏后列表内容变化
+2. `["car", carId]`：车辆详情，当前页面显示的数据
+
+但 `CarDetailPage.tsx`里，收藏这块只有一个 `favoriteMutation`，调用的是 `favoritesApi.add(carId)`，按钮状态只依赖 `favoriteMutation.isPending`——**没有任何地方在追踪"当前用户到底收藏没收藏这辆车"这件事**。这带来两个问题：
+
+1. **只能加，不能取消**——现在压根没有"已收藏"这个状态可以让按钮切换成"取消收藏"，收藏这个动作只支持一个方向
+2. **就算加了这个状态，刷新页面也会丢**——`CarDetail`/`Car` 类型里没有 `isFavorited` 这样的字段，`favoritesApi` 也没有一个"查单个"的接口，只有 `getMyFavorites` 这种分页列表
+
+两个问题的根子是同一个：**前端完全没有一个可信的地方，能告诉它"这个用户到底收藏没收藏这辆车"**。要做乐观更新，先得把这个信息来源补上，不然"乐观更新"这个动作连一个起点都没有。
+
+因此，我们要新增一个查询接口 `GET /favorites/{carId}`，跟现有的 `POST /favorites/{carId}`、`DELETE /favorites/{carId}` 是同一个资源路径，风格一致。这个接口只在 `FavoritesController`/`FavoriteService` 里加，不需要碰 `CarService`——车辆和收藏是两个独立的领域，让 `CarService` 知道收藏的存在会造成不必要的耦合。
+
+
+
+### 3. 后端新增查询收藏状态的接口
+
+修改`FavoriteService.cs`，新增一个方法
+
+```tsx
+// 判断用户是否收藏了某辆车
+public async Task<bool> IsFavoritedAsync(int userId, int carId, CancellationToken cancellationToken = default)
+{
+    var favorite = await _favoriteRepository.GetAsync(userId, carId, cancellationToken);
+    return favorite != null;
+}
+```
+
+修改`FavoritesController.cs`, 新增一个接口
+
+```tsx
+// GET /favorites/{carId}
+// 查询当前用户是否已收藏这辆车，用于详情页正确初始化收藏按钮的状态
+[HttpGet("{carId:int}")]
+public async Task<IActionResult> CheckFavorite(int carId, CancellationToken cancellationToken)
+{
+    var userId = _currentUserService.GetCurrentUserId();
+    if (userId == null)
+        return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+    var isFavorite = await _favoriteService.IsFavoritedAsync(userId.Value, carId, cancellationToken);
+
+    return Ok(ApiResponse<bool>.Ok(isFavorite, "Favorite status retrieved."));
+}
+```
+
+在 `AddFavorite` 和 `RemoveFavorite` 之后、`GetMyFavorites` 之前，加入。
+
+`GET /favorites/{carId}`（带 `:int` 约束）和现有的 `GET /favorites`（不带参数，查列表）路由不冲突，ASP.NET Core 能正确区分这两种不同形状的路由。
+
+
+
+### 4. 前端 `favoritesApi `新增 `check` 方法
+
+打开 `favoritesApi` 所在文件，在 `add`/`remove`/`getMyFavorites` 之后加入：
+
+```tsx
+// ✅ 新增：查询当前用户是否已收藏某辆车
+check: async (carId: number): Promise<boolean> => {
+  const response = await apiClient.get<ApiResponse<boolean>>(`/favorites/${carId}`);
+  return response.data.data!;
+},
+```
+
+
+
+### 5. 更新 CarDetailPage：实现乐观更新
+
+#### 5.1 新增 查询收藏状态 和 本地收藏状态
+
+要让按钮一开始就显示正确的收藏状态，需要先查一次服务器；要让点击按钮时能立刻响应（不等 API 返回），又需要一个能被立刻改写的本地状态。
+
+这是两件不同的事，分别用两个东西来管：
+
+本地收藏状态：
+
+```tsx
+// 本地收藏状态：控制按钮显示什么、点击时立即切换成什么
+const [isFavorited, setIsFavorited] = useState(false);
+```
+
+初始值先给 false，等上面这个查询有结果了，再用下面的 useEffect 同步成真实值.
+
+查询收藏状态:
+
+```tsx
+// 查询当前用户是否已收藏这辆车（未登录用户不需要查）
+const { data: fetchedIsFavorited, isLoading: isCheckingFavorite } = useQuery({
+  queryKey: ["favorite", carId],
+  queryFn: () => favoritesApi.check(carId),
+  enabled: !isNaN(carId) && isAuthenticated(),
+});
+
+```
+
+#### 5.2 把查询结果同步到本地状态
+
+`useState` 的初始值只在组件第一次渲染时生效，而查询是异步的——组件第一次渲染时，查询结果还没回来。要等结果到达之后，再手动同步：
+
+```tsx
+// 服务器的值到达之后，才知道真实的收藏状态，这时候才同步进本地 state
+useEffect(() => {
+  if (isFavoritedFromServer !== undefined) {
+    setIsFavorited(isFavoritedFromServer);
+  }
+}, [isFavoritedFromServer]);
+```
+
+同步完成之后，`isFavorited` 就是"界面当前显示什么"的唯一依据，不再跟随查询结果联动——之后的变化全部交给用户的点击操作驱动。
+
+#### 5.3 把 favoriteMutation 改为双向切换的乐观更新版本
+
+现在按钮需要支持"收藏"和"取消收藏"两个方向，`mutationFn` 需要知道"这次点击到底要切换成哪个状态"。
+
+因此，把添加收藏和取消收藏的``mutation`分开，这样能让每个 `mutationFn` 保持"一个函数只做一件事， 比如：
+
+```tsx
+  /* ── 添加收藏 mutation ── */
+  const addFavoriteMutation = useMutation({
+    mutationFn: () => favoritesApi.add(carId),
+    onSuccess: () => {
+      toast.success("Added to favorites!");
+      queryClient.invalidateQueries({ queryKey: ["favorites"] });
+    },
+    onError: (error) => toast.error(error.message),
+  });
+
+
+  /* ── 取消收藏 mutation ── */
+  const removeFavoriteMutation = useMutation({
+    mutationFn: () => favoritesApi.remove(carId),
+    onSuccess: () => {
+      toast.success("Removed from favorites.");
+      queryClient.invalidateQueries({ queryKey: ["favorites"] });
+    },
+    onError: (error) => toast.error(error.message),
+  });
+
+```
+
+加入乐观更新逻辑：
+
+```tsx
+  /* ── 添加收藏 mutation ── */
+  const addFavoriteMutation = useMutation({
+    mutationFn: () => favoritesApi.add(carId),
+      
+    // onMutate：请求发出之前立即执行
+    onMutate: async () => {
+      // 取消正在进行的 favorites 查询
+      // 原因：如果有正在飞行的 invalidateQuery 请求，
+      // 它的响应可能会覆盖我们即将做的乐观更新，造成状态混乱
+      await queryClient.cancelQueries({ queryKey: ["favorites"] });
+      // 保存操作之前的收藏列表的快照（第一页，万一 API 失败用来回滚）  
+      const FavoritesBeforeThisAction = queryClient.getQueryData([
+        "favorites",
+        { page: 1, pageSize: 10 },
+      ]);
+      // 记录操作之前的按钮状态，失败时回滚成这个，而不是简单地都回滚成 false
+      const isFavoritedBeforeThisAction = isFavorited;
+      // 立即切换到目标状态（不等 API 响应）
+      setIsFavorited(true);
+      return { FavoritesBeforeThisAction, isFavoritedBeforeThisAction };
+    },
+    onSuccess: () => toast.success("Added to favorites!"),
+    // onError：API 失败时，用快照把状态回滚
+    onError: (error, _vars, context) => {
+      toast.error(error.message);
+      if (context) setIsFavorited(context.isFavoritedBeforeThisAction);
+      if (context?.FavoritesBeforeThisAction) {
+        queryClient.setQueryData(
+          ["favorites", { page: 1, pageSize: 10 }],
+          context.FavoritesBeforeThisAction,
+        );
+      }
+    },
+    // onSettled：无论成功还是失败，最终触发
+    // 重新拉取服务端真实数据，确保最终一致性
+    // 两个缓存都要失效：列表页（favorites）和这个页面自己刚查过的单个状态（favorite）
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ["favorites"] });
+      queryClient.invalidateQueries({ queryKey: ["favorite", carId] });
+    },
+  });
+
+  /* ── 取消收藏 mutation ── */
+  const removeFavoriteMutation = useMutation({
+    mutationFn: () => favoritesApi.remove(carId),
+    onMutate: async () => {
+      await queryClient.cancelQueries({ queryKey: ["favorites"] });
+      const FavoritesBeforeThisAction = queryClient.getQueryData([
+        "favorites",
+        { page: 1, pageSize: 10 },
+      ]);
+      const isFavoritedBeforeThisAction = isFavorited;
+      setIsFavorited(false);
+      return { FavoritesBeforeThisAction, isFavoritedBeforeThisAction };
+    },
+    onSuccess: () => toast.success("Removed from favorites."),
+    onError: (error, _vars, context) => {
+      toast.error(error.message);
+      if (context) setIsFavorited(context.isFavoritedBeforeThisAction);
+      if (context?.FavoritesBeforeThisAction) {
+        queryClient.setQueryData(
+          ["favorites", { page: 1, pageSize: 10 }],
+          context.FavoritesBeforeThisAction,
+        );
+      }
+    },
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ["favorites"] });
+      queryClient.invalidateQueries({ queryKey: ["favorite", carId] });
+    },
+  });
+```
+
+#### 5.4 更新收藏按钮的 UI
+
+```tsx
+{canBuy && (
+  <div className="flex flex-col gap-6">
+    <Button
+      variant="outline"
+      className="w-full gap-2"
+      onClick={() =>
+      isFavorited
+        ? removeFavoriteMutation.mutate()
+        : addFavoriteMutation.mutate()
+    	}
+      disabled={
+      addFavoriteMutation.isPending ||
+      removeFavoriteMutation.isPending ||
+      isCheckingFavorite
+    	}
+    >
+      {isFavorited ? "♥ Saved" : "♡ Save Car"}
+    </Button>
+    <Button className="w-full" onClick={() => setDialogOpen(true)}>
+      Buy Now
+    </Button>
+  </div>
+)}
+```
+
+#### 5.5 优化mutation
+
+我们上面的两个mutation（addFavoriteMutation和removeFavoriteMutation）内部的乐观更新逻辑有大量相同的部分，因此我们可以抽取并封装成几个辅助方法，这样便于统一维护。
+
+```tsx
+// 收藏列表缓存的 query key，快照/回滚/失效三处都要用到，
+// 抽成一个常量，避免手写三遍容易打错、以后改动漏改
+const FAVORITES_LIST_KEY = ["favorites", { page: 1, pageSize: 10 }];
+
+// onMutate 的公共逻辑：接收"这次要切换成什么状态"，返回一个可以直接赋给 onMutate 的函数
+const handleOnMutate = (targetState: boolean) => async () => {
+await queryClient.cancelQueries({ queryKey: ["favorites"] });
+
+const FavoritesBeforeThisAction =
+  queryClient.getQueryData(FAVORITES_LIST_KEY);
+const isFavoritedBeforeThisAction = isFavorited;
+
+setIsFavorited(targetState);
+
+return { FavoritesBeforeThisAction, isFavoritedBeforeThisAction };
+};
+
+// onError 的公共逻辑：两个方向完全一样，直接复用
+const handleFavoriteError = (
+error: Error,
+context:
+  | {
+      FavoritesBeforeThisAction: unknown;
+      isFavoritedBeforeThisAction: boolean;
+    }
+  | undefined,
+) => {
+toast.error(error.message);
+if (context) setIsFavorited(context.isFavoritedBeforeThisAction);
+if (context?.FavoritesBeforeThisAction) {
+  queryClient.setQueryData(
+    FAVORITES_LIST_KEY,
+    context.FavoritesBeforeThisAction,
+  );
+}
+};
+
+// onSettled 的公共逻辑：两个方向完全一样
+const invalidateFavoriteQueries = () => {
+queryClient.invalidateQueries({ queryKey: ["favorites"] });
+queryClient.invalidateQueries({ queryKey: ["favorite", carId] });
+};
+
+```
+
+这样添加收藏和取消收藏的mutation可以简化为：
+
+```tsx
+/* ── 添加收藏 mutation ── */
+const addFavoriteMutation = useMutation({
+    mutationFn: () => favoritesApi.add(carId),
+    onMutate: handleOnMutate(true),
+    onSuccess: () => toast.success("Added to favorites!"),
+    onError: (error, _vars, context) => handleFavoriteError(error, context),
+    onSettled: () => invalidateFavoriteQueries,
+});
+
+/* ── 取消收藏 mutation ── */
+const removeFavoriteMutation = useMutation({
+    mutationFn: () => favoritesApi.remove(carId),
+    onMutate: handleOnMutate(false),
+    onSuccess: () => toast.success("Removed from favorites."),
+    onError: (error, _vars, context) => handleFavoriteError(error, context),
+    onSettled: () => invalidateFavoriteQueries,
+});
+```
+
+
+
+### 6. 本地验证
+
+#### 6.1 验证收藏状态正确初始化
+
+1. 用非车主账号登录，进入一辆之前已经收藏过的车辆详情页
+2. 按钮应该直接显示 "♥ Saved"（不是从 "♡ Save Car" 开始）
+3. 进入一辆没收藏过的车辆详情页，按钮显示 "♡ Save Car"
+
+#### 6.2 验证乐观更新的即时响应
+
+1. 进入一辆没收藏过的车辆详情页
+2. 点击 "♡ Save Car"
+3. 按钮**立即**变成 "♥ Saved"，不需要等待 API 响应
+4. API 成功后弹出 "Added to favorites!" 的 Toast
+5. 进入 My Favorites 页，确认收藏已保存
+
+#### 6.3 验证双向切换
+
+1. 在同一个详情页，再点一次 "♥ Saved"
+2. 按钮**立即**变回 "♡ Save Car"
+3. API 成功后弹出 "Removed from favorites." 的 Toast
+4. 进入 My Favorites 页，确认这辆车已经不在列表里
+
+#### 6.4 验证失败回滚
+
+模拟 API 失败（临时在 `favoritesApi.add`/`favoritesApi.remove` 里 throw 一个错误，或者断网）：
+
+1. 点击按钮
+2. 按钮**立即**切换到目标状态（乐观更新）
+3. API 失败，按钮**自动回滚**回操作之前的状态
+4. 弹出错误 Toast
+
+验证完成后还原临时加的 throw。
+
+
+
+### 7. 理解 useInfiniteQuery（知识点说明）
+
+可以用 `useInfiniteQuery` 实现无限滚动，但在 UUcars 里不适合实现：
+
+这里作为知识点简要说明：
+
+```
+分页（Pagination）vs 无限滚动（Infinite Scroll）的选择：
+
+分页适合：
+  - 用户需要知道自己在第几页（"第3页 / 共10页"）
+  - 用户需要跳到特定页
+  - 内容是结构化的"商品/车辆/搜索结果"
+  - 用户会分享或回退到特定页
+  → UUcars 车辆列表 ✅
+
+无限滚动适合：
+  - 内容是连续消费的 Feed 流
+  - 用户不关心"在第几条"
+  - 社交媒体、新闻流、图片瀑布流
+  → 不适合 UUcars
+
+useInfiniteQuery 的核心概念（了解即可）：
+  - getNextPageParam：从上一页的响应里提取下一页的参数
+  - fetchNextPage：手动触发加载下一页
+  - hasNextPage：是否还有更多数据
+  - data.pages：所有已加载页的数组（每次加载都追加，不替换）
+```
+
+
+
+### 8. Git 提交
+
+```bash
+git add .
+git commit -m "feat: optimistic bidirectional favorite toggle with correct initial state"
+git push origin feature/v3-optimistic-favorite
+
+# 合并回 develop
+git checkout develop
+git merge --no-ff feature/v3-optimistic-favorite \
+  -m "merge: feature/v3-optimistic-favorite into develop"
+git push origin develop
+
+# 删除功能分支
+git branch -d feature/v3-optimistic-favorite
+git push origin --delete feature/v3-optimistic-favorite
+```
+
+
+
+### Step 66 完成状态
+
+```
+知识点：
+✅ 理解乐观更新的三个回调（onMutate / onError / onSettled）及其执行时机
+✅ 理解 onMutate 里 cancelQueries 的必要性（防止飞行中的请求覆盖乐观状态）
+✅ 理解 setQueryData vs invalidateQueries 的选择依据
+✅ 理解为什么"目标状态"要作为参数传入 mutate，而不是在回调里现读组件 state（避免读到过时值）
+✅ 理解为什么需要"服务器状态"和"本地显示状态"两个变量，用 useEffect 把前者同步给后者
+✅ 理解无限滚动 vs 分页的适用场景，以及为什么 UUcars 保持分页
+
+后端：
+✅ FavoriteService 新增 GetFavoriteAsync（透传 GetAsync，不额外包一层转换）
+✅ FavoritesController 新增 GET /favorites/{carId}
+
+前端：
+✅ favoritesApi 新增 check 方法
+✅ CarDetailPage 新增查询：useQuery(["favorite", carId]) 获取真实收藏状态
+✅ CarDetailPage 新增 isFavorited 本地状态，通过 useEffect 与查询结果同步
+✅ favoriteMutation 改为双向切换（分割成2个独立的mutation）：
+   - mutationFn 根据传入的目标状态决定调用 add 还是 remove
+   - onMutate：cancelQueries + 保存快照（含操作前的按钮状态）+ 立即切换状态
+   - onError：回滚到操作前的状态 + 回滚缓存快照
+   - onSettled：同时让 favorites 列表和 favorite 单个状态缓存失效
+✅ 收藏按钮 UI：♡ Save Car ⇄ ♥ Saved，可来回切换，不再永久禁用
+
+✅ 本地验证：正确初始化 + 即时响应 + 双向切换 + 失败回滚
+✅ Git commit + 合并回 develop 完成
+```
+
+
+
+## Step 67 · 搜索体验优化
+
+### 这一步做什么
+
+V2 的搜索过滤有两个遗留问题：
+
+**Year（年份）筛选 UI 缺失**：
+
+后端 `CarQueryRequest` 已经有 `MinYear`/`MaxYear` 参数，但前端 `CarFilters` 组件里没有对应的输入框，这个能力完全没有暴露给用户。
+
+当前的`CarFilters.tsx`只有有三个过滤器：Brand、Min Price、Max Price。它们都通过 `updateFilter` 函数同步到 URL 参数：
+
+```tsx
+const updateFilter = (key: string, value: string) => {
+  const current = Object.fromEntries(searchParams.entries());
+  if (value) {
+    current[key] = value;
+  } else {
+    delete current[key]; // 空字符串不写入 URL
+  }
+  delete current["page"]; // 过滤条件变化时重置页码到第1页
+  setSearchParams(current);
+};
+```
+
+这个函数的设计是通用的——任何字符串 key/value 都能处理。Year 筛选完全可以复用这个模式，只需要加两个输入框。
+
+`HomePage.tsx` 目前读取 URL 参数并传给 `carsApi.getPaged`：
+
+```tsx
+const brand = searchParams.get("brand") ?? "";
+const minPrice = searchParams.get("minPrice") ?? "";
+const maxPrice = searchParams.get("maxPrice") ?? "";
+```
+
+这样只需要补上 `minYear`/`maxYear` 的读取和传参。
+
+**搜索词没有高亮**
+
+用户在 Brand 输入框里搜"BMW"，过滤后列表里每辆车都和"BMW"相关， 但用户看着 `CarCard` 上的标题和品牌，无法直观感知"这里匹配了"。
+
+搜索词高亮的实现思路：
+
+```
+原始字符串："2020 BMW 3 Series"
+搜索词："BMW"
+
+按搜索词分割：["2020 ", "BMW", " 3 Series"]
+把匹配部分用 <mark> 包裹：
+  → "2020 " + <mark>BMW</mark> + " 3 Series"
+```
+
+用 JavaScript 的 `RegExp` + `String.split` 实现，不需要引入任何额外的库。
+
+这两个问题都在 `CarFilters.tsx` 和 `CarCard.tsx` 这两个文件里解决，改动集中、范围清晰。
+
+
+
+### 1. 切出功能分支
+
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b feature/v3-search-ux
+git push -u origin feature/v3-search-ux
+```
+
+
+
+### 2. 更新 CarFilters：加入 Year 筛选输入框
+
+打开 `src/components/CarFilters.tsx`。
+
+**从 URL 参数里读取 minYear/maxYear**
+
+```tsx
+// 在现有的三个变量之后加入
+const minYear = searchParams.get("minYear") ?? "";
+const maxYear = searchParams.get("maxYear") ?? "";
+```
+
+**更新 hasFilters 判断**
+
+```tsx
+// 改之前
+const hasFilters = brand || minPrice || maxPrice;
+
+// 改之后
+const hasFilters = brand || minPrice || maxPrice || minYear || maxYear;
+```
+
+**在 Max Price 输入框之后、Clear 按钮之前，加入两个 Year 输入框**
+
+```tsx
+{/* 最小年份 */}
+<div className="flex flex-col gap-1 min-w-[100px] flex-1">
+  <Label
+    htmlFor="minYear"
+    className="text-xs"
+    style={{ color: "var(--color-text-secondary)" }}
+  >
+    Min Year
+  </Label>
+  <Input
+    id="minYear"
+    placeholder="e.g. 2015"
+    type="number"
+    value={minYear}
+    onChange={(e) => updateFilter("minYear", e.target.value)}
+  />
+</div>
+
+{/* 最大年份 */}
+<div className="flex flex-col gap-1 min-w-[100px] flex-1">
+  <Label
+    htmlFor="maxYear"
+    className="text-xs"
+    style={{ color: "var(--color-text-secondary)" }}
+  >
+    Max Year
+  </Label>
+  <Input
+    id="maxYear"
+    placeholder="e.g. 2023"
+    type="number"
+    value={maxYear}
+    onChange={(e) => updateFilter("maxYear", e.target.value)}
+  />
+</div>
+```
+
+
+
+### 3. 更新 HomePage：读取 Year 参数并传给 API
+
+打开 `src/pages/HomePage.tsx`。
+
+**读取 URL 参数**
+
+```tsx
+// 在现有的 brand/minPrice/maxPrice 之后加入
+const minYear = searchParams.get("minYear") ?? "";
+const maxYear = searchParams.get("maxYear") ?? "";
+```
+
+**加入 debounce**
+
+```tsx
+// 在现有的 debouncedMinPrice/debouncedMaxPrice 之后加入
+const debouncedMinYear = useDebounce(minYear, 800);
+const debouncedMaxYear = useDebounce(maxYear, 800);
+```
+
+**加入 queryKey**
+
+```tsx
+queryKey: [
+  "cars",
+  {
+    page,
+    pageSize: PAGE_SIZE,
+    brand: debouncedBrand,
+    minPrice: debouncedMinPrice,
+    maxPrice: debouncedMaxPrice,
+    minYear: debouncedMinYear,   // ✅ 新增
+    maxYear: debouncedMaxYear,   // ✅ 新增
+  },
+],
+```
+
+**加入 queryFn 的传参**
+
+```tsx
+queryFn: () =>
+  carsApi.getPaged({
+    page,
+    pageSize: PAGE_SIZE,
+    brand: debouncedBrand || undefined,
+    minPrice: debouncedMinPrice ? Number(debouncedMinPrice) : undefined,
+    maxPrice: debouncedMaxPrice ? Number(debouncedMaxPrice) : undefined,
+    minYear: debouncedMinYear ? Number(debouncedMinYear) : undefined,   // ✅ 新增
+    maxYear: debouncedMaxYear ? Number(debouncedMaxYear) : undefined,   // ✅ 新增
+  }),
+```
+
+更新 isHomepage 判断**
+
+```tsx
+// 改之前
+const isHomepage = !brand && !minPrice && !maxPrice && page === 1;
+
+// 改之后
+const isHomepage = !brand && !minPrice && !maxPrice && !minYear && !maxYear && page === 1;
+```
+
+
+
+### 4. 验证 Year 筛选
+
+```bash
+npm run dev
+```
+
+1. 首页过滤区域出现 Min Year 和 Max Year 两个输入框
+2. 输入 `2018` 和 `2022`，URL 变成 `?minYear=2018&maxYear=2022`
+3. 车辆列表只显示 2018-2022 年之间的车辆
+4. 点击 Clear 按钮，Year 参数从 URL 里消失，列表恢复全部
+5. 刷新页面，Year 过滤条件从 URL 恢复，列表仍然正确过滤
+
+
+
+### 5. 新建 highlight 工具函数
+
+现在完善了搜索选项，但是搜索词没有高亮。 高亮逻辑会在多个地方用到，抽成独立的工具函数。
+
+新建 `src/lib/highlight.tsx`：
+
+```tsx
+// 把字符串里匹配 keyword 的部分用 <mark> 包裹
+// 返回 React 节点数组（因为包含了 JSX 元素）
+export function highlight(
+  text: string,
+  keyword: string
+): React.ReactNode {
+  if (!keyword.trim()) return text;
+
+  // 'gi' 标志：g = 全局匹配（不只匹配第一个），i = 不区分大小写
+  const regex = new RegExp(`(${escapeRegex(keyword)})`, "gi");
+  const parts = text.split(regex);
+
+  return parts.map((part, i) =>
+    // test 返回 true 说明这个 part 是匹配到的词
+    regex.test(part) ? (
+      <mark
+        key={i}
+        style={{
+          backgroundColor: "var(--color-warning-light)",
+          color: "var(--color-text-primary)",
+        }}
+      >
+        {part}
+      </mark>
+    ) : (
+      part
+    )
+  );
+}
+
+// 对用户输入做转义，避免正则特殊字符（. * + ? 等）引发意外匹配
+// 例如用户搜 "3.5"，不转义的话 "." 会匹配任意字符
+function escapeRegex(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+```
+
+> **为什么文件扩展名是 `.tsx` 而不是 `.ts`？**
+>
+> `highlight` 函数返回值里包含 JSX（`<mark>` 元素）， TypeScript 文件（`.ts`）不支持 JSX 语法，必须用 `.tsx`。
+
+
+
+### 6. 更新 CarCard：接收并应用搜索词高亮
+
+`CarCard` 目前只接收 `car` 这一个 prop。要实现高亮，需要让它知道当前的搜索词。
+
+打开 `src/components/CarCard.tsx`。
+
+**更新 props 接口，加入可选的 `highlightKeyword`**
+
+```tsx
+// 改之前
+interface CarCardProps {
+  car: Car;
+}
+
+// 改之后
+interface CarCardProps {
+  car: Car;
+  highlightKeyword?: string; // 可选：当前搜索词，有值时高亮匹配部分
+}
+```
+
+**函数签名解构新增 prop**
+
+```tsx
+// 改之前
+export default function CarCard({ car }: CarCardProps) {
+
+// 改之后
+export default function CarCard({ car, highlightKeyword }: CarCardProps) {
+```
+
+**Brand 和 Title 应用高亮**
+
+找到 Brand 标签的地方：
+
+```tsx
+import { highlight } from "@/lib/highlight";
+
+// 改之前
+<Badge variant="accent" className="text-xs">
+  {car.brand}
+</Badge>
+
+// 改之后
+<Badge variant="accent" className="text-xs">
+  {highlightKeyword ? highlight(car.brand, highlightKeyword) : car.brand}
+</Badge>
+```
+
+找到 Title 的地方：
+
+```tsx
+// 改之前
+<h3 ...>
+  {car.title}
+</h3>
+
+// 改之后
+<h3 ...>
+  {highlightKeyword ? highlight(car.title, highlightKeyword) : car.title}
+</h3>
+```
+
+
+
+### 7. 更新 HomePage：把搜索词传给 CarCard
+
+打开 `src/pages/HomePage.tsx`，找到渲染 `CarCard` 的地方：
+
+```tsx
+// 改之前
+data?.items.map((car) => <CarCard key={car.id} car={car} />)
+
+// 改之后
+data?.items.map((car) => (
+  <CarCard
+    key={car.id}
+    car={car}
+    highlightKeyword={debouncedBrand || undefined}
+    // 使用 debouncedBrand 而不是 brand 的原因：
+    // brand 是用户正在输入的实时值，可能是未完成的半截词（比如"BM"）
+    // debouncedBrand 是防抖后的稳定值，和实际发出的 API 请求保持一致
+    // 高亮应该和查询结果对应，用 debouncedBrand 更准确
+  />
+))
+```
+
+
+
+### 8. 验证高亮效果
+
+1. 在首页 Brand 输入框输入"Toyota"
+2. 等待防抖触发（500ms），列表刷新
+3. 每张卡片的 Brand 标签和 Title 里，"Toyota"应该被黄色背景高亮显示
+4. 大小写不敏感：输入"toyota"，"Toyota"也被高亮 ✅
+5. 清除搜索词，高亮消失，恢复正常显示 ✅
+
+
+
+### 本地验证清单
+
+### Year 筛选
+
+- [ ] Min Year / Max Year 输入框正常显示
+- [ ] 输入年份后列表正确过滤
+- [ ] 过滤参数同步到 URL
+- [ ] 刷新页面后参数从 URL 恢复，过滤条件生效
+- [ ] Clear 按钮清除 Year 参数
+- [ ] 分享 URL 给他人打开，过滤条件正确还原
+
+### 搜索词高亮
+
+- [ ] 搜索 Brand 后，CarCard 里匹配的文字被高亮
+- [ ] 大小写不敏感
+- [ ] 清除搜索词后高亮消失
+- [ ] 没有搜索词时 CarCard 显示正常，无异常
+
+
+
+### 9. 编译
+
+```bash
+npm run build
+```
+
+
+
+### 10. Git 提交
+
+```bash
+git add .
+git commit -m "feat: year filter UI, search keyword highlight, and URL sync"
+git push origin feature/v3-search-ux
+
+# 合并回 develop
+git checkout develop
+git merge --no-ff feature/v3-search-ux \
+  -m "merge: feature/v3-search-ux into develop"
+git push origin develop
+
+# 删除功能分支
+git branch -d feature/v3-search-ux
+git push origin --delete feature/v3-search-ux
+```
+
+
+
+### Step 67 完成状态
+
+```
+问题一：Year 筛选 UI 缺失
+✅ CarFilters 新增 Min Year / Max Year 输入框（复用现有 updateFilter 模式）
+✅ HomePage 读取 minYear/maxYear URL 参数，加入 debounce
+✅ queryKey 和 queryFn 传参同步更新
+✅ isHomepage 判断补全 minYear/maxYear 条件
+✅ 过滤条件和 URL 双向同步（修改→URL，刷新→从 URL 恢复）
+
+问题二：搜索词没有高亮
+✅ 理解：RegExp + String.split 分割 + map 渲染 <mark> 的高亮原理
+✅ 理解：为什么需要 escapeRegex（防止用户输入的特殊字符破坏正则）
+✅ 理解：为什么用 debouncedBrand 而不是 brand 做高亮（和查询结果保持一致）
+✅ highlight 工具函数（src/lib/highlight.tsx）
+✅ CarCard 新增可选 highlightKeyword prop，Brand 和 Title 应用高亮
+✅ HomePage 把 debouncedBrand 传给 CarCard
+
+✅ 本地验证通过
+✅ npm run build 通过
+✅ Git commit + 合并回 develop 完成
+```
+
+
+
+## Step 68 · React Testing Library 前端单元测试
+
+### 这一步做什么
+
+V1/V2 只有后端测试（xUnit + Testcontainers）。前端完全没有测试覆盖， 意味着任何一次组件改动、依赖升级、重构，都无法自动验证有没有破坏。现有功能，只能靠手动点一遍界面。
+
+这一步要解决的问题：给前端建立一套自动化验证机制。
+
+主要内容都围绕如下几点开展：
+
+- **用什么工具跑测试**（Vitest）
+- **用什么工具操作组件**（RTL）
+- **遇到不该真实执行的代码怎么办**（Mock）
+
+
+
+### 1. 切出功能分支
+
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b feature/v3-frontend-tests
+git push -u origin feature/v3-frontend-tests
+```
+
+
+
+### 2. 测试运行器 - Vitest
+
+写好的测试代码，谁来执行？谁来判断通过还是失败？谁来汇总"3 个通过， 1 个失败"这种报告？
+
+这就是**测试运行器（test runner）**要做的事：发现测试文件、执行里面 的代码、收集断言结果、输出报告。前端项目里常见的测试运行器有 Jest、 Vitest。项目用 Vite 构建，Vitest 是 Vite 官方生态的测试运行器， 配置方式跟 Vite 本身共享一套配置文件，兼容性最好，所以选它。
+
+#### 2.1 安装需要的库
+
+```bash
+npm install -D vitest jsdom
+```
+
+- `vitest`：测试运行器本身，提供 `describe`/`it`/`expect` 这些写测试 用的函数，以及命令行执行能力。
+- `jsdom`：测试代码是在 Node.js 环境里跑的，Node 里没有 `document`、 `window` 这些浏览器对象。`jsdom` 是一个用 JS 实现的"假浏览器"， 让 Node 环境里也能创建 DOM、查询元素、触发事件，测试组件渲染 才有地方可以渲染。
+
+#### 2.2 配置 vite.config.ts
+
+Vitest 直接复用 Vite 的配置文件，只需要在里面加一个 `test` 字段。
+
+当前的 `vite.config.ts`：
+
+```ts
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
+import path from "path";
+
+export default defineConfig({
+  plugins: [react(), tailwindcss()],
+  resolve: {
+    alias: {
+      "@": path.resolve(__dirname, "./src"),
+    },
+  },
+});
+```
+
+加入 `test` 配置：
+
+```ts
+import { defineConfig } from "vitest/config";
+import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
+import path from "path";
+
+export default defineConfig({
+  plugins: [react(), tailwindcss()],
+  resolve: {
+    alias: {
+      "@": path.resolve(__dirname, "./src"),
+    },
+  },
+  // ✅ 新增：vitest 配置
+  test: {
+    // environment: "jsdom" 告诉 vitest 用 jsdom 模拟浏览器环境
+    // 不设置的话默认是 "node"，没有 document/window，组件渲染会直接报错
+    environment: "jsdom",
+    // globals: true 允许测试文件里直接用 describe/it/expect
+    // 不用每个文件手动 import { describe, it, expect } from "vitest"
+    globals: true,
+  },
+});
+
+```
+
+>注意：`defineConfig`的导入方法换成`import { defineConfig } from "vitest/config"`： 
+>
+>`vitest/config` 导出的 `defineConfig` 是 Vite 原版的一个包装版本，它把 `test` 字段的类型声明合并进了 `UserConfigExport` 类型里，其余用法（`plugins`、`resolve` 等）完全兼容，不需要改任何其他代码。
+
+
+
+#### 2.3 让 TypeScript 认识这些全局函数
+
+`globals: true` 只是运行时生效，TypeScript 编译时还是不认识 `describe`/`it`/`expect`，需要在  `tsconfig.app.json` 的 `compilerOptions` 里声明类型来源：
+
+```json
+{
+  "compilerOptions": {
+    "types": ["vitest/globals"]
+  }
+}
+```
+
+#### 2.4 配置一个可以运行的命令
+
+`package.json` 的 `scripts` 里加：
+
+```json
+{
+  "scripts": {
+    "test": "vitest"
+  }
+}
+```
+
+#### 2.5 验证：先跑一个最简单的测试，确认工具链本身没问题
+
+在真正的组件测试之前，先写一个不涉及 React、不涉及 RTL 的 纯逻辑测试，确认 Vitest 配置本身是通的：
+
+新建 `src/test/sanity.test.ts`：
+
+```ts
+describe("环境验证", () => {
+  it("1 + 1 应该等于 2", () => {
+    expect(1 + 1).toBe(2);
+  });
+});
+```
+
+运行：
+
+```bash
+npm test
+```
+
+看到这个测试通过，说明 Vitest + jsdom 的基础环境是通的。这个文件 只是验证用的，确认后可以删掉。
+
+
+
+### 3. 测试时渲染并操作 React 组件 - RTL
+
+Vitest 只负责"运行测试代码、判断断言真假"，它不知道怎么渲染一个 React 组件，也不知道怎么模拟"点击按钮""在输入框打字"这些操作。
+
+**React Testing Library（RTL）** 就是解决这个问题的库：它提供 `render()` 把 React 组件渲染进 jsdom 创建的虚拟 DOM 里，还提供一整套 "查找元素"的方法（比如 `getByText`、`getByRole`），以及配套的 `user-event` 库来模拟真实用户操作（点击、输入、勾选）。
+
+#### 3.1 RTL 的核心设计哲学
+
+RTL 和早期的 Enzyme 这类工具最大的区别是：**RTL 刻意不让访问 组件内部的 state、props、实例方法**。它只允许像真实用户一样， 通过"看到的文字""能操作的按钮""填写的表单"来定位和验证界面。
+
+为什么要这样限制？因为测试内部实现细节会导致两种问题同时发生：
+
+- 假阳性：重构组件内部实现（比如把 `useState` 换成 `useReducer`）， 测试挂了，但用户实际体验没有任何变化——浪费时间去"修"一个根本 没坏的东西。
+- 假阴性（更危险）：如果测试只检查了"内部 state 是 true"，却没检查 这个状态对应的内容是否真的出现在页面上，那么哪怕 CSS 出问题导致 内容视觉上不可见，只要 state 还是 true，测试照样通过——而用户看到 的是一个坏掉的界面。
+
+因此，RTL 强迫只能用用户能感知的方式去验证，从根源上避免这两种问题。
+
+#### 3.2 安装需要的库
+
+```bash
+npm install -D @testing-library/react @testing-library/user-event @testing-library/jest-dom
+```
+
+- `@testing-library/react`：提供 `render`、`screen`、各种 `getBy*` 查询方法
+- `@testing-library/user-event`：提供更接近真实浏览器行为的用户操作 模拟
+- `@testing-library/jest-dom`：给 `expect()` 扩展一批断言方法，比如 `toBeInTheDocument()`、`toHaveAttribute()`，不装这个包这些断言方法 不存在。
+
+#### 3.3 让扩展断言生效
+
+`jest-dom` 的扩展断言需要在每个测试文件执行前导入一次。手动在每个 文件顶部写 `import "@testing-library/jest-dom"` 太麻烦，用 Vitest 的 `setupFiles` 统一处理：
+
+新建 `src/test/setup.ts`：
+
+```ts
+import "@testing-library/jest-dom";
+```
+
+回到 `vite.config.ts`，在 `test` 里加一行：
+
+```ts
+test: {
+  environment: "jsdom",
+  setupFiles: ["./src/test/setup.ts"], // ✅ 新增
+  globals: true,
+},
+```
+
+`tsconfig.app.json` 的 `types` 也补上：
+
+```json
+{
+  "compilerOptions": {
+    "types": ["vitest/globals", "@testing-library/jest-dom"]
+  }
+}
+```
+
+#### 3.4 查询方法怎么选：优先级列表
+
+RTL 提供很多种 `getBy*` 方法，用哪个不是随意的，官方给出了明确的 优先级排序，从高到低：
+
+```
+1. getByRole            —— 最优先，模拟屏幕阅读器/用户感知方式
+2. getByLabelText        —— 表单场景，通过 label 找输入框
+3. getByPlaceholderText
+4. getByText             —— 通过可见文字定位
+5. getByDisplayValue
+6. getByAltText
+7. getByTitle
+8. getByTestId           —— 最后手段，不是禁用项
+```
+
+`getByTestId` 依赖手动加在 DOM 上的 `data-testid` 属性，这个属性 用户根本看不到、感知不到，跟真实使用场景完全脱节，所以排在最后。 但当一个元素确实没有可访问的 role、没有文字内容（比如一个纯装饰性 的 loading spinner），前面几种都用不上时，`getByTestId` 就是合理的 兜底选择。
+
+#### 3.5 第一个组件测试实例
+
+选 `CarCard` 作为第一个测试对象，因为它是最简单的纯展示组件： 接收一个 `car` 对象渲染出来，不涉及任何 API 调用、不涉及 store， 不需要用到 Mock，正好用来练习 RTL 的基本用法。
+
+`CarCard` 内部用了 `<Link>`（跳转到车辆详情页），而 `<Link>` 必须 在路由上下文里才能渲染，所以测试时需要用 `MemoryRouter` 包一层—— 这是 react-router 提供的**真实路由实现**，只是把路由状态放在内存里， 不依赖真实浏览器地址栏，跟"伪造""替换"没有关系，所以这里不算 Mock。
+
+新建 `src/test/components/CarCard.test.tsx`：
+
+```tsx
+import { render, screen } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
+import CarCard from "@/components/CarCard";
+import type { Car } from "@/types";
+
+// 测试用的假车辆数据
+// 只填测试需要验证的字段，其余用合理的默认值
+const mockCar: Car = {
+  id: 1,
+  title: "2020 Toyota Corolla - Low Mileage",
+  brand: "Toyota",
+  model: "Corolla",
+  year: 2020,
+  price: 18000,
+  mileage: 35000,
+  status: "Published",
+  sellerId: 10,
+  sellerUsername: "seller1",
+  createdAt: "2024-01-01T00:00:00Z",
+  updatedAt: "2024-01-01T00:00:00Z",
+};
+
+const renderCard = (props?: Partial<Parameters<typeof CarCard>[0]>) =>
+  render(
+    <MemoryRouter>
+      <CarCard car={mockCar} {...props} />
+    </MemoryRouter>,
+  );
+
+describe("CarCard", () => {
+  it("应该正确渲染车辆的品牌、价格和里程", () => {
+    renderCard();
+
+    // getByText：找到包含这段文字的元素
+    // 用用户实际看到的文字来定位，而不是 class 名
+    expect(screen.getByText("Toyota")).toBeInTheDocument();
+    expect(screen.getByText("$18,000")).toBeInTheDocument();
+    expect(screen.getByText("35,000 km")).toBeInTheDocument();
+  });
+
+  it("没有图片时应该显示占位图标", () => {
+    renderCard();
+
+    // getByRole("img") 找的是可访问树里 role 为 img 的元素
+    // 它的 name 来自 alt 属性
+    // 没有 coverImageUrl 时组件应该渲染占位 SVG 而不是 <img>
+    // 用 queryByRole（找不到时返回 null，不报错）断言它不存在
+    expect(
+      screen.queryByRole("img", { name: /corolla/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("有图片时应该正确渲染图片", () => {
+    const carWithImage = {
+      ...mockCar,
+      coverImageUrl: "https://example.com/car.jpg",
+    };
+    render(
+      <MemoryRouter>
+        <CarCard car={carWithImage} />
+      </MemoryRouter>,
+    );
+
+    const img = screen.getByRole("img", { name: /corolla/i });
+    expect(img).toBeInTheDocument();
+    expect(img).toHaveAttribute("src", "https://example.com/car.jpg");
+  });
+
+  it("有搜索词时应该高亮匹配的品牌文字", () => {
+    renderCard({ highlightKeyword: "Toyota" });
+
+    // highlight 函数会把 "Toyota" 包裹在 <mark> 标签里
+    // <mark> 元素在 DOM 里仍然包含文字 "Toyota"，getByText 依然能找到它
+    const searchTexts = screen.getAllByText("Toyota");
+    expect(searchTexts.some((el) => el.tagName === "MARK")).toBe(true);
+  });
+});
+
+```
+
+运行确认通过：
+
+```bash
+npm test
+```
+
+
+
+### 4. 模拟用户操作——`userEvent` vs `fireEvent`
+
+`CarCard` 测试只涉及渲染后的静态断言，没有用户交互。但接下来要测的 `LoginPage` 需要模拟"输入邮箱""点击提交"这类操作，这时候需要选择触发方式。
+
+RTL 生态里有两种触发事件的方式：
+
+```
+fireEvent.click(button)
+  → 直接在 DOM 上触发一个 click 事件
+  → 跳过了浏览器真实的事件序列（真实点击其实是
+     focus → mousedown → mouseup → click 这一串）
+
+userEvent.click(button)
+  → 来自 @testing-library/user-event 包
+  → 完整模拟真实用户操作会触发的所有底层事件
+  → 更接近真实浏览器行为，能测出只在完整事件序列下才会
+     暴露的问题（比如某个 onBlur 校验逻辑）
+```
+
+**因此，我们使用用 `userEvent`，不用 `fireEvent`。** 
+
+
+
+### 5. 遇到不该真实执行的代码——认识 Mock
+
+以`LoginPage` 组件的测试为例。要测的场景包括"提交成功"和"提交失败"。但测试运行时， 如果真的去调用登录 API：
+
+- 会真的发一个 HTTP 请求出去，测试环境不一定有后端可连，测试会变慢、 变得不稳定（今天数据库有这条数据，明天可能没有）。
+- 登录成功后 `LoginPage` 会调用 `useAuthStore` 的 `setAuth`，这个函数 内部会写 `localStorage`——测试环境里不应该真的产生这种副作用，而且 没法控制"我现在就是要测登录失败的场景"这种特定状态。
+
+**Mock（模拟）** 就是解决这个问题的手段：把某个模块的真实实现， 替换成一个完全可控的假实现。测试时不再依赖真实网络、真实 store， 而是自己决定"这次调用返回什么""这次调用抛出什么错误"。
+
+#### 5.1 Mock 的边界：什么该 Mock，什么不该
+
+```
+✅ 应该 Mock：
+  - API 调用（不能在测试里真正发 HTTP 请求）
+  - Zustand store（隔离测试，控制初始状态，避免真实写 localStorage）
+  - 路由 hook（useNavigate/useLocation，测试环境没有真实浏览器历史栈）
+
+❌ 不应该 Mock：
+  - React 组件本身的渲染逻辑
+  - Zod 验证（这是业务逻辑，Mock 掉就等于没测这部分逻辑）
+  - RHF 表单行为（同样是业务逻辑，必须真实测试）
+```
+
+判断标准很简单：**如果 Mock 掉的是"会产生外部副作用或依赖外部环境 的东西"，就该 Mock；如果 Mock 掉的是"你正想验证对不对的业务逻辑 本身"，就不该 Mock**——Mock 了业务逻辑，测试就只是在验证"我 mock 的假数据符合预期"，没有验证任何真实代码。
+
+#### 5.2 `vi.mock` 怎么用
+
+Vitest 提供 `vi.mock()` 来替换一个模块的导出内容：
+
+```ts
+vi.mock("@/api", () => ({
+  authApi: {
+    login: vi.fn(),
+  },
+}));
+```
+
+这行代码告诉 Vitest：这个测试文件里任何地方 `import { authApi } from "@/api"`，都不要真正加载那个文件，而是返回我这里提供的假对象。
+
+`vi.fn()` 创建一个"可追踪的假函数"——本身默认什么也不做、返回 `undefined`，但可以事后指定它的返回值（`mockResolvedValueOnce`、 `mockReturnValue`），也可以检查它有没有被调用过、调用时传了什么参数 （`toHaveBeenCalledWith`）。
+
+有一个重要的执行时机问题：`vi.mock()` 会被 Vitest **提升 （hoist）到文件最顶部**，比文件里所有的 `const`/`let` 声明都先执行。 正常情况下如果在 `vi.mock` 的工厂函数里引用一个外部变量，会因为 提升导致"变量还没初始化就被访问"而报错。但 Vitest 对**以 `mock` 开头命名的变量**做了特殊放行，允许提前引用。因此，测试 代码里的变量（比如 `mockNavigate`、`mockSetAuth` ）都必须用 `mock` 前缀命名。这不是随意的命名习惯，换成别的名字（比如 `navigateSpy`）会直接报错。
+
+> 注意：项目里 store 的消费方式，决定了怎么 Mock 它
+>
+> `LoginPage` 里这样用 `useAuthStore`：
+>
+> ```tsx
+> const { setAuth } = useAuthStore();
+> ```
+>
+> 这是不带 selector、调用时直接解构整个返回对象的写法（项目里所有 组件都是这个写法）。所以 Mock 时可以让 `useAuthStore` 无论被怎么 调用，都固定返回同一个对象，不需要处理传参：
+>
+> ```ts
+> vi.mock("@/stores/authStore", () => ({
+>   useAuthStore: vi.fn(() => ({
+>     setAuth: vi.fn(),
+>   })),
+> }));
+> ```
+>
+> （题外话，跟测试无关：这种不带 selector 的写法会让组件订阅 store 里所有字段的变化，只要 store 里任何一个字段更新，用这种写法的组件 都会重新渲染。以后如果 store 里字段变多，可能需要评估要不要改成 带 selector 的写法来减少不必要的渲染，但这不是现在要处理的问题。）
+
+#### 5.3 写 LoginPage 测试
+
+`LoginPage`组件里有个bug需要修复一下：
+
+需要在 `<form>` 标签上加 `noValidate`，把浏览器原生校验彻底关掉，让 Zod + RHF 完全接管校验逻辑：
+
+```tsx
+<form onSubmit={handleSubmit(onSubmit)} noValidate className="space-y-5">
+```
+
+这不只是为了让测试通过，**这是使用 React Hook Form 时的标准做法**：只要输入框用了 `type="email"`、`type="number"` 之类带原生校验规则的类型，且打算完全用 RHF/Zod 自己的校验和错误提示 UI，就应该给 `<form>` 加 `noValidate`。不加的话，真实用户在某些浏览器里点提交时，可能会先看到浏览器自带的原生校验气泡提示，而不是精心设计的错误提示样式，跟自定义 UI 冲突。
+
+新建 `src/test/pages/LoginPage.test.tsx`：
+
+```tsx
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { MemoryRouter } from "react-router-dom";
+import LoginPage from "@/pages/LoginPage";
+
+// Mock 路由 hook（LoginPage 里用了 useNavigate 和 useLocation）
+// vi.importActual 保留 react-router-dom 里其他真实导出（比如 MemoryRouter 本身）
+// 只替换 useNavigate/useLocation 这两个 hook
+const mockNavigate = vi.fn();
+vi.mock("react-router-dom", async () => {
+  const actual = await vi.importActual("react-router-dom");
+  return {
+    ...actual,
+    useNavigate: () => mockNavigate,
+    useLocation: () => ({ state: null, pathname: "/login" }),
+  };
+});
+
+// Mock authApi：避免真实发 HTTP 请求
+vi.mock("@/api", () => ({
+  authApi: {
+    login: vi.fn(),
+  },
+}));
+
+// Mock authStore：避免真实写 localStorage
+const mockSetAuth = vi.fn();
+vi.mock("@/stores/authStore", () => ({
+  useAuthStore: vi.fn(() => ({
+    setAuth: mockSetAuth,
+  })),
+}));
+
+const renderLoginPage = () =>
+  render(
+    <MemoryRouter>
+      <LoginPage />
+    </MemoryRouter>
+  );
+
+describe("LoginPage", () => {
+  beforeEach(() => {
+    // 每个测试前清除所有 mock 的调用记录
+    // 避免上一个测试用例的调用历史影响下一个（比如上一个测试
+    // 断言过 login 被调用一次，这个记录不清除会累加到下一个测试里）
+    vi.clearAllMocks();
+  });
+
+  it("空表单提交时应该显示验证错误", async () => {
+    renderLoginPage();
+    const user = userEvent.setup();
+
+    // 直接点提交，不填任何内容
+    await user.click(screen.getByRole("button", { name: /sign in/i }));
+
+    // RHF + Zod 验证失败，应该显示错误提示
+    // 这里必须用 waitFor：Zod resolver 内部走的是 Promise 链，
+    // 即使校验规则本身是同步判断（比如 min(1)），从触发校验到
+    // 错误信息真正写回 DOM 之间仍然隔着至少一个微任务队列的延迟，
+    // 直接同步断言会因为 DOM 还没更新而失败
+    await waitFor(() => {
+      expect(screen.getByText(/password is required/i)).toBeInTheDocument();
+    });
+  });
+
+  it("输入无效邮箱格式时应该显示格式错误", async () => {
+    renderLoginPage();
+    const user = userEvent.setup();
+
+    await user.type(screen.getByLabelText(/email/i), "not-an-email");
+    await user.click(screen.getByRole("button", { name: /sign in/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/invalid email/i)).toBeInTheDocument();
+    });
+  });
+
+  it("填写正确后点击提交应该调用 authApi.login", async () => {
+    // 让 Mock 的 login 函数这一次返回一个成功结果
+    const { authApi } = await import("@/api");
+    vi.mocked(authApi.login).mockResolvedValueOnce({
+      token: "fake-token",
+      user: { id: 1, username: "testuser", email: "test@example.com", role: "User" },
+    } as never);
+
+    renderLoginPage();
+    const user = userEvent.setup();
+
+    await user.type(screen.getByLabelText(/email/i), "test@example.com");
+    await user.type(screen.getByLabelText(/password/i), "password123");
+    await user.click(screen.getByRole("button", { name: /sign in/i }));
+
+    await waitFor(() => {
+      // 验证 login 确实被调用，且传了正确的参数
+      expect(authApi.login).toHaveBeenCalledWith({
+        email: "test@example.com",
+        password: "password123",
+      });
+    });
+  });
+
+  it("API 返回错误时应该显示服务端错误信息", async () => {
+    const { authApi } = await import("@/api");
+    // 让 Mock 的 login 函数这一次抛出一个错误，模拟服务端返回失败
+    vi.mocked(authApi.login).mockRejectedValueOnce(
+      new Error("Invalid email or password")
+    );
+
+    renderLoginPage();
+    const user = userEvent.setup();
+
+    await user.type(screen.getByLabelText(/email/i), "test@example.com");
+    await user.type(screen.getByLabelText(/password/i), "wrongpassword");
+    await user.click(screen.getByRole("button", { name: /sign in/i }));
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(/invalid email or password/i)
+      ).toBeInTheDocument();
+    });
+  });
+});
+```
+
+运行：
+
+```bash
+npm test
+```
+
+
+
+### 6. 同一个 Mock 在不同测试里需要不同状态
+
+以`ProtectedRoute` 为例， 它的行为是：已登录就渲染子页面，没登录就跳转到 `/login`。
+
+如何控制"是否已登录"的状态？这依赖 `useAuthStore` 里的 `isAuthenticated()`。
+
+问题是 `vi.mock` 写在文件顶部，对整个文件的所有测试用例生效一次。 但"未登录"和"已登录"是两个测试用例，需要 `isAuthenticated()` 在 不同测试里返回不同的值。
+
+解决方式：Mock 时不直接写死返回值，而是让它返回一个独立声明的 `vi.fn()`，测试运行时再用 `mockReturnValue()` 动态指定这次要返回 什么：
+
+```ts
+const mockIsAuthenticated = vi.fn();
+vi.mock("@/stores/authStore", () => ({
+  useAuthStore: vi.fn(() => ({
+    isAuthenticated: mockIsAuthenticated,
+  })),
+}));
+
+// 测试里再决定这次返回什么
+mockIsAuthenticated.mockReturnValue(false); // 模拟未登录
+mockIsAuthenticated.mockReturnValue(true);  // 模拟已登录
+```
+
+写 ProtectedRoute 测试
+
+新建 `src/test/components/ProtectedRoute.test.tsx`：
+
+```tsx
+import { render, screen } from "@testing-library/react";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
+import ProtectedRoute from "@/components/ProtectedRoute";
+
+const mockIsAuthenticated = vi.fn();
+vi.mock("@/stores/authStore", () => ({
+  useAuthStore: vi.fn(() => ({
+    isAuthenticated: mockIsAuthenticated,
+  })),
+}));
+
+// 辅助：渲染一个包含 ProtectedRoute 的路由结构
+// initialEntries 模拟初始 URL，ProtectedRoute 包裹一个假的受保护页面
+const renderWithRoute = (initialPath: string) =>
+  render(
+    <MemoryRouter initialEntries={[initialPath]}>
+      <Routes>
+        <Route path="/login" element={<div>Login Page</div>} />
+        <Route element={<ProtectedRoute />}>
+          <Route path="/protected" element={<div>Protected Content</div>} />
+        </Route>
+      </Routes>
+    </MemoryRouter>
+  );
+
+describe("ProtectedRoute", () => {
+  it("未登录时应该重定向到登录页", () => {
+    mockIsAuthenticated.mockReturnValue(false);
+
+    renderWithRoute("/protected");
+
+    expect(screen.getByText("Login Page")).toBeInTheDocument();
+    expect(screen.queryByText("Protected Content")).not.toBeInTheDocument();
+  });
+
+  it("已登录时应该渲染受保护的页面内容", () => {
+    mockIsAuthenticated.mockReturnValue(true);
+
+    renderWithRoute("/protected");
+
+    expect(screen.getByText("Protected Content")).toBeInTheDocument();
+    expect(screen.queryByText("Login Page")).not.toBeInTheDocument();
+  });
+});
+```
+
+运行：
+
+```bash
+npm test
+```
+
+
+
+### 7. 覆盖率报告
+
+现在有了三个组件的测试，但项目里远不止这三个组件。与其凭感觉猜 "是不是测得差不多了"，不如让工具直接告诉哪些文件、哪些代码分支完全没被任何测试执行过。这就是覆盖率（coverage）报告要做的事。
+
+Vitest 本身不内置覆盖率统计能力，需要单独装一个 provider：
+
+```bash
+npm install -D @vitest/coverage-v8
+```
+
+不装这个包直接跑覆盖率命令，会在运行时直接报错提示缺少依赖。
+
+加运行脚本
+
+`package.json` 的 `scripts` 补上：
+
+```json
+{
+  "scripts": {
+    "test": "vitest",
+    "test:coverage": "vitest --coverage"
+  }
+}
+```
+
+运行覆盖率报告：
+
+```bash
+npm run test:coverage
+```
+
+终端会显示每个文件的覆盖率百分比，同时生成 `coverage/` 目录。 这一步不是为了追求某个百分比数字达标，而是让你看到**哪些代码路径 还没被覆盖**，为后续要不要继续补测试提供依据。
+
+
+
+### 8. 本地验证
+
+```bash
+npm test
+```
+
+三个测试文件应该全部通过（绿色）：
+
+```
+✓ src/test/components/CarCard.test.tsx (4)
+✓ src/test/pages/LoginPage.test.tsx (4)
+✓ src/test/components/ProtectedRoute.test.tsx (2)
+```
+
+
+
+### 9. Git 提交
+
+```bash
+git add .
+git commit -m "test: setup vitest + RTL, add tests for CarCard, LoginPage, ProtectedRoute"
+git push -u origin feature/v3-frontend-tests
+
+# 合并回 develop
+git checkout develop
+git merge --no-ff feature/v3-frontend-tests \
+  -m "merge: feature/v3-frontend-tests into develop"
+git push origin develop
+
+# 删除功能分支
+git branch -d feature/v3-frontend-tests
+git push origin --delete feature/v3-frontend-tests
+```
+
+
+
+### Step 68 完成状态
+
+```
+概念理解：
+✅ Vitest 是什么——测试运行器，负责发现/执行测试、汇总结果
+✅ jsdom 是什么——用 JS 模拟浏览器 DOM，让 Node 环境能渲染组件
+✅ RTL 是什么——渲染组件 + 提供用户视角的查询方法，禁止访问组件内部实现
+✅ 查询优先级：getByRole > getByLabelText > ... > getByTestId（最后手段）
+✅ userEvent vs fireEvent：userEvent 模拟完整真实事件序列，优先使用
+✅ Mock 是什么——把有外部副作用/依赖外部环境的模块替换成可控假实现
+✅ Mock 边界：API/Store/路由 hook 该 Mock，业务逻辑（Zod/RHF）不该 Mock
+✅ vi.mock 会被提升到文件顶部，mock 前缀命名是 Vitest 对此的特殊放行规则
+✅ vi.mocked().mockReturnValue：同一 Mock 在不同测试用例间切换返回值
+
+环境搭建（按需逐步安装，非一次性装全）：
+✅ vitest + jsdom（跑通最基础的 sanity test）
+✅ @testing-library/react + user-event + jest-dom（测 CarCard）
+✅ @vitest/coverage-v8（跑覆盖率报告）
+✅ vite.config.ts / tsconfig.json / package.json 逐步补齐对应配置
+
+测试覆盖：
+✅ CarCard：渲染车辆信息、无图片占位、有图片渲染、highlight 高亮
+✅ LoginPage：空表单验证、无效邮箱格式、正确提交调用 API、API 错误显示
+✅ ProtectedRoute：未登录重定向、已登录正常渲染
+
+✅ npm test 全部通过
+✅ Git commit + 合并回 develop 完成
+```
+
+
+
+
+
+## Step 69 · Playwright 端到端测试
+
+### 这一步要做什么
+
+Step 68 建立的 RTL 测试，测的是"单个组件在被隔离的环境里，行为对不对"—— `LoginPage` 组件测试里，API 和 store 全部是 Mock 出来的假的，测试只关心 "点击按钮后，这个组件自己的状态变化对不对"。
+
+但有一类问题，RTL 从设计上就回答不了：**用户从登录到发布一辆车、 等待审核、被别人下单，这一整条链路，串起来到底走不走得通？** 这中间要经过好几个页面、真实的后端 API、真实的数据库读写，任何一环 出问题都会导致用户卡住。RTL 测的是"零件合格",这一步要测的是 "整台机器装起来能不能开"。
+
+
+
+### 1. 切出功能分支
+
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b feature/v3-e2e-tests
+git push -u origin feature/v3-e2e-tests
+```
+
+
+
+### 2. Playwright概述
+
+RTL 测试运行在 jsdom 这个"假浏览器"里，Mock 掉了 API 和路由， 所以能跑得飞快（毫秒级），但它看不到真实后端、真实数据库、真实网络请求。
+
+可以使用Playwright库来处理测试需要的浏览器服务。
+
+**Playwright 是微软开发的浏览器自动化工具**, 核心能力是：它会真的启动一个浏览器 （Chromium/Firefox/WebKit），像真实用户一样打开你的应用，点击、 输入、跳转页面，全程不 Mock 任何东西——前端要连真实运行的 `localhost:5173`，后端要连真实运行的 `localhost:5065`，数据要真的写进数据库。这类测试叫**端到端测试（End-to-End，简称 E2E）**。
+
+```
+RTL（单元/组件级）：
+  → 测试单个组件的行为
+  → 快（毫秒级）
+  → Mock 了 API 和路由
+
+Playwright E2E（端到端）：
+  → 启动真实浏览器，访问真实运行的应用
+  → 模拟真实用户操作（点击、输入、导航）
+  → 验证完整的用户旅程
+  → 慢（秒级）但覆盖了所有层（前端 + 后端 + 数据库）
+```
+
+两者不是谁取代谁，是分工：RTL 覆盖数量多、跑得快的组件级校验， Playwright 覆盖少而关键的几条完整用户旅程，是整个测试体系的最后一道防线——它不关心内部实现，只关心"用户能不能完成他想完成的事"。
+
+我们设计的完整链路包括5个核心E2E测试：
+
+   - 测试1：注册 → 看到验证邮件提示
+
+   - 测试2：登录 → 填写车辆 → 提交审核
+
+   - 测试3：Admin 审核通过（article + filter 定位，基于真实 DOM 结构）
+
+   - 测试4：买家下单
+
+   - 测试5：卖家查看销售订单
+
+     
+
+### 3. 测试数据污染
+
+E2E 测试要操作真实数据库， 如果测试 1 注册了 `test@example.com`，测试 2 又想注册同一个邮箱， 后端会因为"邮箱已存在"直接拒绝，测试 2 就会莫名其妙地失败—— 而且这个失败跟测试 2 本身的逻辑毫无关系，纯粹是数据冲突。
+
+如果多个测试共用同一辆车（比如都对同一个 `carId` 操作），执行顺序 一旦变化（比如某次测试 3 先跑，把车审核通过了；测试 4 本来期望这辆车 还是"待审核"状态），测试结果就会随执行顺序摇摆不定。
+
+**解决方案：每个测试自己生成一份独一无二的测试数据，不共用、 不依赖预先塞好的固定数据（Seed 数据）。**
+
+比如：
+
+```typescript
+// 用时间戳后6位生成唯一标识（完整时间戳太长，会超过用户名长度限制）
+const uid = Date.now().toString().slice(-6);
+const email = `test-${uid}@example.com`;
+const username = `user${uid}`;
+```
+
+只取时间戳的后 6 位而不是完整时间戳，是因为后端对 username 字段 通常有长度限制（下面会看到限制在 20 字符左右），完整的 13 位时间戳 拼上前缀很容易超限。这样处理后，每次运行测试，每个测试用例内部 生成的数据都跟其他测试、跟上一次运行的数据完全不重叠，测试之间 彻底隔离。
+
+
+
+### 4. 重复的定位器和操作
+
+E2E 测试里，几乎每个测试用例都要先登录一次。如果每个测试文件里 都直接手写登录逻辑，比如：
+
+```typescript
+await page.fill('[name="email"]', email);
+await page.fill('[name="password"]', "Test@123456");
+await page.click('button[type="submit"]');
+```
+
+这样写有一个隐患：如果登录按钮的文字以后从 "Sign In" 改成了 "Log In"，或者 email 输入框换了个 `name` 属性，所有用到登录操作的 测试文件都要跟着改一遍，改一处漏一处的风险很高。因此，可以使用POM来解决。
+
+**Page Object Model（POM）是什么？**
+
+**POM 就是把某个页面的定位器和操作封装进一个类里，测试代码只调用 类的方法，不直接接触底层的选择器细节：**
+
+```typescript
+class LoginPage {
+  async login(email: string, password: string) {
+    await this.page.getByLabel("Email").fill(email);
+    await this.page.getByLabel("Password").fill(password);
+    await this.page.getByRole("button", { name: /sign in/i }).click();
+  }
+}
+```
+
+以后按钮文字变了，只需要改 `LoginPage` 类里这一处，所有调用 `loginPage.login(...)` 的测试自动跟着修复，不需要挨个测试文件去改。
+
+**哪些页面值得抽 POM ？**
+
+**只有当一个页面的操作会被多个测试复用时，才值得花力气抽象成类。** 比如这一步里 `LoginPage` 几乎每个测试都要用到，值得抽。但像发布车辆、 下单这些页面的操作，本步骤里只有单个测试用到一次，直接把定位器 写在测试文件里就够了。
+
+
+
+### 5. 安装 Playwright，配置运行方式
+
+```bash
+cd uucars-web
+npm install -D @playwright/test
+npx playwright install chromium
+```
+
+这里只装 Chromium 一个浏览器内核，不装 Firefox、WebKit 全套。 Chromium 已经覆盖了绝大多数用户实际使用的浏览器内核。
+
+在 `uucars-web/` 根目录新建 `playwright.config.ts`：
+
+```typescript
+import { defineConfig } from "@playwright/test";
+
+export default defineConfig({
+  // 测试文件根目录
+  testDir: "./e2e",
+    
+  // 生成 HTML 测试报告，跑完后可以用 npx playwright show-report 查看
+  reporter: "html",
+
+  // 串行执行，不并行
+  // 原因：多个测试共用 Admin 账号，并行时会产生状态冲突
+  // （比如测试3审核了测试4准备的车辆，导致测试4流程出错）
+  fullyParallel: false,
+  workers: 1,
+
+  // CI 环境下禁止 only（防止忘记移除 test.only 导致其他测试没跑）
+  forbidOnly: !!process.env.CI,
+
+  // 失败时不重试（重试会掩盖不稳定的测试）
+  retries: 0,
+
+  // 单个测试的超时时间：30秒
+  timeout: 30000,
+
+  use: {
+    baseURL: "http://localhost:5173",
+
+    // 失败时自动截图，保存在 test-results/ 目录
+    // 截图是 E2E 调试的关键工具——失败时能看到浏览器当时的状态
+    screenshot: "only-on-failure",
+
+    trace: "on-first-retry",
+  },
+
+  projects: [
+    {
+      name: "chromium",
+      use: { browserName: "chromium" },
+    },
+  ],
+});
+```
+
+`fullyParallel: false` + `workers: 1` 这两项是专门针对本步骤测试 场景做的取舍：后面测试 3、4、5 都会用同一个 Admin 账号登录去审核 车辆，如果多个测试并行跑，Admin 账号在同一时刻被多个测试同时操作， 测试 3 可能会审核到本该属于测试 4 的车辆——这不是 Playwright 本身 的问题，是"共用一个账号"这个设计决策带来的约束，串行执行是用 牺牲一点速度换取结果的确定性。
+
+`tsconfig.node.json`配置文件里包含这个文件
+
+```json
+{
+ ...
+ ,
+  "include": ["vite.config.ts", "playwright.config.ts"]
+}
+```
+
+
+
+### 第六步：写第一个 POM——LoginPage
+
+新建 `uucars-web/e2e/pages/LoginPage.ts`：
+
+```typescript
+import { type Page } from "@playwright/test";
+
+export class LoginPage {
+  constructor(private readonly page: Page) {}
+
+  async goto() {
+    await this.page.goto("/login");
+  }
+
+  async login(email: string, password: string) {
+    await this.page.getByLabel("Email").fill(email);
+    await this.page.getByLabel("Password").fill(password);
+    await this.page.getByRole("button", { name: /sign in/i }).click();
+  }
+
+  // 登录并等待跳转到首页（登录成功的标志）
+  async loginAndWait(email: string, password: string) {
+    await this.goto();
+    await this.login(email, password);
+    await this.page.waitForURL("/");
+  }
+}
+```
+
+这里 `getByLabel("Email")`、`getByLabel("Password")` 依赖的是页面上 label 标签的实际文字，跟 Step 68 RTL 里查询优先级的道理是一致的—— 优先用用户能感知的方式定位元素。写这个文件之前，建议对照真实的 `LoginPage.tsx` 源码，把 label 文案抄一遍，而不是凭空假设文字 一定是 "Email"、"Password" 这两个词，避免因为文案对不上导致 后面所有测试从第一步登录就失败。
+
+
+
+### 7. 测试数据——写 API 辅助函数
+
+**为什么不干脆都走 UI 操作？**
+
+测试 3（Admin 审核）、测试 4（买家下单）、测试 5（卖家查看订单） 这几个场景，都需要先有一辆"已经提交审核"甚至"已经审核通过"的车 作为前置条件。如果每个测试都从"注册账号 → 登录 → 填写表单 → 上传图片 → 提交审核"这一整套 UI 操作走一遍才能进入测试真正关心的 那一步，E2E 测试本身已经很慢，会被这些重复的前置准备工作拖得 更慢，而且这些步骤不是当前测试真正要验证的点——注册流程已经在 测试 1 里专门测过了，不需要在测试 3、4、5 里重复验证一遍。
+
+**所以：跟当前测试真正想验证的行为无关的前置数据，走 API 直接创建；只有测试本身关心的那部分操作，才走 UI。**
+
+新建 `uucars-web/e2e/helpers/api.ts`：
+
+```typescript
+import { type APIRequestContext } from "@playwright/test";
+
+const BASE_URL = "http://localhost:5065";
+
+// 注册用户并验证邮箱
+// 为什么通过 API 而不是走 UI？
+// 节省时间：E2E 测试本身已经够慢了，准备数据尽量走 API
+// UI 注册流程在测试1里专门测，其他测试不需要重复这个步骤
+export async function createAndVerifyUser(
+  request: APIRequestContext,
+  email: string,
+  password = "Test@123456"
+) {
+  // 从邮箱前缀截取 username，截短到合理长度避免超过字段长度限制
+  const username = email.split("@")[0].slice(0, 20);
+
+  // 1. 注册
+  await request.post(`${BASE_URL}/auth/register`, {
+    data: { email, username, password },
+  });
+
+  // 2. 取出验证 Token（走测试辅助接口，不走邮件）
+  const tokenRes = await request.get(
+    `${BASE_URL}/auth/test-verification-token?email=${encodeURIComponent(email)}`
+  );
+  const { token } = await tokenRes.json();
+
+  // 3. 验证邮箱
+  await request.get(`${BASE_URL}/auth/verify-email?token=${token}`);
+
+  return { email, password, username };
+}
+
+// 登录并拿到 JWT Token（供需要认证的 API 调用使用）
+export async function loginAndGetToken(
+  request: APIRequestContext,
+  email: string,
+  password = "Test@123456"
+): Promise<string> {
+  const res = await request.post(`${BASE_URL}/auth/login`, {
+    data: { email, password },
+  });
+  const body = await res.json();
+  return body.data.token;
+}
+```
+
+`email.split("@")[0].slice(0, 20)` 这行需要留意一下：邮箱前缀本身 如果已经比较长（比如 `test-seller2-123456`），截到 20 字符是留出的 安全余量，实际动手前最好核对一下后端对 username 字段设的具体长度 限制，跟这个截断值对上号。
+
+> **`/auth/test-verification-token` 这个接口现在还不存在**， 下一步在后端新建它。
+
+
+
+### 8. 后端新增一个只在开发环境暴露的接口
+
+正常的邮箱验证流程，是后端生成一个 Token，通过邮件发给用户， 用户点邮件里的链接完成验证。但 E2E 测试运行的环境（本地、CI） 通常没有真实可用的邮件服务，测试代码没办法去"收邮件"拿到这个 Token。所以需要一个后门：直接用邮箱去查这个 Token 是什么，跳过 "发邮件、收邮件"这一步。
+
+**这个接口必须只在开发环境存在，生产环境绝对不能暴露**—— 一旦生产环境也能通过邮箱查到任意用户的验证 Token，相当于给了 一个绕过邮箱验证的攻击入口。
+
+**第一步：在 `UserService.cs` 加入查询方法**
+
+```csharp
+// 仅供 E2E 测试使用：根据邮箱直接查询邮箱验证 Token
+// 生产环境里这个 Token 只会通过邮件发送，不会通过 API 暴露
+public async Task<string?> GetEmailConfirmationTokenAsync(
+    string email,
+    CancellationToken cancellationToken = default)
+{
+    var user = await _userRepository.GetByEmailAsync(
+        email.ToLower(), cancellationToken);
+
+    // 用户不存在，或已经验证过（Token 已消费）
+    if (user == null || user.EmailConfirmed)
+        return null;
+
+    return user.EmailConfirmationToken;
+}
+```
+
+**第二步：在 `AuthController.cs` 注入 `IWebHostEnvironment`**
+
+`IWebHostEnvironment` 是 ASP.NET Core 内置的服务，用来判断当前 运行环境是 Development、Staging 还是 Production，正是用来做 "仅开发环境暴露"这层判断的关键依赖：
+
+```csharp
+private readonly IWebHostEnvironment _environment; // ✅ 新增
+
+public AuthController(
+    UserService userService,
+    RefreshTokenService refreshTokenService,
+    IWebHostEnvironment environment, // ✅ 新增
+    ILogger<AuthController> logger)
+{
+    _userService = userService;
+    _refreshTokenService = refreshTokenService;
+    _environment = environment; // ✅ 新增
+    _logger = logger;
+}
+```
+
+**第三步：在 `AuthController.cs` 加入接口**
+
+```csharp
+// GET /auth/test-verification-token?email=xxx
+// ⚠️ 仅开发环境：供 E2E 测试绕过邮件验证
+// 非开发环境返回 404，和接口不存在完全一样
+[HttpGet("test-verification-token")]
+public async Task<IActionResult> GetTestVerificationToken(
+    [FromQuery] string email,
+    CancellationToken cancellationToken)
+{
+    if (!_environment.IsDevelopment())
+        return NotFound();
+
+    var token = await _userService.GetEmailConfirmationTokenAsync(
+        email, cancellationToken);
+
+    if (token == null)
+        return NotFound();
+
+    return Ok(new { token });
+}
+```
+
+刻意让非开发环境返回 404，而不是返回 403（禁止访问）之类更明确的 状态码，是为了让这个接口在生产环境看起来"就像不存在"，不暴露 "这里其实有一个被拦截的接口"这个信息，减少攻击者的探测线索。
+
+**验证接口正常（用 Scalar）：**
+
+先注册一个用户但不验证邮箱，然后：
+
+```
+GET http://localhost:5065/auth/test-verification-token?email=该邮箱
+```
+
+应该返回 `{ "token": "xxxxx" }`。
+
+
+
+### 9. 编写核心 E2E 测试
+
+写 E2E 测试有个和 RTL 不一样的地方：RTL 测试里组件的 DOM 结构是自己写代码渲染出来，心里有数；但 E2E 测的是已经跑起来的真实页面，很多细节（页面跳转去了哪、状态用什么文字显示、容器是什么标签）**光靠读组件源码猜，猜错的概率不低**。所以这一步的实际过程是"写一个、跑一个、根据真实报错和真实页面行为修正假设、再继续下一个"——下面就按这个真实发生的顺序走一遍。
+
+#### 9.1 先解决一个通用问题：POM 里"登录后跳去哪"不是写死的
+
+在写具体测试之前，先看一眼 `LoginPage.ts` 这个 POM 里 `loginAndWait` 方法：
+
+```typescript
+async loginAndWait(email: string, password: string) {
+  await this.goto();
+  await this.login(email, password);
+  await this.page.waitForURL("/");
+}
+```
+
+这里把"登录后跳转到哪"写死成了根路径 `"/"`。这个假设对普通用户 （卖家、买家）成立，但用 Admin 账号登录——而 `LoginPage.tsx` 的真实逻辑是 Admin 登录后跳转到 `/admin`，不是 `/`。如果不处理这个 差异，凡是 Admin 登录的测试都会在这一行死等一个永远不会发生的跳转， 直到 30 秒超时。
+
+修改`e2e/pages/LoginPage.ts,` 把这个参数开放出来
+
+```ts
+// e2e/pages/LoginPage.ts
+import { type Page } from "@playwright/test";
+
+export class LoginPage {
+  constructor(private readonly page: Page) {}
+
+  async goto() {
+    await this.page.goto("/login");
+  }
+
+  async login(email: string, password: string) {
+    await this.page.getByLabel("Email").fill(email);
+    await this.page.getByLabel("Password").fill(password);
+    await this.page.getByRole("button", { name: /sign in/i }).click();
+  }
+
+  // expectedUrl 默认还是 "/"，普通用户登录不用改调用方式
+  // Admin 登录时传 "/admin"，跳过去哪由调用方决定，不由 POM 自己假设
+  async loginAndWait(
+    email: string,
+    password: string,
+    expectedUrl: string | RegExp = "/"
+  ) {
+    await this.goto();
+    await this.login(email, password);
+    await this.page.waitForURL(expectedUrl);
+  }
+}
+```
+
+#### 9.2 测试1：注册流程
+
+这是唯一一个完整走 UI 注册流程的测试，其他测试的账号准备都会走 API（下面会讲原因），所以先写这一个，确认 Playwright、后端、前端 三者真的能联动起来：
+
+新建 `uucars-web/e2e/flows.spec.ts`, 并编写第一个测试流程：
+
+```ts
+import { test, expect } from "@playwright/test";
+
+test.describe("核心用户流程", () => {
+    
+  // ── 测试1：注册流程 ────────────
+  test("测试1：用户注册并收到验证提示", async ({ page }) => {
+    const uid = Date.now().toString().slice(-6);
+    const email = `test-reg-${uid}@example.com`;
+
+    await page.goto("/register");
+
+    await page.getByLabel("Username").fill(`user${uid}`);
+    await page.getByLabel("Email").fill(email);
+    await page.getByLabel("Password").fill("Test@123456");
+    await page.getByRole("button", { name: /create account/i }).click();
+
+    // 注册成功后应该显示"请检查邮箱"的提示
+    await expect(page.getByText(/check your email/i)).toBeVisible({
+      timeout: 10000,
+    });
+  });
+    
+})
+```
+
+注意一点：后面几个测试都会连续调用 注册、登录接口，如果后端配置了基于 IP 的限流策略（Rate Limiting）， 连续跑 5 个测试累积的请求次数有可能撞到限流阈值，导致后面某个测试 莫名其妙地登录失败——这不是测试代码或应用逻辑的问题，而是限流策略 本身在本地高频测试场景下过于敏感。本地跑 E2E 之前，可以考虑把 限流阈值临时调大，或者给测试环境单独放宽限流规则。
+
+运行测试
+
+```bash
+# 有头模式（能看到浏览器操作过程，调试时用）
+npm run e2e:headed
+```
+
+#### 9.3 测试2：卖家发布车辆并提交审核
+
+卖家发布车辆并提交审核:
+
+- 创建车辆时，车辆标题不易写成固定字符串，比如"2020 Toyota Corolla Test Car"， 每个测试要用 `uid` 生成独立数据、避免污染。 每跑一次测试，数据库里就会多一条标题完全相同的记录，等跑过几次之后，如果测试改用标题文字去定位这辆车，会因为匹配到多个 同名元素而报错
+- 草稿创建成功后跳到编辑页时，URL 里已经带了车辆的 id，顺手从 URL 里取出真实的 carId
+
+- 点击"Submit for review"之后，页面**跳转**去了 `/profile/listings?page=1`, 创建的车辆都是通过独立的组件`ListingCard`渲染的：
+
+    ```tsx
+    export default function ListingCard({...}: ListingCardProps) {
+      return (
+        <div
+          className="block group w-full max-w-sm mx-auto p-4 border overflow-hidden card-hover"
+          ...
+        >
+    ```
+
+    但是容器是普通 `<div>`，没有可用 的语义化 role，需要靠 `data-testid` 兜底定位。
+
+    ```tsx
+    <div
+      data-testid={`listing-card-${car.id}`}  {/* ✅ 新增，供 E2E 测试定位 */}
+      className="block group w-full max-w-sm mx-auto p-4 border overflow-hidden card-hover"
+      ...
+    >
+    ```
+
+编写测试2的测试逻辑：
+
+```ts
+import { test, expect } from "@playwright/test";
+import { LoginPage } from "./pages/LoginPage";
+import { createAndVerifyUser } from "./helpers/api";
+
+test.describe("核心用户流程", () => {
+  // ── 测试1：注册流程 ────────────
+  ...
+
+  
+  test("测试2：卖家发布车辆并提交审核", async ({ page, request }) => {
+    const uid = Date.now().toString().slice(-6);
+    const email = `test-seller-${uid}@example.com`;
+    await createAndVerifyUser(request, email);
+
+    const loginPage = new LoginPage(page);
+    await loginPage.loginAndWait(email, "Test@123456");
+
+    await page.goto("/cars/new");
+
+    // 标题拼上 uid，避免多次运行产生标题完全相同的重复数据
+    await page.getByLabel("Title").fill(`2020 Toyota Corolla Test Car ${uid}`);
+    await page.getByLabel("Brand").fill("Toyota");
+    await page.getByLabel("Model").fill("Corolla");
+    await page.getByLabel("Year").fill("2020");
+    await page.getByLabel("Price ($)").fill("18000");
+    await page.getByLabel("Mileage (km)").fill("35000");
+
+    await page.getByRole("button", { name: /create draft/i }).click();
+
+    // 草稿创建成功后跳转到编辑页，顺手从 URL 里取出真实的 carId
+    await page.waitForURL(/\/cars\/(\d+)\/edit/);
+    const carId = page.url().match(/\/cars\/(\d+)\/edit/)?.[1];
+
+    await page.getByRole("button", { name: /submit for review/i }).click();
+
+    // 提交后会真正跳转到列表页
+    await page.waitForURL(/\/profile\/listings/);
+
+    // 用 carId 精确定位到这张卡片，确认状态徽标显示的真实文字 "Pending"
+    const listingCard = page.getByTestId(`listing-card-${carId}`);
+    await expect(listingCard).toBeVisible({ timeout: 10000 });
+    await expect(listingCard.getByText("Pending")).toBeVisible();
+  });
+})
+```
+
+#### 9.4 测试3：Admin 审核车辆通过
+
+ `AdminPendingPage.tsx` 的真实结构：
+
+- 每辆待审核的车渲染在一个普通的 `<div>` 里 （`<div className="flex flex-col gap-3 rounded-...">`）
+- 没有用 `<article>` 这类带隐式语义化 role 的标签，`<div>` 里同时包含标题 文字和右边的操作按钮（Approve / Reject / Remove）。
+
+这个结构决定了两件事：第一，定位 Approve 按钮不能直接全局搜索 "名字叫 Approve 的按钮"，如果待审核列表里同时存在好几辆车，页面 上会有好几个 "Approve" 按钮，必须先精确定位到"这辆车"对应的那个 容器，再到这个容器内部去找按钮。第二，因为容器是普通 `<div>`， 没有可用的语义化 role，跟测试 2 一样，需要靠 `data-testid` 兜底。
+
+打开 `AdminPendingPage.tsx`，给渲染每辆车的这个 `<div>` 加一行：
+
+```tsx
+<div
+  key={car.id}
+  data-testid={`pending-car-${car.id}`}  {/* ✅ 新增，供 E2E 测试定位 */}
+  className="flex flex-col gap-3 rounded-[var(--radius-lg)] border p-4 sm:flex-row sm:items-center sm:justify-between"
+  style={{
+    backgroundColor: "var(--color-surface)",
+    borderColor: "var(--color-border)",
+    boxShadow: "var(--shadow-card)",
+  }}
+>
+```
+
+编写测试逻辑代码，得用上前面为 Admin 场景专门开放的 `expectedUrl` 参数——Admin 登录后跳转的是 `/admin`，不是默认的 `"/"`：
+
+```ts
+import { test, expect } from "@playwright/test";
+import { LoginPage } from "./pages/LoginPage";
+import { createAndVerifyUser, loginAndGetToken } from "./helpers/api";
+
+const ADMIN_EMAIL = "admin@uucars.com";
+const ADMIN_PASSWORD = "Admin@123456";
+const API = "http://localhost:5065";
+
+test.describe("核心用户流程", () => {
+  // ── 测试1：注册流程 ────────────
+  ...
+  
+  // ── 测试2：卖家发布车辆并提交审核 ────────────
+  ...
+
+  test("测试3：Admin 审核车辆通过", async ({ page, request }) => {
+    const uid = Date.now().toString().slice(-6);
+    const sellerEmail = `test-seller2-${uid}@example.com`;
+    await createAndVerifyUser(request, sellerEmail);
+    const sellerToken = await loginAndGetToken(request, sellerEmail);
+
+    // 通过 API 创建并提交车辆（这不是这个测试的测试点，走 UI 浪费时间）
+    const carRes = await request.post(`${API}/cars`, {
+      headers: { Authorization: `Bearer ${sellerToken}` },
+      data: {
+        title: `Admin Test Car ${uid}`,
+        brand: "Honda",
+        model: "Civic",
+        year: 2019,
+        price: 15000,
+        mileage: 60000,
+      },
+    });
+    const carId = (await carRes.json()).data.id;
+
+    await request.post(`${API}/cars/${carId}/submit`, {
+      headers: { Authorization: `Bearer ${sellerToken}` },
+    });
+
+    // Admin 登录后跳转到 /admin，不是根路径，显式传第三个参数
+    const loginPage = new LoginPage(page);
+    await loginPage.loginAndWait(ADMIN_EMAIL, ADMIN_PASSWORD, "/admin");
+
+    // 用 carId 拼出的 data-testid 精确定位到这张卡片，再在里面找 Approve 按钮
+    const carCard = page.getByTestId(`pending-car-${carId}`);
+
+    await expect(carCard).toBeVisible({ timeout: 10000 });
+
+    await carCard.getByRole("button", { name: /approve/i }).click();
+
+    // 审核通过后车辆从待审核列表消失
+    await expect(carCard).not.toBeVisible({ timeout: 10000 });
+  });
+})
+```
+
+测试 3、4、5 都用固定账号 `admin@uucars.com` / `Admin@123456` 登录， 这依赖本地数据库里本来就有这个 Admin 种子账号。
+
+#### 9.5 测试4：买家下单
+
+写断言之前先确认一下确认下单弹窗的真实文案：标题是 **"Confirm Purchase"**，正文是 **"You are about to purchase [车辆标题] for $[价格]. This action cannot be undone."**，确认按钮上的文字同样是 "Confirm Purchase"。
+
+这里有个需要留意的地方：**标题和确认按钮用的是同一句话**，如果 断言直接写 `getByText(/confirm purchase/i)`，页面上同时存在标题和 按钮两处都含这段文字，会匹配到多个元素报错。所以断言应该挑正文 段落里那句更独特、不会跟按钮文字重复的话（"you are about to purchase"），而不是标题；点击确认按钮时，用 `getByRole("button", ...)` 把范围限定在按钮上，就不会跟纯文本的标题混淆：
+
+```tsx
+import { test, expect } from "@playwright/test";
+import { LoginPage } from "./pages/LoginPage";
+import { createAndVerifyUser, loginAndGetToken } from "./helpers/api";
+
+const ADMIN_EMAIL = "admin@uucars.com";
+const ADMIN_PASSWORD = "Admin@123456";
+const API = "http://localhost:5065";
+
+test.describe("核心用户流程", () => {
+  // ── 测试1：注册流程 ────────────
+  ...
+  // ── 测试2：卖家发布车辆并提交审核 ────────────
+  ...
+  // ── 测试3：Admin 审核车辆通过 ────────────
+  ...
+
+  // ── 测试4：买家下单 ────────────────────────────────────────
+  // 车辆的准备（创建、提交、审核）全部走 API
+  // 买家下单是这个测试真正要验证的行为，走 UI
+  test("测试4：买家浏览车辆并下单", async ({ page, request }) => {
+    const uid = Date.now().toString().slice(-6);
+
+    // 准备一辆 Published 状态的车辆
+    const sellerEmail = `test-seller3-${uid}@example.com`;
+    await createAndVerifyUser(request, sellerEmail);
+    const sellerToken = await loginAndGetToken(request, sellerEmail);
+
+    const carRes = await request.post(`${API}/cars`, {
+      headers: { Authorization: `Bearer ${sellerToken}` },
+      data: {
+        title: `Published Car ${uid}`,
+        brand: "Mazda",
+        model: "CX-5",
+        year: 2021,
+        price: 30000,
+        mileage: 20000,
+      },
+    });
+    const carId = (await carRes.json()).data.id;
+
+    await request.post(`${API}/cars/${carId}/submit`, {
+      headers: { Authorization: `Bearer ${sellerToken}` },
+    });
+
+    // Admin 审核通过（走 API，不走 UI）
+    const adminToken = await loginAndGetToken(
+      request,
+      ADMIN_EMAIL,
+      ADMIN_PASSWORD,
+    );
+    await request.post(`${API}/admin/cars/${carId}/approve`, {
+      headers: { Authorization: `Bearer ${adminToken}` },
+    });
+
+    // 买家登录
+    const buyerEmail = `test-buyer-${uid}@example.com`;
+    await createAndVerifyUser(request, buyerEmail);
+    const loginPage = new LoginPage(page);
+    await loginPage.loginAndWait(buyerEmail, "Test@123456");
+
+    // 进入车辆详情页
+    await page.goto(`/cars/${carId}`);
+
+    await page.getByRole("button", { name: /buy now/i }).click();
+
+    // 确认下单对话框出现——用正文段落文字断言，避免跟 "Confirm Purchase" 按钮/标题重名冲突
+    await expect(page.getByText(/you are about to purchase/i)).toBeVisible({
+      timeout: 10000,
+    });
+
+    await page.getByRole("button", { name: /confirm purchase/i }).click();
+
+    // 下单成功提示
+    await expect(page.getByText(/order.*success/i)).toBeVisible({
+      timeout: 10000,
+    });
+  });
+})
+```
+
+#### 9.6 测试5：卖家查看收到的订单
+
+这个测试是 5 个里最后一个跑的，前面几个测试已经连续发了不少注册和 登录请求——这也是为什么测试 1 那里提前提醒过要留意本地限流配置， 这个测试正是最容易撞到限流阈值的一个，动手跑之前记得确认限流阈值 已经放宽。
+
+```tsx
+import { test, expect } from "@playwright/test";
+import { LoginPage } from "./pages/LoginPage";
+import { createAndVerifyUser, loginAndGetToken } from "./helpers/api";
+
+const ADMIN_EMAIL = "admin@uucars.com";
+const ADMIN_PASSWORD = "Admin@123456";
+const API = "http://localhost:5065";
+
+test.describe("核心用户流程", () => {
+  // ── 测试1：注册流程 ────────────
+  ...
+  // ── 测试2：卖家发布车辆并提交审核 ────────────
+  ...
+  // ── 测试3：Admin 审核车辆通过 ────────────
+  ...
+  // ── 测试4：买家下单 ───────────
+  ...
+  
+  // ── 测试5：卖家查看收到的订单 ────────────
+  // 车辆和订单的准备全部走 API
+  // 卖家查看订单页面是这个测试真正要验证的行为，走 UI
+  test("测试5：卖家查看收到的订单", async ({ page, request }) => {
+    const uid = Date.now().toString().slice(-6);
+
+    // 准备车辆
+    const sellerEmail = `test-seller4-${uid}@example.com`;
+    await createAndVerifyUser(request, sellerEmail);
+    const sellerToken = await loginAndGetToken(request, sellerEmail);
+
+    const carRes = await request.post(`${API}/cars`, {
+      headers: { Authorization: `Bearer ${sellerToken}` },
+      data: {
+        title: `Seller Sales Car ${uid}`,
+        brand: "Nissan",
+        model: "Leaf",
+        year: 2022,
+        price: 25000,
+        mileage: 10000,
+      },
+    });
+    const carId = (await carRes.json()).data.id;
+
+    await request.post(`${API}/cars/${carId}/submit`, {
+      headers: { Authorization: `Bearer ${sellerToken}` },
+    });
+
+    const adminToken = await loginAndGetToken(
+      request,
+      ADMIN_EMAIL,
+      ADMIN_PASSWORD,
+    );
+    await request.post(`${API}/admin/cars/${carId}/approve`, {
+      headers: { Authorization: `Bearer ${adminToken}` },
+    });
+
+    // 买家下单
+    const buyerEmail = `test-buyer2-${uid}@example.com`;
+    await createAndVerifyUser(request, buyerEmail);
+    const buyerToken = await loginAndGetToken(request, buyerEmail);
+    await request.post(`${API}/orders`, {
+      headers: { Authorization: `Bearer ${buyerToken}` },
+      data: { carId },
+    });
+
+    // 卖家登录查看销售订单
+    const loginPage = new LoginPage(page);
+    await loginPage.loginAndWait(sellerEmail, "Test@123456");
+
+    await page.goto("/profile/sales");
+
+    await expect(page.getByText(`Seller Sales Car ${uid}`)).toBeVisible({
+      timeout: 10000,
+    });
+  });
+})
+```
+
+
+
+### 10. 加运行脚本
+
+```json
+{
+  "scripts": {
+    "e2e": "playwright test",
+    "e2e:ui": "playwright test --ui",
+    "e2e:headed": "playwright test --headed"
+  }
+}
+```
+
+三个脚本对应三种运行方式：`e2e` 是无头模式（不显示浏览器界面， 跑得快，适合日常验证）；`e2e:headed` 会真的弹出浏览器窗口，能 看到测试操作过程，适合调试某个测试为什么失败；`e2e:ui` 打开 Playwright 自带的可视化界面，能单独重跑某一个测试、查看每一步 的截图和 DOM 快照，排查问题时最直观。
+
+
+
+### 11. 本地运行验证
+
+确保前后端都已启动，然后：
+
+```bash
+# 有头模式（能看到浏览器操作过程，调试时用）
+npm run e2e:headed
+
+# 无头模式（更快）
+npm run e2e
+```
+
+5 个测试全部通过后，查看测试报告：
+
+```bash
+npx playwright show-report
+```
+
+
+
+### 12. CI 集成
+
+E2E 测试要在 CI 里跑起来，意味着 CI 环境要真的启动一个后端服务、 一个前端服务、一个数据库、跑完所有 Migration，配置所有环境变量—— 这一整套基础设施在 CI 流水线里临时搭建，复杂度和维护成本都不低。
+
+真实生产项目里更常见的做法是：E2E 测试连一个已经部署好的 **Staging（预发布）环境**跑，而不是在 CI 任务运行的当下临时搭建 一整套服务。这一步只先把 CI 里的 job 结构搭出来，占住位置， 实际的运行逻辑留到以后有 Staging 环境时再补上。
+
+在 `.github/workflows/ci.yml` 里加入 E2E job 骨架：
+
+```yaml
+e2e:
+  name: E2E Tests (Playwright)
+  runs-on: ubuntu-latest
+  needs: [test, build-and-push]
+  if: github.ref == 'refs/heads/main'
+
+  steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: "20"
+
+    - name: Install dependencies
+      run: cd uucars-web && npm ci
+
+    - name: Install Playwright browsers
+      run: cd uucars-web && npx playwright install --with-deps chromium
+
+    # TODO: 生产项目里这里应该连 Staging 环境（前后端已部署）运行
+    # 而不是在 CI 里临时启动服务——启动服务需要数据库、环境变量、Migration 等
+    # 当前跳过实际运行，只保留 job 结构
+    - name: Run E2E tests (skipped - needs Staging environment)
+      run: echo "E2E tests would run against Staging environment here"
+
+    - name: Upload test artifacts on failure
+      uses: actions/upload-artifact@v4
+      if: failure()
+      with:
+        name: playwright-screenshots
+        path: uucars-web/test-results/
+        retention-days: 7
+```
+
+
+
+### 13. Git 提交
+
+Step 64-69（前端功能 + 测试体系）全部完成。
+
+```bash
+git add .
+git commit -m "test: Playwright E2E tests for 5 core user journeys"
+git push origin feature/v3-e2e-tests
+
+# 合并回 develop
+git checkout develop
+git merge --no-ff feature/v3-e2e-tests \
+  -m "merge: feature/v3-e2e-tests into develop"
+git push origin develop
+
+# 合并到 main，打 v3.2 Tag
+git checkout main
+git pull origin main
+git merge --no-ff develop \
+  -m "release: v3.2 - Frontend features + Testing"
+git tag -a v3.2 \
+  -m "v3.2: Image upload, Rich text, Optimistic update, Search UX, RTL + E2E tests"
+git push origin main
+git push origin main --tags
+
+git checkout develop
+```
+
+
+
+### Step 69 完成状态
+
+```
+概念理解：
+✅ E2E 测试 vs RTL 单元测试的职责划分——RTL 测零件，E2E 测整台机器
+✅ 测试数据污染问题及解决方案——时间戳 uid 隔离，不依赖固定 Seed 数据
+✅ POM 的价值和适用边界——复用率高才抽，不过度抽象
+✅ 为什么 E2E 准备数据走 API 而不是 UI——只有测试本身关心的行为才走 UI
+✅ 为什么串行执行——Admin 账号共享，并行会产生状态冲突
+✅ 为什么 CI E2E 连 Staging 而不是临时启动服务
+
+实现（按需逐步搭建）：
+✅ @playwright/test 安装 + playwright.config.ts（串行，workers: 1）
+✅ LoginPage POM
+✅ 测试辅助函数（createAndVerifyUser / loginAndGetToken）
+   - username 截短到 20 字符，避免超过后端长度限制
+   - uid 只取时间戳后6位，避免用户名过长
+✅ 后端 GET /auth/test-verification-token（仅开发环境，IsDevelopment 守卫）
+✅ UserService.GetEmailConfirmationTokenAsync
+✅ 5 个核心 E2E 测试（每个测试用独立的 uid 隔离数据）：
+   - 测试1：注册 → 看到验证邮件提示
+   - 测试2：登录 → 填写车辆 → 提交审核
+   - 测试3：Admin 审核通过（article + filter 定位，基于真实 DOM 结构）
+   - 测试4：买家下单
+   - 测试5：卖家查看销售订单
+✅ CI yml E2E job 骨架
+
+
+动手前需要核对的地方：
+⚠️ getByLabel 依赖的文案要跟真实页面逐字核对
+⚠️ Admin 种子账号需要提前确认在本地数据库里存在且密码正确
+⚠️ retries: 0 是设计取舍，若本地环境偶发抖动导致结果不稳定，
+   可临时改成 retries: 1 排查是环境问题还是代码问题
+
+✅ 本地 5 个 E2E 测试全部通过
+✅ v3.2 里程碑：合并到 main + 打 Tag
+```
+
+
+
 ## fixed Issues 
 
 ### Fix 1. 并发 Refresh Token 请求竞态条件（Refresh Token Rotation Race Condition）
@@ -8716,6 +13945,807 @@ git merge --no-ff develop \
   -m "merge: fix/cookie-samesite-production into main"
 git push origin main
 git checkout develop
+```
+
+
+
+### Fix3：图片上传组件体验优化
+
+#### 1. 切出 fix 分支
+
+```bash
+git checkout develop
+git pull origin develop	
+git checkout -b fix/ImageUploader-ux-improvements
+git push -u origin fix/ImageUploader-ux-improvements
+```
+
+#### 2.  问题描述
+
+图片上传组件的拖拽和删除各占一小块固定区域，操作不直观。`SortableImageItem` 中拖拽手柄是右下角一个独立小图标，而删除按钮是右上角另一个独立小图标，用户必须精确点在对应的小区域内才能触发操作。不如那种"整卡片可拖、悬浮才显示反馈、删除区域自动隔离"的模式直观。
+
+同时，添加图片按钮 `Add Images`是网格下方独立按钮，不是网格内的方块, 这导致 **图片网格和`Add Images`按钮是视觉上分离的两段**。按钮是标准横向按钮，不是跟图片同尺寸、排在网格末尾的方块，这种设计和"添加照片"方块体验相比有差距。
+
+#### 3. 根本原因
+
+根本原因是：现有设计靠"手柄和删除按钮物理位置分开"来避免两者抢事件，这是可行但不够友好的规避方式；没有用到 dnd-kit `activationConstraint`（8px 位移阈值）本身已经具备的"单纯点击不触发拖拽"能力，也没有给删除按钮做事件隔离。
+
+而对应添加图片功能按钮的设计， 三块内容（已上传图片、待上传预览、添加按钮）原本写成了三个独立的 `<div>`，天然不在同一个 flex 布局里，所以"添加"没法自然排进网格序列的最后一项。
+
+#### 4. 解决方案
+
+要实现整卡片可拖，删除按钮完全隔离拖拽感知，不再靠"手柄和删除按钮物理位置分开"这种规避方式，而是让整个卡片都能响应拖拽手势，删除按钮自己拦截事件、确保永远不会被误判成拖拽起点。
+
+**优化 `SortableImageItem`组件：**
+
+- `{...attributes} {...listeners}` 从手柄按钮挪到整个卡片
+- 拖拽手柄整个去掉， 不再需要一个独立的小手柄，整张卡片本身就是拖拽触发区
+
+```tsx
+import type { CarImage } from "@/types";
+import { useSortable } from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+
+interface SortableImageItemProps {
+  image: CarImage;
+  onDelete: () => void;
+  isDeleting: boolean;
+}
+/* -- 已上传图片：可拖拽排序的单个图片项 - */
+function SortableImageItem({
+  image,
+  onDelete,
+  isDeleting,
+}: SortableImageItemProps) {
+  // useSortable 把这个元素注册为可排序项
+  // attributes/listeners 绑在整个卡片上（不再是独立手柄）：
+  // 单纯点击（没有产生 8px 位移，见 ImageUploader 里的 activationConstraint）
+  // 不会触发拖拽，配合删除按钮自己拦截事件（见下面），足以区分"点删除"和"开始拖拽"
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: image.id });
+
+  return (
+    <div
+      ref={setNodeRef}
+      className="relative"
+      {...attributes}
+      {...listeners}
+      style={{
+        transform: CSS.Transform.toString(transform),
+        transition,
+        opacity: isDragging ? 0.5 : 1,
+      }}
+    >
+      <img
+        src={image.imageUrl}
+        alt="Car"
+        className="h-24 w-24 rounded-lg object-cover"
+      />
+
+      {/* 删除按钮 */}
+      <button
+        onClick={onDelete}
+        disabled={isDeleting}
+        className="absolute -right-2 -top-2 flex h-5 w-5
+                           items-center justify-center rounded-full
+                           bg-red-500 text-xs text-white
+                           hover:bg-red-600"
+      >
+        ×
+      </button>
+    </div>
+  );
+}
+
+export default SortableImageItem;
+
+```
+
+**图片删除图标阻止冒泡**：
+
+给删除按钮加 `onPointerDown={(e) => e.stopPropagation()}`，这样按下删除按钮的这个动作，根本不会冒泡到外层触发拖拽感知，不管按下去之后手指有没有轻微移动，都不会被误判成拖拽起点。同时删除按钮显式加了 `cursor-pointer`，覆盖父级 `cursor-grab` 的光标样式，鼠标移到删除图标上会正确切回普通指针
+
+```tsx
+function SortableImageItem({
+  image,
+  onDelete,
+  isDeleting,
+}: SortableImageItemProps) {
+  ...
+
+  return (
+    <div
+      ref={setNodeRef}
+      className="relative"
+      {...attributes}
+      {...listeners}
+      style={{
+        transform: CSS.Transform.toString(transform),
+        transition,
+        opacity: isDragging ? 0.5 : 1,
+      }}
+    >
+      ...
+
+      {/* 删除按钮：onPointerDown 阻止冒泡，保证按下这个按钮永远不会被
+          外层的拖拽感知捕获，不管按下后有没有轻微位移 */}
+      <button
+        onClick={onDelete}
+        onPointerDown={(e) => {e.stopPropagation()}}
+        disabled={isDeleting}
+        className="absolute -right-2 -top-2 flex h-5 w-5
+                           items-center justify-center rounded-full
+                           bg-red-500 text-xs text-white
+                           hover:bg-red-600 cursor-pointer"
+      >
+        ×
+      </button>
+    </div>
+  );
+}
+```
+
+**新增悬浮遮罩**:
+
+ 使用Tailwind 的 `group`/`group-hover`， 这样鼠标移入卡片时才显现半透明遮罩，提示"这里可以拖动"；`pointer-events-none` 保证这层遮罩不会挡住下面删除按钮的点击。
+
+```tsx
+function SortableImageItem({
+  image,
+  onDelete,
+  isDeleting,
+}: SortableImageItemProps) {
+  ...
+  return (
+    <div
+      ref={setNodeRef}
+      className="group relative cursor-move active:cursor-grabbing"
+      {...attributes}
+      {...listeners}
+      style={{
+        transform: CSS.Transform.toString(transform),
+        transition,
+        opacity: isDragging ? 0.5 : 1,
+      }}
+    >
+      <img
+        src={image.imageUrl}
+        alt="Car"
+        className="h-24 w-24 rounded-lg object-cover"
+      />
+
+      {/* 悬浮遮罩：只在鼠标移入时显现，提示"这里可以拖动"；
+          pointer-events-none 避免挡住下面删除按钮的点击 */}
+      <div className="pointer-events-none absolute inset-0 rounded-lg bg-black/0 transition-colors group-hover:bg-black/20" />
+
+      {/* 删除按钮 */}
+      ...
+    </div>
+  );
+}
+```
+
+**添加图片按钮 `Add Images`的布局优化：**
+
+优化`ImageUploader`组件， 把原来三个独立区块（已上传图片网格、待上传预览网格、按钮区块）合并成一个 `flex flex-wrap` 容器， 这样三个功能快在同一行横向依次显示
+
+```tsx
+...
+
+export default function ImageUploader({ carId, images }: ImageUploaderProps) {
+  ...
+
+  return (
+    <div className="space-y-4">
+      <h2 className="font-semibold">Images</h2>
+          
+      {/* 图片网格：已上传图片（可拖拽排序）+ 待上传预览 + 末尾的"添加"方块，统一放在同一行 */}
+      <DndContext
+        sensors={sensors}
+        collisionDetection={closestCenter}
+        onDragEnd={handleDragEnd}
+      >
+        <SortableContext
+          items={localImages.map((img) => img.id)}
+          strategy={rectSortingStrategy}
+        >
+          <div className="flex flex-wrap gap-3">
+              
+            {/* 已上传的图片列表：可拖拽排序 */}
+            {localImages.map((image) => (
+              <SortableImageItem
+                key={image.id}
+                image={image}
+                onDelete={() => deleteMutation.mutate(image.id)}
+                isDeleting={
+                  deleteMutation.isPending &&
+                  deleteMutation.variables === image.id
+                }
+              />
+            ))}
+
+            {/* 待上传文件：每一项独立显示上传中或失败重试，互不影响 */}
+            {pendingFiles.map((pending) => (
+              <div key={pending.id} className="relative">
+                <img
+                  src={pending.previewUrl}
+                  alt="Preview"
+                  className="h-24 w-24 rounded-lg object-cover"
+                />
+
+                ...
+              </div>
+            ))}
+
+            {/* 选择新图片：上传图片按钮 */}
+            <div className="space-y-3">
+              ...
+            </div>
+          </div>
+        </SortableContext>
+      </DndContext>
+    </div>
+  );
+}
+```
+
+`DndContext`/`SortableContext` 现在包住整个网格（不只是已上传图片那部分）。 这不影响拖拽逻辑，因为 dnd-kit 只会追踪调用了 `useSortable` 的元素，待上传预览和添加图片本身没有调用这个 Hook，混在同一个容器里不会被误判成可拖拽项。
+
+**改造添加图片按钮：**
+
+新增一个 `h-24 w-24` 虚线边框方块（`Plus` 图标 + "Add" 文字），用 `canAddMore` 控制显隐，作为整个 `.map()` 序列里的最后一项。
+
+```tsx
+...
+
+export default function ImageUploader({ carId, images }: ImageUploaderProps) {
+  ...
+
+  // 已有图片 + 待上传数量是否已达上限，达到就不再显示"添加"方块
+  const canAddMore = localImages.length + pendingFiles.length < MAX_IMAGES;
+
+  return (
+    <div className="space-y-4">
+      <h2 className="font-semibold">Images</h2>
+          
+      {/* 图片网格：已上传图片（可拖拽排序）+ 待上传预览 + 末尾的"添加"方块，统一放在同一行 */}
+      <DndContext
+        sensors={sensors}
+        collisionDetection={closestCenter}
+        onDragEnd={handleDragEnd}
+      >
+        <SortableContext
+          items={localImages.map((img) => img.id)}
+          strategy={rectSortingStrategy}
+        >
+          <div className="flex flex-wrap gap-3">
+            {/* 已上传的图片列表：可拖拽排序 */}
+              
+            ...
+
+            {/* 待上传文件：每一项独立显示上传中或失败重试，互不影响 */}
+
+            ...
+
+            {/* 添加图片：跟图片同尺寸的方块，始终排在网格最后一个 */}
+            {canAddMore && (
+              <button
+                type="button"
+                onClick={() => inputRef.current?.click()}
+                className="flex h-24 w-24 flex-col items-center justify-center gap-1 rounded-lg border-2 border-dashed border-gray-300 text-gray-400 transition-colors hover:border-gray-400 hover:text-gray-500"
+              >
+                <Plus className="h-5 w-5" />
+                <span className="text-[10px]">Add</span>
+              </button>
+            )}
+          </div>
+        </SortableContext>
+      </DndContext>
+
+      {/* 隐藏的原生文件选择 input，multiple 允许一次选多个文件 */}
+      <input
+        ref={inputRef}
+        type="file"
+        accept="image/jpeg,image/png,image/webp"
+        multiple
+        className="hidden"
+        onChange={handleFileChange}
+      />
+      <p className="text-xs text-gray-500">
+        JPEG, PNG or WebP · Max 5 MB per image · Up to {MAX_IMAGES} images total
+      </p>
+    </div>
+  );
+}
+
+```
+
+**格外的一个小改动**：
+
+现在的 `Edit Car`页面中，"文本表单 + Save Changes 按钮"在上面、"Images + Add Images 按钮"在下面，非常自然地会以为"是不是要先点 Save Changes，图片才会跟着车辆信息一起保存"。而实际上，`Save Changes` 只负责保存**文本字段**（Title/Brand/Model 这些），跟图片完全无关——图片是选中即上传、每张独立立刻持久化的，不需要点 `Save Changes` 才生效。
+
+这个纯粹由布局顺序制造出来的误导需要优化一下：把 `Images` 区块整体挪到 `CarForm` 上面。
+
+```tsx
+export default function EditCarPage() {
+  ...
+
+  return (
+    <div className="mx-auto max-w-2xl space-y-8">
+      <div className="flex items-center justify-between">
+        <h1 className="text-2xl font-bold">Edit Car</h1>
+        {/* 提交审核按钮 */}
+        <Button
+          onClick={() => submitMutation.mutate()}
+          disabled={submitMutation.isPending}
+        >
+          {submitMutation.isPending ? "Submitting..." : "Submit for Review"}
+        </Button>
+      </div>
+
+      {/* 图片上传 */}
+      <ImageUploader carId={carId} images={car.images} />
+
+      {/* 车辆信息表单，defaultValues 填入已有数据 */}
+      ...
+    </div>
+  );
+}
+
+```
+
+#### 5. 测试并合并分支
+
+修改完成之后:
+
+- 拖拽手柄移除，整个卡片能实现拖拽
+- 添加图片按钮和图片卡片外形一致，并并列展示
+- 车辆编辑页面的图片区域移到`CarForm`之前
+
+合并分支
+
+```bash
+git add .
+git commit -m "fix: improve ImageUploader UX"
+git push origin fix/ImageUploader-ux-improvements
+
+git checkout develop
+git merge --no-ff fix/ImageUploader-ux-improvements \
+  -m "merge: fix/ImageUploader-ux-improvements into develop"
+git push origin develop
+
+git branch -d fix/ImageUploader-ux-improvements
+git push origin --delete fix/ImageUploader-ux-improvements
+```
+
+
+
+### Fix4：车辆发布体验优化（图片预上传）
+
+#### 1. 切出 fix 分支
+
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b fix/add-images-when-create-car
+git push -u origin fix/add-images-when-create-car
+```
+
+#### 2. 问题描述
+
+创建车辆阶段无法预先选图片，当前流程：
+
+CreateCarPage 只有 CarForm，用户填完信息点 Create Draft 后，carsApi.create 成功才跳转到 EditCarPage，图片必须等跳转过去之后才能添加。用户体验上应该允许"填资料的同时就能选好图片"，不需要先创建、再跳页面、再选图。
+
+#### 3. 根本原因
+
+CarImage 在数据库里通过 CarId 外键归属于一辆具体的车（AddImagesBatchAsync 第一步就是 _carRepository.GetByIdAsync(carId, ...)，车不存在直接 404）。这意味着图片必须挂在一个已存在的 carId 上，而 CreateCarPage 阶段车辆还没创建，天然不具备这个前提。
+
+#### 4. 解决方案
+
+不改后端任何接口，前端在 CreateCarPage 里让用户"先选图片、暂存在本地、不真正上传"，等 carsApi.create 真正成功拿到 car.id 之后，紧接着调用已有的 carsApi.uploadImagesBatch(car.id, files) 把暂存的文件批量传上去；如果图片上传失败，不影响创建结果，依然跳转 EditCarPage，让用户在编辑页重新添加。
+
+**新增本地状态数组**：
+
+`CreateCarPage` 现状完全没有跟图片相关的状态。要让用户"先选图片、暂存本地、提交时才真正上传"，需要一个新的本地状态数组，装"已选中但还没上传"的文件。 这里跟 ImageUploader 里的 PendingFile 不同——PendingFile 需要 status: "uploading" | "error"，是因为那边选完立即发请求；这里选完完全不发请求，只是本地暂存，所以不需要状态字段，只需要文件本身和预览地址： 
+
+```tsx
+// 创建阶段本地暂存的图片：车辆还不存在，不能真正上传，
+// 只在本地生成预览，等提交成功拿到 carId 才批量上传
+interface LocalImage {
+  id: string;
+  file: File;
+  previewUrl: string;
+}
+
+export default function CreateCarPage() {
+ ...
+}
+
+```
+
+对应组件内部新增状态： 
+
+```tsx
+export default function CreateCarPage() {
+  // 本地暂存的图片（车辆还不存在，不能真正上传）
+  const [localImages, setLocalImages] = useState<LocalImage[]>([]);
+  ...
+}
+```
+
+如果我们有了本地暂存的图片数据，需要渲染这部分数据， 这部分数据渲染的功能，我们创建一个独立的组件`ImagePicker`, 并把数据和更新数据的操作传递过去, 这样根据本地不同的数据，就能渲染出不同的车辆图片。
+
+```tsx
+export default function CreateCarPage() {
+  // 本地暂存的图片（车辆还不存在，不能真正上传）
+  const [localImages, setLocalImages] = useState<LocalImage[]>([]);
+
+  ...
+
+  return (
+    <div className="mx-auto max-w-2xl space-y-6">
+      <h1 className="text-2xl font-bold">List Your Car</h1>
+          
+      {/* image selector */}
+      <ImagePicker images={localImages} onChange={setLocalImages} />
+
+      <CarForm
+        onSubmit={handleSubmit}
+        isSubmitting={createMutation.isPending}
+        submitLabel="Create Draft"
+      />
+    </div>
+  );
+}
+```
+
+**创建图片本地选择器组件`ImagePicker`**
+
+和`ImageUploader`不同，`ImagePicker`内部**完全不需要**任何网络请求:
+
+- 没有 `carsApi` 导入
+- 没有 `useMutation`
+- 没有 `useQueryClient`
+
+但需要选择、删除、拖拽这三件事， 他们全部只是纯数组操作。同时`ImagePicker` 只负责"展示 + 触发变化",不自己拥有状态,这是标准的**受控组件**模式,跟 `CarForm` 的 `onSubmit`/`defaultValues` 是同一个思路。
+
+```tsx
+interface ImagePickerProps {
+  // 受控组件：状态由父组件持有，这里只负责展示和触发变化
+  images: LocalImage[];
+  onChange: (images: LocalImage[]) => void;
+}
+
+export default function ImagePicker({ images, onChange }: ImagePickerProps) {
+ 
+
+  /* --- 选择 --- */
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    ...
+    onChange(...);
+  };
+  /* --- 删除 --- */
+  // 纯本地数组操作，没有对应的后端记录，不发请求
+  const handleDelete = (id: string) => {
+    ...
+    onChange(...);
+  };
+
+  /* --- 拖拽 --- */
+  // 拖拽结束：纯本地重排，没有已持久化的 SortOrder 需要同步给后端
+  const handleDragEnd = (event: DragEndEvent) => {
+    ...
+    onChange(...);
+  };
+
+  const canAddMore = images.length < MAX_IMAGES;
+
+  return (
+    <div className="space-y-2">
+      ...
+    </div>
+  );
+}
+
+```
+
+完善选择+删除+拖拽逻辑，渲染数据（复用可拖拽卡`SortableImageItem`)
+
+```tsx
+import { useRef } from "react";
+import { toast } from "sonner";
+import { Plus } from "lucide-react";
+import {
+  DndContext,
+  closestCenter,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  rectSortingStrategy,
+  arrayMove,
+} from "@dnd-kit/sortable";
+import SortableImageItem from "./SortableImageItem";
+import type { LocalImage } from "@/pages/CreateCarPage";
+
+const MAX_IMAGES = 10; // 与后端 AddImagesBatchAsync 的上限保持一致
+
+interface ImagePickerProps {
+  // 受控组件：状态由父组件持有，这里只负责展示和触发变化
+  images: LocalImage[];
+  onChange: (images: LocalImage[]) => void;
+}
+
+export default function ImagePicker({ images, onChange }: ImagePickerProps) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  const sensors = useSensors(
+    useSensor(PointerSensor, {
+      activationConstraint: { distance: 8 },
+    }),
+  );
+  const canAddMore = images.length < MAX_IMAGES;
+
+  /* --- 选择 --- */
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+
+    const fileArray = Array.from(files);
+
+    // 数量上限：只在本地拦截，此时没有 carId，无法调后端校验
+    if (images.length + fileArray.length > MAX_IMAGES) {
+      toast.error(
+        `A car can have at most ${MAX_IMAGES} images. ` +
+          `Currently selected ${images.length}, ` +
+          `you selected ${fileArray.length} more.`,
+      );
+      if (inputRef.current) inputRef.current.value = "";
+      return;
+    }
+
+    const newImages: LocalImage[] = fileArray.map((file) => ({
+      id: `local-${Date.now()}-${Math.random()}`,
+      file,
+      previewUrl: URL.createObjectURL(file),
+    }));
+
+    onChange([...images, ...newImages]);
+
+    if (inputRef.current) inputRef.current.value = "";
+  };
+  /* --- 删除 --- */
+  // 纯本地数组操作，没有对应的后端记录，不发请求
+  const handleDelete = (id: string) => {
+    const target = images.find((img) => img.id === id);
+    if (target) URL.revokeObjectURL(target.previewUrl);
+    onChange(images.filter((img) => img.id !== id));
+  };
+
+  /* --- 拖拽 --- */
+  // 拖拽结束：纯本地重排，没有已持久化的 SortOrder 需要同步给后端
+  const handleDragEnd = (event: DragEndEvent) => {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+
+    const oldIndex = images.findIndex((img) => img.id === active.id);
+    const newIndex = images.findIndex((img) => img.id === over.id);
+
+    onChange(arrayMove(images, oldIndex, newIndex));
+  };
+
+  return (
+    <div className="space-y-2">
+      <h2 className="font-semibold">Images</h2>
+      <DndContext
+        sensors={sensors}
+        collisionDetection={closestCenter}
+        onDragEnd={handleDragEnd}
+      >
+        <SortableContext
+          items={images.map((img) => img.id)}
+          strategy={rectSortingStrategy}
+        >
+          <div className="flex flex-wrap gap-3">
+            {images.map((img) => (
+              <SortableImageItem
+                key={img.id}
+                image={{ id: img.id, imageUrl: img.previewUrl }}
+                onDelete={() => handleDelete(img.id)}
+                isDeleting={false}
+              />
+            ))}
+
+            {/* 添加图片：跟图片同尺寸的方块，始终排在最后一个 */}
+            {canAddMore && (
+              <button
+                type="button"
+                onClick={() => inputRef.current?.click()}
+                className="flex h-24 w-24 flex-col items-center justify-center gap-1
+                           rounded-lg border-2 border-dashed border-gray-300
+                           text-gray-400 transition-colors
+                           hover:border-gray-400 hover:text-gray-500"
+              >
+                <Plus className="h-5 w-5" />
+                <span className="text-[10px]">Add</span>
+              </button>
+            )}
+          </div>
+        </SortableContext>
+      </DndContext>
+          
+	  {/* 隐藏的原生文件选择 input，multiple 允许一次选多个文件 */}
+      <input
+        ref={inputRef}
+        type="file"
+        accept="image/jpeg,image/png,image/webp"
+        multiple
+        className="hidden"
+        onChange={handleFileChange}
+      />
+      <p className="text-xs text-gray-500">
+        JPEG, PNG or WebP · Max 5 MB per image · Up to {MAX_IMAGES} images total
+      </p>
+    </div>
+  );
+}
+```
+
+注意：复用`SortableImageItem` 会有类型不匹配
+
+`SortableImageItem` 现在的 prop 类型是 `image: CarImage`,而本地暂存的文件对象长得不一样(`id` 是字符串、字段叫 `previewUrl` 不是 `imageUrl`)。
+
+需要把 `SortableImageItem` 依赖的类型**收窄成它真正需要的最小形状**——它其实只用到 `id` 和 `imageUrl` 两个字段,不需要整个 `CarImage`。这样两边都能类型安全地复用同一个展示组件。
+
+```tsx
+// 只依赖"展示 + 拖拽 + 删除"真正需要的字段，不绑定具体是
+// 已持久化的 CarImage，还是本地文件生成的预览对象——
+// CarImage 结构上天然满足这个形状，可以直接传入，不需要改 ImageUploader
+export interface ImageLike {
+  id: string | number;
+  imageUrl: string;
+}
+
+interface SortableImageItemProps {
+  image: ImageLike;
+  onDelete: () => void;
+  isDeleting: boolean;
+}
+/* -- 已上传图片：可拖拽排序的单个图片项 - */
+function SortableImageItem() {
+ ...
+}
+```
+
+**重写表单提交逻辑**
+
+之前的提交逻辑不包含上传图片的部分，使用`useMutation`合理，现在的提交动作是"创建车辆 → 上传图片 → 跳转"三步连续的流程，`useMutation` 的 `isPending` 只反映 `mutationFn` 本身（原来的 `carsApi.create`）有没有完成——`create` 请求一返回，`isPending` 立刻变回 `false`，哪怕紧接着的图片上传还没做完，按钮会提前恢复可点击状态，用户可能在图片还在传的时候又点一次提交。因此，我们选择**手写一个 `async` 函数配合自己的 `isSubmitting` 状态更直接**。
+
+之前的逻辑：
+
+```tsx
+const createMutation = useMutation({
+  mutationFn: (values: CarFormValues) => carsApi.create(values),
+  onSuccess: (car) => {
+    toast.success("Draft created!");
+    navigate(`/cars/${car.id}/edit`);
+  },
+  onError: (error) => {
+    toast.error(error.message);
+  },
+});
+
+const handleSubmit = async (values: CarFormValues) => {
+  createMutation.mutate(values);
+};
+```
+
+修改提交逻辑
+
+```tsx
+import { useNavigate } from "react-router-dom";
+import { toast } from "sonner";
+import { carsApi } from "@/api";
+import CarForm from "@/components/CarForm";
+import type { CarFormValues } from "@/components/CarForm";
+import { useState } from "react";
+import ImagePicker from "@/components/ImagePicker";
+
+// 车辆创建前本地暂存的图片：还没有 carId，不会真正上传，
+// 只在本地生成预览、支持删除和拖拽排序；真正的上传由父组件
+// 在拿到 carId 之后调用 carsApi.uploadImagesBatch 完成
+export interface LocalImage {
+  id: string;
+  file: File;
+  previewUrl: string;
+}
+
+export default function CreateCarPage() {
+  const navigate = useNavigate();
+
+  // 本地暂存的图片：车辆还不存在，选择、删除、排序都只发生在本地，
+  // 全部逻辑交给 ImageSelector，这里只持有状态，提交时读出来用
+  const [localImages, setLocalImages] = useState<LocalImage[]>([]);
+  // 提交状态：涵盖"创建车辆 + 上传图片"整个过程，不只是创建这一步
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const handleSubmit = async (values: CarFormValues) => {
+    setIsSubmitting(true);
+    try {
+      // 第一步：创建车辆，拿到真实的 carId
+      const car = await carsApi.create(values);
+      toast.success("Draft created!");
+
+      // 第二步：如果用户选过图片，用刚拿到的 carId 批量上传
+      if (localImages.length > 0) {
+        try {
+          await carsApi.uploadImagesBatch(
+            car.id,
+            localImages.map((img) => img.file),
+          );
+        } catch {
+          // 图片上传失败不影响车辆已创建这个事实，只提示用户去编辑页补传
+          toast.error(
+            "Draft created, but images failed to upload. You can add them on the next page.",
+          );
+        }
+      }
+
+      // 第三步：跳转编辑页（车辆一定已存在，图片传没传成功都可以在这里补）
+      navigate(`/cars/${car.id}/edit`);
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "Failed to create draft.",
+      );
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="mx-auto max-w-2xl space-y-6">
+      <h1 className="text-2xl font-bold">List Your Car</h1>
+
+      <ImagePicker images={localImages} onChange={setLocalImages} />
+
+      <CarForm
+        onSubmit={handleSubmit}
+        isSubmitting={isSubmitting}
+        submitLabel="Create Draft"
+      />
+    </div>
+  );
+}
+
+```
+
+#### 5. 测试并合并分支
+
+修改之后，创建车辆草稿时，能批量上传图片（预览+拖拽排序+删除）
+
+合并分支
+
+```tsx
+git add .
+git commit -m "fix: improve car listing UX, add images"
+git push origin fix/add-images-when-create-car
+
+git checkout develop
+git merge --no-ff fix/add-images-when-create-car \
+  -m "merge: fix/add-images-when-create-car into develop"
+git push origin develop
+
+git branch -d fix/add-images-when-create-car
+git push origin --delete fix/add-images-when-create-car
 ```
 
 

@@ -4,9 +4,11 @@ import { Gauge, Calendar, Car as CarIcon } from "lucide-react";
 import type { Car } from "@/types";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
+import { highlight } from "@/lib/highlight";
 
 interface CarCardProps {
   car: Car;
+  highlightKeyword?: string; // 可选：当前搜索词，有值时高亮匹配部分
 }
 
 // 计算距今多久（用于显示发布时间）
@@ -16,7 +18,7 @@ function getRelativeTime(dateStr: string): string {
   return `${days}d ago`;
 }
 
-export default function CarCard({ car }: CarCardProps) {
+export default function CarCard({ car, highlightKeyword }: CarCardProps) {
   return (
     <Link
       to={`/cars/${car.id}`}
@@ -58,7 +60,10 @@ export default function CarCard({ car }: CarCardProps) {
           {/* 品牌 + 年份 */}
           <div className="mb-2 flex items-center justify-between">
             <Badge variant="accent" className="text-xs">
-              {car.brand}
+              {/* brand 使用搜索高亮 */}
+              {highlightKeyword
+                ? highlight(car.brand, highlightKeyword)
+                : car.brand}
             </Badge>
             <span
               className="flex items-center gap-1 text-xs"
@@ -78,7 +83,10 @@ export default function CarCard({ car }: CarCardProps) {
             )}
             style={{ color: "var(--color-text-primary)" }}
           >
-            {car.title}
+            {/* title 使用搜索高亮 */}
+            {highlightKeyword
+              ? highlight(car.title, highlightKeyword)
+              : car.title}
           </h3>
 
           {/* 价格 */}

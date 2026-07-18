@@ -4,6 +4,8 @@ import { z } from "zod";
 import { Label } from "./ui/label";
 import { Input } from "./ui/input";
 import { Button } from "./ui/button";
+import { useEffect, useRef } from "react";
+import { toast } from "sonner";
 
 const carSchema = z.object({
   title: z
@@ -43,6 +45,8 @@ interface CarFormProps {
   isSubmitting: boolean;
   // submitLabel：按钮文字（"Create Draft" 或 "Save Changes"）
   submitLabel: string;
+  // ✅ 新增：由调用方传入，格式如 "car-draft-new" 或 "car-draft-5"
+  draftKey: string;
 }
 
 export default function CarForm({
@@ -50,18 +54,87 @@ export default function CarForm({
   onSubmit,
   isSubmitting,
   submitLabel,
+  draftKey,
 }: CarFormProps) {
   const {
     register,
     handleSubmit,
+    // 用来订阅表单所有字段的变化
+    watch,
+    // 用于把恢复的草稿数据重新填回表单
+    reset,
     formState: { errors },
   } = useForm<CarFormValues>({
     resolver: zodResolver(carSchema),
     defaultValues,
   });
 
+  /* -------------- 保存草稿 -------------- */
+  // 内容变化时：2 秒 debounce 自动保存
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    const subscription = watch((values) => {
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = setTimeout(() => {
+        localStorage.setItem(draftKey, JSON.stringify(values));
+      }, 2000);
+    });
+    return () => {
+      subscription.unsubscribe();
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    };
+  }, [watch, draftKey]);
+
+  /* ------------- 草稿数据回填 ------------- */
+  // 进入页面时：检查是否有未保存的草稿
+  const draftRestoredRef = useRef(false);
+
+  useEffect(() => {
+    if (draftRestoredRef.current) return; // 只在初次渲染时执行一次
+    draftRestoredRef.current = true;
+
+    const saved = localStorage.getItem(draftKey);
+    if (!saved) return;
+
+    try {
+      const parsed = JSON.parse(saved) as CarFormValues;
+      // setTimeout(300ms)：等 Toaster 完成挂载再调用 toast()，
+      // 否则组件刚挂载时 Toaster 可能还没准备好，Toast 不会显示
+      setTimeout(() => {
+        toast("Unsaved draft found.", {
+          description: "Do you want to restore your previous draft?",
+          action: {
+            label: "Restore",
+            onClick: () => {
+              reset(parsed);
+              toast.success("Draft restored.");
+            },
+          },
+          cancel: {
+            label: "Discard",
+            onClick: () => localStorage.removeItem(draftKey),
+          },
+          duration: 10000, // 给用户足够时间决定
+        });
+      }, 300);
+    } catch {
+      // JSON 解析失败（数据损坏），静默清除
+      localStorage.removeItem(draftKey);
+    }
+  }, [draftKey, reset]);
+
+  /* ------------- 提交处理函数 ------------- */
+  // 封装了清除草稿的逻辑
+  const handleFormSubmit = async (values: CarFormValues) => {
+    //提交表单数据
+    await onSubmit(values);
+    // 手动清除草稿
+    localStorage.removeItem(draftKey);
+  };
+
   return (
-    <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+    <form onSubmit={handleSubmit(handleFormSubmit)} className="space-y-4">
       <div className="space-y-2">
         <Label htmlFor="title">Title</Label>
         <Input
