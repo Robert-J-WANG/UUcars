@@ -58,7 +58,7 @@ public static class RateLimitingExtensions
                     _ => new FixedWindowRateLimiterOptions
                     {
                         Window = TimeSpan.FromMinutes(1),
-                        PermitLimit = 10,
+                        PermitLimit = 20,
                         QueueLimit = 0, // 不排队，超出直接拒绝
                         QueueProcessingOrder = QueueProcessingOrder.OldestFirst
                     });
@@ -77,7 +77,7 @@ public static class RateLimitingExtensions
                     _ => new FixedWindowRateLimiterOptions
                     {
                         Window = TimeSpan.FromHours(1),
-                        PermitLimit = 5,
+                        PermitLimit = 20,
                         QueueLimit = 0
                     });
             });

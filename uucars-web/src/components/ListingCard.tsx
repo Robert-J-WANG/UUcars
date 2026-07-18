@@ -66,6 +66,8 @@ export default function ListingCard({
 }: ListingCardProps) {
   return (
     <div
+      /* ✅ 新增，供 E2E 测试定位 */
+      data-testid={`listing-card-${car.id}`}
       // ✅ flex flex-col 让内容撑满，按钮区 mt-auto 沉底
       // min-h 保证无按钮的卡片和有按钮的卡片视觉高度接近
       className="block group w-full max-w-sm mx-auto p-4 border overflow-hidden

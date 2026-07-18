@@ -76,6 +76,8 @@ export default function AdminPendingPage() {
         {data.items.map((car) => (
           <div
             key={car.id}
+            /* ✅ 新增，供 E2E 测试定位 */
+            data-testid={`pending-car-${car.id}`}
             className="flex flex-col gap-3 rounded-[var(--radius-lg)] border p-4 sm:flex-row sm:items-center sm:justify-between"
             style={{
               backgroundColor: "var(--color-surface)",

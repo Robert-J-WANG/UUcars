@@ -347,4 +347,20 @@ public class UserService
             CreatedAt = user.CreatedAt
         };
     }
+
+    // 仅供 E2E 测试使用：根据邮箱直接查询邮箱验证 Token
+    // 生产环境里这个 Token 只会通过邮件发送，不会通过 API 暴露
+    public async Task<string?> GetEmailConfirmationTokenAsync(
+        string email,
+        CancellationToken cancellationToken = default)
+    {
+        var user = await _userRepository.GetByEmailAsync(
+            email.ToLower(), cancellationToken);
+
+        // 用户不存在，或已经验证过（Token 已消费）
+        if (user == null || user.EmailConfirmed)
+            return null;
+
+        return user.EmailConfirmationToken;
+    }
 }
