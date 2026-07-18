@@ -12101,7 +12101,7 @@ export default defineConfig({
 
 #### 2.3 让 TypeScript 认识这些全局函数
 
-`globals: true` 只是运行时生效，TypeScript 编译时还是不认识 `describe`/`it`/`expect`，需要在 `tsconfig.json`（或 `tsconfig.app.json`） 的 `compilerOptions` 里声明类型来源：
+`globals: true` 只是运行时生效，TypeScript 编译时还是不认识 `describe`/`it`/`expect`，需要在  `tsconfig.app.json` 的 `compilerOptions` 里声明类型来源：
 
 ```json
 {
@@ -12194,7 +12194,7 @@ test: {
 },
 ```
 
-`tsconfig.json` 的 `types` 也补上：
+`tsconfig.app.json` 的 `types` 也补上：
 
 ```json
 {
@@ -12731,6 +12731,949 @@ git push origin --delete feature/v3-frontend-tests
 
 ✅ npm test 全部通过
 ✅ Git commit + 合并回 develop 完成
+```
+
+
+
+
+
+## Step 69 · Playwright 端到端测试
+
+### 这一步要做什么
+
+Step 68 建立的 RTL 测试，测的是"单个组件在被隔离的环境里，行为对不对"—— `LoginPage` 组件测试里，API 和 store 全部是 Mock 出来的假的，测试只关心 "点击按钮后，这个组件自己的状态变化对不对"。
+
+但有一类问题，RTL 从设计上就回答不了：**用户从登录到发布一辆车、 等待审核、被别人下单，这一整条链路，串起来到底走不走得通？** 这中间要经过好几个页面、真实的后端 API、真实的数据库读写，任何一环 出问题都会导致用户卡住。RTL 测的是"零件合格",这一步要测的是 "整台机器装起来能不能开"。
+
+
+
+### 1. 切出功能分支
+
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b feature/v3-e2e-tests
+git push -u origin feature/v3-e2e-tests
+```
+
+
+
+### 2. Playwright概述
+
+RTL 测试运行在 jsdom 这个"假浏览器"里，Mock 掉了 API 和路由， 所以能跑得飞快（毫秒级），但它看不到真实后端、真实数据库、真实网络请求。
+
+可以使用Playwright库来处理测试需要的浏览器服务。
+
+**Playwright 是微软开发的浏览器自动化工具**, 核心能力是：它会真的启动一个浏览器 （Chromium/Firefox/WebKit），像真实用户一样打开你的应用，点击、 输入、跳转页面，全程不 Mock 任何东西——前端要连真实运行的 `localhost:5173`，后端要连真实运行的 `localhost:5065`，数据要真的写进数据库。这类测试叫**端到端测试（End-to-End，简称 E2E）**。
+
+```
+RTL（单元/组件级）：
+  → 测试单个组件的行为
+  → 快（毫秒级）
+  → Mock 了 API 和路由
+
+Playwright E2E（端到端）：
+  → 启动真实浏览器，访问真实运行的应用
+  → 模拟真实用户操作（点击、输入、导航）
+  → 验证完整的用户旅程
+  → 慢（秒级）但覆盖了所有层（前端 + 后端 + 数据库）
+```
+
+两者不是谁取代谁，是分工：RTL 覆盖数量多、跑得快的组件级校验， Playwright 覆盖少而关键的几条完整用户旅程，是整个测试体系的最后一道防线——它不关心内部实现，只关心"用户能不能完成他想完成的事"。
+
+我们设计的完整链路包括5个核心E2E测试：
+
+   - 测试1：注册 → 看到验证邮件提示
+
+   - 测试2：登录 → 填写车辆 → 提交审核
+
+   - 测试3：Admin 审核通过（article + filter 定位，基于真实 DOM 结构）
+
+   - 测试4：买家下单
+
+   - 测试5：卖家查看销售订单
+
+     
+
+### 3. 测试数据污染
+
+E2E 测试要操作真实数据库， 如果测试 1 注册了 `test@example.com`，测试 2 又想注册同一个邮箱， 后端会因为"邮箱已存在"直接拒绝，测试 2 就会莫名其妙地失败—— 而且这个失败跟测试 2 本身的逻辑毫无关系，纯粹是数据冲突。
+
+如果多个测试共用同一辆车（比如都对同一个 `carId` 操作），执行顺序 一旦变化（比如某次测试 3 先跑，把车审核通过了；测试 4 本来期望这辆车 还是"待审核"状态），测试结果就会随执行顺序摇摆不定。
+
+**解决方案：每个测试自己生成一份独一无二的测试数据，不共用、 不依赖预先塞好的固定数据（Seed 数据）。**
+
+比如：
+
+```typescript
+// 用时间戳后6位生成唯一标识（完整时间戳太长，会超过用户名长度限制）
+const uid = Date.now().toString().slice(-6);
+const email = `test-${uid}@example.com`;
+const username = `user${uid}`;
+```
+
+只取时间戳的后 6 位而不是完整时间戳，是因为后端对 username 字段 通常有长度限制（下面会看到限制在 20 字符左右），完整的 13 位时间戳 拼上前缀很容易超限。这样处理后，每次运行测试，每个测试用例内部 生成的数据都跟其他测试、跟上一次运行的数据完全不重叠，测试之间 彻底隔离。
+
+
+
+### 4. 重复的定位器和操作
+
+E2E 测试里，几乎每个测试用例都要先登录一次。如果每个测试文件里 都直接手写登录逻辑，比如：
+
+```typescript
+await page.fill('[name="email"]', email);
+await page.fill('[name="password"]', "Test@123456");
+await page.click('button[type="submit"]');
+```
+
+这样写有一个隐患：如果登录按钮的文字以后从 "Sign In" 改成了 "Log In"，或者 email 输入框换了个 `name` 属性，所有用到登录操作的 测试文件都要跟着改一遍，改一处漏一处的风险很高。因此，可以使用POM来解决。
+
+**Page Object Model（POM）是什么？**
+
+**POM 就是把某个页面的定位器和操作封装进一个类里，测试代码只调用 类的方法，不直接接触底层的选择器细节：**
+
+```typescript
+class LoginPage {
+  async login(email: string, password: string) {
+    await this.page.getByLabel("Email").fill(email);
+    await this.page.getByLabel("Password").fill(password);
+    await this.page.getByRole("button", { name: /sign in/i }).click();
+  }
+}
+```
+
+以后按钮文字变了，只需要改 `LoginPage` 类里这一处，所有调用 `loginPage.login(...)` 的测试自动跟着修复，不需要挨个测试文件去改。
+
+**哪些页面值得抽 POM ？**
+
+**只有当一个页面的操作会被多个测试复用时，才值得花力气抽象成类。** 比如这一步里 `LoginPage` 几乎每个测试都要用到，值得抽。但像发布车辆、 下单这些页面的操作，本步骤里只有单个测试用到一次，直接把定位器 写在测试文件里就够了。
+
+
+
+### 5. 安装 Playwright，配置运行方式
+
+```bash
+cd uucars-web
+npm install -D @playwright/test
+npx playwright install chromium
+```
+
+这里只装 Chromium 一个浏览器内核，不装 Firefox、WebKit 全套。 Chromium 已经覆盖了绝大多数用户实际使用的浏览器内核。
+
+在 `uucars-web/` 根目录新建 `playwright.config.ts`：
+
+```typescript
+import { defineConfig } from "@playwright/test";
+
+export default defineConfig({
+  // 测试文件根目录
+  testDir: "./e2e",
+    
+  // 生成 HTML 测试报告，跑完后可以用 npx playwright show-report 查看
+  reporter: "html",
+
+  // 串行执行，不并行
+  // 原因：多个测试共用 Admin 账号，并行时会产生状态冲突
+  // （比如测试3审核了测试4准备的车辆，导致测试4流程出错）
+  fullyParallel: false,
+  workers: 1,
+
+  // CI 环境下禁止 only（防止忘记移除 test.only 导致其他测试没跑）
+  forbidOnly: !!process.env.CI,
+
+  // 失败时不重试（重试会掩盖不稳定的测试）
+  retries: 0,
+
+  // 单个测试的超时时间：30秒
+  timeout: 30000,
+
+  use: {
+    baseURL: "http://localhost:5173",
+
+    // 失败时自动截图，保存在 test-results/ 目录
+    // 截图是 E2E 调试的关键工具——失败时能看到浏览器当时的状态
+    screenshot: "only-on-failure",
+
+    trace: "on-first-retry",
+  },
+
+  projects: [
+    {
+      name: "chromium",
+      use: { browserName: "chromium" },
+    },
+  ],
+});
+```
+
+`fullyParallel: false` + `workers: 1` 这两项是专门针对本步骤测试 场景做的取舍：后面测试 3、4、5 都会用同一个 Admin 账号登录去审核 车辆，如果多个测试并行跑，Admin 账号在同一时刻被多个测试同时操作， 测试 3 可能会审核到本该属于测试 4 的车辆——这不是 Playwright 本身 的问题，是"共用一个账号"这个设计决策带来的约束，串行执行是用 牺牲一点速度换取结果的确定性。
+
+`tsconfig.node.json`配置文件里包含这个文件
+
+```json
+{
+ ...
+ ,
+  "include": ["vite.config.ts", "playwright.config.ts"]
+}
+```
+
+
+
+### 第六步：写第一个 POM——LoginPage
+
+新建 `uucars-web/e2e/pages/LoginPage.ts`：
+
+```typescript
+import { type Page } from "@playwright/test";
+
+export class LoginPage {
+  constructor(private readonly page: Page) {}
+
+  async goto() {
+    await this.page.goto("/login");
+  }
+
+  async login(email: string, password: string) {
+    await this.page.getByLabel("Email").fill(email);
+    await this.page.getByLabel("Password").fill(password);
+    await this.page.getByRole("button", { name: /sign in/i }).click();
+  }
+
+  // 登录并等待跳转到首页（登录成功的标志）
+  async loginAndWait(email: string, password: string) {
+    await this.goto();
+    await this.login(email, password);
+    await this.page.waitForURL("/");
+  }
+}
+```
+
+这里 `getByLabel("Email")`、`getByLabel("Password")` 依赖的是页面上 label 标签的实际文字，跟 Step 68 RTL 里查询优先级的道理是一致的—— 优先用用户能感知的方式定位元素。写这个文件之前，建议对照真实的 `LoginPage.tsx` 源码，把 label 文案抄一遍，而不是凭空假设文字 一定是 "Email"、"Password" 这两个词，避免因为文案对不上导致 后面所有测试从第一步登录就失败。
+
+
+
+### 7. 测试数据——写 API 辅助函数
+
+**为什么不干脆都走 UI 操作？**
+
+测试 3（Admin 审核）、测试 4（买家下单）、测试 5（卖家查看订单） 这几个场景，都需要先有一辆"已经提交审核"甚至"已经审核通过"的车 作为前置条件。如果每个测试都从"注册账号 → 登录 → 填写表单 → 上传图片 → 提交审核"这一整套 UI 操作走一遍才能进入测试真正关心的 那一步，E2E 测试本身已经很慢，会被这些重复的前置准备工作拖得 更慢，而且这些步骤不是当前测试真正要验证的点——注册流程已经在 测试 1 里专门测过了，不需要在测试 3、4、5 里重复验证一遍。
+
+**所以：跟当前测试真正想验证的行为无关的前置数据，走 API 直接创建；只有测试本身关心的那部分操作，才走 UI。**
+
+新建 `uucars-web/e2e/helpers/api.ts`：
+
+```typescript
+import { type APIRequestContext } from "@playwright/test";
+
+const BASE_URL = "http://localhost:5065";
+
+// 注册用户并验证邮箱
+// 为什么通过 API 而不是走 UI？
+// 节省时间：E2E 测试本身已经够慢了，准备数据尽量走 API
+// UI 注册流程在测试1里专门测，其他测试不需要重复这个步骤
+export async function createAndVerifyUser(
+  request: APIRequestContext,
+  email: string,
+  password = "Test@123456"
+) {
+  // 从邮箱前缀截取 username，截短到合理长度避免超过字段长度限制
+  const username = email.split("@")[0].slice(0, 20);
+
+  // 1. 注册
+  await request.post(`${BASE_URL}/auth/register`, {
+    data: { email, username, password },
+  });
+
+  // 2. 取出验证 Token（走测试辅助接口，不走邮件）
+  const tokenRes = await request.get(
+    `${BASE_URL}/auth/test-verification-token?email=${encodeURIComponent(email)}`
+  );
+  const { token } = await tokenRes.json();
+
+  // 3. 验证邮箱
+  await request.get(`${BASE_URL}/auth/verify-email?token=${token}`);
+
+  return { email, password, username };
+}
+
+// 登录并拿到 JWT Token（供需要认证的 API 调用使用）
+export async function loginAndGetToken(
+  request: APIRequestContext,
+  email: string,
+  password = "Test@123456"
+): Promise<string> {
+  const res = await request.post(`${BASE_URL}/auth/login`, {
+    data: { email, password },
+  });
+  const body = await res.json();
+  return body.data.token;
+}
+```
+
+`email.split("@")[0].slice(0, 20)` 这行需要留意一下：邮箱前缀本身 如果已经比较长（比如 `test-seller2-123456`），截到 20 字符是留出的 安全余量，实际动手前最好核对一下后端对 username 字段设的具体长度 限制，跟这个截断值对上号。
+
+> **`/auth/test-verification-token` 这个接口现在还不存在**， 下一步在后端新建它。
+
+
+
+### 8. 后端新增一个只在开发环境暴露的接口
+
+正常的邮箱验证流程，是后端生成一个 Token，通过邮件发给用户， 用户点邮件里的链接完成验证。但 E2E 测试运行的环境（本地、CI） 通常没有真实可用的邮件服务，测试代码没办法去"收邮件"拿到这个 Token。所以需要一个后门：直接用邮箱去查这个 Token 是什么，跳过 "发邮件、收邮件"这一步。
+
+**这个接口必须只在开发环境存在，生产环境绝对不能暴露**—— 一旦生产环境也能通过邮箱查到任意用户的验证 Token，相当于给了 一个绕过邮箱验证的攻击入口。
+
+**第一步：在 `UserService.cs` 加入查询方法**
+
+```csharp
+// 仅供 E2E 测试使用：根据邮箱直接查询邮箱验证 Token
+// 生产环境里这个 Token 只会通过邮件发送，不会通过 API 暴露
+public async Task<string?> GetEmailConfirmationTokenAsync(
+    string email,
+    CancellationToken cancellationToken = default)
+{
+    var user = await _userRepository.GetByEmailAsync(
+        email.ToLower(), cancellationToken);
+
+    // 用户不存在，或已经验证过（Token 已消费）
+    if (user == null || user.EmailConfirmed)
+        return null;
+
+    return user.EmailConfirmationToken;
+}
+```
+
+**第二步：在 `AuthController.cs` 注入 `IWebHostEnvironment`**
+
+`IWebHostEnvironment` 是 ASP.NET Core 内置的服务，用来判断当前 运行环境是 Development、Staging 还是 Production，正是用来做 "仅开发环境暴露"这层判断的关键依赖：
+
+```csharp
+private readonly IWebHostEnvironment _environment; // ✅ 新增
+
+public AuthController(
+    UserService userService,
+    RefreshTokenService refreshTokenService,
+    IWebHostEnvironment environment, // ✅ 新增
+    ILogger<AuthController> logger)
+{
+    _userService = userService;
+    _refreshTokenService = refreshTokenService;
+    _environment = environment; // ✅ 新增
+    _logger = logger;
+}
+```
+
+**第三步：在 `AuthController.cs` 加入接口**
+
+```csharp
+// GET /auth/test-verification-token?email=xxx
+// ⚠️ 仅开发环境：供 E2E 测试绕过邮件验证
+// 非开发环境返回 404，和接口不存在完全一样
+[HttpGet("test-verification-token")]
+public async Task<IActionResult> GetTestVerificationToken(
+    [FromQuery] string email,
+    CancellationToken cancellationToken)
+{
+    if (!_environment.IsDevelopment())
+        return NotFound();
+
+    var token = await _userService.GetEmailConfirmationTokenAsync(
+        email, cancellationToken);
+
+    if (token == null)
+        return NotFound();
+
+    return Ok(new { token });
+}
+```
+
+刻意让非开发环境返回 404，而不是返回 403（禁止访问）之类更明确的 状态码，是为了让这个接口在生产环境看起来"就像不存在"，不暴露 "这里其实有一个被拦截的接口"这个信息，减少攻击者的探测线索。
+
+**验证接口正常（用 Scalar）：**
+
+先注册一个用户但不验证邮箱，然后：
+
+```
+GET http://localhost:5065/auth/test-verification-token?email=该邮箱
+```
+
+应该返回 `{ "token": "xxxxx" }`。
+
+
+
+### 9. 编写核心 E2E 测试
+
+写 E2E 测试有个和 RTL 不一样的地方：RTL 测试里组件的 DOM 结构是自己写代码渲染出来，心里有数；但 E2E 测的是已经跑起来的真实页面，很多细节（页面跳转去了哪、状态用什么文字显示、容器是什么标签）**光靠读组件源码猜，猜错的概率不低**。所以这一步的实际过程是"写一个、跑一个、根据真实报错和真实页面行为修正假设、再继续下一个"——下面就按这个真实发生的顺序走一遍。
+
+#### 9.1 先解决一个通用问题：POM 里"登录后跳去哪"不是写死的
+
+在写具体测试之前，先看一眼 `LoginPage.ts` 这个 POM 里 `loginAndWait` 方法：
+
+```typescript
+async loginAndWait(email: string, password: string) {
+  await this.goto();
+  await this.login(email, password);
+  await this.page.waitForURL("/");
+}
+```
+
+这里把"登录后跳转到哪"写死成了根路径 `"/"`。这个假设对普通用户 （卖家、买家）成立，但用 Admin 账号登录——而 `LoginPage.tsx` 的真实逻辑是 Admin 登录后跳转到 `/admin`，不是 `/`。如果不处理这个 差异，凡是 Admin 登录的测试都会在这一行死等一个永远不会发生的跳转， 直到 30 秒超时。
+
+修改`e2e/pages/LoginPage.ts,` 把这个参数开放出来
+
+```ts
+// e2e/pages/LoginPage.ts
+import { type Page } from "@playwright/test";
+
+export class LoginPage {
+  constructor(private readonly page: Page) {}
+
+  async goto() {
+    await this.page.goto("/login");
+  }
+
+  async login(email: string, password: string) {
+    await this.page.getByLabel("Email").fill(email);
+    await this.page.getByLabel("Password").fill(password);
+    await this.page.getByRole("button", { name: /sign in/i }).click();
+  }
+
+  // expectedUrl 默认还是 "/"，普通用户登录不用改调用方式
+  // Admin 登录时传 "/admin"，跳过去哪由调用方决定，不由 POM 自己假设
+  async loginAndWait(
+    email: string,
+    password: string,
+    expectedUrl: string | RegExp = "/"
+  ) {
+    await this.goto();
+    await this.login(email, password);
+    await this.page.waitForURL(expectedUrl);
+  }
+}
+```
+
+#### 9.2 测试1：注册流程
+
+这是唯一一个完整走 UI 注册流程的测试，其他测试的账号准备都会走 API（下面会讲原因），所以先写这一个，确认 Playwright、后端、前端 三者真的能联动起来：
+
+新建 `uucars-web/e2e/flows.spec.ts`, 并编写第一个测试流程：
+
+```ts
+import { test, expect } from "@playwright/test";
+
+test.describe("核心用户流程", () => {
+    
+  // ── 测试1：注册流程 ────────────
+  test("测试1：用户注册并收到验证提示", async ({ page }) => {
+    const uid = Date.now().toString().slice(-6);
+    const email = `test-reg-${uid}@example.com`;
+
+    await page.goto("/register");
+
+    await page.getByLabel("Username").fill(`user${uid}`);
+    await page.getByLabel("Email").fill(email);
+    await page.getByLabel("Password").fill("Test@123456");
+    await page.getByRole("button", { name: /create account/i }).click();
+
+    // 注册成功后应该显示"请检查邮箱"的提示
+    await expect(page.getByText(/check your email/i)).toBeVisible({
+      timeout: 10000,
+    });
+  });
+    
+})
+```
+
+注意一点：后面几个测试都会连续调用 注册、登录接口，如果后端配置了基于 IP 的限流策略（Rate Limiting）， 连续跑 5 个测试累积的请求次数有可能撞到限流阈值，导致后面某个测试 莫名其妙地登录失败——这不是测试代码或应用逻辑的问题，而是限流策略 本身在本地高频测试场景下过于敏感。本地跑 E2E 之前，可以考虑把 限流阈值临时调大，或者给测试环境单独放宽限流规则。
+
+运行测试
+
+```bash
+# 有头模式（能看到浏览器操作过程，调试时用）
+npm run e2e:headed
+```
+
+#### 9.3 测试2：卖家发布车辆并提交审核
+
+卖家发布车辆并提交审核:
+
+- 创建车辆时，车辆标题不易写成固定字符串，比如"2020 Toyota Corolla Test Car"， 每个测试要用 `uid` 生成独立数据、避免污染。 每跑一次测试，数据库里就会多一条标题完全相同的记录，等跑过几次之后，如果测试改用标题文字去定位这辆车，会因为匹配到多个 同名元素而报错
+- 草稿创建成功后跳到编辑页时，URL 里已经带了车辆的 id，顺手从 URL 里取出真实的 carId
+
+- 点击"Submit for review"之后，页面**跳转**去了 `/profile/listings?page=1`, 创建的车辆都是通过独立的组件`ListingCard`渲染的：
+
+    ```tsx
+    export default function ListingCard({...}: ListingCardProps) {
+      return (
+        <div
+          className="block group w-full max-w-sm mx-auto p-4 border overflow-hidden card-hover"
+          ...
+        >
+    ```
+
+    但是容器是普通 `<div>`，没有可用 的语义化 role，需要靠 `data-testid` 兜底定位。
+
+    ```tsx
+    <div
+      data-testid={`listing-card-${car.id}`}  {/* ✅ 新增，供 E2E 测试定位 */}
+      className="block group w-full max-w-sm mx-auto p-4 border overflow-hidden card-hover"
+      ...
+    >
+    ```
+
+编写测试2的测试逻辑：
+
+```ts
+import { test, expect } from "@playwright/test";
+import { LoginPage } from "./pages/LoginPage";
+import { createAndVerifyUser } from "./helpers/api";
+
+test.describe("核心用户流程", () => {
+  // ── 测试1：注册流程 ────────────
+  ...
+
+  
+  test("测试2：卖家发布车辆并提交审核", async ({ page, request }) => {
+    const uid = Date.now().toString().slice(-6);
+    const email = `test-seller-${uid}@example.com`;
+    await createAndVerifyUser(request, email);
+
+    const loginPage = new LoginPage(page);
+    await loginPage.loginAndWait(email, "Test@123456");
+
+    await page.goto("/cars/new");
+
+    // 标题拼上 uid，避免多次运行产生标题完全相同的重复数据
+    await page.getByLabel("Title").fill(`2020 Toyota Corolla Test Car ${uid}`);
+    await page.getByLabel("Brand").fill("Toyota");
+    await page.getByLabel("Model").fill("Corolla");
+    await page.getByLabel("Year").fill("2020");
+    await page.getByLabel("Price ($)").fill("18000");
+    await page.getByLabel("Mileage (km)").fill("35000");
+
+    await page.getByRole("button", { name: /create draft/i }).click();
+
+    // 草稿创建成功后跳转到编辑页，顺手从 URL 里取出真实的 carId
+    await page.waitForURL(/\/cars\/(\d+)\/edit/);
+    const carId = page.url().match(/\/cars\/(\d+)\/edit/)?.[1];
+
+    await page.getByRole("button", { name: /submit for review/i }).click();
+
+    // 提交后会真正跳转到列表页
+    await page.waitForURL(/\/profile\/listings/);
+
+    // 用 carId 精确定位到这张卡片，确认状态徽标显示的真实文字 "Pending"
+    const listingCard = page.getByTestId(`listing-card-${carId}`);
+    await expect(listingCard).toBeVisible({ timeout: 10000 });
+    await expect(listingCard.getByText("Pending")).toBeVisible();
+  });
+})
+```
+
+#### 9.4 测试3：Admin 审核车辆通过
+
+ `AdminPendingPage.tsx` 的真实结构：
+
+- 每辆待审核的车渲染在一个普通的 `<div>` 里 （`<div className="flex flex-col gap-3 rounded-...">`）
+- 没有用 `<article>` 这类带隐式语义化 role 的标签，`<div>` 里同时包含标题 文字和右边的操作按钮（Approve / Reject / Remove）。
+
+这个结构决定了两件事：第一，定位 Approve 按钮不能直接全局搜索 "名字叫 Approve 的按钮"，如果待审核列表里同时存在好几辆车，页面 上会有好几个 "Approve" 按钮，必须先精确定位到"这辆车"对应的那个 容器，再到这个容器内部去找按钮。第二，因为容器是普通 `<div>`， 没有可用的语义化 role，跟测试 2 一样，需要靠 `data-testid` 兜底。
+
+打开 `AdminPendingPage.tsx`，给渲染每辆车的这个 `<div>` 加一行：
+
+```tsx
+<div
+  key={car.id}
+  data-testid={`pending-car-${car.id}`}  {/* ✅ 新增，供 E2E 测试定位 */}
+  className="flex flex-col gap-3 rounded-[var(--radius-lg)] border p-4 sm:flex-row sm:items-center sm:justify-between"
+  style={{
+    backgroundColor: "var(--color-surface)",
+    borderColor: "var(--color-border)",
+    boxShadow: "var(--shadow-card)",
+  }}
+>
+```
+
+编写测试逻辑代码，得用上前面为 Admin 场景专门开放的 `expectedUrl` 参数——Admin 登录后跳转的是 `/admin`，不是默认的 `"/"`：
+
+```ts
+import { test, expect } from "@playwright/test";
+import { LoginPage } from "./pages/LoginPage";
+import { createAndVerifyUser, loginAndGetToken } from "./helpers/api";
+
+const ADMIN_EMAIL = "admin@uucars.com";
+const ADMIN_PASSWORD = "Admin@123456";
+const API = "http://localhost:5065";
+
+test.describe("核心用户流程", () => {
+  // ── 测试1：注册流程 ────────────
+  ...
+  
+  // ── 测试2：卖家发布车辆并提交审核 ────────────
+  ...
+
+  test("测试3：Admin 审核车辆通过", async ({ page, request }) => {
+    const uid = Date.now().toString().slice(-6);
+    const sellerEmail = `test-seller2-${uid}@example.com`;
+    await createAndVerifyUser(request, sellerEmail);
+    const sellerToken = await loginAndGetToken(request, sellerEmail);
+
+    // 通过 API 创建并提交车辆（这不是这个测试的测试点，走 UI 浪费时间）
+    const carRes = await request.post(`${API}/cars`, {
+      headers: { Authorization: `Bearer ${sellerToken}` },
+      data: {
+        title: `Admin Test Car ${uid}`,
+        brand: "Honda",
+        model: "Civic",
+        year: 2019,
+        price: 15000,
+        mileage: 60000,
+      },
+    });
+    const carId = (await carRes.json()).data.id;
+
+    await request.post(`${API}/cars/${carId}/submit`, {
+      headers: { Authorization: `Bearer ${sellerToken}` },
+    });
+
+    // Admin 登录后跳转到 /admin，不是根路径，显式传第三个参数
+    const loginPage = new LoginPage(page);
+    await loginPage.loginAndWait(ADMIN_EMAIL, ADMIN_PASSWORD, "/admin");
+
+    // 用 carId 拼出的 data-testid 精确定位到这张卡片，再在里面找 Approve 按钮
+    const carCard = page.getByTestId(`pending-car-${carId}`);
+
+    await expect(carCard).toBeVisible({ timeout: 10000 });
+
+    await carCard.getByRole("button", { name: /approve/i }).click();
+
+    // 审核通过后车辆从待审核列表消失
+    await expect(carCard).not.toBeVisible({ timeout: 10000 });
+  });
+})
+```
+
+测试 3、4、5 都用固定账号 `admin@uucars.com` / `Admin@123456` 登录， 这依赖本地数据库里本来就有这个 Admin 种子账号。
+
+#### 9.5 测试4：买家下单
+
+写断言之前先确认一下确认下单弹窗的真实文案：标题是 **"Confirm Purchase"**，正文是 **"You are about to purchase [车辆标题] for $[价格]. This action cannot be undone."**，确认按钮上的文字同样是 "Confirm Purchase"。
+
+这里有个需要留意的地方：**标题和确认按钮用的是同一句话**，如果 断言直接写 `getByText(/confirm purchase/i)`，页面上同时存在标题和 按钮两处都含这段文字，会匹配到多个元素报错。所以断言应该挑正文 段落里那句更独特、不会跟按钮文字重复的话（"you are about to purchase"），而不是标题；点击确认按钮时，用 `getByRole("button", ...)` 把范围限定在按钮上，就不会跟纯文本的标题混淆：
+
+```tsx
+import { test, expect } from "@playwright/test";
+import { LoginPage } from "./pages/LoginPage";
+import { createAndVerifyUser, loginAndGetToken } from "./helpers/api";
+
+const ADMIN_EMAIL = "admin@uucars.com";
+const ADMIN_PASSWORD = "Admin@123456";
+const API = "http://localhost:5065";
+
+test.describe("核心用户流程", () => {
+  // ── 测试1：注册流程 ────────────
+  ...
+  // ── 测试2：卖家发布车辆并提交审核 ────────────
+  ...
+  // ── 测试3：Admin 审核车辆通过 ────────────
+  ...
+
+  // ── 测试4：买家下单 ────────────────────────────────────────
+  // 车辆的准备（创建、提交、审核）全部走 API
+  // 买家下单是这个测试真正要验证的行为，走 UI
+  test("测试4：买家浏览车辆并下单", async ({ page, request }) => {
+    const uid = Date.now().toString().slice(-6);
+
+    // 准备一辆 Published 状态的车辆
+    const sellerEmail = `test-seller3-${uid}@example.com`;
+    await createAndVerifyUser(request, sellerEmail);
+    const sellerToken = await loginAndGetToken(request, sellerEmail);
+
+    const carRes = await request.post(`${API}/cars`, {
+      headers: { Authorization: `Bearer ${sellerToken}` },
+      data: {
+        title: `Published Car ${uid}`,
+        brand: "Mazda",
+        model: "CX-5",
+        year: 2021,
+        price: 30000,
+        mileage: 20000,
+      },
+    });
+    const carId = (await carRes.json()).data.id;
+
+    await request.post(`${API}/cars/${carId}/submit`, {
+      headers: { Authorization: `Bearer ${sellerToken}` },
+    });
+
+    // Admin 审核通过（走 API，不走 UI）
+    const adminToken = await loginAndGetToken(
+      request,
+      ADMIN_EMAIL,
+      ADMIN_PASSWORD,
+    );
+    await request.post(`${API}/admin/cars/${carId}/approve`, {
+      headers: { Authorization: `Bearer ${adminToken}` },
+    });
+
+    // 买家登录
+    const buyerEmail = `test-buyer-${uid}@example.com`;
+    await createAndVerifyUser(request, buyerEmail);
+    const loginPage = new LoginPage(page);
+    await loginPage.loginAndWait(buyerEmail, "Test@123456");
+
+    // 进入车辆详情页
+    await page.goto(`/cars/${carId}`);
+
+    await page.getByRole("button", { name: /buy now/i }).click();
+
+    // 确认下单对话框出现——用正文段落文字断言，避免跟 "Confirm Purchase" 按钮/标题重名冲突
+    await expect(page.getByText(/you are about to purchase/i)).toBeVisible({
+      timeout: 10000,
+    });
+
+    await page.getByRole("button", { name: /confirm purchase/i }).click();
+
+    // 下单成功提示
+    await expect(page.getByText(/order.*success/i)).toBeVisible({
+      timeout: 10000,
+    });
+  });
+})
+```
+
+#### 9.6 测试5：卖家查看收到的订单
+
+这个测试是 5 个里最后一个跑的，前面几个测试已经连续发了不少注册和 登录请求——这也是为什么测试 1 那里提前提醒过要留意本地限流配置， 这个测试正是最容易撞到限流阈值的一个，动手跑之前记得确认限流阈值 已经放宽。
+
+```tsx
+import { test, expect } from "@playwright/test";
+import { LoginPage } from "./pages/LoginPage";
+import { createAndVerifyUser, loginAndGetToken } from "./helpers/api";
+
+const ADMIN_EMAIL = "admin@uucars.com";
+const ADMIN_PASSWORD = "Admin@123456";
+const API = "http://localhost:5065";
+
+test.describe("核心用户流程", () => {
+  // ── 测试1：注册流程 ────────────
+  ...
+  // ── 测试2：卖家发布车辆并提交审核 ────────────
+  ...
+  // ── 测试3：Admin 审核车辆通过 ────────────
+  ...
+  // ── 测试4：买家下单 ───────────
+  ...
+  
+  // ── 测试5：卖家查看收到的订单 ────────────
+  // 车辆和订单的准备全部走 API
+  // 卖家查看订单页面是这个测试真正要验证的行为，走 UI
+  test("测试5：卖家查看收到的订单", async ({ page, request }) => {
+    const uid = Date.now().toString().slice(-6);
+
+    // 准备车辆
+    const sellerEmail = `test-seller4-${uid}@example.com`;
+    await createAndVerifyUser(request, sellerEmail);
+    const sellerToken = await loginAndGetToken(request, sellerEmail);
+
+    const carRes = await request.post(`${API}/cars`, {
+      headers: { Authorization: `Bearer ${sellerToken}` },
+      data: {
+        title: `Seller Sales Car ${uid}`,
+        brand: "Nissan",
+        model: "Leaf",
+        year: 2022,
+        price: 25000,
+        mileage: 10000,
+      },
+    });
+    const carId = (await carRes.json()).data.id;
+
+    await request.post(`${API}/cars/${carId}/submit`, {
+      headers: { Authorization: `Bearer ${sellerToken}` },
+    });
+
+    const adminToken = await loginAndGetToken(
+      request,
+      ADMIN_EMAIL,
+      ADMIN_PASSWORD,
+    );
+    await request.post(`${API}/admin/cars/${carId}/approve`, {
+      headers: { Authorization: `Bearer ${adminToken}` },
+    });
+
+    // 买家下单
+    const buyerEmail = `test-buyer2-${uid}@example.com`;
+    await createAndVerifyUser(request, buyerEmail);
+    const buyerToken = await loginAndGetToken(request, buyerEmail);
+    await request.post(`${API}/orders`, {
+      headers: { Authorization: `Bearer ${buyerToken}` },
+      data: { carId },
+    });
+
+    // 卖家登录查看销售订单
+    const loginPage = new LoginPage(page);
+    await loginPage.loginAndWait(sellerEmail, "Test@123456");
+
+    await page.goto("/profile/sales");
+
+    await expect(page.getByText(`Seller Sales Car ${uid}`)).toBeVisible({
+      timeout: 10000,
+    });
+  });
+})
+```
+
+
+
+### 10. 加运行脚本
+
+```json
+{
+  "scripts": {
+    "e2e": "playwright test",
+    "e2e:ui": "playwright test --ui",
+    "e2e:headed": "playwright test --headed"
+  }
+}
+```
+
+三个脚本对应三种运行方式：`e2e` 是无头模式（不显示浏览器界面， 跑得快，适合日常验证）；`e2e:headed` 会真的弹出浏览器窗口，能 看到测试操作过程，适合调试某个测试为什么失败；`e2e:ui` 打开 Playwright 自带的可视化界面，能单独重跑某一个测试、查看每一步 的截图和 DOM 快照，排查问题时最直观。
+
+
+
+### 11. 本地运行验证
+
+确保前后端都已启动，然后：
+
+```bash
+# 有头模式（能看到浏览器操作过程，调试时用）
+npm run e2e:headed
+
+# 无头模式（更快）
+npm run e2e
+```
+
+5 个测试全部通过后，查看测试报告：
+
+```bash
+npx playwright show-report
+```
+
+
+
+### 12. CI 集成
+
+E2E 测试要在 CI 里跑起来，意味着 CI 环境要真的启动一个后端服务、 一个前端服务、一个数据库、跑完所有 Migration，配置所有环境变量—— 这一整套基础设施在 CI 流水线里临时搭建，复杂度和维护成本都不低。
+
+真实生产项目里更常见的做法是：E2E 测试连一个已经部署好的 **Staging（预发布）环境**跑，而不是在 CI 任务运行的当下临时搭建 一整套服务。这一步只先把 CI 里的 job 结构搭出来，占住位置， 实际的运行逻辑留到以后有 Staging 环境时再补上。
+
+在 `.github/workflows/ci.yml` 里加入 E2E job 骨架：
+
+```yaml
+e2e:
+  name: E2E Tests (Playwright)
+  runs-on: ubuntu-latest
+  needs: [test, build-and-push]
+  if: github.ref == 'refs/heads/main'
+
+  steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: "20"
+
+    - name: Install dependencies
+      run: cd uucars-web && npm ci
+
+    - name: Install Playwright browsers
+      run: cd uucars-web && npx playwright install --with-deps chromium
+
+    # TODO: 生产项目里这里应该连 Staging 环境（前后端已部署）运行
+    # 而不是在 CI 里临时启动服务——启动服务需要数据库、环境变量、Migration 等
+    # 当前跳过实际运行，只保留 job 结构
+    - name: Run E2E tests (skipped - needs Staging environment)
+      run: echo "E2E tests would run against Staging environment here"
+
+    - name: Upload test artifacts on failure
+      uses: actions/upload-artifact@v4
+      if: failure()
+      with:
+        name: playwright-screenshots
+        path: uucars-web/test-results/
+        retention-days: 7
+```
+
+
+
+### 13. Git 提交
+
+Step 64-69（前端功能 + 测试体系）全部完成。
+
+```bash
+git add .
+git commit -m "test: Playwright E2E tests for 5 core user journeys"
+git push origin feature/v3-e2e-tests
+
+# 合并回 develop
+git checkout develop
+git merge --no-ff feature/v3-e2e-tests \
+  -m "merge: feature/v3-e2e-tests into develop"
+git push origin develop
+
+# 合并到 main，打 v3.2 Tag
+git checkout main
+git pull origin main
+git merge --no-ff develop \
+  -m "release: v3.2 - Frontend features + Testing"
+git tag -a v3.2 \
+  -m "v3.2: Image upload, Rich text, Optimistic update, Search UX, RTL + E2E tests"
+git push origin main
+git push origin main --tags
+
+git checkout develop
+```
+
+
+
+### Step 69 完成状态
+
+```
+概念理解：
+✅ E2E 测试 vs RTL 单元测试的职责划分——RTL 测零件，E2E 测整台机器
+✅ 测试数据污染问题及解决方案——时间戳 uid 隔离，不依赖固定 Seed 数据
+✅ POM 的价值和适用边界——复用率高才抽，不过度抽象
+✅ 为什么 E2E 准备数据走 API 而不是 UI——只有测试本身关心的行为才走 UI
+✅ 为什么串行执行——Admin 账号共享，并行会产生状态冲突
+✅ 为什么 CI E2E 连 Staging 而不是临时启动服务
+
+实现（按需逐步搭建）：
+✅ @playwright/test 安装 + playwright.config.ts（串行，workers: 1）
+✅ LoginPage POM
+✅ 测试辅助函数（createAndVerifyUser / loginAndGetToken）
+   - username 截短到 20 字符，避免超过后端长度限制
+   - uid 只取时间戳后6位，避免用户名过长
+✅ 后端 GET /auth/test-verification-token（仅开发环境，IsDevelopment 守卫）
+✅ UserService.GetEmailConfirmationTokenAsync
+✅ 5 个核心 E2E 测试（每个测试用独立的 uid 隔离数据）：
+   - 测试1：注册 → 看到验证邮件提示
+   - 测试2：登录 → 填写车辆 → 提交审核
+   - 测试3：Admin 审核通过（article + filter 定位，基于真实 DOM 结构）
+   - 测试4：买家下单
+   - 测试5：卖家查看销售订单
+✅ CI yml E2E job 骨架
+
+
+动手前需要核对的地方：
+⚠️ getByLabel 依赖的文案要跟真实页面逐字核对
+⚠️ Admin 种子账号需要提前确认在本地数据库里存在且密码正确
+⚠️ retries: 0 是设计取舍，若本地环境偶发抖动导致结果不稳定，
+   可临时改成 retries: 1 排查是环境问题还是代码问题
+
+✅ 本地 5 个 E2E 测试全部通过
+✅ v3.2 里程碑：合并到 main + 打 Tag
 ```
 
 

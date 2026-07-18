@@ -13,12 +13,18 @@ namespace UUcars.API.Controllers;
 public class AuthController : ControllerBase
 {
     private readonly UserService _userService;
+
     private readonly RefreshTokenService _refreshTokenService;
 
-    public AuthController(UserService userService, RefreshTokenService refreshTokenService)
+    // ✅ 新增： 用于判断当前运行环境是Development、Staging 还是 Production
+    private readonly IWebHostEnvironment _environment;
+
+    public AuthController(UserService userService, RefreshTokenService refreshTokenService,
+        IWebHostEnvironment environment)
     {
         _userService = userService;
         _refreshTokenService = refreshTokenService;
+        _environment = environment;
     }
 
     [HttpPost("register")]
@@ -173,6 +179,28 @@ public class AuthController : ControllerBase
 
         return Ok(ApiResponse<object>.Ok("Logged out successfully"));
     }
+
+
+    // GET /auth/test-verification-token?email=xxx
+// ⚠️ 仅开发环境：供 E2E 测试绕过邮件验证
+// 非开发环境返回 404，和接口不存在完全一样
+    [HttpGet("test-verification-token")]
+    public async Task<IActionResult> GetTestVerificationToken(
+        [FromQuery] string email,
+        CancellationToken cancellationToken)
+    {
+        if (!_environment.IsDevelopment())
+            return NotFound();
+
+        var token = await _userService.GetEmailConfirmationTokenAsync(
+            email, cancellationToken);
+
+        if (token == null)
+            return NotFound();
+
+        return Ok(new { token });
+    }
+
 
     /// <summary>
     /// 把 RefreshToken 写入 HttpOnly Cookie
