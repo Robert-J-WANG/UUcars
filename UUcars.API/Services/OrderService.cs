@@ -8,6 +8,7 @@ using UUcars.API.Entities.Enums;
 using UUcars.API.Exceptions;
 using UUcars.API.Repositories;
 using UUcars.API.Services.Cache;
+using UUcars.API.Services.Notifications;
 
 namespace UUcars.API.Services;
 
@@ -19,15 +20,17 @@ public class OrderService
     private readonly AppDbContext _context;
     private readonly ILogger<OrderService> _logger;
     private readonly IOrderRepository _orderRepository;
+    private readonly INotificationService _notificationService;
 
     public OrderService(ICacheService cache, ICarRepository carRepository, AppDbContext context,
-        ILogger<OrderService> logger, IOrderRepository orderRepository)
+        ILogger<OrderService> logger, IOrderRepository orderRepository, INotificationService notificationService)
     {
         _cache = cache;
         _carRepository = carRepository;
         _context = context;
         _logger = logger;
         _orderRepository = orderRepository;
+        _notificationService = notificationService;
     }
 
     public async Task<OrderResponse> CreateAsync(
@@ -94,6 +97,14 @@ public class OrderService
         // 如果抛了 ConcurrencyException，catch 里直接 throw，缓存清理代码不会执行
         await _cache.RemoveByPrefixAsync(CacheKeys.PublishedCarsPrefix, cancellationToken);
 
+        // ✅ 新增：通知卖家有新订单
+        await _notificationService.SendNotificationAsync(
+            car.SellerId,
+            NotificationTypes.NewOrder,
+            $"You have a new order for \"{car.Title}\"!",
+            order.Id,
+            cancellationToken);
+
         _logger.LogInformation(
             "Order {OrderId} created: buyer {BuyerId} purchased car {CarId} from seller {SellerId}",
             order.Id, buyerId, car.Id, car.SellerId);
@@ -156,6 +167,14 @@ public class OrderService
 
         // ✅ 车辆恢复 Published，重回公开列表，清缓存
         await _cache.RemoveByPrefixAsync(CacheKeys.PublishedCarsPrefix, cancellationToken);
+
+        // ✅ 新增：通知卖家订单被取消
+        await _notificationService.SendNotificationAsync(
+            order.Car.SellerId,
+            NotificationTypes.OrderCancelled,
+            $"The order for \"{order.Car.Title}\" has been cancelled by the buyer.",
+            order.Id,
+            cancellationToken);
 
         _logger.LogInformation(
             "Order {OrderId} cancelled by buyer {BuyerId}, car {CarId} restored to Published",

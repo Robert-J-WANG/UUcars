@@ -20,6 +20,7 @@ public class AppDbContext : DbContext
     public DbSet<Order> Orders => Set<Order>();
     public DbSet<Favorite> Favorites => Set<Favorite>();
     public DbSet<Review> Reviews => Set<Review>();
+    public DbSet<Notification> Notifications => Set<Notification>();
 
     // 新增
     public DbSet<AuditLog> AuditLogs => Set<AuditLog>();

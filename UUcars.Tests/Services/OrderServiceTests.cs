@@ -7,6 +7,7 @@ using UUcars.API.Entities.Enums;
 using UUcars.API.Exceptions;
 using UUcars.API.Repositories;
 using UUcars.API.Services;
+using UUcars.API.Services.Notifications;
 using UUcars.Tests.Fakes;
 
 namespace UUcars.Tests.Services;
@@ -26,7 +27,9 @@ public class OrderServiceTests
 
     private static OrderService CreateService(
         AppDbContext context,
-        FakeCarRepository? carRepo = null)
+        FakeCarRepository? carRepo = null,
+        // ✅ 新增
+        INotificationService? notificationService = null)
     {
         // 这个测试需要验证事务性保存，用真实的 EfOrderRepository + InMemory 数据库
         // 而不是 FakeOrderRepository——因为 OrderService 直接操作 _context 保存，
@@ -37,7 +40,9 @@ public class OrderServiceTests
             carRepo ?? new FakeCarRepository(),
             context,
             NullLogger<OrderService>.Instance,
-            orderRepo
+            orderRepo,
+            // 新增通知
+            notificationService ?? new FakeNotificationService()
         );
     }
 
@@ -338,5 +343,163 @@ public class OrderServiceTests
         await Assert.ThrowsAsync<CarNotFoundException>(() => service.CreateAsync(
             2,
             new OrderCreateRequest { CarId = 999 }));
+    }
+
+    // 新增2个发送通知的测试
+    [Fact]
+    public async Task CreateAsync_WhenSuccessful_SendsNewOrderNotificationToSeller()
+    {
+        // Arrange
+        var context = CreateDbContext();
+        var carRepo = new FakeCarRepository();
+        var fakeNotifications = new FakeNotificationService();
+
+        var buyer = new User
+        {
+            Id = 2,
+            Username = "buyer",
+            Email = "buyer@test.com",
+            PasswordHash = "hash",
+            Role = UserRole.User,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        var seller = new User
+        {
+            Id = 10,
+            Username = "seller",
+            Email = "seller@test.com",
+            PasswordHash = "hash",
+            Role = UserRole.User,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        var car = new Car
+        {
+            Id = 1,
+            SellerId = 10,
+            Price = 260000,
+            Status = CarStatus.Published,
+            Title = "BMW 3 Series",
+            Brand = "BMW",
+            Model = "3 Series",
+            Year = 2020,
+            Mileage = 15000,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        context.Users.AddRange(buyer, seller);
+        context.Cars.Add(car);
+        await context.SaveChangesAsync();
+
+        carRepo.Seed(car);
+
+        var service = CreateService(
+            context,
+            carRepo,
+            fakeNotifications);
+
+        // Act
+        var result = await service.CreateAsync(
+            buyer.Id,
+            new OrderCreateRequest { CarId = car.Id });
+
+        // Assert
+        var notification =
+            Assert.Single(fakeNotifications.SentNotifications);
+
+        Assert.Equal(seller.Id, notification.UserId);
+        Assert.Equal(
+            NotificationTypes.NewOrder,
+            notification.Type);
+        Assert.Equal(result.Id, notification.RelatedId);
+    }
+
+    [Fact]
+    public async Task CancelAsync_WhenSuccessful_SendsOrderCancelledNotificationToSeller()
+    {
+        // Arrange
+        var context = CreateDbContext();
+        var carRepo = new FakeCarRepository();
+        var fakeNotifications = new FakeNotificationService();
+
+        var buyer = new User
+        {
+            Id = 2,
+            Username = "buyer",
+            Email = "buyer@test.com",
+            PasswordHash = "hash",
+            Role = UserRole.User,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        var seller = new User
+        {
+            Id = 10,
+            Username = "seller",
+            Email = "seller@test.com",
+            PasswordHash = "hash",
+            Role = UserRole.User,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        var car = new Car
+        {
+            Id = 1,
+            SellerId = seller.Id,
+            Price = 260000,
+            Status = CarStatus.Sold,
+            Title = "BMW 3 Series",
+            Brand = "BMW",
+            Model = "3 Series",
+            Year = 2020,
+            Mileage = 15000,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        var order = new Order
+        {
+            Id = 1,
+            CarId = car.Id,
+            BuyerId = buyer.Id,
+            SellerId = seller.Id,
+            Price = car.Price,
+            Status = OrderStatus.Pending,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        context.Users.AddRange(buyer, seller);
+        context.Cars.Add(car);
+        context.Orders.Add(order);
+        await context.SaveChangesAsync();
+
+        carRepo.Seed(car);
+
+        var service = CreateService(
+            context,
+            carRepo,
+            fakeNotifications);
+
+        // Act
+        var result = await service.CancelAsync(
+            order.Id,
+            buyer.Id);
+
+        // Assert
+        var notification =
+            Assert.Single(fakeNotifications.SentNotifications);
+
+        Assert.Equal(seller.Id, notification.UserId);
+        Assert.Equal(
+            NotificationTypes.OrderCancelled,
+            notification.Type);
+        Assert.Equal(result.Id, notification.RelatedId);
     }
 }

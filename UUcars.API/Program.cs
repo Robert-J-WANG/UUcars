@@ -11,12 +11,14 @@ using UUcars.API.Auth.Hangfire;
 using UUcars.API.Data;
 using UUcars.API.Entities;
 using UUcars.API.Extensions;
+using UUcars.API.Hubs;
 using UUcars.API.Middleware;
 using UUcars.API.Repositories;
 using UUcars.API.Services;
 using UUcars.API.Services.Audit;
 using UUcars.API.Services.Cache;
 using UUcars.API.Services.Email;
+using UUcars.API.Services.Notifications;
 using UUcars.API.Services.Storage;
 
 // =============================================
@@ -154,6 +156,9 @@ try
     // 限流策略服务 - 自定义的扩展方法
     builder.Services.AddRateLimiting();
 
+    // 实时通信 - SignalR 
+    builder.Services.AddSignalR();
+
 
     // 用户模块
     // AddScoped：每次 HTTP 请求创建一个新实例，请求结束后销毁
@@ -203,6 +208,10 @@ try
     // ── Refresh Token ──────────────────────────────────
     builder.Services.AddScoped<IRefreshTokenRepository, EfRefreshTokenRepository>();
     builder.Services.AddScoped<RefreshTokenService>();
+
+    // Notification模块
+    builder.Services.AddScoped<INotificationRepository, EfNotificationRepository>();
+    builder.Services.AddScoped<INotificationService, NotificationService>();
 
     // =============================================
     // 构建应用
@@ -267,8 +276,10 @@ try
         app.UseHangfireJobs();
     }
 
-
     app.MapControllers();
+    // 映射Hub路由
+    app.MapHub<NotificationHub>("/hubs/notification");
+
 
     // 自动执行 Migration（V1 学习项目用法）
     // 生产环境建议改为独立的部署脚本，不在应用启动时执行

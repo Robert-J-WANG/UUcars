@@ -3,12 +3,14 @@ using UUcars.API.Data;
 using UUcars.API.DTOs;
 using UUcars.API.DTOs.Requests;
 using UUcars.API.DTOs.Responses;
+using UUcars.API.Entities;
 using UUcars.API.Entities.Audit;
 using UUcars.API.Entities.Enums;
 using UUcars.API.Exceptions;
 using UUcars.API.Repositories;
 using UUcars.API.Services.Audit;
 using UUcars.API.Services.Cache;
+using UUcars.API.Services.Notifications;
 
 namespace UUcars.API.Services;
 
@@ -20,12 +22,14 @@ public class AdminCarService
 
     private readonly IAuditLogService _auditLogService; // ✅ 新增
     private readonly CurrentUserService _currentUserService; // ✅ 新增
+    private readonly INotificationService _notificationService;
 
     // 构造函数加入 AppDbContext
     private readonly AppDbContext _context; // ✅ 新增：仅用于审计日志查询
 
     public AdminCarService(ICacheService cache, ICarRepository carRepository, ILogger<AdminCarService> logger,
-        IAuditLogService auditLogService, CurrentUserService currentUserService, AppDbContext context)
+        IAuditLogService auditLogService, CurrentUserService currentUserService, AppDbContext context,
+        INotificationService notificationService)
     {
         _cache = cache;
         _carRepository = carRepository;
@@ -33,6 +37,7 @@ public class AdminCarService
         _auditLogService = auditLogService;
         _currentUserService = currentUserService;
         _context = context;
+        _notificationService = notificationService;
     }
 
 
@@ -62,6 +67,14 @@ public class AdminCarService
             // 用前缀删除：一次清掉所有分页（page1/page2/page3...）
             await _cache.RemoveByPrefixAsync(CacheKeys.PublishedCarsPrefix, cancellationToken);
             await _cache.RemoveByPrefixAsync(CacheKeys.PendingCarsPrefix, cancellationToken);
+
+            // ✅ 新增：通知卖家审核通过
+            await _notificationService.SendNotificationAsync(
+                car.SellerId,
+                NotificationTypes.CarApproved,
+                $"Your car listing \"{car.Title}\" has been approved and is now live!",
+                car.Id,
+                cancellationToken);
 
             // ✅ 写审计日志
             // GetCurrentUserId 理论上不会返回 null（Controller 已用 [Authorize(Roles="Admin")] 保护）
@@ -110,6 +123,14 @@ public class AdminCarService
 
             // ✅ 车辆退回 → 待审核列表变了 → 清待审核列表缓存
             await _cache.RemoveByPrefixAsync(CacheKeys.PendingCarsPrefix, cancellationToken);
+
+            // ✅ 新增：通知卖家审核被拒绝
+            await _notificationService.SendNotificationAsync(
+                car.SellerId,
+                NotificationTypes.CarRejected,
+                $"Your car listing \"{car.Title}\" was not approved. Please review and resubmit.",
+                car.Id,
+                cancellationToken);
 
             // ✅ 写审计日志
             var adminId = _currentUserService.GetCurrentUserId();
