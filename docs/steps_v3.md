@@ -13678,6 +13678,2824 @@ git checkout develop
 
 
 
+## Step 70 · SignalR 实时通知
+
+### 这一步做什么
+
+目前的 UUcars 有一个体验缺口：
+
+```
+Admin 审核通过了卖家的车 → 卖家不知道，只能自己刷新页面查看
+买家下单了 → 卖家不知道，只能定时去看订单列表
+```
+
+我们的数据通信使用的是HTTP协议，它是**请求-响应模型**：客户端问，服务端答。服务端没有办法主动推送消息给客户端。
+
+有没有办法让服务器主动通知客户端？
+
+这类"有事发生时主动告知"的需求，是实时通信（Real-time Communication）需要解决的问题。简单来说，就是**需要在服务端和客户端之间建立一个持久连接， 服务端可以随时主动向客户端推送消息。**
+
+**实时通信有哪些方案**
+
+历史上有很多方案，主要包括如下3个：
+
+- Polling（轮询）
+
+    ```bash
+    Browser → GET /messages → 没有 → 5秒后再来 → GET /messages → ...
+    ```
+
+    这种方式最简单，但也最浪费资源
+
+- Long Polling（长轮询）
+
+    ```bash
+    Browser → GET /messages → 没有 → 一直等 → 直到返回消息
+    ```
+
+    比普通轮询好
+
+- Server-Sent Events（SSE）
+
+    ```bash
+    Server → Browser
+    ```
+
+    服务器可以一直往浏览器推送消息， 浏览器不能通过同一条连接发消息，只能单向。
+
+最终的解决方案是WebSocket。 
+
+
+
+### 1. WebSocket 
+
+WebSocket：是一种网络协议（Protocol）， 它的作用是：让浏览器和服务器建立一条持续存在的双向通信连接：
+
+第一次， WebSocket 会先通过 HTTP 建立连接：
+
+```bash
+Browser → HTTP 请求（Upgrade: websocket） → Server → 101 Switching Protocols → 升级成功
+```
+
+从这一刻开始， HTTP 就结束了。双方进入：
+
+```bash 
+Browser <========> Server
+```
+
+这条连接会一直保持。
+
+于是， 服务器可以主动发消息：
+
+```bash
+Server → "新订单" → Browser
+```
+
+浏览器也可以主动发：
+
+```bash
+Browser → "发送聊天消息" → Server
+```
+
+这样双方随时都能发送数据， 因此WebSocket 是**真正的双向通信（Full Duplex）**。
+
+WebSocket是底层的网络协议，原生的配置很麻烦，比如：
+
+- 用户管理
+
+- 广播
+
+- 群组
+
+- 连接管理
+
+- 断线重连
+
+    ...
+
+- 身份认证
+
+需要自己处理很多基础配置。 但是我们可以使用一些工具，比如SignalR。
+
+
+
+### 2. SignalR 
+
+**SignalR 是 ASP.NET Core 生态里，专门把上面这些重复的基础设施工作封装掉的一个库**。它不是取代 WebSocket，而是站在 WebSocket（以及 SSE、Long Polling）之上的一层抽象：自动协商用哪种传输方式、自动处理降级、把"发消息"包装成像直接调用函数一样的编程体验、内置自动重连、提供"给一群连接批量发消息"的能力。
+
+SignalR 会根据客户端和服务端的能力，自动选择最合适的传输方式：
+
+```
+WebSocket（首选）：
+  → 真正的双向持久连接
+  → 延迟最低，性能最好
+  → 现代浏览器和服务器都支持
+
+Server-Sent Events（降级）：
+  → 服务端单向推送
+  → 不支持 WebSocket 时的备选
+
+Long Polling（最后手段）：
+  → 客户端不断发请求"有新消息吗？"
+  → 兼容性最好，但性能最差
+```
+
+SignalR 自动处理这个降级逻辑，使用者不需要关心底层用的是哪种。
+
+#### 2.1  Hub 
+
+**Hub** 是 SignalR 的核心概念，一个 Hub 就是一个通信端点，类似于 Controller，但不是处理 HTTP 请求，而是处理 WebSocket 连接。 客户端连接到这个Hub 后，服务器就可以调用这个连接上注册的方法， 而客户端就可以接收服务端推送的消息。
+
+#### 2.2 Connection
+
+每一次客户端连上Hub，SignalR 都会给这次连接分配一个唯一的 `ConnectionId`。同一个用户如果开了两个浏览器标签页，会产生**两个不同的** ConnectionId。
+
+#### 2.3 Group
+
+但只有 Hub 还不够。假设服务器要通知用户 A（UserId=5）车辆审核通过了，直接摆在面前的几种做法都有问题：
+
+```
+方案一：给所有连接广播 → 所有用户都收到通知，错误
+方案二：用 ConnectionId 定向发送 → 一个用户同时开了两个标签页，只有一个收到，错误
+方案三：用 UserId 命名 Group → 同一个用户的所有连接都在这个 Group 里
+         → 给 Group "user-5" 发消息 → 这个用户的所有标签页都收到 ✅
+```
+
+**Group** 就是 SignalR 提供的"给一群连接打标签、按标签批量发消息" 的机制，实现的思路是：
+
+- 用户连接时， 把这个连接加进一个用 UserId 命名的 Group： `AddToGroupAsync("user-{userId}")`
+- 服务端给特定用户发消息时 `Clients.Group("user-{userId}").SendAsync(...)`， 不用关心这个用户当前具体开了几个标签页、每个标签页对应哪个 ConnectionId。
+
+#### 2.4 Client
+
+服务器想给谁发消息，靠 `Clients` 这个对象决定目标范围，常见的几种：
+
+```
+Clients.All              → 所有连接的人都收到 （服务器广播通知给所有人）
+Clients.Caller           → 客户端调用 Hub 方法，调用的那个连接收到通知
+Clients.Group("xxx")     → 只有加入了 "xxx" 这个 Group 的连接收到
+Clients.User("userId")   → SignalR 内置的按用户身份定向
+```
+
+**场景还原：**
+
+假设在一个在线文档协作系统（类似 Google Docs）：
+
+1. **客户端 A** 在页面上点击了“保存”按钮，主动调用了服务端的 `SaveDocument()` 方法。
+2. 此时 **客户端 A 就是 `Caller`**。
+3. 服务端收到请求，保存数据库成功后，可以：
+    - 回复**客户端 A**（`Clients.Caller`）：“保存成功！”（只有 A 需要看到这个提示）
+    - 推送给**其他人**（`Clients.Others`）：“客户端 A 刚刚更新了文档，请刷新界面。”
+
+在这个场景里，客户端主动触发了一个动作，服务端针对这个动作给它返回了专属响应， 此时就是双向通信的体现。
+
+#### 2.5 User
+
+值得知道的是，SignalR 其实**内置**了一套按用户身份定向的能力—— `Clients.User("userId")`。它的原理是：SignalR 有一个叫 `IUserIdProvider` 的接口，默认实现会从连接的身份信息（`Context.User`） 里读取 `ClaimTypes.NameIdentifier` 这个 Claim，把它当成这个连接的 "用户标识"，自动维护好"同一个用户的多个连接"这份映射——这跟 自己手动维护一个 `user-{id}` 命名的 Group，解决的其实是同一个问题。
+
+这两个方案不应该在同一条通知链路里叠加使用。本项目为了完整练习 Group 的连接管理，明确选择手动维护 `user-{id}` Group；`Clients.User(...)` 只作为 SignalR 内置替代方案了解。
+
+当前实现面向单个 API 实例。将来若在 Azure Container Apps 中运行多个 API 副本，需要在部署与扩展阶段接入 Azure SignalR Service 或其他 SignalR backplane，让不同实例之间共享连接路由；这不属于本步骤的基础 Group 实现。
+
+#### 2.6 IHubContext
+
+触发通知的地方（审核通过、下单成功）通常发生在 Controller 或 Service 里的普通业务代码里，它们不是 Hub 内部的方法，没法直接用 `Clients`。 `IHubContext<T>` 就是解决这个问题的——它是一个可以被注入到**任意服务**里的接口，让 Hub 外部的代码也能"以 Hub 的身份"推送消息。
+
+
+
+### 3. 切出功能分支
+
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b feature/v3-signalr-notifications
+git push -u origin feature/v3-signalr-notifications
+```
+
+
+
+### 4. 配置 SignalR 这套工具链
+
+先实现浏览器通过 SignalR 与 ASP.NET Core 建立连接，并完成一次最简单的双向通信。
+
+#### 4.1 注册SignalR服务
+
+SignalR 是 ASP.NET Core 内置的一部分，不需要额外装 NuGet 包。打开 `UUcars.API/Program.cs`，在服务注册部分加入：
+
+```c#
+// 实时通信 - SignalR 
+builder.Services.AddSignalR();
+```
+
+这里只是**注册能力**。此时：
+
+- 没有 Hub
+- 没有连接
+- 没有 WebSocket
+
+什么都还没有发生。
+
+#### 4.2 创建通知Hub
+
+新建 `UUcars.API/Hubs/NotificationHub.cs`：
+
+```c#
+using Microsoft.AspNetCore.SignalR;
+
+namespace UUcars.API.Hubs;
+
+public class NotificationHub : Hub
+{
+}
+```
+
+为什么需要 Hub？
+
+HTTP 请求都有一个 Controller：
+
+```
+GET /cars → CarsController
+```
+
+SignalR 也需要一个入口，这个入口就是：
+
+```
+Browser → NotificationHub
+```
+
+以后， 所有来自客户端的实时消息，都会先进入 Hub。所以：Hub 可以理解为 SignalR 的 Controller。
+
+目前我们先创建一个空 Hub。
+
+#### 4.3 映射 Hub 路由
+
+和映射Controller路由一样,  我们需要映射Hub 路由
+
+```c#
+app.MapControllers();
+ // 映射Hub路由
+app.MapHub<NotificationHub>("/hubs/notification");
+```
+
+这句话表示：`/hubs/notification`以后就是一个 SignalR 端点。但它不是普通 HTTP API。以后浏览器连接的是：`ws://localhost:5065/hubs/notification` 。
+
+现在整个项目已经拥有了 SignalR 服务。流程如下：
+
+```bash
+Program.cs → AddSignalR() → MapHub<NotificationHub>() → 等待客户端连接
+```
+
+目前服务器仍然不会主动做任何事情, 因为还没有客户端连接。
+
+#### 4.4 客户端连接
+
+前端要使用连接的话，需要使用工具库`SignalR Client`,  先安装库
+
+```
+npm install @microsoft/signalr
+```
+
+我们把通知相关的处理，封装进一个单独的组件 `NotificationBell` 通知铃铛
+
+```tsx
+export default function NotificationBell() {
+  return (
+    <div>
+       NotificationBell
+    </div>
+  );
+}
+```
+
+挂载组件到项目最上层组件`Layout`的标题栏中，这样任何页面打开都能挂载通知铃铛组件
+
+```tsx
+{/* 右侧 */}
+<div className="flex items-center gap-3">
+    
+  {/* 1. 通知铃铛组件 */}
+  <NotificationBell />
+    
+  {isAuthenticated() ? (
+    ...
+  )}
+
+  {/* 移动端汉堡菜单按钮 */}
+  <button onClick={() => setMobileOpen(!mobileOpen)} ...>
+    {/* ... */}
+  </button>
+```
+
+组件`NotificationBell`中使用 `signalr`库来建立signalR的连接 : 
+
+把建立连接的逻辑写进副作用钩子 `useEffect`中， 这样组件初次挂载就执行一次。
+
+- signalR内置的`HubConnectionBuilder()` 方法可以创建一下连接对象 connection
+- connection 对象 的 `start()`方法， 开始建立连接
+- connection 对象 的 `stop()`方法， 停止连接
+
+```tsx
+import * as signalR from "@microsoft/signalr";
+import { useEffect } from "react";
+
+export default function NotificationBell() {
+  useEffect(() => {
+    // 创建了连接对象。
+    const connection = new signalR.HubConnectionBuilder()
+      .withUrl("http://localhost:5065/hubs/notification")
+      .withAutomaticReconnect()
+      .build();
+
+    // 开始连接
+    connection
+      .start()
+      .then(() => {
+        console.log("✅ SignalR Connected");
+      })
+      .catch((err) => {
+        console.error(err);
+      });
+
+    return () => {
+      connection.stop();
+    };
+  }, []);
+
+  return <div>NotificationBell</div>;
+}
+
+```
+
+这样，打开页面，挂载组件`NotificationBell`, 执行连接逻辑。
+
+如果连接成功, 控制台会输出：
+
+```bash
+✅ SignalR Connected
+```
+
+上面的代码中，开始起作用的是
+
+```tsx
+await connection.start();
+```
+
+SignalR 内部把`start()`封装了很多事情:
+
+1. negotiate
+
+    ```bash
+    connection.start() → ① POST /hubs/notification/negotiate → 拿到：{connectionId, connectionToken, availableTransports}
+    ```
+
+2. 判断服务器支持什么
+
+    ```bash
+    if (支持 WebSocket)
+        使用 WebSocket
+    else if (支持 ServerSentEvents)
+        使用 SSE
+    else
+        使用 Long Polling
+    ```
+
+3. 发起 WebSocket Upgrade
+
+    ```bash
+    GET /hubs/notification?id=xxxxx → 等待服务器返回 101 → 建立 WebSocket → 开始监听服务器消息 → Promise resolve() → .then(() => {console.log("Connected")})
+    ```
+
+也就是说：**`start()` 其实包含了 negotiate + Upgrade + 建立连接 整个流程。**
+
+除了上面的 `start()`和 `stop()`方法外，connection对象还有以下常用方法：
+
+- `connection.on(事件名, 回调函数)`  - 用来监听 SignalR hub里定义的方法， 客户端无需主动发起请求，服务端只要触发hub里定义的方法， 客户端就能监听到
+- `connection.invoke(方法名, 参数)` - 用来主动发起请求触发服务端SignalR hub里定义的方法
+
+#### 4.5 创建Hub 方法 
+
+到目前为止， 浏览器已经连接到了 Hub。但是服务器什么都没有做，SignalR 框架是怎么知道连接建立的时候该执行我们写的逻辑的？
+
+`Hub` 这个基类封装了一些虚方法， 是空的方法，作为建立连接时的钩子， 比如：
+
+```c#
+public abstract class Hub : IDisposable
+{
+  ...
+
+  public virtual Task OnConnectedAsync();
+  public virtual Task OnDisconnectedAsync(Exception? exception);
+
+  ...
+}
+
+```
+
+我们自己的`NotificationHub`可以继承这个基类`Hub`, 并对基类的虚方法进行重写：
+
+```c#
+using Microsoft.AspNetCore.SignalR;
+
+namespace UUcars.API.Hubs;
+
+public class NotificationHub : Hub
+{
+    public override async Task OnConnectedAsync()
+    {
+        // 发送通知的逻辑
+    }
+}
+```
+
+`OnConnectedAsync()`这个方法，属于"生命周期钩子", 触发它的不是前端代码里某一行调用,而是 SignalR 框架本身。只要握手成功、这条 WebSocket 连接真正建立起来了,框架会**自动**在服务器端实例化一个 `Hub` 对象来处理这条连接,并且自动调用它的 `OnConnectedAsync()`。前端唯一需要做的事就是:
+
+1. 建立连接 
+
+2. 监听或者主动调用
+
+**那么如何编写方法让前端监听或者调用呢？**
+
+先指定Clients的范围，再使用扩展方法`SendAsync(“方法名”, 参数， 可选参数)`的链式调用法：
+
+```c#
+using Microsoft.AspNetCore.SignalR;
+
+namespace UUcars.API.Hubs;
+
+public class NotificationHub : Hub
+{
+    public override async Task OnConnectedAsync()
+    {
+        // Clients.All：发给所有连接的人
+        await Clients.All.SendAsync("ReceiveNotification", "Hello All from server!");
+            
+        // 不要把基类的行为完全覆盖丢掉
+        await base.OnConnectedAsync();
+    }
+}
+```
+
+客户端监听这个事件`ReceiveNotification`， 并渲染通知数据
+
+```tsx
+import * as signalR from "@microsoft/signalr";
+import { useEffect, useState } from "react";
+
+export default function NotificationBell() {
+  const [notification, setNotification] = useState("");
+
+  useEffect(() => {
+    // 创建了连接对象。
+    const connection = new signalR.HubConnectionBuilder()
+      .withUrl("http://localhost:5065/hubs/notification")
+      .withAutomaticReconnect()
+      .build();
+
+    // 开始连接
+    connection
+      .start()
+      .then(() => {
+        console.log("✅ SignalR Connected");
+      })
+      .catch((err) => {
+        console.error(err);
+      });
+
+    // 监听事件
+    connection.on("ReceiveNotification", (msg: string) => {
+      setNotification(msg);
+    });
+
+    return () => {
+      connection.stop();
+    };
+  }, []);
+
+  return (
+    <div>
+      <p>{notification}</p>
+    </div>
+  );
+}
+
+```
+
+这样页面一加载，就能收到通知 `Hello All from server!`
+
+同样，也可以定义客户端用来主动发起请求的方法，注意，这个方法不能定义在框架提供的`OnConnectedAsync()`, 否则会被自动监听
+
+```c#
+using Microsoft.AspNetCore.SignalR;
+
+namespace UUcars.API.Hubs;
+
+public class NotificationHub : Hub
+{
+    public override async Task OnConnectedAsync()
+    {
+        // Clients.All：发给所以连接的人
+        await Clients.All.SendAsync("ReceiveNotification", "Hello All from server!");
+        // 不要把基类的行为完全覆盖丢掉
+        await base.OnConnectedAsync();
+    }
+
+    // 这是一个自定义方法，不是生命周期钩子
+    public async Task SendMessage(string text)
+    {
+        // Clients.Caller：只发给触发这次连接的这一个连接
+        await Clients.Caller.SendAsync("Hello", "receive message: " + text);
+    }
+}
+```
+
+前端主动请求调用这个方法`SendMessage`, 并且可以监听事件`Hello`
+
+```tsx
+import * as signalR from "@microsoft/signalr";
+import { useEffect, useRef, useState } from "react";
+
+export default function NotificationBell() {
+  const [notification, setNotification] = useState("");
+  const connectionRef = useRef<signalR.HubConnection>(null);
+
+  useEffect(() => {
+    // 创建了连接对象。
+    const connection = new signalR.HubConnectionBuilder()
+      .withUrl("http://localhost:5065/hubs/notification")
+      .withAutomaticReconnect()
+      .build();
+
+    // 开始连接
+    connection
+      .start()
+      .then(() => {
+        console.log("✅ SignalR Connected");
+      })
+      .catch((err) => {
+        console.error(err);
+      });
+
+    connectionRef.current = connection;
+
+    connection.on("ReceiveNotification", (msg: string) => {
+      setNotification(msg);
+    });
+
+    return () => {
+      connection.stop();
+    };
+  }, []);
+
+  return (
+    <div>
+      <p>{notification}</p>
+      <button
+        onClick={() => {
+          connectionRef.current?.invoke("SendMessage", "invoke tested");
+          connectionRef.current?.on("Hello", (msg) => {
+            console.log(msg);
+          });
+        }}
+      >
+        点击测试 invoke
+      </button>
+    </div>
+  );
+}
+
+```
+
+> **那 `invoke()` 到底是用来干嘛的？**
+>
+> 这里要分清楚 SignalR 客户端提供的三个不同的 API,它们对应完全不同的场景：
+>
+> ```
+>connection.start()              → 建立连接（触发服务器 OnConnectedAsync）
+> connection.on(事件名, 回调函数)   → 被动监听：服务器主动推送消息时执行这个回调
+> connection.invoke(方法名, 参数)  → 主动调用：前端主动"喊"服务器 Hub 里的某个自定义方法
+> ```
+> 
+> `invoke()` 对应的是**前端主动发起、服务器执行后可能还要返回结果**的场景——有点像前端在正常调用一个后端 API,只是走的是 WebSocket 通道而不是普通 HTTP 请求。
+>
+> 
+
+#### 4.6 JWT身份认证
+
+目前，任何客户端都可以尝试连接 `NotificationHub` 并监听通知事件。即使用户没有登录，只要前端创建了 SignalR 连接并监听对应事件，就可能接收服务器推送的内容。
+
+对于用户通知、管理员通知等功能，这是不安全的。
+
+因此需要做到：
+
+1. 未登录用户不能连接 `NotificationHub`；
+2. 已登录用户建立 SignalR 连接时，必须携带 JWT Token；
+3. 后端必须验证 Token，并根据验证结果决定是否允许连接。
+
+##### 如何过滤未登录用户？
+
+类似于HTTP controller里关于是否登录身份的验证方式，我们也可以给`NotificationHub`加上 `[Authorize]` 特征标签:
+
+```c#
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.SignalR;
+
+namespace UUcars.API.Hubs;
+
+[Authorize]
+public class NotificationHub : Hub
+{
+    ...
+}
+```
+
+这样未登录的访问加载`NotificationBell`组件，建立SignalR的连接时：
+
+协商阶段（Negotiate）— 纯 HTTP 请求
+
+- 前端（SignalR SDK）发送一个普通的 HTTP POST 请求到 `http://localhost:5065/hubs/notification/negotiate`， 此时请求头（Request Header）里没有带 `Authorization: Bearer <Token>` ， 即使手动设置了，未登录token也是空。
+- 请求到达服务器，**首先拦截它的是 Auth 授权中间件**。 授权中间件发现 `NotificationHub` 上写了 `[Authorize]`。它去检查这个 POST 请求的 Header，发现里面没有 `Authorization` 属性或者为空。
+- 授权中间件直接拦截请求，返回 401 Unauthorized，Hub 不会建立连接
+
+升级阶段（WebSocket Handshake）— 根本未到达此阶段就结束，后面的连接和监听等等根本不执行。
+
+同时， 对于前端组件，也可以使用是否已登录进行过滤， 未登录的话直接不渲染通知组件：
+
+移动 `<NotificationBell />`组件的挂载位置，只有 `isAuthenticated()`为 true的时候才渲染
+
+```tsx
+{/* 右侧 */}
+  <div className="flex items-center gap-3">
+    {isAuthenticated() ? (
+      <>
+        {/* 通知铃铛组件*/}
+        <NotificationBell />
+        {/* 普通用户：Sell a Car 按钮 */}
+        {!isAdmin && (
+          ...
+        )}
+
+        {/* 用户下拉菜单 */}
+        ...
+      </>
+    ) : (
+      <>
+        ...
+      </>
+    )}
+
+    {/* 移动端汉堡 */}
+    ...
+  </div>
+```
+
+##### 登录后如何验证身份？
+
+用户登录成功并建立signalR连接时，会经过3个阶段：
+
+- 正常登录
+
+    用户登录时，前端发送正常的 HTTP 登录请求：
+
+    ```bash
+    POST /auth/login
+    ```
+
+    后端验证用户名和密码成功后，返回 JWT Token：
+
+    ```json
+    { "accessToken": "eyJhbGciOiJIUzI1NiIs..." }
+    ```
+
+    前端将 Token 保存到 Zustand：
+
+    ```ts
+    useAuthStore.getState().accessToken
+    ```
+
+    对于普通的 HTTP API 请求，我们已经通过 Axios 请求拦截器自动添加 Token 到请求头：
+
+    ```bash
+    Authorization: Bearer <access_token>
+    ```
+
+    这样之后所有的 http 请求，都会在请求头中自动携带token。
+
+- 登录成功后，Negotiate 协商请求
+
+    用户登录后，挂载通知铃铛组件`NotificationBell`，前端调用：
+
+    ```ts
+    connection.start();
+    ```
+
+    发起建立signalR的Negotiate 协商请求
+
+    ```bash
+    POST /hubs/notification/negotiate
+    ```
+
+    这是一个标准的 HTTP 请求，但它由 SignalR Client 发起，不经过 Axios。SignalR Client 会调用后面配置的 `accessTokenFactory`，并在协商请求中携带 Token。
+
+    ```bash
+    Authorization: Bearer eyJhbGciOiJIUzI1NiIs...
+    ```
+
+    这个请求到达服务端：
+
+    - 路由系统匹配请求路径 `/hubs/notification`
+    - 认证中间件 `UseAuthentication()` 拦截请求，从请求头中读取token，并进行身份验证；
+    - 验证通过则允许请求继续，Negotiate 成功。
+
+- Negotiate成功后，建立 WebSocket 长连接
+
+    ```
+    ws://localhost:5065/hubs/notification
+    ```
+
+    **这个请求不是http，而是WebSocket **。
+
+    SignalR 不会经过 Axios，因此 Axios 的请求拦截器不会帮 SignalR 自动添加 Token。所以，SignalR 必须单独配置如何自动携带 Token。
+
+    前端建立SignalR连接实例时，通过配置对象里的 `accessTokenFactory`函数来设置：
+
+    ```tsx
+    import { useAuthStore } from "@/stores/authStore";
+    ...
+    
+    export default function NotificationBell() {
+      ...
+      
+      useEffect(() => {
+        // 创建了连接对象。
+        const connection = new signalR.HubConnectionBuilder()
+          .withUrl("http://localhost:5065/hubs/notification", {
+              
+            // 告诉 SignalR 建立连接时带上 Token
+            accessTokenFactory: () => useAuthStore.getState().accessToken ?? "",
+          })
+          .withAutomaticReconnect()
+          .build();
+    
+        // 开始连接
+        ...
+      }, []);
+    
+      return (
+       ...
+      );
+    }
+    
+    ```
+
+    >`accessTokenFactory` 是一个函数，而不是固定的 Token 值。
+    >
+    >```
+    >accessTokenFactory: () => useAuthStore.getState().accessToken ?? ""
+    >```
+    >
+    >每次 SignalR 建立连接或自动重连时，都会调用这个函数，读取 Zustand 中最新的 Token。
+
+    但是浏览器原生 WebSocket API 有一个限制：
+
+    > JavaScript 无法为 WebSocket 请求自定义 `Authorization` Header。
+
+    因此，SignalR 无法继续像普通 HTTP 请求一样发送：
+
+    ```bash
+    Authorization: Bearer <access_token>
+    ```
+
+    作为替代，SignalR 会自动将 Token 放到 URL 的 Query String：
+
+    ```bash
+    ws://localhost:5065/hubs/notification?access_token=<access_token>
+    ```
+
+    这个 WebSocket 请求同样会到达服务端，并需要再次经过认证和授权。但此时会出现问题：
+
+    >**JWT Bearer 默认只从 `Authorization` Header 读取 Token，不会自动读取 URL Query String 中的。**
+
+    因此，需要配置Auth 授权中间件，让它读取URL Query String 参数
+
+    ```c#
+    public static class AuthExtensions
+    {
+        public static IServiceCollection AddJwtAuthentication(this IServiceCollection services,
+            IConfiguration configuration)
+        {
+            var jwtSettings = configuration.GetSection("JwtSettings").Get<JwtSettings>()!;
+            services.AddAuthentication(options =>
+                {
+                    options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
+                    options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
+                })
+                .AddJwtBearer(options =>
+                {
+                    // TokenValidationParameters：告诉框架"验证 Token 时要检查哪些东西"
+                    options.TokenValidationParameters = new TokenValidationParameters
+                    {
+                        ...
+                    };
+    
+                    // ===== 核心新增：配置 JwtBearer 事件响应以兼容 SignalR Query Token =====
+                    options.Events = new JwtBearerEvents
+                    {
+                        OnMessageReceived = context =>
+                        {
+                            // 1. 从 URL Query 参数中尝试读取 access_token
+                            var accessToken = context.Request.Query["access_token"];
+    
+                            // 2. 获取当前请求的路径
+                            var path = context.HttpContext.Request.Path;
+    
+                            // 3. 判断：如果有 access_token 且请求路径指向 SignalR Hub
+                            //  匹配具体的 Hub 路径，如 "/chatHub" 或以特定前缀开头的路径）
+                            if (!string.IsNullOrEmpty(accessToken) &&
+                                path.StartsWithSegments("/hubs")) // 💡 根路由路径或根前缀
+                             // 将 Token 赋给上下文，JwtBearer 中间件后续就会拿这个Token去做签名和合法性校验
+                                context.Token = accessToken;
+    
+                            return Task.CompletedTask;
+                        }
+                    };
+                });
+    
+            return services;
+        }
+    }
+    ```
+
+    于是，WebSocket 请求会到达服务端：
+
+    - 认证中间件 `UseAuthentication()` 拦截请求，从请求URL Query String 参数中读取token，并进行身份验证；
+    - 验证通过则允许请求继续，WebSocket 连接建立成功
+
+完成上面`登录，negotiate， WebSocket长连接`3个阶段的完整请求和身份认证之后， 客户端的登录用户就能开始监听和接收通知。
+
+#### 4.7 如何细分已登录用户？
+
+现在虽然过滤掉了未登录访客，但是不同的已登录用户，都能连接SignalR。这意味着只要监听了事件，所有用户都能收到通知。 比如这样的场景：
+
+```bash
+管理员通过车辆审核后，发通知给车主`Seller`, 而此时的`Buyer` 不应该收到通知。
+```
+
+因此需要解决2个问题：
+
+- 如何确认哪个登录的用户是当前的车主？？
+- 如何只给当前的车主发通知而不是广播通知`await Clients.All.SendAsync()`给所有人？
+
+##### 从用户身份到 SignalR 连接
+
+前面已经通过 JWT 完成了 SignalR 连接认证。连接建立后，SignalR 可以通过 `Context.UserIdentifier` 识别当前连接属于哪个用户。
+
+但是，“识别出当前用户”还不能直接解决通知路由问题。SignalR 实际管理的是一条条独立的连接，每条连接都有自己的 `ConnectionId`。同一个用户如果同时打开多个浏览器标签页，就会建立多条 SignalR 连接：
+
+```text
+用户 5
+├── 标签页 A → ConnectionId: abc123
+├── 标签页 B → ConnectionId: xyz789
+└── 手机浏览器 → ConnectionId: mobile456
+```
+
+如果只记录其中一个 `ConnectionId`，通知就可能只到达一个标签页；而且断线重连后，旧的 `ConnectionId` 还会失效。
+
+因此，本项目不直接维护某一个 `ConnectionId`，而是在每次连接建立时，把当前连接加入该用户专属的 Group：
+
+```text
+Group: user-5
+├── abc123
+├── xyz789
+└── mobile456
+```
+
+业务服务以后只需要向 `user-5` 发送一次消息，该用户当前所有在线连接就都能收到。整个映射关系是：
+
+```text
+经过 JWT 验证的用户身份
+        ↓
+Context.UserIdentifier
+        ↓
+用户专属 Group：user-{id}
+        ↓
+该用户当前所有 ConnectionId
+```
+
+Group 只是 SignalR 用于管理连接和路由消息的机制，不是数据库中的用户组，也不是角色或权限系统。
+
+##### 使用 UserId Group
+
+本项目使用 `user-{id}` 作为通知 Group 名称。真实用户 ID 只从通过验证的 JWT 身份中读取，不接受客户端传入的 Group 名称。
+
+统一 Group 命名：
+
+```csharp
+/// <summary>
+/// 集中管理通知系统使用的 SignalR Group 名称，
+/// 避免加入 Group 和发送消息时使用不同的命名格式。
+/// </summary>
+public static class NotificationGroups
+{
+    /// <summary>
+    /// 根据数据库用户 ID 生成该用户专属的通知 Group 名称。
+    /// 例如 userId 为 5 时，返回 "user-5"。
+    /// </summary>
+    public static string ForUser(int userId)
+    {
+        return $"user-{userId}";
+    }
+}
+```
+
+连接建立后，将当前 Connection 加入对应用户 Group：
+
+```csharp
+/// <summary>
+/// 每当客户端成功建立一条新的 SignalR 连接时，
+/// SignalR 都会自动调用这个生命周期方法。
+/// </summary>
+public override async Task OnConnectedAsync()
+{
+    // SignalR 提供的 UserIdentifier 是字符串，
+    // 而 UUcars 使用整数 User.Id，因此需要先完成转换和格式验证。
+    if (!int.TryParse(Context.UserIdentifier, out var userId))
+    {
+        // 无法确定连接所属的有效用户时，立即终止连接。
+        Context.Abort();
+        return;
+    }
+
+    // 同一个用户的所有连接都会加入同一个 user-{id} Group。
+    await Groups.AddToGroupAsync(
+        Context.ConnectionId,
+        NotificationGroups.ForUser(userId));
+
+    // 继续执行 SignalR Hub 原有的连接生命周期逻辑。
+    await base.OnConnectedAsync();
+}
+```
+
+同一个用户打开多个标签页时，每个标签页拥有独立的 ConnectionId，但都会加入同一个 `user-{id}` Group。断线后 SignalR 会自动移除旧连接；自动重连建立新连接时，`OnConnectedAsync()` 会再次执行并重新加入 Group。
+
+业务触发点仍然负责确定精确的目标用户。例如：
+
+```bash
+管理员点击“通过车辆审核”
+```
+
+在数据库里，车辆（Car）一定会关联一个车主 ID（`SellerId`）。当管理员审核通过时，API 从车辆读取 SellerId，这就确定了目标用户；通知服务随后向 `NotificationGroups.ForUser(sellerId)` 发送消息。
+
+##### 拆分业务逻辑
+
+`发什么通知？给谁发？什么时候发？` 这些事务其实是具体的业务逻辑，比如:
+
+```bash
+管理员审核通过通知车主
+车主创建草稿通知管理员
+...
+```
+
+因此，需要把业务相关逻辑从Hub中移出来，在具体的业务service方法中实现。
+
+而hub中仅保留基本的连接配置, 主要负责处理**客户端主动发起的连接、断开，或者客户端主动调用的方法**（比如聊天室里用户发消息）。
+
+生产环境中，`OnConnectedAsync()` 通常**不需要推送任何消息**。如果需要做点什么，只需留给基础设施逻辑（如记录日志、关联连接与用户）：
+
+```c#
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.SignalR;
+
+namespace UUcars.API.Hubs;
+
+[Authorize]
+public class NotificationHub : Hub
+
+{
+    private readonly ILogger<NotificationHub> _logger;
+
+    public NotificationHub(ILogger<NotificationHub> logger)
+    {
+        _logger = logger;
+    }
+
+    public override async Task OnConnectedAsync()
+    {
+        // 只做生命周期相关的辅助工作，比如打个日志
+        var userId = Context.UserIdentifier;
+        _logger.LogInformation("用户 {UserId} 已连接", userId);
+
+        // 不要把基类的行为完全覆盖丢掉
+        await base.OnConnectedAsync();
+    }
+}
+```
+
+##### 那如何发通知呢？
+
+asp.net core 提供了**`IHubContext`（服务端上下文）接口**：允许在 **Hub 外部**（如 API Controller、Service、后台定时任务）直接向客户端推送消息。把外部Hub传入接口之后，能获得当前hub的想下文对象 hubContext, 直接使用这个hubContext执行推送消息等操作。
+
+编写通知业务的接口和Service方法， 这样其他外部service都能直接引入使用， 不会和其他业务本身的逻辑耦合。
+
+新建 `UUcars.API/Services/Notifications/INotificationService.cs`：
+
+```c#
+namespace UUcars.API.Services.Notifications;
+
+public interface INotificationService
+{
+    /// <summary>
+    /// 实时推送给目标用户
+    /// </summary>
+    Task SendNotificationAsync(
+        int userId,
+        string message,
+        CancellationToken cancellationToken = default);
+}
+```
+
+Service方法实现接口：
+
+```c#
+using Microsoft.AspNetCore.SignalR;
+using UUcars.API.Hubs;
+
+namespace UUcars.API.Services.Notifications;
+
+public class NotificationService : INotificationService
+{
+    private readonly IHubContext<NotificationHub> _hubContext; // ✅ 新增
+    private readonly ILogger<NotificationService> _logger; // ✅ 新增
+
+    public NotificationService(IHubContext<NotificationHub> hubContext,
+        ILogger<NotificationService> logger)
+    {
+        _hubContext = hubContext;
+        _logger = logger;
+    }
+
+    public async Task SendNotificationAsync(
+        int userId,
+        string message)
+    {
+        // 推送（这一步失败只记录日志，不影响主流程）
+        // 通知指定用户
+        try
+        {
+            await _hubContext.Clients
+                .Group(NotificationGroups.ForUser(userId))
+                .SendAsync(
+                "ReceiveNotification", message);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "Failed to push SignalR notification to user {UserId}", userId);
+        }
+    }
+
+}
+```
+
+##### AdminCarService中触发通知推送
+
+在“管理员审核车辆”这个场景下：
+
+- 触发动作的是**管理员点击 API**（HTTP POST 请求到了 `AdminCarController`）。
+- ``AdminCarController`` 调用 `AdminCarService` 通过审核的方法 `ApproveAsync`
+- ``ApproveAsync``方法调用 `NotificationService`中的`SendNotificationAsync`方法
+
+```c#
+public class AdminCarService
+{
+    ...
+    private readonly INotificationService _notificationService;
+
+    public AdminCarService(...,
+        INotificationService notificationService)
+    {
+       ...
+        _notificationService = notificationService;
+    }
+
+
+    public async Task<CarResponse> ApproveAsync(
+        int carId,
+        CancellationToken cancellationToken = default)
+    {
+        var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+        ...
+
+        try
+        {
+            var updated = await _carRepository.UpdateAsync(car, cancellationToken);
+            await _cache.RemoveByPrefixAsync(CacheKeys.PublishedCarsPrefix, cancellationToken);
+            await _cache.RemoveByPrefixAsync(CacheKeys.PendingCarsPrefix, cancellationToken);
+            
+			// 审核通过，推送消息给车主
+            await _notificationService.SendNotificationAsync(car.SellerId, $"Your car {car.Title} has been approved.");
+
+            // ✅ 写审计日志
+            ...
+
+            return CarService.MapToResponse(updated);
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            ...
+        }
+    }
+
+    ...
+}
+```
+
+这样车主（Seller）只要打开着网页，就能收到通知。
+
+
+
+### 5. 数据持久化
+
+上面验证的推送，只在用户当时开着页面、连接还活着的情况下才有效。 如果只做实时推送，用户在事情发生的那一刻不在线，这条消息就永远错过了。因此，需要将通知持久化到数据库，之后的场景：
+
+- 用户已登录在线，能实时收到通知
+- 用户离线，未能收到实时通知，但通知会写入数据库保存，标记为未读
+- 用户再次登录上线，浏览器来取数据库里的未读通知并渲染
+- 用户点击通知，跳转链接到不同的内容页面，标记通知已读
+- 用户点击，标记所有通知已读
+
+#### 5.1 Notification 实体
+
+新建 `UUcars.API/Entities/Notification.cs`：
+
+```c#
+namespace UUcars.API.Entities;
+
+/// <summary>
+///     通知记录：实时推送 + 持久化，保证用户离线时也能看到历史通知
+/// </summary>
+public class Notification
+{
+    public int Id { get; set; }
+
+    /// <summary>
+    /// 接收者（目标用户）
+    /// </summary>
+    public int UserId { get; set; }
+
+    // 关联到 User 表
+    public User User { get; set; } = null!;
+
+    /// <summary>
+    /// 通知类型，用于前端决定跳转到哪个页面
+    /// </summary>
+    public string Type { get; set; } = string.Empty;
+
+    /// <summary>
+    /// 通知正文，直接展示给用户
+    /// </summary>
+    public string Message { get; set; } = string.Empty;
+
+    /// <summary>
+    /// 关联的业务实体 Id（CarId 或 OrderId），用于跳转
+    /// </summary>
+    public int? RelatedId { get; set; }
+
+    /// <summary>
+    /// 是否已读，默认未读
+    /// </summary>
+    public bool IsRead { get; set; } = false;
+
+    public DateTime CreatedAt { get; set; }
+}
+```
+
+#### 5.2 EF Core 配置
+
+新建 `UUcars.API/Configurations/NotificationConfiguration.cs`：
+
+```c#
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+using UUcars.API.Entities;
+
+namespace UUcars.API.Configurations;
+
+public class NotificationConfiguration : IEntityTypeConfiguration<Notification>
+{
+    public void Configure(EntityTypeBuilder<Notification> builder)
+    {
+        builder.HasKey(n => n.Id);
+
+        builder.Property(n => n.Type)
+            .IsRequired()
+            .HasMaxLength(50);
+
+        // Message 是固定文案 + car.Title（上限100个字符）拼接出来的字符串
+        // 300 留出比最坏情况更宽松的余量，避免长标题导致 SaveChanges 抛异常
+        builder.Property(n => n.Message)
+            .IsRequired()
+            .HasMaxLength(300);
+
+        builder.Property(n => n.IsRead)
+            .IsRequired()
+            .HasDefaultValue(false);
+
+        builder.Property(n => n.CreatedAt)
+            .IsRequired();
+
+        builder.HasOne(n => n.User)
+            .WithMany()
+            .HasForeignKey(n => n.UserId)
+            .OnDelete(DeleteBehavior.Cascade);
+        // Cascade：用户删除时其通知一起删除，合理
+
+        // 最常见查询：某个用户的未读通知，按时间倒序
+        builder.HasIndex(n => new { n.UserId, n.IsRead, n.CreatedAt })
+            .HasDatabaseName("IX_Notifications_UserId_IsRead_CreatedAt");
+    }
+}
+```
+
+加入表格， 打开 `UUcars.API/Data/AppDbContext.cs`，加入：
+
+```c#
+public DbSet<Notification> Notifications => Set<Notification>();
+```
+
+数据库迁移
+
+```bash
+cd UUcars.API
+dotnet ef migrations add AddNotificationsTable 
+dotnet ef database update
+```
+
+#### 5.3 编写Repository
+
+新建 `UUcars.API/Repositories/INotificationRepository.cs`：
+
+```c#
+using UUcars.API.Entities;
+
+namespace UUcars.API.Repositories;
+
+public interface INotificationRepository
+{
+    Task AddAsync(Notification notification, CancellationToken cancellationToken = default);
+
+    Task<List<Notification>> GetAllUnreadAsync(int userId, CancellationToken cancellationToken = default);
+
+    Task<Notification?> GetByIdUnreadAsync(
+        int notificationId, int userId, CancellationToken cancellationToken = default);
+
+    Task MarkAllAsReadAsync(int userId, CancellationToken cancellationToken = default);
+
+    Task SaveChangesAsync(CancellationToken cancellationToken = default);
+}
+```
+
+新建 `UUcars.API/Repositories/NotificationRepository.cs`：
+
+```c#
+using Microsoft.EntityFrameworkCore;
+using UUcars.API.Data;
+using UUcars.API.Entities;
+
+namespace UUcars.API.Repositories;
+
+public class EfNotificationRepository : INotificationRepository
+{
+    private readonly AppDbContext _context;
+
+    public EfNotificationRepository(AppDbContext context)
+    {
+        _context = context;
+    }
+
+    // 添加一个消息到数据库
+    public async Task AddAsync(
+        Notification notification, CancellationToken cancellationToken = default)
+    {
+        _context.Notifications.Add(notification);
+        await _context.SaveChangesAsync(cancellationToken);
+    }
+
+    // 取出所有未读消息
+    public async Task<List<Notification>> GetAllUnreadAsync(
+        int userId, CancellationToken cancellationToken = default)
+    {
+        return await _context.Notifications
+            .Where(n => n.UserId == userId && !n.IsRead)
+            .OrderByDescending(n => n.CreatedAt)
+            .ToListAsync(cancellationToken);
+    }
+
+    // 取出一个未读消息
+    public async Task<Notification?> GetByIdUnreadAsync(
+        int notificationId, int userId, CancellationToken cancellationToken = default)
+    {
+        // 同时按 notificationId 和 userId 过滤，防止 IDOR
+        // （不能只按 id 查到就随便让人标记别人的通知已读）
+        return await _context.Notifications
+            .FirstOrDefaultAsync(
+                n => n.Id == notificationId && n.UserId == userId && !n.IsRead,
+                cancellationToken);
+    }
+
+
+    public async Task MarkAllAsReadAsync(
+        int userId, CancellationToken cancellationToken = default)
+    {
+        // ExecuteUpdateAsync：EF Core 7+ 提供的批量更新 API
+        // 直接在数据库层面执行一条 UPDATE 语句，不需要先把符合条件的
+        // 实体全部加载进内存、逐个改字段再 SaveChanges——未读通知可能有
+        // 几十上百条，这种场景下批量更新比"加载 + 逐条改 + 保存"效率高得多
+        await _context.Notifications
+            .Where(n => n.UserId == userId && !n.IsRead)
+            .ExecuteUpdateAsync(
+                s => s.SetProperty(n => n.IsRead, true),
+                cancellationToken);
+    }
+
+    public async Task SaveChangesAsync(CancellationToken cancellationToken = default)
+    {
+        await _context.SaveChangesAsync(cancellationToken);
+    }
+}
+```
+
+#### 5.4 编写数据持久化的逻辑Service
+
+这一步的 `NotificationService` 负责持久化，也有推送给目标用户的能力。
+
+定义`NotificationService` 的数据响应模型， 新建 `UUcars.API/DTOs/Responses/NotificationResponse.cs`：
+
+```c#
+namespace UUcars.API.DTOs.Responses;
+
+public class NotificationResponse
+{
+    public int Id { get; set; }
+    public string Type { get; set; } = string.Empty;
+    public string Message { get; set; } = string.Empty;
+    public int? RelatedId { get; set; }
+    public bool IsRead { get; set; }
+    public DateTime CreatedAt { get; set; }
+}
+```
+
+补充 `UUcars.API/Services/Notifications/INotificationService.cs`里的和数据库交互的能力：
+
+- 写入数据库（写入库后可以推送通知）
+- 查询当前用户的未读通知
+- 标记单条通知已读
+- 全部全部标记已读
+
+```c#
+using UUcars.API.DTOs.Responses;
+
+namespace UUcars.API.Services.Notifications;
+
+public interface INotificationService
+{
+    /// <summary>
+    /// 写入数据库 + 实时推送给目标用户
+    /// </summary>
+    Task SendNotificationAsync(
+        int userId,
+        string type,
+        string message,
+        int? relatedId = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 查询当前用户的未读通知
+    /// </summary>
+    Task<List<NotificationResponse>> GetUnreadNotificationsAsync(
+        int userId,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 标记单条已读
+    /// </summary>
+    Task MarkNotificationAsReadAsync(
+        int notificationId,
+        int userId,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 全部标记已读
+    /// </summary>
+    Task MarkAllNotificationsAsReadAsync(
+        int userId,
+        CancellationToken cancellationToken = default);
+}
+```
+
+实现 `INotificationService`接口
+
+```c#
+using Microsoft.AspNetCore.SignalR;
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Entities;
+using UUcars.API.Hubs;
+using UUcars.API.Repositories;
+
+namespace UUcars.API.Services.Notifications;
+
+public class NotificationService : INotificationService
+{
+    private readonly INotificationRepository _repository;
+    private readonly IHubContext<NotificationHub> _hubContext;
+    private readonly ILogger<NotificationService> _logger;
+
+    public NotificationService(INotificationRepository repository, IHubContext<NotificationHub> hubContext,
+        ILogger<NotificationService> logger)
+    {
+        _repository = repository;
+        _hubContext = hubContext;
+        _logger = logger;
+    }
+
+    public async Task SendNotificationAsync(
+        int userId, string type, string message,
+        int? relatedId = null, CancellationToken cancellationToken = default)
+    {
+        var notification = new Notification
+        {
+            UserId = userId,
+            Type = type,
+            Message = message,
+            RelatedId = relatedId,
+            IsRead = false,
+            CreatedAt = DateTime.UtcNow
+        };
+
+        await _repository.AddAsync(notification, cancellationToken);
+
+        var response = new NotificationResponse
+        {
+            Id = notification.Id,
+            Type = notification.Type,
+            Message = notification.Message,
+            RelatedId = notification.RelatedId,
+            IsRead = notification.IsRead,
+            CreatedAt = notification.CreatedAt
+        };
+
+        // 写库成功之后，尝试向目标用户 Group 实时推送完整通知对象
+        try
+        {
+            await _hubContext.Clients
+                .Group(NotificationGroups.ForUser(userId))
+                .SendAsync("ReceiveNotification", response, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "Failed to push SignalR notification to user {UserId}", userId);
+        }
+    }
+
+    public async Task<List<NotificationResponse>> GetUnreadNotificationsAsync(
+        int userId, CancellationToken cancellationToken = default)
+    {
+        var list = await _repository.GetAllUnreadAsync(userId, cancellationToken);
+
+        return list.Select(n => new NotificationResponse
+        {
+            Id = n.Id,
+            Type = n.Type,
+            Message = n.Message,
+            RelatedId = n.RelatedId,
+            IsRead = n.IsRead,
+            CreatedAt = n.CreatedAt
+        }).ToList();
+    }
+
+    public async Task MarkNotificationAsReadAsync(
+        int notificationId, int userId, CancellationToken cancellationToken = default)
+    {
+        var notification = await _repository.GetByIdUnreadAsync(
+            notificationId, userId, cancellationToken);
+
+        if (notification == null) return; // 静默处理，不暴露是否存在
+
+        notification.IsRead = true;
+        await _repository.SaveChangesAsync(cancellationToken);
+    }
+
+    public async Task MarkAllNotificationsAsReadAsync(
+        int userId, CancellationToken cancellationToken = default)
+    {
+        await _repository.MarkAllAsReadAsync(userId, cancellationToken);
+    }
+}
+```
+
+#### 5.5 NotificationsController端口
+
+新建 `UUcars.API/Controllers/NotificationsController.cs`：
+
+```c#
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
+using UUcars.API.DTOs;
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Services;
+using UUcars.API.Services.Notifications;
+
+namespace UUcars.API.Controllers;
+
+[ApiController]
+[Route("notifications")]
+[Authorize]
+public class NotificationsController : ControllerBase
+{
+    private readonly INotificationService _notificationService;
+    private readonly CurrentUserService _currentUserService;
+
+    public NotificationsController(
+        INotificationService notificationService,
+        CurrentUserService currentUserService)
+    {
+        _notificationService = notificationService;
+        _currentUserService = currentUserService;
+    }
+
+    [HttpGet]
+    [EnableRateLimiting(RateLimitPolicies.Browse)]
+    public async Task<IActionResult> GetUnread(CancellationToken cancellationToken)
+    {
+        var userId = _currentUserService.GetCurrentUserId();
+        if (userId == null)
+            return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+        var notifications = await _notificationService
+            .GetUnreadNotificationsAsync(userId.Value, cancellationToken);
+
+        return Ok(ApiResponse<List<NotificationResponse>>.Ok(notifications));
+    }
+
+    [HttpPut("{id:int}/read")]
+    [EnableRateLimiting(RateLimitPolicies.Write)]
+    public async Task<IActionResult> MarkAsRead(int id, CancellationToken cancellationToken)
+    {
+        var userId = _currentUserService.GetCurrentUserId();
+        if (userId == null)
+            return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+        await _notificationService.MarkNotificationAsReadAsync(id, userId.Value, cancellationToken);
+        return Ok(ApiResponse<object>.Ok(null, "Notification marked as read."));
+    }
+
+    [HttpPut("read-all")]
+    [EnableRateLimiting(RateLimitPolicies.Write)]
+    public async Task<IActionResult> MarkAllAsRead(CancellationToken cancellationToken)
+    {
+        var userId = _currentUserService.GetCurrentUserId();
+        if (userId == null)
+            return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+        await _notificationService.MarkAllAsReadAsync(userId.Value, cancellationToken);
+        return Ok(ApiResponse<object>.Ok(null, "All notifications marked as read."));
+    }
+}
+```
+
+注意： `NotificationService`里的`SendNotificationAsync`方法不需要使用一个api端口去调用触发，因为通知写入库并发送通知的逻辑并不需要单独的按钮或者action主动触发，而是在其他业务逻辑中附带执行的， 比如我们上面的实例中，管理员审核通过，附带执行通知入库并触发通知的推送。而其他逻辑需要客户端手动触发才能执行， 比如：
+
+- 用户登录成功，渲染通知铃铛组件，浏览器触发api，拉取未读通知
+- 用户手动点击某条未读通知，标记为已读
+
+等等其他动作。
+
+#### 5.6 注册这两个新服务
+
+在 `Program.cs` 注册这两个新服务：
+
+```c#
+builder.Services.AddScoped<INotificationRepository, EfNotificationRepository>();
+builder.Services.AddScoped<INotificationService, NotificationService>();
+```
+
+用 Scalar 手动调一下（或者临时在别处调用一次 `SendAsync`），确认 `GET /notifications` 能查到、`PUT .../read` 能改状态。 这一步先只验证持久化这条链路是通的，跟 SignalR 完全无关。
+
+#### 5.7 验证通知的入库和推送
+
+还是以真实业务中的场景为例：
+
+```bash
+管理员通过车辆审核，通知车主
+```
+
+更新`AdminCarService`中触发通知推送的逻辑：使用新的 `NotificationService`
+
+```c#
+public class AdminCarService
+{
+    ...
+    private readonly INotificationService _notificationService;
+
+    public AdminCarService(...,
+        INotificationService notificationService)
+    {
+       ...
+        _notificationService = notificationService;
+    }
+
+
+    public async Task<CarResponse> ApproveAsync(
+        int carId,
+        CancellationToken cancellationToken = default)
+    {
+        var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+        ...
+
+        try
+        {
+            var updated = await _carRepository.UpdateAsync(car, cancellationToken);
+            await _cache.RemoveByPrefixAsync(CacheKeys.PublishedCarsPrefix, cancellationToken);
+            await _cache.RemoveByPrefixAsync(CacheKeys.PendingCarsPrefix, cancellationToken);
+            
+			// 审核通过，推送消息给车主
+            await _notificationService.SendNotificationAsync(car.SellerId, "test",
+                $"Your car {car.Title} has been approved.", carId, cancellationToken);
+
+            // ✅ 写审计日志
+            ...
+
+            return CarService.MapToResponse(updated);
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            ...
+        }
+    }
+
+    ...
+}
+```
+
+admin登录，并通过一台待审核车辆，通知数据写入数据库， 车主能收到通知。
+
+其他接口，用 Scalar 手动调一下，确认 `GET /notifications` 能查到、`PUT .../read` 能改状态。 
+
+### 6. 数据的优化渲染
+
+#### 6.1 渲染通知数据
+
+我们上面的通知组件只做了基础的连接和维护，但需要对这个组件的功能进行完善，包括未读通知的处理，阅读通知等等。
+
+整个过程需要调用我们上面创建的几个api接口，因此我们先统一封装一下这部分的前端axios请求接口
+
+新建 `src/types/notification.ts`:
+
+```ts
+// 对应后端 NotificationResponse
+export interface Notification {
+  id: number;
+  type: string;
+  message: string;
+  relatedId: number | null;
+  isRead: boolean;
+  createdAt: string;
+}
+```
+
+新建 `src/api/notification.ts`:
+
+```tsx
+import type { Notification, ApiResponse } from "@/types";
+import apiClient from "./client";
+
+export const notificationApi = {
+  // 历史未读通知
+  getAll: async (): Promise<Notification[]> => {
+    const response =
+      await apiClient.get<ApiResponse<Notification[]>>("/notifications");
+    return response.data.data!;
+  },
+
+  // 单条已读
+  read: async (id: number): Promise<void> => {
+    await apiClient.put(`/notifications/${id}/read`);
+  },
+
+  // 全部已读
+  readAll: async (): Promise<void> => {
+    await apiClient.put("/notifications/read-all");
+  },
+};
+
+```
+
+目前**只能收到"页面开着期间"新推送的通知**。如果用户在通知发生时没开着页面，等他打开页面，那条通知早就写进数据库了，但组件从来没有主动去查过历史数据，压根不知道有这条通知存在。因此需要组件第一次挂载时，主动调一次 `GET /notifications`，把历史未读通知塞进现有的 `notifications` 这个 State 里，跟 SignalR 推送过来的新通知共用同一份状态、同一套渲染逻辑，不用另外单独维护一份"历史通知"。
+
+```tsx
+import * as signalR from "@microsoft/signalr";
+import { useEffect, useState } from "react";
+import type { Notification } from "@/types";
+import { notificationApi } from "@/api";
+import { useAuthStore } from "@/stores/authStore";
+
+export default function NotificationBell() {
+  const [notifications, setNotifications] = useState<Notification[]>([]);
+
+  // 拉取历史未读通知
+  const fetchUnread = async () => {
+    try {
+      const data = await notificationApi.getAll();
+      setNotifications(data);
+    } catch {
+      // 静默处理，通知拉取失败不影响主流程
+    }
+  };
+
+  useEffect(() => {
+    // 初次渲染时来取历史数据
+    fetchUnread();
+
+    // 建立 SignalR 连接
+    const connection = new signalR.HubConnectionBuilder()
+      .withUrl(`${import.meta.env.VITE_API_BASE_URL}/hubs/notification`, {
+        // 告诉 SignalR 建立连接时带上 Token
+        accessTokenFactory: () => useAuthStore.getState().accessToken ?? "",
+      })
+      // 连接断开后自动重连（SignalR 内置，不需要手动实现）
+      .withAutomaticReconnect()
+      .build();
+
+    // 监听服务端推送的通知事件
+    // "ReceiveNotification" 对应服务端 SendAsync("ReceiveNotification", ...)
+    connection.on("ReceiveNotification", (data: Notification) => {
+      // 新通知加到列表顶部
+      setNotifications((prev) => [data, ...prev]);
+    });
+
+    // 启动连接
+    connection.start().catch((err) => console.error(err));
+
+    // 组件卸载时断开连接
+    return () => {
+      connection.stop();
+    };
+  }, []);
+
+  return (
+    <div className="relative">
+      {notifications &&
+        notifications.map((n) => (
+          <p key={n.id}>
+            {n.id} - {n.message}
+          </p>
+        ))}
+    </div>
+  );
+}
+
+
+```
+
+完善标记通知已读逻辑，需要2个功能：
+
+- 标记单条已读
+- 标记全部已读
+
+并使用变量`const unreadCount = notifications.length` 来记录未读通知的数量。
+
+定义标记已读的方法， 并简单渲染按钮操作：
+
+```tsx
+import * as signalR from "@microsoft/signalr";
+import { useEffect, useState } from "react";
+import type { Notification } from "@/types";
+import { notificationApi } from "@/api";
+import { useAuthStore } from "@/stores/authStore";
+import { Button } from "./ui/button";
+
+export default function NotificationBell() {
+  const [notifications, setNotifications] = useState<Notification[]>([]);
+
+  const unreadCount = notifications.length;
+
+  // 拉取历史未读通知
+  ...
+
+  // 标记单条已读
+  const markAsRead = async (id: number) => {
+    try {
+      await notificationApi.read(id);
+      setNotifications((prev) => prev.filter((n) => n.id !== id));
+    } catch {
+      // 静默处理，通知拉取失败不影响主流程
+    }
+  };
+
+  // 全部标记已读
+  const markAllAsRead = async () => {
+    try {
+      await notificationApi.readAll();
+      setNotifications([]);
+    } catch {
+      // 静默处理
+    }
+  };
+
+  useEffect(() => {
+    ...
+  }, []);
+
+  return (
+    <div>
+      {notifications.map((n) => (
+        <div key={n.id} className="flex flex-row items-center gap-10">
+          <span>
+            {n.id} - {n.message}
+          </span>
+          <Button
+            variant={"outline"}
+            onClick={() => {
+              markAsRead(n.id);
+            }}
+          >
+            mark as read
+          </Button>
+        </div>
+      ))}
+      <p>未读通知：{unreadCount}</p>
+
+      <Button onClick={markAllAsRead}>read all</Button>
+    </div>
+  );
+}
+
+```
+
+现在的状态是：
+
+1. **页面首次加载完成时**：`fetchUnread()` 拿到数据 -> 调用 `setNotifications(data)` -> **触发 1 次渲染**展示列表。
+2. **接收到实时通知时**：SignalR 推送消息 -> 调用 `setNotifications(prev => ...)` -> **触发 1 次渲染**追加新消息。
+3. **点击 `markAsRead` 时**：过滤数组 -> 调用 `setNotifications(prev => ...)` -> **触发 1 次渲染**剔除已读项。
+4. **点击 `markAllAsRead` 时**：清空数组 -> 调用 `setNotifications([])` -> **触发 1 次渲染**清空列表。
+
+#### 6.2 优化：使用React Query
+
+使用TanStack Query (React Query) 来替代手写的 `fetchUnread` 和 `useState`。手写状态管理时，需要手动处理加载状态、错误捕捉以及数据更新逻辑。改用 `useQuery` + `useQueryClient` 后，不仅代码更优雅，还能轻松实现“收到 SignalR 实时通知后直接更新 React Query 缓存”的高级模式。
+
+```tsx
+import * as signalR from "@microsoft/signalr";
+import { useEffect } from "react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import type { Notification } from "@/types";
+import { notificationApi } from "@/api";
+import { Button } from "./ui/button";
+
+// 辅助函数，用于生成一个根据`userId`动态变化的query key
+const notificationKeys = {
+  unread: (userId: number | undefined) =>
+    ["notifications", "unread", userId] as const,
+};
+
+export default function NotificationBell() {
+  const queryClient = useQueryClient();
+  // 当前用户的id
+  const userId = useAuthStore((state) => state.user?.id);
+ 
+  // 1. 获取未读消息列表（自动托管 loading / error / data 状态）
+  const { data: notifications = [] } = useQuery({
+    queryKey: queryKey: notificationKeys.unread(userId),
+    queryFn: () => notificationApi.getAll(),
+    retry: false, // 通知拉取失败不影响主流程，无需反复重试
+  });
+
+  // 派生状态：不需要额外的 unreadCount State，直接算就行，效率更高！
+  const unreadCount = notifications.length;
+
+  // 2. 标记单条已读 Mutation
+  const readMutation = useMutation({
+    mutationFn: (id: number) => notificationApi.read(id),
+    onSuccess: () => {
+      // 操作成功后统一作废 key，让 TanStack Query 重新同步后台数据
+      queryClient.invalidateQueries({ queryKey: notificationKeys.unread(userId)});
+    },
+    onError: (error) => toast.error(error.message),
+  });
+
+  // 3. 全部标记已读 Mutation
+  const readAllMutation = useMutation({
+    mutationFn: () => notificationApi.readAll(),
+    onSuccess: () => {
+      toast.success("All notifications marked as read.");
+      queryClient.invalidateQueries({ queryKey: queryKey: notificationKeys.unread(userId)});
+    },
+    onError: (error) => toast.error(error.message),
+  });
+
+  // 4. SignalR 监听逻辑（仅在组件挂载时建立一次连接）
+  useEffect(() => {
+      
+    if (userId === undefined) return;
+
+      /*
+       * queryKey 定义在 Effect 内部，不需要放进依赖数组。
+       * userId 改变时，Effect 会重新执行并生成新用户的 Query Key。
+       */
+    const queryKey = notificationKeys.unread(userId);
+      
+    const connection = new signalR.HubConnectionBuilder()
+      .withUrl(`${import.meta.env.VITE_API_BASE_URL}/hubs/notification`, {
+        // 告诉 SignalR 建立连接时带上 Token
+        accessTokenFactory: () => useAuthStore.getState().accessToken ?? "",
+      })
+      .withAutomaticReconnect()
+      .build();
+
+    // 收到实时消息时，让 query 缓存失效，自动拉取最新的通知列表
+    connection.on("ReceiveNotification", () => {
+      queryClient.invalidateQueries({ queryKey });
+      // 弹出 Toast 提示
+      toast.info("You have received a new notification!", {
+        duration: 5000,
+      });
+    });
+
+    connection.start().catch((err) => console.error(err));
+
+    return () => {
+      connection.stop();
+    };
+  }, [queryClient, userId]); // ✅ 依赖项只有 queryClient，整个生命周期只连接一次 SignalR
+
+  return (
+    <div>
+      {notifications.map((n) => (
+        <div key={n.id} className="flex flex-row items-center gap-10">
+          <span>
+            {n.id} - {n.message}
+          </span>
+          <Button
+            variant="outline"
+            disabled={readMutation.isPending}
+            onClick={() => readMutation.mutate(n.id)}
+          >
+            mark as read
+          </Button>
+        </div>
+      ))}
+
+      <p>未读通知：{unreadCount}</p>
+
+      <Button
+        disabled={readAllMutation.isPending || unreadCount === 0}
+        onClick={() => readAllMutation.mutate()}
+      >
+        read all
+      </Button>
+    </div>
+  );
+}
+```
+
+
+
+#### 6.3 完善组件UI：
+
+新增状态 `isOpen` 控制铃铛的开关
+
+```tsx
+import * as signalR from "@microsoft/signalr";
+import { useEffect, useState } from "react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { notificationApi } from "@/api";
+import { Bell } from "lucide-react";
+import { toast } from "sonner";
+
+
+export default function NotificationBell() {
+  ...
+  const [isOpen, setIsOpen] = useState(false);
+
+  // 1. 获取未读消息列表（自动托管 loading / error / data 状态）
+  ...
+
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        onClick={() => setIsOpen((prev) => !prev)}
+        className="relative flex h-9 w-9 items-center justify-center rounded-full transition-colors"
+        style={{ color: "var(--color-text-secondary)" }}
+        aria-label={`Notifications (${unreadCount} unread)`}
+      >
+        <Bell className="h-5 w-5" />
+        {unreadCount > 0 && (
+          <span
+            className="absolute -right-0.5 -top-0.5 flex h-4 w-4 items-center
+                       justify-center rounded-full text-[10px] font-bold text-white"
+            style={{ backgroundColor: "var(--color-danger)" }}
+          >
+            {unreadCount}
+          </span>
+        )}
+      </button>
+
+      {isOpen && (
+        <>
+          <div
+            className="fixed inset-0 z-10"
+            onClick={() => setIsOpen(false)}
+          />
+
+          <div
+            className="absolute right-0 top-10 z-20 w-80 rounded-[var(--radius-lg)] border shadow-lg"
+            style={{
+              backgroundColor: "var(--color-warning-light)",
+              borderColor: "var(--color-border)",
+            }}
+          >
+            <div
+              className="flex items-center justify-between border-b px-4 py-3"
+              style={{ borderColor: "var(--color-border)" }}
+            >
+              <span
+                className="text-sm font-semibold"
+                style={{ color: "var(--color-text-primary)" }}
+              >
+                Notifications
+              </span>
+              {unreadCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => readAllMutation.mutate()}
+                  className="text-xs"
+                  style={{ color: "var(--color-primary)" }}
+                >
+                  Mark all as read
+                </button>
+              )}
+            </div>
+
+            <div className="max-h-80 overflow-y-auto">
+              {notifications.length === 0 ? (
+                <p
+                  className="px-4 py-6 text-center text-sm"
+                  style={{ color: "var(--color-text-muted)" }}
+                >
+                  No unread notifications
+                </p>
+              ) : (
+                notifications.map((n) => (
+                  <button
+                    key={n.id}
+                    type="button"
+                    onClick={() => {
+                      readMutation.mutate(n.id);
+                      setIsOpen(false);
+                    }}
+                    className="w-full border-b px-4 py-3 text-left transition-colors last:border-b-0"
+                    style={{
+                      borderColor: "var(--color-border)",
+                      backgroundColor: "transparent",
+                    }}
+                  >
+                    <p
+                      className="text-sm"
+                      style={{ color: "var(--color-text-primary)" }}
+                    >
+                      {n.message}
+                    </p>
+                    <p
+                      className="mt-0.5 text-xs"
+                      style={{ color: "var(--color-text-muted)" }}
+                    >
+                      {new Date(n.createdAt).toLocaleDateString()}
+                    </p>
+                  </button>
+                ))
+              )}
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+```
+
+
+
+### 7. 在业务操作里触发通知
+
+上面我们只测试了
+
+```bash
+管理员通过车辆审核，通知车主
+```
+
+的场景， 那么针对其他不同的场景，我们需要设计不同的通知类型。
+
+#### 7.1 编写通知常量类型
+
+把通知类型统一管理，新建 `UUcars.API/Entities/NotificationTypes.cs`：
+
+```csharp
+namespace UUcars.API.Entities;
+
+/// <summary>
+///     通知类型常量
+///     前端根据 Type 决定点击后跳转到哪个页面
+/// </summary>
+public static class NotificationTypes
+{
+    public const string CarApproved = "CarApproved";    // → 车辆详情页
+    public const string CarRejected = "CarRejected";    // → 车辆编辑页
+    public const string NewOrder = "NewOrder";          // → 销售订单列表
+    public const string OrderCancelled = "OrderCancelled"; // → 销售订单列表
+}
+```
+
+根据不同的业务场景，补充推送通知的服务：
+
+- 通知卖家审核通过
+- 通知卖家审核被拒绝
+- 通知卖家有新订单
+- 通知卖家订单被取消
+
+#### 7.2 更新 AdminCarServic
+
+**在 `ApproveAsync` 的 `try` 块里，缓存清理之后加入：**
+
+```csharp
+// ✅ 新增：通知卖家审核通过
+await _notificationService.SendNotificationAsync(
+    car.SellerId,
+    NotificationTypes.CarApproved,
+    $"Your car listing \"{car.Title}\" has been approved and is now live!",
+    relatedId: car.Id,
+    cancellationToken: cancellationToken);
+```
+
+**在 `RejectAsync` 的 `try` 块里，缓存清理之后加入：**
+
+```csharp
+// ✅ 新增：通知卖家审核被拒绝
+await _notificationService.SendNotificationAsync(
+    car.SellerId,
+    NotificationTypes.CarRejected,
+    $"Your car listing \"{car.Title}\" was not approved. Please review and resubmit.",
+    relatedId: car.Id,
+    cancellationToken: cancellationToken);
+```
+
+#### 7.3 更新 OrderService
+
+在`CreateAsync` 里，缓存清理之后加入通知
+
+找到这一行：
+
+```csharp
+await _cache.RemoveByPrefixAsync(CacheKeys.PublishedCarsPrefix, cancellationToken);
+```
+
+在这行之后加入：
+
+```csharp
+// ✅ 新增：通知卖家有新订单
+// car 对象在前面已经通过 GetByIdAsync 取出，直接用 car.SellerId 和 car.Title
+await _notificationService.SendNotificationAsync(
+    car.SellerId,
+    NotificationTypes.NewOrder,
+    $"You have a new order for \"{car.Title}\"!",
+    relatedId: order.Id,
+    cancellationToken: cancellationToken);
+```
+
+**`CancelAsync` 里，状态更新成功后加入通知**
+
+找到 `_logger.LogInformation("Order {OrderId} cancelled", orderId)` 这行之前，加入：
+
+```csharp
+// ✅ 新增：通知卖家订单被取消
+// order.Car 已经通过 Include 加载，直接使用
+await _notificationService.SendNotificationAsync(
+    order.Car.SellerId,
+    NotificationTypes.OrderCancelled,
+    $"The order for \"{order.Car.Title}\" has been cancelled by the buyer.",
+    relatedId: order.Id,
+    cancellationToken: cancellationToken);
+```
+
+### 8. 通知详情跳转
+
+客户端查重通知详情后， 需要根据不同的通知类型，调转到不同的操作页面。
+
+`NotificationBell`组件中定义辅助方法：
+
+```tsx
+...
+import type { Notification } from "@/types";
+import { useNavigate } from "react-router-dom";
+
+
+export default function NotificationBell() {
+  ...
+  const navigate = useNavigate();
+
+  // 根据通知类型决定点击后跳转到哪里
+  function getNotificationUrl(notification: Notification): string {
+    switch (notification.type) {
+      case "CarApproved":
+        return `/cars/${notification.relatedId}`;
+      case "CarRejected":
+        return `/cars/${notification.relatedId}/edit`;
+      case "NewOrder":
+      case "OrderCancelled":
+        return "/profile/sales";
+      default:
+        return "/";
+    }
+  }
+
+  ...
+
+    return () => {
+      connection.stop();
+    };
+  }, [queryClient]); // ✅ 依赖项只有 queryClient，整个生命周期只连接一次 SignalR
+
+  return (
+    <div className="relative">
+      ...
+    </div>
+  );
+}
+
+```
+
+点击阅读通知时跳转页面
+
+```tsx
+...
+import type { Notification } from "@/types";
+import { useNavigate } from "react-router-dom";
+
+
+export default function NotificationBell() {
+  ...
+  const navigate = useNavigate();
+
+  // 根据通知类型决定点击后跳转到哪里
+  function getNotificationUrl(notification: Notification): string {
+    switch (notification.type) {
+      case "CarApproved":
+        return `/cars/${notification.relatedId}`;
+      case "CarRejected":
+        return `/cars/${notification.relatedId}/edit`;
+      case "NewOrder":
+      case "OrderCancelled":
+        return "/profile/sales";
+      default:
+        return "/";
+    }
+  }
+
+  ...
+
+  return (
+    <div className="relative">
+      <button
+        ...
+      </button>
+
+      {isOpen && (
+        <>
+          <div
+            className="fixed inset-0 z-10"
+            onClick={() => setIsOpen(false)}
+          />
+
+          <div
+            ...
+            <div className="max-h-80 overflow-y-auto">
+              {notifications.length === 0 ? (
+                <p
+                  className="px-4 py-6 text-center text-sm"
+                  style={{ color: "var(--color-text-muted)" }}
+                >
+                  No unread notifications
+                </p>
+              ) : (
+                notifications.map((n) => (
+                  <button
+                    key={n.id}
+                    type="button"
+                    onClick={() => {
+                      readMutation.mutate(n.id);
+                      setIsOpen(false);
+                      // 点击跳转
+                      navigate(getNotificationUrl(n));
+                    }}
+                    className="w-full border-b px-4 py-3 text-left transition-colors last:border-b-0"
+                    style={{
+                      borderColor: "var(--color-border)",
+                      backgroundColor: "transparent",
+                    }}
+                  >
+                    ...
+                  </button>
+                ))
+              )}
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+```
+
+
+
+### 9 后端单元测试
+
+#### 9.1 新建 FakeNotificationService
+
+新建 `UUcars.Tests/Fakes/FakeNotificationService.cs`：
+
+```csharp
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Services.Notifications;
+
+namespace UUcars.Tests.Fakes;
+
+public class FakeNotificationService : INotificationService
+{
+    public record SentNotification(
+        int UserId,
+        string Type,
+        string Message,
+        int? RelatedId);
+
+    public List<SentNotification> SentNotifications { get; } = new();
+
+    public Task SendNotificationAsync
+    (
+        int userId,
+        string type,
+        string message,
+        int? relatedId = null,
+        CancellationToken cancellationToken = default)
+    {
+        SentNotifications.Add(new SentNotification(userId, type, message, relatedId));
+        return Task.CompletedTask;
+    }
+
+    public Task<List<NotificationResponse>> GetUnreadNotificationsAsync(
+        int userId,
+        CancellationToken cancellationToken = default)
+    {
+        return Task.FromResult(new List<NotificationResponse>());
+    }
+
+    public Task MarkNotificationAsReadAsync(
+        int notificationId,
+        int userId,
+        CancellationToken cancellationToken = default)
+    {
+        return Task.CompletedTask;
+    }
+
+    public Task MarkAllNotificationsAsReadAsync(
+        int userId,
+        CancellationToken cancellationToken = default)
+    {
+        return Task.CompletedTask;
+    }
+}
+```
+
+#### 9.2 更新 AdminCarServiceTests
+
+`AdminCarService` 构造函数多了 `INotificationService`，更新 CreateService 辅助方法：
+
+```csharp
+...
+namespace UUcars.Tests.Services;
+
+public class AdminCarServiceTests
+{
+    
+    private static AdminCarService CreateService(
+        ICarRepository carRepository,
+        IAuditLogService? auditLogService = null,
+        // ✅ 新增
+        INotificationService? notificationService = null) 
+    {
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseInMemoryDatabase(Guid.NewGuid().ToString())
+            .Options;
+        var context = new AppDbContext(options);
+
+        var httpContextAccessor = new HttpContextAccessor();
+        var currentUserService = new CurrentUserService(httpContextAccessor);
+
+        return new AdminCarService(
+            new FakeCacheService(),
+            carRepository,
+            NullLogger<AdminCarService>.Instance,
+            auditLogService ?? new FakeAuditLogService(),
+            currentUserService,
+            // ✅ 新增
+            context, notificationService ?? new FakeNotificationService() 
+        );
+    }
+
+	...
+}
+
+
+```
+
+#### 9.3 新增通知测试
+
+在 `AdminCarServiceTests.cs` 里加入：
+
+```csharp
+// 新增推送通知测试
+
+[Fact]
+public async Task ApproveAsync_WhenSuccessful_SendsNotificationToSeller()
+{
+    var fakeRepo = new FakeCarRepository();
+    var fakeNotifications = new FakeNotificationService();
+    var service = CreateService(fakeRepo, notificationService: fakeNotifications);
+
+    fakeRepo.Seed(new Car
+    {
+        Id = 1,
+        SellerId = 42,
+        Title = "My Test Car",
+        Brand = "Toyota",
+        Model = "Corolla",
+        Year = 2020,
+        Price = 10000,
+        Mileage = 50000,
+        Status = CarStatus.PendingReview,
+        CreatedAt = DateTime.UtcNow,
+        UpdatedAt = DateTime.UtcNow
+    });
+
+    await service.ApproveAsync(1);
+
+    // 验证通知被发送给卖家（SellerId = 42）
+    Assert.Single(fakeNotifications.SentNotifications);
+    Assert.Equal(42, fakeNotifications.SentNotifications[0].UserId);
+    Assert.Equal(NotificationTypes.CarApproved,
+        fakeNotifications.SentNotifications[0].Type);
+}
+
+[Fact]
+public async Task RejectAsync_WhenSuccessful_SendsNotificationToSeller()
+{
+    var fakeRepo = new FakeCarRepository();
+    var fakeNotifications = new FakeNotificationService();
+    var service = CreateService(fakeRepo, notificationService: fakeNotifications);
+
+    fakeRepo.Seed(new Car
+    {
+        Id = 1,
+        SellerId = 42,
+        Title = "My Test Car",
+        Brand = "Toyota",
+        Model = "Corolla",
+        Year = 2020,
+        Price = 10000,
+        Mileage = 50000,
+        Status = CarStatus.PendingReview,
+        CreatedAt = DateTime.UtcNow,
+        UpdatedAt = DateTime.UtcNow
+    });
+
+    await service.RejectAsync(1);
+
+    Assert.Single(fakeNotifications.SentNotifications);
+    Assert.Equal(42, fakeNotifications.SentNotifications[0].UserId);
+    Assert.Equal(NotificationTypes.CarRejected,
+        fakeNotifications.SentNotifications[0].Type);
+}
+```
+
+#### 9.4 更新 OrderServiceTests
+
+`OrderService` 构造函数多了 `INotificationService`，更新 CreateService 辅助方法：
+
+```c#
+...
+
+namespace UUcars.Tests.Services;
+
+public class OrderServiceTests
+{
+    private static AppDbContext CreateDbContext()
+    {
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseInMemoryDatabase(Guid.NewGuid().ToString())
+            .Options;
+        return new AppDbContext(options);
+    }
+
+    private static OrderService CreateService(
+        AppDbContext context,
+        FakeCarRepository? carRepo = null,
+        // ✅ 新增
+        INotificationService? notificationService = null)
+    {
+        var orderRepo = new EfOrderRepository(context);
+        return new OrderService(
+            new FakeCacheService(),
+            carRepo ?? new FakeCarRepository(),
+            context,
+            NullLogger<OrderService>.Instance,
+            orderRepo,
+            // 新增通知
+            notificationService ?? new FakeNotificationService()
+        );
+    }
+
+    ...
+    
+}
+```
+
+#### 9.5 新增orderService里通知的测试 
+
+ 新增2个创建订单通知测试：
+
+- CreateAsync_WhenSuccessful_SendsNewOrderNotificationToSeller
+- CancelAsync_WhenSuccessful_SendsOrderCancelledNotificationToSeller
+
+```c#
+[Fact]
+public async Task CreateAsync_WhenSuccessful_SendsNewOrderNotificationToSeller()
+{
+    // Arrange
+    var context = CreateDbContext();
+    var carRepo = new FakeCarRepository();
+    var fakeNotifications = new FakeNotificationService();
+
+    var buyer = new User
+    {
+        Id = 2,
+        Username = "buyer",
+        Email = "buyer@test.com",
+        PasswordHash = "hash",
+        Role = UserRole.User,
+        CreatedAt = DateTime.UtcNow,
+        UpdatedAt = DateTime.UtcNow
+    };
+
+    var seller = new User
+    {
+        Id = 10,
+        Username = "seller",
+        Email = "seller@test.com",
+        PasswordHash = "hash",
+        Role = UserRole.User,
+        CreatedAt = DateTime.UtcNow,
+        UpdatedAt = DateTime.UtcNow
+    };
+
+    var car = new Car
+    {
+        Id = 1,
+        SellerId = 10,
+        Price = 260000,
+        Status = CarStatus.Published,
+        Title = "BMW 3 Series",
+        Brand = "BMW",
+        Model = "3 Series",
+        Year = 2020,
+        Mileage = 15000,
+        CreatedAt = DateTime.UtcNow,
+        UpdatedAt = DateTime.UtcNow
+    };
+
+    context.Users.AddRange(buyer, seller);
+    context.Cars.Add(car);
+    await context.SaveChangesAsync();
+
+    carRepo.Seed(car);
+
+    var service = CreateService(
+        context,
+        carRepo,
+        fakeNotifications);
+
+    // Act
+    var result = await service.CreateAsync(
+        buyer.Id,
+        new OrderCreateRequest { CarId = car.Id });
+
+    // Assert
+    var notification =
+        Assert.Single(fakeNotifications.SentNotifications);
+
+    Assert.Equal(seller.Id, notification.UserId);
+    Assert.Equal(
+        NotificationTypes.NewOrder,
+        notification.Type);
+    Assert.Equal(result.Id, notification.RelatedId);
+}
+
+[Fact]
+public async Task CancelAsync_WhenSuccessful_SendsOrderCancelledNotificationToSeller()
+{
+    // Arrange
+    var context = CreateDbContext();
+    var carRepo = new FakeCarRepository();
+    var fakeNotifications = new FakeNotificationService();
+
+    var buyer = new User
+    {
+        Id = 2,
+        Username = "buyer",
+        Email = "buyer@test.com",
+        PasswordHash = "hash",
+        Role = UserRole.User,
+        CreatedAt = DateTime.UtcNow,
+        UpdatedAt = DateTime.UtcNow
+    };
+
+    var seller = new User
+    {
+        Id = 10,
+        Username = "seller",
+        Email = "seller@test.com",
+        PasswordHash = "hash",
+        Role = UserRole.User,
+        CreatedAt = DateTime.UtcNow,
+        UpdatedAt = DateTime.UtcNow
+    };
+
+    var car = new Car
+    {
+        Id = 1,
+        SellerId = seller.Id,
+        Price = 260000,
+        Status = CarStatus.Sold,
+        Title = "BMW 3 Series",
+        Brand = "BMW",
+        Model = "3 Series",
+        Year = 2020,
+        Mileage = 15000,
+        CreatedAt = DateTime.UtcNow,
+        UpdatedAt = DateTime.UtcNow
+    };
+
+    var order = new Order
+    {
+        Id = 1,
+        CarId = car.Id,
+        BuyerId = buyer.Id,
+        SellerId = seller.Id,
+        Price = car.Price,
+        Status = OrderStatus.Pending,
+        CreatedAt = DateTime.UtcNow,
+        UpdatedAt = DateTime.UtcNow
+    };
+
+    context.Users.AddRange(buyer, seller);
+    context.Cars.Add(car);
+    context.Orders.Add(order);
+    await context.SaveChangesAsync();
+
+    carRepo.Seed(car);
+
+    var service = CreateService(
+        context,
+        carRepo,
+        fakeNotifications);
+
+    // Act
+    var result = await service.CancelAsync(
+        order.Id,
+        buyer.Id);
+
+    // Assert
+    var notification =
+        Assert.Single(fakeNotifications.SentNotifications);
+
+    Assert.Equal(seller.Id, notification.UserId);
+    Assert.Equal(
+        NotificationTypes.OrderCancelled,
+        notification.Type);
+    Assert.Equal(result.Id, notification.RelatedId);
+}
+```
+
+
+
+### 10. 本地验证
+
+#### 10.1 验证 SignalR 连接
+
+1. 卖家账号登录前端
+2. 打开 DevTools → Network → WS（WebSocket 过滤）
+3. 应该看到一条到 `/hubs/notification` 的 WebSocket 连接，状态是 101 Switching Protocols
+
+如果这里连接一直建立不起来、Network 面板里 negotiate 请求直接报跨域 相关错误，第一时间去确认 `app.UseCors(...)` 中间件是不是真的注册在 `app.MapHub<NotificationHub>(...)` 之前生效。
+
+#### 10.2 验证实时通知
+
+1. 用两个浏览器窗口（或无痕 + 普通）分别以卖家和 Admin 身份登录
+2. 有一辆车处于 PendingReview 状态
+3. Admin 窗口点击 Approve
+4. 卖家窗口**立即**弹出 Toast 通知，不需要刷新
+5. 铃铛角标数字增加 1
+
+#### 10.3 验证持久化
+
+1. 卖家关闭浏览器窗口（或退出登录再重新登录）
+2. 重新打开后铃铛角标仍然显示未读数
+3. 点开铃铛，能看到历史未读通知列表
+
+
+
+### 11. 编译和测试
+
+```bash
+dotnet build
+dotnet test
+cd uucars-web && npm run build
+```
+
+
+
+### 12. Git 提交
+
+```bash
+git add .
+git commit -m "feat: SignalR real-time notifications with persistence"
+git push origin feature/v3-signalr-notifications
+
+git checkout develop
+git merge --no-ff feature/v3-signalr-notifications \
+  -m "merge: feature/v3-signalr-notifications into develop"
+git push origin develop
+
+git branch -d feature/v3-signalr-notifications
+git push origin --delete feature/v3-signalr-notifications
+```
+
+
+
+### Step 70 完成状态
+
+```
+知识点：
+✅ 理解 SignalR 的传输方式选择（WebSocket → SSE → Long Polling 自动降级）
+✅ 理解 Hub 和 Group 的概念（同一用户的多个连接加入同一个 `user-{id}` Group）
+✅ 理解 SignalR JWT 从 QueryString 取 Token 的原因（WebSocket 不支持自定义请求头）
+✅ 理解通知为什么要持久化（用户离线时推送失败，重新上线可从数据库恢复）
+✅ 理解推送失败静默处理的原因（用户不在线是正常情况，不能影响主流程）
+✅ 理解为什么 Hub 内部不能沿用 CurrentUserService（IHttpContextAccessor
+   面向 HTTP 请求-响应周期设计，Hub 是长连接场景，应直接用 Context.User）
+✅ 理解 IHubContext<T> 的作用（让 Hub 外部的普通服务也能向指定 Group 推送消息）
+✅ 理解 ExecuteUpdateAsync 的适用场景（批量更新不需要先加载实体到内存）
+
+实现（后端）：
+✅ Notification 实体 + NotificationTypes 常量 + EF 配置
+✅ Migration: AddNotificationsTable
+✅ AuthExtensions 更新（SignalR JWT QueryString 配置）
+✅ NotificationGroups 统一 Group 命名
+✅ NotificationHub（从 Context.UserIdentifier 解析 userId，并将连接加入用户 Group）
+✅ INotificationService 接口 + NotificationService 实现（写DB + 向用户 Group 推送完整通知对象）
+✅ NotificationsController（GET/PUT 三个接口，用 CurrentUserService 完全没问题）
+✅ AdminCarService：Approve/Reject 时发送通知
+✅ OrderService：CreateAsync/CancelAsync 时发送通知
+✅ Program.cs：AddSignalR + MapHub
+
+实现（前端）：
+✅ @microsoft/signalr 安装
+✅ NotificationBell 组件
+✅ Layout 集成 NotificationBell
+✅ NotificationResponse 类型定义
+
+测试：
+✅ FakeNotificationService
+✅ AdminCarServiceTests 更新（加入 FakeNotificationService）
+✅ 新增2个通知测试（Approve/Reject 发送通知给正确的卖家）
+✅ OrderServiceTests 更新（Create/Cancel 验证通知类型、目标卖家和关联订单）
+```
+
+
+
 ## fixed Issues 
 
 ### Fix 1. 并发 Refresh Token 请求竞态条件（Refresh Token Rotation Race Condition）
@@ -14747,6 +17565,3 @@ git push origin develop
 git branch -d fix/add-images-when-create-car
 git push origin --delete fix/add-images-when-create-car
 ```
-
-
-

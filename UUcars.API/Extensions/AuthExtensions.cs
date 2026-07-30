@@ -74,6 +74,28 @@ public static class AuthExtensions
                     // 明确指定后，任何不是 HmacSha256 签名的 Token 都会被直接拒绝
                     ValidAlgorithms = [SecurityAlgorithms.HmacSha256]
                 };
+
+                // ===== 核心新增：配置 JwtBearer 事件响应以兼容 SignalR Query Token =====
+                options.Events = new JwtBearerEvents
+                {
+                    OnMessageReceived = context =>
+                    {
+                        // 1. 从 URL Query 参数中尝试读取 access_token
+                        var accessToken = context.Request.Query["access_token"];
+
+                        // 2. 获取当前请求的路径
+                        var path = context.HttpContext.Request.Path;
+
+                        // 3. 判断：如果有 access_token 且请求路径指向 SignalR Hub
+                        //  匹配具体的 Hub 路径，如 "/chatHub" 或以特定前缀开头的路径）
+                        if (!string.IsNullOrEmpty(accessToken) &&
+                            path.StartsWithSegments("/hubs")) // 💡 根路由路径或根前缀
+                            // 将 Token 赋给上下文，JwtBearer 中间件后续就会拿这个 Token 去做签名和合法性校验
+                            context.Token = accessToken;
+
+                        return Task.CompletedTask;
+                    }
+                };
             });
 
 
