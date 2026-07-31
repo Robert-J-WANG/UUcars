@@ -62,7 +62,7 @@ describe("LoginPage", () => {
       expect(screen.getByText(/password is required/i)).toBeInTheDocument();
     });
   });
-  screen.debug(undefined, 300000); // 临时加这行，看完整渲染结果
+
   it("输入无效邮箱格式时应该显示格式错误", async () => {
     renderLoginPage();
     const user = userEvent.setup();
