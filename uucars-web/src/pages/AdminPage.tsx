@@ -1,8 +1,9 @@
 // src/pages/AdminPage.tsx
 import { NavLink, Outlet } from "react-router-dom";
-import { ClipboardList } from "lucide-react";
+import { ClipboardList, LayoutDashboard } from "lucide-react";
 
 const tabs = [
+  { to: "/admin/dashboard", label: "Dashboard", icon: LayoutDashboard },
   { to: "/admin/pending", label: "Pending Review", icon: ClipboardList },
 ];
 

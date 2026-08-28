@@ -16494,6 +16494,3749 @@ git push origin --delete feature/v3-signalr-notifications
 ✅ OrderServiceTests 更新（Create/Cancel 验证通知类型、目标卖家和关联订单）
 ```
 
+## Step 71 · Admin 数据面板
+
+### 这一步做什么
+
+Step 70 完成了实时通知，系统已经能够处理车辆发布、审核、下单、成交和用户通知。
+
+但现在 Admin 只能处理一条条具体业务记录：
+
+```
+查看待审核车辆
+→ Approve / Reject / Delete
+→ 查看审计日志
+```
+
+Admin 仍然无法回答更高层的问题：
+
+```
+平台现在有多少车辆？
+有多少车辆还在等待审核？
+本月产生了多少订单？
+本月实际完成了多少交易额？
+最近 30 天的车辆和收入趋势如何？
+平台上哪些品牌最多？
+```
+
+这些问题与普通列表查询不同。
+
+列表查询回答的是：
+
+```
+“有哪些记录？”
+```
+
+Dashboard 统计回答的是：
+
+```
+“这些记录整体呈现什么状态和趋势？”
+```
+
+这一步会以 Admin Dashboard 为载体，学习：
+
+- SQL Aggregate；
+- `Count`、`Sum` 和 `GroupBy`；
+- UTC 日期边界；
+- 时间序列补零；
+- Dashboard DTO；
+- 短期缓存；
+- Recharts；
+- 图表数据与页面状态处理。
+
+最终数据流是：
+
+```bash
+Cars / Orders / Users
+        ↓
+EfAdminStatsRepository
+        ↓
+AdminStatsService
+        ↓
+Redis 5 分钟缓存
+        ↓
+GET /admin/stats
+        ↓
+TanStack Query
+        ↓
+统计卡片 + LineChart + PieChart
+```
+
+同时，Step 63 已经完成了审计日志的写入和查询接口，但目前还没有前端页面使用它。
+
+审计日志继续使用现有接口：
+
+```
+GET /admin/audit-logs
+```
+
+本步骤将在 Dashboard 中加入审计日志表格和分页。
+
+
+
+### 1. 切出功能分支
+
+先检查当前状态：
+
+```
+git status --short --branch
+```
+
+确认在干净的 `develop` 后：
+
+```
+git pull --ff-only origin develop
+git checkout -b feature/v3-admin-dashboard
+git push -u origin feature/v3-admin-dashboard
+```
+
+
+
+### 2. SQL Aggregate 聚合查询
+
+普通查询通常返回一组记录：
+
+```
+SELECT *
+FROM Cars
+WHERE Status = 'Published'
+```
+
+Aggregate 查询不会返回每一辆车，而是把多行数据压缩为一个结果：
+
+```
+SELECT COUNT(*)
+FROM Cars
+WHERE Status = 'Published'
+```
+
+常见 Aggregate：
+
+```
+COUNT   统计记录数量
+SUM     合计数值
+AVG     平均值
+MIN     最小值
+MAX     最大值
+```
+
+在 EF Core 中对应：
+
+```
+await query.CountAsync();
+await query.SumAsync();
+await query.AverageAsync();
+await query.MinAsync();
+await query.MaxAsync();
+```
+
+#### 2.1 为什么不能先 `ToListAsync` 再统计？
+
+下面的写法虽然能工作，但会把所有车辆加载到应用内存：
+
+```
+var cars = await _context.Cars.ToListAsync();
+
+var totalCars = cars.Count(c => c.Status != CarStatus.Deleted);
+```
+
+生成的过程是：
+
+```
+SQL Server 读取所有 Cars 行
+→ 把全部字段传给 API
+→ EF Core 创建全部 Car 对象
+→ C# 在内存里 Count
+```
+
+正确写法：
+
+```
+var totalCars = await _context.Cars
+    .CountAsync(c => c.Status != CarStatus.Deleted);
+```
+
+生成的是类似：
+
+```
+SELECT COUNT(*)
+FROM Cars
+WHERE Status <> 'Deleted'
+```
+
+统计发生在数据库中，只返回一个数字。
+
+#### 2.2 Aggregate 查询还需要 `AsNoTracking` 吗？
+
+变更追踪针对的是加载进内存的 Entity。
+
+`CountAsync`、`SumAsync` 和投影后的 `GroupBy` 不会返回完整 Entity，因此本身没有大量实体追踪成本。
+
+因此，这类聚合查询不需要额外调用 `AsNoTracking()`。真正关键的是：
+
+```
+不要先加载 Entity
+而要让数据库完成聚合
+```
+
+
+
+### 3. 实现一个最小的 Aggregate 查询
+
+我们同样采用项目约定的分层结构：
+
+```
+Controller
+  负责 HTTP
+
+Service
+  负责业务规则和流程编排
+
+Repository
+  负责 EF Core 查询与持久化
+```
+
+因此，主要的操作如下：
+
+```
+新建 EfAdminStatsRepository
+  → 数据库过滤
+  → Count / Sum / GroupBy
+  → 只返回数据库实际存在的聚合结果
+
+新建 AdminStatsService
+  → 决定业务时间范围
+  → 补齐没有数据的日期
+  → 组合最终 DTO
+  → 处理 5 分钟缓存
+
+AdminController 中新增接口 `GET /admin/stats`
+  → 处理 HTTP 请求
+  → 鉴权
+  → 限流
+```
+
+我们先实现一个最小的查询：先让 Admin 能读到总车辆数， 来打通数据流。
+
+#### 3.1 定义 Dashboard DTO
+
+新建 `UUcars.API/DTOs/Responses/AdminStatsResponse.cs`
+
+```c#
+namespace UUcars.API.DTOs.Responses;
+
+public sealed class AdminStatsResponse
+{
+    public int TotalCars { get; init; }
+}
+```
+
+#### 3.2 定义统计数据 Repository
+
+定义仓库接口，新建 `UUcars.API/Repositories/IAdminStatsRepository.cs`：
+
+```c#
+namespace UUcars.API.Repositories;
+
+public interface IAdminStatsRepository
+{
+    Task<int> GetTotalCarsAsync(CancellationToken cancellationToken = default);
+}
+```
+
+实现接口方法，新建 `UUcars.API/Repositories/EfAdminStatsRepository.cs`：
+
+```c#
+using Microsoft.EntityFrameworkCore;
+using UUcars.API.Data;
+using UUcars.API.Entities.Enums;
+
+namespace UUcars.API.Repositories;
+
+public class EfAdminStatsRepository : IAdminStatsRepository
+{
+    private readonly AppDbContext _context;
+
+    public EfAdminStatsRepository(AppDbContext context)
+    {
+        _context = context;
+    }
+
+    public async Task<int> GetTotalCarsAsync(CancellationToken cancellationToken = default)
+    {
+        return await _context.Cars
+            .CountAsync(c => c.Status != CarStatus.Deleted, cancellationToken);
+    }
+}
+```
+
+`CountAsync()` 会直接生成数据库聚合查询，不会把 `Car` 实体加载进内存，因此这里不需要额外调用 `AsNoTracking()`。
+
+#### 3.3 实现 AdminStats 业务
+
+新建 `UUcars.API/Services/AdminStatsService.cs`：
+
+```c#
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Repositories;
+
+namespace UUcars.API.Services;
+
+public class AdminStatsService
+{
+    private readonly IAdminStatsRepository _adminStatsRepository;
+
+    public AdminStatsService(IAdminStatsRepository adminStatsRepository)
+    {
+        _adminStatsRepository = adminStatsRepository;
+    }
+
+    public async Task<AdminStatsResponse> GetStatsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        var totalCars = await _adminStatsRepository.GetTotalCarsAsync(cancellationToken);
+
+        return new AdminStatsResponse
+        {
+            TotalCars = totalCars
+        };
+    }
+}
+```
+
+#### 3.4 在 AdminController 新增接口
+
+在 `UUcars.API/Controllers/AdminController.cs`中新增接口，并调用AdminStatsService
+
+```c#
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using UUcars.API.DTOs;
+using UUcars.API.DTOs.Requests;
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Services;
+
+namespace UUcars.API.Controllers;
+
+[ApiController]
+[Route("admin")]
+[Authorize(Roles = "Admin")] // Controller 级别：所有 Admin 接口都需要 Admin 角色
+public class AdminController : ControllerBase
+{
+    private readonly AdminCarService _adminCarService;
+    private readonly AdminStatsService _adminStatsService;
+
+    public AdminController(AdminCarService adminCarService, AdminStatsService adminStatsService)
+    {
+        _adminCarService = adminCarService;
+        _adminStatsService = adminStatsService;
+    }
+
+    ...
+
+    // 新增统计数据接口
+    // GET /admin/stats
+    [HttpGet("stats")]
+    public async Task<IActionResult> GetStats(CancellationToken cancellationToken)
+    {
+        var stats = await _adminStatsService.GetStatsAsync(cancellationToken);
+        return Ok(ApiResponse<AdminStatsResponse>.Ok(stats));
+    }
+}
+```
+
+#### 3.5 注册服务
+
+在 `UUcars.API/Program.cs` 的 Repository 和 Service 注册区域加入：
+
+```c#
+builder.Services.AddScoped<IAdminStatsRepository, EfAdminStatsRepository>();
+builder.Services.AddScoped<AdminStatsService>();
+```
+
+#### 3.6 业务验证
+
+在 Scalar 中发送请求：
+
+```
+GET /admin/stats
+```
+
+预期结果：
+
+```json
+{
+  "success": true,
+  "data": {
+    "totalCars": 41
+  },
+  "message": null,
+  "errors": null
+}
+```
+
+这样，实现了一个最小的Aggregate 查询， 并打通了完整的后端数据流。
+
+
+
+### 4. Dashboard DTO 设计
+
+Dashboard 的统计数据除了上面实现的 `totalCars` 指标外，还需要包含其他核心指标和图表数据。因此接下来定义完整的统计口径和响应 DTO。
+
+#### 4.1 约定“统计口径”
+
+统计代码最容易出现的问题，不是语法错误，而是不同人对同一个指标有不同理解。
+
+例如：
+
+```
+monthlyOrders
+```
+
+可能表示：
+
+```
+本月创建的全部订单
+本月完成的订单
+本月仍处于 Pending 的订单
+本月除 Cancelled 外的订单
+```
+
+这几种写法都能通过编译，但返回的是完全不同的业务答案。
+
+因此，Dashboard 开发不能从 `CountAsync()` 开始，而应该先把每个指标的含义锁定。
+
+##### 统计卡片
+
+Dashboard 需要显示 6 个统计卡片：
+
+```
+totalCars
+  = Draft + PendingReview + Published + Sold
+  = 排除 Deleted
+
+pendingCars
+  = PendingReview
+
+publishedCars
+  = Published
+  = 不包含 Sold
+
+totalUsers
+  = Users 表全部记录
+  = 包含 Admin Seed
+
+monthlyOrders
+  = 当前 UTC 月内创建的全部订单
+  = 根据 CreatedAt 判断
+  = 不因为后来 Cancelled 就从历史订单量里消失
+
+monthlyRevenue
+  = 当前 UTC 月内完成的订单金额
+  = 只统计 Completed
+  = 根据完成时间判断
+```
+
+`monthlyOrders` 和 `monthlyRevenue` 的口径不同，这是有意的。
+
+订单量回答的是：
+
+```
+“这个月产生了多少购买行为？”
+```
+
+成交额回答的是：
+
+```
+“这个月真正完成了多少交易？”
+```
+
+Pending 和 Cancelled 订单都是已经产生过的订单，所以计入订单量；但它们没有形成真实成交，所以不能计入收入。
+
+除了上面的 6 个统计卡片，还需要按日期和品牌维度返回趋势与分布数据：
+
+##### 每日新增车辆
+
+```
+dailyNewCars
+  = 近 30 个 UTC 日期内创建的车辆数量
+  = 根据 Car.CreatedAt
+  = 包括后来变成 Deleted 的车辆
+```
+
+这里与 `totalCars` 的口径不同。
+
+`totalCars` 是当前状态快照：
+
+```
+“平台现在有多少非 Deleted 车辆？”
+```
+
+`dailyNewCars` 是历史事件趋势：
+
+```
+“这些日期当时创建了多少车辆？”
+```
+
+如果一辆车创建后又被删除，创建事件仍然真实发生过。因此它仍然进入历史新增趋势。
+
+##### 每日收入
+
+```
+dailyRevenue
+  = 近 30 个 UTC 日期内完成的订单金额
+  = Status == Completed
+  = 根据订单完成时间分组
+```
+
+##### 品牌分布
+
+```
+brandDistribution
+  = Published + Sold
+  = 按 Brand 分组
+  = Count 降序
+  = 数量相同时 Brand 升序
+  = 只取前 10
+```
+
+> 为什么不包含 Draft 和 PendingReview？
+>
+> 因为这些车辆还没有真正进入公开市场。Dashboard 的品牌分布要表达的是已经进入市场的车辆构成，而不是卖家尚未完成或 Admin 尚未通过的草稿。
+>
+> 为什么包含 Sold？
+>
+> 因为 Sold 车辆曾经真实进入市场，也反映平台历史上的品牌构成。
+
+上面的一些指标都涉及到了时间维度：
+
+```
+当前 UTC 月
+近 30 个 UTC 日期
+订单完成时间
+```
+
+需要对这些时间维度进行统一约定。
+
+##### 近 30 天的边界
+
+```
+包含今天
+共 30 个 UTC 日期
+```
+
+如果今天是：
+
+```
+2026-08-08
+```
+
+范围就是：
+
+```
+2026-07-10 00:00:00 UTC
+到
+2026-08-09 00:00:00 UTC
+```
+
+查询使用半开区间：
+
+```
+timestamp >= start
+timestamp < endExclusive
+```
+
+不是：
+
+```
+timestamp <= 2026-08-08 23:59:59.999
+```
+
+原因是数据库时间精度可能比毫秒更细。使用下一天的 00:00 作为 exclusive end，不需要猜测一天最后一刻的精度。
+
+##### 订单完成时间
+
+当前 `Order` 只有：
+
+```
+CreatedAt
+UpdatedAt
+```
+
+没有 `CompletedAt`，收入应该按什么时间计算？
+
+订单完成时，`OrderService.CompleteAsync` 会执行：
+
+```
+order.Status = OrderStatus.Completed;
+order.UpdatedAt = DateTime.UtcNow;
+```
+
+当前状态机只允许：
+
+```
+Pending → Completed
+Pending → Cancelled
+```
+
+Completed 订单没有后续编辑流程，所以在目前代码中：
+
+```
+Completed 订单的 UpdatedAt = 订单完成时间
+```
+
+因此可以使用：
+
+```
+Status == Completed + UpdatedAt
+```
+
+来统计成交额。
+
+这依赖一个当前成立的业务约束：
+
+> Completed 订单完成后不会再次更新。
+
+如果以后允许修改 Completed 订单，`UpdatedAt` 就不再等同于完成时间，那时才应该增加专用 `CompletedAt`。
+
+#### 4.2 定义 Dashboard DTO
+
+前端发送一次 Dashboard 统计 API 请求：
+
+```bash
+GET /admin/stats
+```
+
+接口需要返回统一的完整 Dashboard DTO，而不需要为不同指标分别设计 API 请求。
+
+因此需要定义完整的 Dashboard DTO 来对应 Dashboard 统计指标。
+
+修改 `UUcars.API/DTOs/Responses/AdminStatsResponse.cs`，加入完整的 9 个顶层属性：
+
+```c#
+namespace UUcars.API.DTOs.Responses;
+
+public class AdminStatsResponse
+{
+    // 核心指标（统计卡片用）
+    public int TotalCars { get; set; }
+    public int PendingCars { get; set; }
+    public int PublishedCars { get; set; }
+    public int TotalUsers { get; set; }
+    public int MonthlyOrders { get; set; }
+    public decimal MonthlyRevenue { get; set; }
+
+    // 趋势数据 （折线图用）
+    public List<DailyCountDto> DailyNewCars { get; set; } = [];
+    public List<DailyRevenueDto> DailyRevenue { get; set; } = [];
+
+    // 品牌分布 （饼图用）
+    public List<BrandCountDto> BrandDistribution { get; set; } = [];
+}
+
+public class DailyCountDto
+{
+    public DateOnly Date { get; set; }
+    public int Count { get; set; }
+}
+
+public class DailyRevenueDto
+{
+    public DateOnly Date { get; set; }
+    public decimal Revenue { get; set; }
+}
+
+public class BrandCountDto
+{
+    public string Brand { get; set; } = string.Empty;
+    public int Count { get; set; }
+}
+```
+
+>**为什么日期使用 `DateOnly`？**
+>
+>这些数据代表：
+>
+>```
+>2026-08-08 这个 UTC 日期桶
+>```
+>
+>不是某一个具体时刻。
+>
+>如果返回完整 `DateTime`：
+>
+>```
+>"2026-08-08T00:00:00Z"
+>```
+>
+>前端可能把它转成浏览器本地时区，导致日期移动。
+>
+>使用 `DateOnly` 后 JSON 表达为：
+>
+>```
+>"2026-08-08"
+>```
+>
+>更符合时间序列日期桶的语义。
+
+
+
+### 5. 实现完整的 Repository
+
+#### 5.1 补齐接口方法
+
+补充 `IAdminStatsRepository` 接口里的方法：
+
+```c#
+public interface IAdminStatsRepository
+{
+    // ── 核心指标 ─────────────────────────────────────────────
+    Task<int> GetTotalCarsAsync(CancellationToken cancellationToken = default);
+    Task<int> GetPendingCarsAsync(CancellationToken cancellationToken = default);
+    Task<int> GetPublishedCarsAsync(CancellationToken cancellationToken = default);
+    Task<int> GetTotalUsersAsync(CancellationToken cancellationToken = default);
+    Task<int> GetMonthlyOrdersAsync(DateTime startOfMonth, CancellationToken cancellationToken = default);
+    Task<decimal> GetMonthlyRevenueAsync(DateTime startOfMonth, CancellationToken cancellationToken = default);
+
+    // ── 趋势数据 ─────────────────────────────────────────────
+    Task<List<DailyCountDto>> GetDailyNewCarsAsync(DateTime dailyFrom, DateTime dailyTo,
+        CancellationToken cancellationToken = default);
+
+    Task<List<DailyRevenueDto>> GetDailyRevenueAsync(DateTime dailyFrom, DateTime dailyTo,
+        CancellationToken cancellationToken = default);
+
+    // ── 品牌分布 ─────────────────────────────────────────────
+    Task<List<BrandCountDto>> GetBrandDistributionAsync(int top, CancellationToken cancellationToken = default);
+}
+```
+
+然后在 `EfAdminStatsRepository` 中实现这些方法。
+
+#### 5.2 实现核心指标
+
+```c#
+public class EfAdminStatsRepository : IAdminStatsRepository
+{
+    private readonly AppDbContext _context;
+
+    public EfAdminStatsRepository(AppDbContext context)
+    {
+        _context = context;
+    }
+
+    // ── 核心指标 ─────────────────────────────────────────────
+    public Task<int> GetTotalCarsAsync(CancellationToken cancellationToken = default)
+    {
+        return _context.Cars
+            .CountAsync(c => c.Status != CarStatus.Deleted, cancellationToken);
+    }
+
+    public Task<int> GetPendingCarsAsync(CancellationToken cancellationToken = default)
+    {
+        return _context.Cars
+            .CountAsync(c => c.Status == CarStatus.PendingReview, cancellationToken);
+    }
+
+    public Task<int> GetPublishedCarsAsync(CancellationToken cancellationToken = default)
+    {
+        return _context.Cars
+            .CountAsync(c => c.Status == CarStatus.Published, cancellationToken);
+    }
+
+    public Task<int> GetTotalUsersAsync(CancellationToken cancellationToken = default)
+    {
+        return _context.Users.CountAsync(cancellationToken);
+    }
+
+    public Task<int> GetMonthlyOrdersAsync(
+        DateTime startOfMonth,
+        CancellationToken cancellationToken = default)
+    {
+        return _context.Orders
+            .CountAsync(o => o.CreatedAt >= startOfMonth &&
+                             o.CreatedAt < startOfMonth.AddMonths(1), cancellationToken);
+    }
+
+    public async Task<decimal> GetMonthlyRevenueAsync(
+        DateTime startOfMonth,
+        CancellationToken cancellationToken = default)
+    {
+        // SumAsync 在没有数据时返回 null（因为类型是 decimal?），
+        // 所以这里用 ?? 0m 保证返回值不为 null
+        var result = await _context.Orders
+            .Where(o => o.Status == OrderStatus.Completed &&
+                        o.UpdatedAt >= startOfMonth &&
+                        o.UpdatedAt < startOfMonth.AddMonths(1))
+            .Select(o => (decimal?)o.Price)
+            .SumAsync(cancellationToken);
+
+        return result ?? 0m;
+    }
+
+}
+```
+
+#### 5.3 实现趋势数据
+
+##### 理解 `GroupBy`：从一个总数到每天一个数字
+
+月度收入只需要一个数字，例如：
+
+```
+monthlyRevenue = 85000
+```
+
+折线图需要的是一组日期，例如：
+
+```
+2026-08-01 → 0
+2026-08-02 → 18000
+2026-08-03 → 0
+2026-08-04 → 25000
+```
+
+如果只写：
+
+```
+SumAsync()
+```
+
+所有日期会被合并成一个总数。
+
+要按日期分别计算，必须先分组：
+
+```
+先按日期把记录分成多组
+→ 每组分别 Count 或 Sum
+```
+
+SQL 类似：
+
+```
+SELECT
+    CAST(CreatedAt AS date) AS Date,
+    COUNT(*) AS Count
+FROM Cars
+GROUP BY CAST(CreatedAt AS date)
+```
+
+EF Core 对应：
+
+```
+.GroupBy(c => c.CreatedAt.Date)
+.Select(group => new
+{
+    Date = group.Key,
+    Count = group.Count()
+})
+```
+
+`group.Key` 是日期，`group.Count()` 是该日期内的车辆数量。
+
+##### 近 30 天每日新增车辆
+
+```c#
+public async Task<List<DailyCountDto>> GetDailyNewCarsAsync(
+    DateTime dailyFrom,
+    DateTime dailyTo,
+    CancellationToken cancellationToken = default)
+{
+    return await _context.Cars
+        .Where(c => c.CreatedAt >= dailyFrom && c.CreatedAt < dailyTo)
+        .GroupBy(c => c.CreatedAt.Date).Select(g => new DailyCountDto
+            {
+                Date = DateOnly.FromDateTime(g.Key),
+                Count = g.Count()
+            }
+        ).OrderBy(item => item.Date)
+        .ToListAsync(cancellationToken);
+}
+```
+
+这里没有过滤 `CarStatus`（排除 Deleted），因为这个指标统计历史创建事件。
+
+##### 近 30 天每日收入
+
+```c#
+public async Task<List<DailyRevenueDto>> GetDailyRevenueAsync(
+    DateTime dailyFrom,
+    DateTime dailyTo,
+    CancellationToken cancellationToken = default)
+{
+    return await _context.Orders
+        .Where(o => o.Status == OrderStatus.Completed && o.UpdatedAt >= dailyFrom && o.UpdatedAt < dailyTo)
+        .GroupBy(o => o.UpdatedAt.Date).Select(g => new DailyRevenueDto
+        {
+            Date = DateOnly.FromDateTime(g.Key),
+            Revenue = g.Sum(o => o.Price)
+        }).OrderBy(item => item.Date).ToListAsync(cancellationToken);
+}
+```
+
+##### 数据库没有记录的日期去哪了？
+
+假设数据库只有：
+
+```
+08-01：2 辆
+08-03：1 辆
+```
+
+`GroupBy` 返回：
+
+```
+[
+  { "date": "08-01", "count": 2 },
+  { "date": "08-03", "count": 1 }
+]
+```
+
+数据库不会自动创造：
+
+```
+08-02：0
+```
+
+如果直接把结果交给折线图，横轴会从 08-01 跳到 08-03。视觉上可能像两天连续，实际上中间缺了一天。
+
+因此需要补零。
+
+补零不属于数据库聚合，而属于 Dashboard 的业务展示规则：
+
+```
+无数据日期也必须显示
+```
+
+所以补零放在 Service，不放 Repository。
+
+#### 5.4 实现品牌分布
+
+品牌分布同样交给数据库完成过滤、分组、排序和截取。Repository 最终只把前 10 条结果返回给 Service。
+
+##### 如何稳定排序？
+
+如果 Toyota 和 BMW 都有 5 辆：
+
+```
+Toyota 5
+BMW    5
+```
+
+只写：
+
+```
+OrderByDescending(item => item.Count)
+```
+
+数据库不保证两条相同 Count 的记录顺序。不同调用可能返回不同顺序，饼图颜色也会跟着交换。
+
+增加：
+
+```
+.ThenBy(item => item.Brand)
+```
+
+后：
+
+```
+BMW
+Toyota
+```
+
+顺序固定，图表颜色和图例更稳定。
+
+##### `Take(10)` 的使用
+
+查询的正确思路：
+
+```
+数据库 GroupBy
+→ 数据库排序
+→ 数据库 Top 10
+→ API 只接收 10 条
+```
+
+完整实现如下：
+
+```c#
+public Task<List<BrandCountDto>> GetBrandDistributionAsync(
+    int top,
+    CancellationToken cancellationToken = default)
+{
+    return _context.Cars
+        .Where(c => c.Status == CarStatus.Published || c.Status == CarStatus.Sold)
+        .GroupBy(c => c.Brand)
+        .Select(g => new BrandCountDto
+        {
+            Brand = g.Key,
+            Count = g.Count()
+        })
+        .OrderByDescending(item => item.Count)
+        .ThenBy(item => item.Brand)
+        .Take(top)
+        .ToListAsync(cancellationToken);
+}
+```
+
+
+
+### 6. 实现完整的 AdminStatsService 业务
+
+在前面的最小 Aggregate 查询基础上，接下来补齐剩余指标。开始实现之前，先解决 UTC 时间边界和时间序列补零两个问题。
+
+#### 6.1 UTC 边界问题
+
+月度指标和趋势查询都依赖“当前时间”：
+
+```c#
+var nowUtc = DateTime.UtcNow;
+```
+
+在service中直接这样写，运行时没有问题，但测试很难固定“现在”。比如要测试：
+
+```
+当前时间是 2026-08-01 00:00:00 UTC
+```
+
+如果代码内部直接读取系统时钟，测试无法控制这个值，只能依赖实际日期。
+
+.NET 提供了：
+
+```
+TimeProvider
+```
+
+它把“取得当前时间”抽象成一个依赖：
+
+```
+生产环境 → TimeProvider.System
+测试环境 → 固定时间的 FakeTimeProvider
+```
+
+这不是为了抽象而抽象，而是为了解决 UTC 边界无法稳定测试的问题。
+
+这样我们得到此刻时间如下：
+
+```c#
+var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+```
+
+#### 6.2 时间序列如何补齐？
+
+现在的查询逻辑是 `GroupBy`——**它只会返回"有数据的那些天"**。
+
+```
+假设近 30 天里，只有第 1 天、第 5 天、第 10 天创建了新车：
+GroupBy 的结果：[{Date: "第1天", Count: 3}, {Date: "第5天", Count: 1}, {Date: "第10天", Count: 2}]
+
+第2、3、4、6、7、8、9天完全不在结果里（不是 Count=0，而是压根没有这一行）
+```
+
+对折线图来说，这是个真实问题：
+
+```
+Recharts 拿到这个不连续的数组，X 轴会怎么显示？
+→ 数据点之间的间距不是按真实天数算的，而是按数组里"第几个元素"算的
+→ 图表看起来会是"数据点均匀分布"，但实际上第1天到第5天中间空了3天没有画出来
+→ 视觉上完全无法看出"这段时间是真的没有新车，还是查询漏掉了"
+```
+
+折线图需要一条连续的时间轴，每一天都要有对应的值（哪怕是0），这样才能正确反映"哪几天是真的没有活动"。
+
+#### 6.3 实现 `AdminStatsService` 业务逻辑
+
+先在 `Program.cs` 注册系统时钟：
+
+```c#
+builder.Services.AddSingleton<TimeProvider>(TimeProvider.System);
+```
+
+实现基础逻辑
+
+```c#
+public class AdminStatsService
+{
+    private readonly IAdminStatsRepository _adminStatsRepository;
+    private readonly TimeProvider _timeProvider;
+
+    public AdminStatsService(IAdminStatsRepository adminStatsRepository, TimeProvider timeProvider)
+    {
+        _adminStatsRepository = adminStatsRepository;
+        _timeProvider = timeProvider;
+    }
+
+    public async Task<AdminStatsResponse> GetStatsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        // 获取当前时间戳
+        var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+
+        // ── 核心指标 ─────────────────────────────────────────────
+        var totalCars = await _adminStatsRepository.GetTotalCarsAsync(cancellationToken);
+        var pendingCars = await _adminStatsRepository.GetPendingCarsAsync(cancellationToken);
+        var publishedCars = await _adminStatsRepository.GetPublishedCarsAsync(cancellationToken);
+        var totalUsers = await _adminStatsRepository.GetTotalUsersAsync(cancellationToken);
+
+        // 当前月份的第一天
+        var startOfMonth = new DateTime(nowUtc.Year, nowUtc.Month, 1, 0, 0, 0, DateTimeKind.Utc);
+
+        var monthlyOrders = await _adminStatsRepository.GetMonthlyOrdersAsync(startOfMonth, cancellationToken);
+        var monthlyRevenue =
+            await _adminStatsRepository.GetMonthlyRevenueAsync(startOfMonth, cancellationToken);
+
+        // ── 趋势数据 ─────────────────────────────────────────────
+        var todayUtc = DateOnly.FromDateTime(nowUtc);
+        var dailyFrom = todayUtc
+            .AddDays(-29)
+            .ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
+        var dailyTo = todayUtc
+            .AddDays(1)
+            .ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
+
+        var dailyNewCars = await _adminStatsRepository.GetDailyNewCarsAsync(dailyFrom, dailyTo, cancellationToken);
+        var dailyRevenue = await _adminStatsRepository.GetDailyRevenueAsync(dailyFrom, dailyTo, cancellationToken);
+
+        // ── 品牌分布 ─────────────────────────────────────────────
+        var brandDistribution = await _adminStatsRepository.GetBrandDistributionAsync(10, cancellationToken);
+
+        return new AdminStatsResponse
+        {
+            TotalCars = totalCars,
+            PendingCars = pendingCars,
+            PublishedCars = publishedCars,
+            TotalUsers = totalUsers,
+            MonthlyOrders = monthlyOrders,
+            MonthlyRevenue = monthlyRevenue,
+            DailyNewCars = dailyNewCars,
+            DailyRevenue = dailyRevenue,
+            BrandDistribution = brandDistribution
+        };
+    }
+}
+```
+
+**查询数据补零**
+
+补零应该紧跟在 Repository 查询之后、组装最终 `AdminStatsResponse` 之前完成。在 `AdminStatsService.cs` 里加两个辅助方法，对 `dailyNewCars` 和 `dailyRevenue` 分别做补零。
+
+先明确日期窗口的定义：**近30天，包含今天，一共30个自然日**。
+
+定义辅助方法：
+
+```c#
+private static List<DailyCountDto> FillMissingDailyNewCars(
+    DateTime dailyFrom,
+    DateTime dailyTo,
+    List<DailyCountDto> dailyNewCarsFromDatabase)
+{
+    // 将数据库实际返回的“日期 → 新增车辆数”转换为便于按日期查找的结构。
+    // Repository 已经按日期 GroupBy，因此每个日期只会有一条记录。
+    var countByDate = dailyNewCarsFromDatabase.ToDictionary(
+        item => item.Date,
+        item => item.Count);
+
+    // 最终返回给前端的完整 30 天序列。
+    var completedDailyNewCars = new List<DailyCountDto>();
+
+    // dailyFrom 是包含边界，dailyTo 是不包含边界；
+    // 每次循环处理一个 UTC 日期，直到 dailyTo 前一天。
+    for (
+        var currentDateTime = dailyFrom;
+        currentDateTime < dailyTo;
+        currentDateTime = currentDateTime.AddDays(1))
+    {
+        var currentDate = DateOnly.FromDateTime(currentDateTime);
+
+        completedDailyNewCars.Add(new DailyCountDto
+        {
+            Date = currentDate,
+
+            // 数据库有当天记录时使用真实数量；
+            // 没有记录时补 0，确保图表时间轴连续。
+            Count = countByDate.GetValueOrDefault(currentDate, 0)
+        });
+    }
+
+    return completedDailyNewCars;
+}
+
+private static List<DailyRevenueDto> FillMissingDailyRevenue(
+    DateTime dailyFrom,
+    DateTime dailyTo,
+    List<DailyRevenueDto> dailyRevenueFromDatabase)
+{
+    // 将数据库实际返回的“日期 → 当日成交额”转换为按日期查找的结构。
+    var revenueByDate = dailyRevenueFromDatabase.ToDictionary(
+        item => item.Date,
+        item => item.Revenue);
+
+    // 最终返回给前端的完整 30 天序列。
+    var completedDailyRevenue = new List<DailyRevenueDto>();
+
+    // 与 Repository 使用相同的 [dailyFrom, dailyTo) UTC 时间范围。
+    for (
+        var currentDateTime = dailyFrom;
+        currentDateTime < dailyTo;
+        currentDateTime = currentDateTime.AddDays(1))
+    {
+        var currentDate = DateOnly.FromDateTime(currentDateTime);
+
+        completedDailyRevenue.Add(new DailyRevenueDto
+        {
+            Date = currentDate,
+
+            // 数据库没有当天成交订单时，成交额应为 0。
+            Revenue = revenueByDate.GetValueOrDefault(currentDate, 0m)
+        });
+    }
+
+    return completedDailyRevenue;
+}
+```
+
+使用补零复杂方法实现完整的逻辑
+
+```c#
+public class AdminStatsService
+{
+    private readonly IAdminStatsRepository _adminStatsRepository;
+    private readonly TimeProvider _timeProvider;
+
+    public AdminStatsService(IAdminStatsRepository adminStatsRepository, TimeProvider timeProvider)
+    {
+        _adminStatsRepository = adminStatsRepository;
+        _timeProvider = timeProvider;
+    }
+
+    public async Task<AdminStatsResponse> GetStatsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        // 获取当前时间戳
+        var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+
+        // ── 核心指标 ─────────────────────────────────────────────
+        var totalCars = await _adminStatsRepository.GetTotalCarsAsync(cancellationToken);
+        var pendingCars = await _adminStatsRepository.GetPendingCarsAsync(cancellationToken);
+        var publishedCars = await _adminStatsRepository.GetPublishedCarsAsync(cancellationToken);
+        var totalUsers = await _adminStatsRepository.GetTotalUsersAsync(cancellationToken);
+
+        // 当前月份的第一天
+        var startOfMonth = new DateTime(nowUtc.Year, nowUtc.Month, 1, 0, 0, 0, DateTimeKind.Utc);
+
+        var monthlyOrders = await _adminStatsRepository.GetMonthlyOrdersAsync(startOfMonth, cancellationToken);
+        var monthlyRevenue =
+            await _adminStatsRepository.GetMonthlyRevenueAsync(startOfMonth, cancellationToken);
+
+        // ── 趋势数据 ─────────────────────────────────────────────
+        var todayUtc = DateOnly.FromDateTime(nowUtc);
+        var dailyFrom = todayUtc
+            .AddDays(-29)
+            .ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
+        var dailyTo = todayUtc
+            .AddDays(1)
+            .ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
+
+        var dailyNewCars = await _adminStatsRepository.GetDailyNewCarsAsync(dailyFrom, dailyTo, cancellationToken);
+        var dailyRevenue = await _adminStatsRepository.GetDailyRevenueAsync(dailyFrom, dailyTo, cancellationToken);
+
+
+        // ── 品牌分布 ─────────────────────────────────────────────
+        var brandDistribution = await _adminStatsRepository.GetBrandDistributionAsync(10, cancellationToken);
+
+        return new AdminStatsResponse
+        {
+            TotalCars = totalCars,
+            PendingCars = pendingCars,
+            PublishedCars = publishedCars,
+            TotalUsers = totalUsers,
+            MonthlyOrders = monthlyOrders,
+            MonthlyRevenue = monthlyRevenue,
+            DailyNewCars = FillMissingDailyNewCars(dailyFrom, dailyTo, dailyNewCars),
+            DailyRevenue = FillMissingDailyRevenue(dailyFrom, dailyTo, dailyRevenue),
+            BrandDistribution = brandDistribution
+        };
+    }
+
+    // ── 补零辅助方法 ─────────────────────────────────────────────
+    ...
+}
+```
+
+controller不用做修改，继续使用现有的接口。使用 Scalar 或 Postman 进行简单测试：
+
+```json
+{
+    "success": true,
+    "data": {
+        "totalCars": 41,
+        "pendingCars": 0,
+        "publishedCars": 27,
+        "totalUsers": 40,
+        "monthlyOrders": 2,
+        "monthlyRevenue": 12000.00,
+        "dailyNewCars": [
+            {
+                "date": "2026-07-27",
+                "count": 0
+            },
+            ...省略， 总共30个
+            {
+                "date": "2026-08-25",
+                "count": 0
+            }
+        ],
+        "dailyRevenue": [
+            {
+                "date": "2026-07-27",
+                "revenue": 0
+            },
+            ...省略， 总共30个
+            {
+                "date": "2026-08-25",
+                "revenue": 0
+            }
+        ],
+        "brandDistribution": [
+            {
+                "brand": "Toyota",
+                "count": 8
+            },
+            {
+                "brand": "Honda",
+                "count": 7
+            },
+            {
+                "brand": "MAZDA",
+                "count": 7
+            },
+            {
+                "brand": "Nissan",
+                "count": 5
+            },
+            {
+                "brand": "BMW",
+                "count": 2
+            },
+            {
+                "brand": "Ford",
+                "count": 2
+            },
+            {
+                "brand": "Hyundai",
+                "count": 2
+            },
+            {
+                "brand": "Subaru",
+                "count": 2
+            },
+            {
+                "brand": "HHH",
+                "count": 1
+            },
+            {
+                "brand": "Kia",
+                "count": 1
+            }
+        ]
+    },
+    "message": null,
+    "errors": null
+}
+```
+
+
+
+### 7. 优化：加入缓存策略
+
+Dashboard 查询不是一条 SQL。一次请求需要：
+
+- 基础 Count；
+- 月订单 Count；
+- 月收入 Sum；
+- 每日车辆 GroupBy；
+- 每日收入 GroupBy；
+- 品牌 GroupBy。
+
+这些查询远比读取一条车辆详情昂贵。
+
+但 Dashboard 数据也不要求每一秒绝对实时。Admin 能接受：
+
+```
+最多延迟 5 分钟
+```
+
+因此适合缓存整个 `AdminStatsResponse`：
+
+```
+第一次请求
+→ 查询数据库
+→ 组合 DTO
+→ 写入 Redis
+
+5 分钟内再次请求
+→ 直接返回 Redis DTO
+→ 不执行统计 SQL
+```
+
+当前 `/admin/stats` 一次请求会执行：
+
+```
+4 个核心 Count
++ 2 个月度聚合
++ 2 个每日 GroupBy
++ 1 个品牌 GroupBy
+= 9 条数据库查询
+```
+
+这些结果总是一起展示，最合理的缓存粒度是“完整的 `AdminStatsResponse`”，而不是为每个数字建立一个 key。
+
+#### 7.1 缓存策略
+
+```
+缓存 key：admin:stats
+缓存内容：完整 AdminStatsResponse
+TTL：5 分钟
+模式：Cache-Aside
+```
+
+请求流程：
+
+```
+GET /admin/stats
+    ↓
+Redis 是否有 admin:stats？
+    ├─ 有 → 反序列化并直接返回，不执行 9 条查询
+    └─ 没有 → 执行现有统计逻辑 → Redis 保存 5 分钟 → 返回结果
+```
+
+这里使用一个固定 key 是正确的，因为该 API 没有分页、筛选条件或用户私有数据；所有 Admin 看到的是同一份平台总览。
+
+#### 7.2 不做主动失效
+
+本步骤应采用“5 分钟 TTL 自然过期”，不在车辆、订单、注册等每一个写操作后主动删除 `admin:stats`。
+
+原因是这份 Dashboard 本来就定义为短期缓存数据，允许最多五分钟延迟。若现在加入主动失效，需要修改多个业务 Service：
+
+```
+CarService
+AdminCarService
+OrderService
+UserService
+```
+
+还要逐一判断每种状态变更是否影响哪些统计，复杂度会突然升高。
+
+因此本步骤的资料一致性定义为：
+
+```
+Dashboard 最多显示五分钟前的数据。
+五分钟后，下一个请求自动重新聚合。
+```
+
+如果未来产品要求“管理员审核通过后卡片必须立刻变化”，再单独做主动失效步骤。
+
+#### 7.3 新增统一缓存 Key
+
+在 `UUcars.API/Services/Cache/CacheKeys.cs` 的 `CacheKeys` 类中加入：
+
+```c#
+// Admin Dashboard 的完整统计数据。
+// 此接口没有分页或筛选参数，因此所有 Admin 共用一个固定 Key。
+public const string AdminStats = "admin:stats";
+```
+
+这里不需要 `Prefix`，因为只有一个 Dashboard 结果，没有 `page1`、`page2` 这类需要批量删除的 key。
+
+#### 7.4 在 Service 中加入缓存
+
+```c#
+public class AdminStatsService
+{
+    private readonly IAdminStatsRepository _adminStatsRepository;
+    private readonly TimeProvider _timeProvider;
+    private readonly ICacheService _cache;
+
+    public AdminStatsService(IAdminStatsRepository adminStatsRepository, TimeProvider timeProvider, ICacheService cache)
+    {
+        _adminStatsRepository = adminStatsRepository;
+        _timeProvider = timeProvider;
+        _cache = cache;
+    }
+
+    public async Task<AdminStatsResponse> GetStatsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        // Dashboard 没有分页、筛选或用户私有数据，
+        // 因此所有 Admin 共用同一个统计缓存 Key。
+        var cacheKey = CacheKeys.AdminStats;
+
+        // 缓存命中：直接返回 Redis 中的 AdminStatsResponse。
+        // 缓存未命中：才执行下面 lambda 内的完整统计逻辑。
+        return await _cache.GetOrSetAsync(cacheKey, async () =>
+        {
+            // 获取当前 UTC 时间。它放在 lambda 内，
+            // 只有真的需要重新查询统计数据时才会计算时间边界。
+            var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+
+            // ── 核心指标 ─────────────────────────────────────────────
+            ...
+
+            // ── 趋势数据 ─────────────────────────────────────────────
+            ...
+
+            // ── 品牌分布 ─────────────────────────────────────────────
+            ...
+        }, TimeSpan.FromMinutes(5), cancellationToken);
+    }
+
+    // ── 补零辅助方法 ─────────────────────────────────────────────
+    ...
+}
+```
+
+终端项目根目录中，手动验证是否配置成功
+
+```bash
+docker exec uucars-redis redis-cli --scan --pattern 'uucars:admin:stats'
+```
+
+预计输出
+
+```bash
+uucars:admin:stats
+```
+
+### 8. 后端测试
+
+`GET /admin/stats` 的风险主要来自三部分：
+
+```
+时间边界是否正确；
+真实 SQL 聚合是否正确；
+非 Admin 是否被拒绝。
+```
+
+缓存可以通过真实 Redis 手动验证：
+
+```
+第一次请求：Cache MISS + SQL 查询
+第二次请求：Cache HIT + 无 SQL 查询
+```
+
+因此自动化测试不再重复 Redis 行为。现有 `SqlServerTestFactory` 也会用 `FakeCacheService` 替换真实 Redis，确保集成测试不依赖本地缓存服务。
+
+本步骤只新增三项测试：
+
+```
+1. Service 单元测试：
+   固定 UTC 时间，验证近 30 天范围和补零。
+
+2. API 集成测试：
+   使用真实 SQL Server，验证 Deleted 排除、月度统计、每日成交额和 Top 10 品牌。
+
+3. API 集成测试：
+   验证普通用户访问 GET /admin/stats 得到 403。
+```
+
+不测试：
+
+```
+DTO 属性
+Controller 的简单转发
+Redis 序列化
+CacheKey 字符串
+每一个 CountAsync 的独立实现
+```
+
+#### 8.1 Service 单元测试
+
+新建 `FakeAdminStatsRepository`, 使用fake Repository 来隔离数据库
+
+```c#
+public class FakeAdminStatsRepository : IAdminStatsRepository
+{
+    public AdminStatsResponse Stats { get; set; } = new();
+
+    // ── IAdminStatsRepository 实现 ─────────────────────────────
+    public Task<int> GetTotalCarsAsync(CancellationToken cancellationToken = default)
+    {
+        return Task.FromResult(Stats.TotalCars);
+    }
+
+    public Task<int> GetPendingCarsAsync(CancellationToken cancellationToken = default)
+    {
+        return Task.FromResult(Stats.PendingCars);
+    }
+
+    public Task<int> GetPublishedCarsAsync(CancellationToken cancellationToken = default)
+    {
+        return Task.FromResult(Stats.PublishedCars);
+    }
+
+    public Task<int> GetTotalUsersAsync(CancellationToken cancellationToken = default)
+    {
+        return Task.FromResult(Stats.TotalUsers);
+    }
+
+    public Task<int> GetMonthlyOrdersAsync(DateTime startOfMonth, CancellationToken cancellationToken = default)
+    {
+        return Task.FromResult(Stats.MonthlyOrders);
+    }
+
+    public Task<decimal> GetMonthlyRevenueAsync(DateTime startOfMonth,
+        CancellationToken cancellationToken = default)
+    {
+        return Task.FromResult(Stats.MonthlyRevenue);
+    }
+
+    public Task<List<DailyCountDto>> GetDailyNewCarsAsync(DateTime dailyFrom, DateTime dailyTo,
+        CancellationToken cancellationToken = default)
+    {
+        return Task.FromResult(Stats.DailyNewCars);
+    }
+
+    public Task<List<DailyRevenueDto>> GetDailyRevenueAsync(DateTime dailyFrom, DateTime dailyTo,
+        CancellationToken cancellationToken = default)
+    {
+        return Task.FromResult(Stats.DailyRevenue);
+    }
+
+    public Task<List<BrandCountDto>> GetBrandDistributionAsync(int top,
+        CancellationToken cancellationToken = default)
+    {
+        return Task.FromResult(Stats.BrandDistribution);
+    }
+}
+```
+
+实现单元测试逻辑，新建`AdminStatsServiceTests`
+
+```c#
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Services;
+using UUcars.Tests.Fakes;
+
+namespace UUcars.Tests.Services;
+
+public class AdminStatsServiceTests
+{
+    // 和现有 CarServiceTests、OrderServiceTests 保持相同结构：
+    // 统一在辅助方法中创建被测试的 Service。
+    private static AdminStatsService CreateService(
+        FakeAdminStatsRepository repository,
+        TimeProvider? timeProvider = null)
+    {
+        return new AdminStatsService(
+            repository,
+            timeProvider ?? TimeProvider.System,
+            new FakeCacheService());
+    }
+
+    [Fact]
+    public async Task GetStatsAsync_ShouldFillMissingDaysForLastThirtyDays()
+    {
+        // Arrange
+        var repository = new FakeAdminStatsRepository
+        {
+            Stats = new AdminStatsResponse
+            {
+                DailyNewCars =
+                [
+                    new DailyCountDto
+                    {
+                        Date = new DateOnly(2026, 7, 30),
+                        Count = 2
+                    },
+                    new DailyCountDto
+                    {
+                        Date = new DateOnly(2026, 8, 28),
+                        Count = 1
+                    }
+                ],
+                DailyRevenue =
+                [
+                    new DailyRevenueDto
+                    {
+                        Date = new DateOnly(2026, 8, 27),
+                        Revenue = 12000m
+                    }
+                ]
+            }
+        };
+
+        // 固定“当前时间”，避免测试结果随着真实日期变化。
+        var timeProvider = new FixedTimeProvider(
+            new DateTimeOffset(
+                2026, 8, 28,
+                12, 0, 0,
+                TimeSpan.Zero));
+
+        var service = CreateService(repository, timeProvider);
+
+
+        // Act
+        var result = await service.GetStatsAsync();
+
+        // Assert：近 30 天必须正好返回 30 项
+        Assert.Equal(30, result.DailyNewCars.Count);
+        Assert.Equal(30, result.DailyRevenue.Count);
+
+        // Assert：包含今天，从 29 天前开始
+        Assert.Equal(
+            new DateOnly(2026, 7, 30),
+            result.DailyNewCars[0].Date);
+
+        Assert.Equal(
+            new DateOnly(2026, 8, 28),
+            result.DailyNewCars[^1].Date);
+
+        // Assert：数据库已有的数据保留原值
+        Assert.Equal(
+            2,
+            result.DailyNewCars.Single(item => item.Date == new DateOnly(2026, 7, 30)).Count);
+
+        Assert.Equal(
+            1,
+            result.DailyNewCars.Single(item => item.Date == new DateOnly(2026, 8, 28)).Count);
+
+        Assert.Equal(
+            12000m,
+            result.DailyRevenue.Single(item => item.Date == new DateOnly(2026, 8, 27)).Revenue);
+
+        // Assert：数据库没有返回的日期补 0
+        Assert.Equal(
+            0,
+            result.DailyNewCars.Single(item => item.Date == new DateOnly(2026, 7, 31)).Count);
+
+        Assert.Equal(
+            0m,
+            result.DailyRevenue.Single(item => item.Date == new DateOnly(2026, 7, 31)).Revenue);
+    }
+}
+
+// TimeProvider.System 会读取运行测试时的真实时间。
+// 这个测试替代实现只返回构造时传入的固定 UTC 时间。
+internal class FixedTimeProvider : TimeProvider
+{
+    private readonly DateTimeOffset _utcNow;
+
+    public FixedTimeProvider(DateTimeOffset utcNow)
+    {
+        _utcNow = utcNow;
+    }
+
+    public override DateTimeOffset GetUtcNow()
+    {
+        return _utcNow;
+    }
+}
+```
+
+#### 8.2 集成测试
+
+这个测试集中验证同一个目标：
+
+```
+真实数据库中的统计数据
+经过完整 HTTP 请求后
+是否形成正确的 AdminStatsResponse
+普通用户权限测试
+```
+
+在 `CoreFlowIntegrationTests` 类中加入Admin 统计集成测试的逻辑
+
+```c#
+// ===== Admin Dashboard =====
+
+[Fact]
+public async Task GetAdminStats_AsAdmin_ShouldReturnCorrectStatistics()
+{
+    // Arrange
+    var nowUtc = DateTime.UtcNow;
+    var todayUtc = nowUtc.Date;
+
+    var startOfMonth = new DateTime(
+        nowUtc.Year,
+        nowUtc.Month,
+        1,
+        0, 0, 0,
+        DateTimeKind.Utc);
+
+    var startOfNextMonth = startOfMonth.AddMonths(1);
+
+    await using var db = Factory.GetDbContext();
+
+    var seller = new User
+    {
+        Username = "stats-seller",
+        Email = "stats-seller@example.com",
+        PasswordHash = "test-hash",
+        Role = UserRole.User,
+        EmailConfirmed = true,
+        CreatedAt = nowUtc,
+        UpdatedAt = nowUtc
+    };
+
+    var buyer = new User
+    {
+        Username = "stats-buyer",
+        Email = "stats-buyer@example.com",
+        PasswordHash = "test-hash",
+        Role = UserRole.User,
+        EmailConfirmed = true,
+        CreatedAt = nowUtc,
+        UpdatedAt = nowUtc
+    };
+
+    db.Users.AddRange(seller, buyer);
+    await db.SaveChangesAsync();
+
+    // Published + Sold 共 11 个品牌。
+    // Toyota 有 3 辆，其余品牌各 1 辆。
+    // Top 10 排序后，ZzzTestBrand 应被排除。
+    var marketCarDefinitions = new (string Brand, CarStatus Status)[]
+    {
+        ("Toyota", CarStatus.Published),
+        ("Toyota", CarStatus.Published),
+        ("Toyota", CarStatus.Sold),
+        ("Mazda", CarStatus.Published),
+        ("Honda", CarStatus.Published),
+        ("Ford", CarStatus.Published),
+        ("BMW", CarStatus.Published),
+        ("Audi", CarStatus.Published),
+        ("Nissan", CarStatus.Published),
+        ("Hyundai", CarStatus.Published),
+        ("Kia", CarStatus.Published),
+        ("Suzuki", CarStatus.Published),
+        ("ZzzTestBrand", CarStatus.Published)
+    };
+
+    var marketCars = marketCarDefinitions
+        .Select((item, index) => new Car
+        {
+            Title = $"{item.Brand} test car {index + 1}",
+            Brand = item.Brand,
+            Model = "Test Model",
+            Year = 2020,
+            Price = 10000m,
+            Mileage = 50000,
+            SellerId = seller.Id,
+            Status = item.Status,
+            CreatedAt = nowUtc,
+            UpdatedAt = nowUtc
+        })
+        .ToList();
+
+    var pendingCar = new Car
+    {
+        Title = "Pending test car",
+        Brand = "PendingBrand",
+        Model = "Test Model",
+        Year = 2020,
+        Price = 10000m,
+        Mileage = 50000,
+        SellerId = seller.Id,
+        Status = CarStatus.PendingReview,
+        CreatedAt = nowUtc,
+        UpdatedAt = nowUtc
+    };
+
+    var draftCar = new Car
+    {
+        Title = "Draft test car",
+        Brand = "DraftBrand",
+        Model = "Test Model",
+        Year = 2020,
+        Price = 10000m,
+        Mileage = 50000,
+        SellerId = seller.Id,
+        Status = CarStatus.Draft,
+        CreatedAt = nowUtc,
+        UpdatedAt = nowUtc
+    };
+
+    var deletedCar = new Car
+    {
+        Title = "Deleted test car",
+        Brand = "DeletedBrand",
+        Model = "Test Model",
+        Year = 2020,
+        Price = 10000m,
+        Mileage = 50000,
+        SellerId = seller.Id,
+        Status = CarStatus.Deleted,
+        CreatedAt = nowUtc,
+        UpdatedAt = nowUtc
+    };
+
+    db.Cars.AddRange(marketCars);
+    db.Cars.AddRange(pendingCar, draftCar, deletedCar);
+    await db.SaveChangesAsync();
+
+    var soldCar = marketCars.Single(
+        car => car.Status == CarStatus.Sold);
+
+    db.Orders.AddRange(
+        // 本月第一刻创建：计入 monthlyOrders。
+        // 本月完成：计入 monthlyRevenue。
+        new Order
+        {
+            CarId = soldCar.Id,
+            BuyerId = buyer.Id,
+            SellerId = seller.Id,
+            Price = 10000m,
+            Status = OrderStatus.Completed,
+            CreatedAt = startOfMonth,
+            UpdatedAt = nowUtc
+        },
+
+        // Pending 订单计入 monthlyOrders，
+        // 但不计入 monthlyRevenue。
+        new Order
+        {
+            CarId = soldCar.Id,
+            BuyerId = buyer.Id,
+            SellerId = seller.Id,
+            Price = 5000m,
+            Status = OrderStatus.Pending,
+            CreatedAt = startOfMonth,
+            UpdatedAt = nowUtc
+        },
+
+        // 上月创建，不计入 monthlyOrders；
+        // 本月完成，所以计入 monthlyRevenue。
+        new Order
+        {
+            CarId = soldCar.Id,
+            BuyerId = buyer.Id,
+            SellerId = seller.Id,
+            Price = 20000m,
+            Status = OrderStatus.Completed,
+            CreatedAt = startOfMonth.AddTicks(-1),
+            UpdatedAt = nowUtc
+        },
+
+        // 下月第一刻创建并完成，
+        // 不进入当前月份的订单量和成交额。
+        new Order
+        {
+            CarId = soldCar.Id,
+            BuyerId = buyer.Id,
+            SellerId = seller.Id,
+            Price = 40000m,
+            Status = OrderStatus.Completed,
+            CreatedAt = startOfNextMonth,
+            UpdatedAt = startOfNextMonth
+        });
+
+    await db.SaveChangesAsync();
+
+    // 使用测试数据库中已经存在的 Admin 登录
+    var loginResponse = await Client.PostAsync(
+        "/auth/login",
+        JsonContent(new
+        {
+            email = "admin@uucars.com",
+            password = "Admin@123456"
+        }));
+
+    var adminToken =
+        (await DeserializeAsync<ApiResponse<LoginData>>(loginResponse))
+        ?.Data?.Token;
+
+    SetBearerToken(adminToken!);
+
+    // Act
+    var response = await Client.GetAsync("/admin/stats");
+
+    // Assert
+    Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+    var result =
+        await DeserializeAsync<ApiResponse<AdminStatsResponse>>(response);
+
+    Assert.NotNull(result);
+    Assert.True(result.Success);
+    Assert.NotNull(result.Data);
+
+    var stats = result.Data;
+
+    // 13 辆 Published/Sold + Pending + Draft；
+    // Deleted 不计入 totalCars。
+    Assert.Equal(15, stats.TotalCars);
+    Assert.Equal(1, stats.PendingCars);
+    Assert.Equal(12, stats.PublishedCars);
+
+    // 测试数据库保留 1 个 Admin，再加入 seller 和 buyer。
+    Assert.Equal(3, stats.TotalUsers);
+
+    // 当前月创建了 2 个订单；
+    // 当前月完成金额为 10000 + 20000。
+    Assert.Equal(2, stats.MonthlyOrders);
+    Assert.Equal(30000m, stats.MonthlyRevenue);
+
+    // Service 应返回连续的最近 30 个 UTC 日期。
+    Assert.Equal(30, stats.DailyNewCars.Count);
+    Assert.Equal(30, stats.DailyRevenue.Count);
+    Assert.Equal(
+        DateOnly.FromDateTime(todayUtc.AddDays(-29)),
+        stats.DailyNewCars[0].Date);
+    Assert.Equal(
+        DateOnly.FromDateTime(todayUtc),
+        stats.DailyNewCars[^1].Date);
+
+    // 所有 16 辆车都在今天创建。
+    // dailyNewCars 记录创建事件，因此 Deleted 也包含在内。
+    Assert.Equal(
+        16,
+        stats.DailyNewCars.Single(
+            item => item.Date == DateOnly.FromDateTime(todayUtc)).Count);
+
+    // 两个 Completed 订单在今天完成。
+    Assert.Equal(
+        30000m,
+        stats.DailyRevenue.Single(
+            item => item.Date == DateOnly.FromDateTime(todayUtc)).Revenue);
+
+    // 品牌只返回前 10。
+    Assert.Equal(10, stats.BrandDistribution.Count);
+    Assert.Equal("Toyota", stats.BrandDistribution[0].Brand);
+    Assert.Equal(3, stats.BrandDistribution[0].Count);
+    Assert.DoesNotContain(
+        stats.BrandDistribution,
+        item => item.Brand == "ZzzTestBrand");
+}
+```
+
+普通用户权限测试， 继续在 `CoreFlowIntegrationTests` 中加入：
+
+```c#
+[Fact]
+public async Task GetAdminStats_WithNonAdminToken_ShouldReturn403()
+{
+    // Arrange
+    var userToken = await RegisterAndLoginAsync(
+        "stats-user@example.com",
+        "stats-user");
+
+    SetBearerToken(userToken);
+
+    // Act
+    var response = await Client.GetAsync("/admin/stats");
+
+    // Assert
+    Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+}
+```
+
+运行测试
+
+```bash
+dotnet build
+dotnet test --filter AdminStats
+dotnet test
+```
+
+
+
+### 9. 前端请求数据
+
+现在完成前端请求数据的逻辑，包括路由跳转、HTTP 请求和响应数据接收。
+
+#### 9.1 新建 AdminDashboardPage 组件
+
+先新建一个简单的 `AdminDashboardPage` 页面，用来确认路由能够正常渲染：
+
+```tsx
+function AdminDashboardPage() {
+  return <div>AdminDashboardPage</div>;
+}
+
+export default AdminDashboardPage;
+
+```
+
+#### 9.2 配置跳转路由
+
+当前 `router.tsx` 里 Admin 路由的 index 渲染的是 `AdminPendingPage`， 需要新增一个 `/admin/dashboard` 子路由，并把 index 改为指向 Dashboard。
+
+```ts
+// 新增 import
+import AdminDashboardPage from "@/pages/AdminDashboardPage";
+
+// Admin 路由更新
+{
+  element: <AdminRoute />,
+  children: [
+    {
+      path: "/admin",
+      element: withEB(<AdminPage />),
+      children: [
+          {
+            index: true,
+            element: <Navigate to="dashboard" replace />,
+          },
+          { path: "dashboard", element: withEB(<AdminDashboardPage />) },
+          { path: "pending", element: withEB(<AdminPendingPage />) },
+        ],
+    },
+  ],
+},
+```
+
+#### 9.3 更新 AdminPage 导航
+
+打开 `src/pages/AdminPage.tsx`，在 Pending Review 的导航链接之前加入 Dashboard 链接, 用来点击跳转页面
+
+```tsx
+// src/pages/AdminPage.tsx
+import { NavLink, Outlet } from "react-router-dom";
+import { ClipboardList, LayoutDashboard } from "lucide-react";
+
+const tabs = [
+  { to: "/admin/dashboard", label: "Dashboard", icon: LayoutDashboard },
+  { to: "/admin/pending", label: "Pending Review", icon: ClipboardList },
+];
+
+export default function AdminPage() {
+  return (
+    <div className="space-y-6">
+      ...
+    </div>
+  );
+}
+
+```
+
+#### 9.4 编写前端 API 接口
+
+先建立与后端一致的 TypeScript contract。 新建 `uucars-web/src/types/admin.ts`：
+
+```ts
+export interface DailyCarStat {
+  date: string;
+  count: number;
+}
+
+export interface DailyRevenueStat {
+  date: string;
+  revenue: number;
+}
+
+export interface BrandDistribution {
+  brand: string;
+  count: number;
+}
+
+export interface AdminStats {
+  totalCars: number;
+  pendingCars: number;
+  publishedCars: number;
+  totalUsers: number;
+  monthlyOrders: number;
+  monthlyRevenue: number;
+  dailyNewCars: DailyCarStat[];
+  dailyRevenue: DailyRevenueStat[];
+  brandDistribution: BrandDistribution[];
+}
+
+export interface AuditLog {
+  id: number;
+  adminId: number;
+  adminUsername: string;
+  action: string;
+  entityType: string;
+  entityId: number;
+  detail: string | null;
+  createdAt: string;
+}
+```
+
+在 `uucars-web/src/types/index.ts` 中统一导出
+
+```ts
+export * from "./admin";
+```
+
+> 为什么日期在 C# 是 `DateOnly`，TypeScript 还是 `string`？
+>
+> TypeScript 运行时没有 `DateOnly`。HTTP JSON 传输的是：
+>
+> ```
+> "2026-08-08"
+> ```
+>
+> 因此前端类型应该诚实表示传输格式，而不是假装 Axios 自动把它变成 `Date`。
+
+扩展 `adminApi`, 修改 `uucars-web/src/api/admin.ts` ，在现有 pending/approve/reject/delete 基础上新增：
+
+```ts
+getStats: async (): Promise<AdminStats> => {
+  const response =
+    await apiClient.get<ApiResponse<AdminStats>>("/admin/stats");
+
+  return response.data.data!;
+},
+
+getAuditLogs: async (
+  page = 1,
+  pageSize = 10,
+): Promise<PagedResponse<AuditLog>> => {
+  const response =
+    await apiClient.get<ApiResponse<PagedResponse<AuditLog>>>(
+      "/admin/audit-logs",
+      { params: { page, pageSize } },
+    );
+
+  return response.data.data!;
+},
+```
+
+继续遵守当前 Axios 分工：
+
+```
+apiClient
+  → token 和统一 transport error
+
+adminApi
+  → 具体 endpoint
+  → 解包 response.data.data
+
+页面
+  → 只处理业务数据
+```
+
+页面不应该知道 Axios response 的层级。
+
+#### 9.5 发送 HTTP 请求，拉取数据
+
+在 `AdminDashboardPage` 组件中编写请求数据的逻辑。这里继续使用 TanStack Query。
+
+Dashboard 有两类数据：
+
+```
+Stats
+  → 固定一份
+  → 后端缓存 5 分钟
+
+Audit Logs
+  → 有 page/pageSize
+  → 翻页变化
+```
+
+如果把它们放进同一个 Query：
+
+```
+日志翻页
+→ 整个 Query key 变化
+→ Stats 也重新请求
+```
+
+所以使用两个独立 Query。
+
+Stats：
+
+```
+useQuery({
+  queryKey: ["admin", "stats"],
+  queryFn: adminApi.getStats,
+});
+```
+
+Audit Logs：
+
+```
+useQuery({
+  queryKey: ["admin", "audit-logs", { page, pageSize }],
+  queryFn: () => adminApi.getAuditLogs(page, pageSize),
+});
+```
+
+Query key 表达依赖：
+
+```
+Stats 不依赖 page
+Audit Logs 依赖 page/pageSize
+```
+
+因此日志翻页不会让 Stats Query key 改变。
+
+先使用 `useQuery` 拉取数据，并进行简单渲染：
+
+```tsx
+import { adminApi } from "@/api";
+import { useQuery } from "@tanstack/react-query";
+import { useSearchParams } from "react-router-dom";
+
+const PAGE_SIZE = 10;
+function AdminDashboardPage() {
+  const [searchParams] = useSearchParams();
+  const page = Number(searchParams.get("page") ?? "1");
+
+  // ── 拉取统计数据 ─────────────────────────────────────────
+  const { data: stats } = useQuery({
+    queryKey: ["admin", "stats"],
+    queryFn: () => adminApi.getStats(),
+  });
+
+  // ── 拉取审计日志 ─────────────────────────────────────────
+  const { data: auditLogs } = useQuery({
+    queryKey: ["admin", "audit-logs", { page, pageSize: PAGE_SIZE }],
+    queryFn: () => adminApi.getAuditLogs(page, PAGE_SIZE),
+  });
+
+  return (
+    <div>
+      <h1>AdminDashboardPage</h1>
+      <p>TotalCars: {stats?.totalCars}</p>
+      <ul>
+        {auditLogs?.items.map((i) => (
+          <li key={i.id}>
+            {i.action} - {i.entityId} - {i.createdAt}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+export default AdminDashboardPage;
+
+```
+
+
+
+### 10. Recharts 数据渲染
+
+现在前端已经拿到数据，但仍然只是临时输出，例如：
+
+```
+<p>TotalCars: {stats?.totalCars}</p>
+```
+
+这一节要把数据转换成真正的 Dashboard：
+
+```
+AdminStats
+├── 6 个核心指标 → 统计卡片
+├── dailyNewCars → 每日新增车辆折线图
+├── dailyRevenue → 每日成交额折线图
+└── brandDistribution → 品牌分布饼图
+
+Audit Logs
+└── 表格 + 分页
+```
+
+#### 10.1 Recharts 概述和安装
+
+Recharts 是基于 React 组件的数据可视化库。
+
+不用 Recharts 时，我们需要自己处理：
+
+```
+SVG 坐标
+数据比例
+折线路径
+坐标轴
+Tooltip
+图例
+响应式尺寸
+```
+
+Recharts 把这些能力封装成 React 组件：
+
+```
+<LineChart>
+  <XAxis />
+  <YAxis />
+  <Tooltip />
+  <Line />
+</LineChart>
+```
+
+在本项目中主要使用以下组件：
+
+```
+ResponsiveContainer   根据父容器尺寸调整图表
+LineChart             折线图坐标系统
+Line                  读取数据并绘制折线
+XAxis / YAxis         横轴和纵轴
+CartesianGrid         背景网格
+Tooltip               鼠标悬停时显示数据
+PieChart              饼图容器
+Pie                   绘制品牌扇区
+Legend                图例
+```
+
+`ResponsiveContainer` 会观察父容器尺寸，因此父元素必须具有真实高度。
+
+下面先通过每日新增车辆折线图理解基本的数据映射。
+
+以每日新增车辆折线图 `dailyNewCars` 为例，后端返回：
+
+后端返回：
+
+```
+dailyNewCars: [
+  { date: "2026-08-01", count: 2 },
+  { date: "2026-08-02", count: 0 },
+];
+```
+
+我们需要把数据传给图表：
+
+```
+<LineChart data={stats.dailyNewCars}>
+```
+
+再告诉各组件读取哪个属性：
+
+```
+<XAxis dataKey="date" />
+<Line dataKey="count" />
+```
+
+关系是：
+
+```
+data             → 整个对象数组
+XAxis dataKey    → 横轴读取 date
+Line dataKey     → 折线读取 count
+```
+
+Recharts 的 `LineChart` 官方 API 把数据定义为对象数组，并通过 `dataKey` 选择对象属性。
+
+在饼图中设置各扇区颜色时，当前 Recharts 已经将 `Cell` 标记为 deprecated，并计划在 Recharts 4 删除。因此不再使用 `Cell`，而是把 `fill` 直接加入饼图数据，例如：
+
+```tsx
+const brandChartData = stats.brandDistribution.map((item, index) => ({
+  ...item,
+  fill: PIE_COLORS[index % PIE_COLORS.length],
+}));
+```
+
+安装 Recharts：
+
+```bash
+cd uucars-web
+npm install recharts
+```
+
+不需要安装：
+
+```
+npm install @types/recharts
+```
+
+Recharts 自身已经包含 TypeScript 类型。
+
+#### 10.2 处理 useQuery 响应状态
+
+HTTP 请求不会直接从“没有数据”跳到“成功数据”，而是会经历：
+
+```
+Loading
+Success
+Error
+```
+
+对于数组数据，还可能出现：
+
+```
+Empty
+```
+
+因此，需要处理 `useQuery` 的不同响应状态。
+
+Stats 和 Audit Logs 是两个独立 Query，所以状态也要独立处理。
+
+修改两个 `useQuery` 的解构：
+
+```tsx
+const {
+  data: stats,
+  isLoading: statsIsLoading,
+  error: statsError,
+} = useQuery({
+  queryKey: ["admin", "stats"],
+  queryFn: () => adminApi.getStats(),
+});
+
+const {
+  data: auditLogs,
+  isLoading: auditLogsIsLoading,
+  error: auditLogsError,
+} = useQuery({
+  queryKey: ["admin", "audit-logs", { page, pageSize: PAGE_SIZE }],
+  queryFn: () => adminApi.getAuditLogs(page, PAGE_SIZE),
+});
+```
+
+不能直接在页面顶部写：
+
+```
+if (statsError) {
+  return <div>Failed</div>;
+}
+```
+
+这样 Stats 请求失败时，已经成功取得的 Audit Logs 也会被整个隐藏。
+
+正确结构是让两个区域分别处理自己的状态：
+
+```tsx
+return (
+  <div className="space-y-6">
+    {/* Stats 自己处理 Loading / Error / Success */}
+
+    {/* Audit Logs 自己处理 Loading / Error / Empty / Success */}
+  </div>
+);
+```
+
+##### Stats Loading
+
+项目已经有 `Skeleton`，直接引入使用
+
+```
+import { Skeleton } from "@/components/ui/skeleton";
+```
+
+Stats 加载时先显示六个卡片占位：
+
+```tsx
+{statsIsLoading && (
+  <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+    {Array.from({ length: 6 }).map((_, index) => (
+      <Skeleton key={index} className="h-28" />
+    ))}
+  </div>
+)}
+```
+
+##### Stats Error
+
+```tsx
+{statsError && (
+  <div
+    className="rounded-[var(--radius-lg)] border px-6 py-10 text-center text-sm"
+    style={{
+      color: "var(--color-danger)",
+      borderColor: "var(--color-border)",
+      backgroundColor: "var(--color-surface)",
+    }}
+  >
+    Failed to load dashboard statistics. Please try again.
+  </div>
+)}
+```
+
+##### Stats Success
+
+只有真正获得 `stats` 后才渲染卡片和图表：
+
+```
+{stats && (
+  <>
+    {/* 统计卡片 */}
+    {/* 折线图 */}
+    {/* 饼图 */}
+  </>
+)}
+```
+
+这样不需要使用不安全的：
+
+```
+stats!.totalCars
+```
+
+完整的架构：
+
+```tsx
+import { adminApi } from "@/api";
+import { Card } from "@/components/ui/card";
+import { Skeleton } from "@/components/ui/skeleton";
+import { useQuery } from "@tanstack/react-query";
+import { useSearchParams } from "react-router-dom";
+
+const PAGE_SIZE = 10;
+function AdminDashboardPage() {
+  const [searchParams] = useSearchParams();
+  const page = Number(searchParams.get("page") ?? "1");
+
+  // ── 拉取统计数据 ─────────────────────────────────────────
+  const {
+    data: stats,
+    isLoading: statsIsLoading,
+    error: statsError,
+  } = useQuery({
+    queryKey: ["admin", "stats"],
+    queryFn: () => adminApi.getStats(),
+  });
+
+  // ── 拉取审计日志 ─────────────────────────────────────────
+  const {
+    data: auditLogs,
+    isLoading: auditLogsIsLoading,
+    error: auditLogsError,
+  } = useQuery({
+    queryKey: ["admin", "audit-logs", { page, pageSize: PAGE_SIZE }],
+    queryFn: () => adminApi.getAuditLogs(page, PAGE_SIZE),
+  });
+
+  return (
+    <div className="space-y-6">
+      {/* Stats Loading */}
+      {statsIsLoading && (
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+          {Array.from({ length: 6 }).map((_, index) => (
+            <Skeleton key={index} className="h-28" />
+          ))}
+        </div>
+      )}
+
+      {/* Stats Error */}
+      {statsError && (
+        <div
+          className="rounded-[var(--radius-lg)] border px-6 py-10 text-center text-sm"
+          style={{
+            color: "var(--color-danger)",
+            borderColor: "var(--color-border)",
+            backgroundColor: "var(--color-surface)",
+          }}
+        >
+          Failed to load dashboard statistics. Please try again.
+        </div>
+      )}
+
+      {/* Stats Success */}
+      {stats && (
+        <>
+          <p>stats</p>
+          {/* 6 张统计卡片 */}
+
+          {/* 两个折线图 */}
+
+          {/* 品牌分布饼图 */}
+        </>
+      )}
+
+      {/* Audit Logs 独立区域 */}
+      <Card>
+        {/* /* Audit Loading / Error / Empty / Success */}
+        {auditLogsIsLoading && (
+          <div className="space-y-3">
+            {Array.from({ length: 5 }).map((_, index) => (
+              <Skeleton key={index} className="h-10" />
+            ))}
+          </div>
+        )}
+        {auditLogsError && (
+          <div
+            className="py-10 text-center text-sm"
+            style={{ color: "var(--color-danger)" }}
+          >
+            Failed to load audit logs. Please try again.
+          </div>
+        )}
+        {auditLogs && (
+          <>
+            <p>audit logs</p>
+            {/* auditLogs表格 */}
+          </>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+export default AdminDashboardPage;
+```
+
+#### 10.3 新西兰格式与 UTC 日期桶
+
+统计接口返回的是原始数字和日期字符串。前端在显示时需要统一使用新西兰格式。
+
+在 `AdminDashboardPage.tsx` 中定义这些格式转换的辅助方法
+
+```tsx
+...
+
+const PAGE_SIZE = 10;
+
+// ── 格式化辅助方法 ─────────────────────────────────────────
+// 普通数字：使用新西兰千分位格式
+const formatNumber = (value: number) => value.toLocaleString("en-NZ");
+
+// 金额：使用新西兰元格式
+const formatCurrency = (value: number) =>
+  value.toLocaleString("en-NZ", {
+    style: "currency",
+    currency: "NZD",
+  });
+
+// 趋势图日期：将 yyyy-MM-dd 显示为 dd/MM
+const formatChartDate = (value: string) => {
+  const [, month, day] = value.split("-");
+  return `${day}/${month}`;
+};
+
+// 审计日志时间：将 UTC 时间转换为用户本地时间，并使用新西兰格式
+const formatAuditDate = (value: string) => {
+  const utcValue = value.endsWith("Z") ? value : `${value}Z`;
+
+  return new Date(utcValue).toLocaleString("en-NZ", {
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
+};
+
+function AdminDashboardPage() {
+  ...
+}
+
+```
+
+##### 数字格式
+
+`formatNumber()` 用于车辆数量、用户数量和订单数量：
+
+```
+formatNumber(stats.totalCars);
+formatNumber(stats.totalUsers);
+formatNumber(stats.monthlyOrders);
+```
+
+例如：
+
+```
+1234567 → 1,234,567
+```
+
+##### 金额格式
+
+`formatCurrency()` 用于月度成交额和每日成交额：
+
+```
+formatCurrency(stats.monthlyRevenue);
+```
+
+例如：
+
+```
+1234.5 → $1,234.50
+```
+
+指定：
+
+```
+currency: "NZD"
+```
+
+可以确保金额按照新西兰元显示。
+
+##### 趋势图日期桶
+
+后端趋势 DTO 使用 `DateOnly`：
+
+```
+public DateOnly Date { get; set; }
+```
+
+前端收到的日期是：
+
+```
+2026-08-28
+```
+
+这个值表示 UTC 统计中的某一天，不是具体时间点。因此不需要创建 JavaScript `Date`，只需要调整显示顺序：
+
+```
+<XAxis dataKey="date" tickFormatter={formatChartDate} />
+```
+
+显示结果：
+
+```
+2026-08-28 → 28/08
+```
+
+近 30 天范围和缺失日期补零已经由后端完成，前端只负责显示接口返回的日期桶。
+
+##### 审计日志时间
+
+审计日志的 `createdAt` 表示操作发生的具体时间，因此需要转换为日期时间：
+
+```
+<TableCell>{formatAuditDate(item.createdAt)}</TableCell>
+```
+
+如果后端返回的 UTC 时间没有 `Z`：
+
+```
+2026-08-28T08:30:00
+```
+
+代码会补充为：
+
+```
+2026-08-28T08:30:00Z
+```
+
+然后由浏览器转换为用户本地时间，并使用 `en-NZ` 格式显示。
+
+#### 10.4 数据渲染
+
+统计数据和审计日志已经分别完成请求状态处理。接下来按照页面组成逐步渲染：
+
+```
+统计卡片
+→ 每日新增车辆折线图
+→ 每日成交额折线图
+→ 品牌分布饼图
+→ 审计日志表格和分页
+```
+
+##### 渲染 6 张统计卡片
+
+统计卡片都包含标题、数值和图标，结构相同。因此先把 6 张卡片的数据整理成数组，再通过 `map()` 渲染。
+
+先引入统计卡片需要的组件
+
+```
+import { Card, CardContent } from "@/components/ui/card";
+```
+
+引入统计卡片图标：
+
+```tsx
+import {
+  Car,
+  CheckCircle,
+  Clock,
+  DollarSign,
+  ShoppingCart,
+  Users,
+} from "lucide-react";
+```
+
+整理统计卡片数据数组：
+
+在两个 `useQuery()` 后：面加入：
+
+```tsx
+const statCards = stats
+  ? [
+      {
+        title: "Total cars",
+        value: formatNumber(stats.totalCars),
+        icon: Car,
+      },
+      {
+        title: "Pending cars",
+        value: formatNumber(stats.pendingCars),
+        icon: Clock,
+      },
+      {
+        title: "Published cars",
+        value: formatNumber(stats.publishedCars),
+        icon: CheckCircle,
+      },
+      {
+        title: "Total users",
+        value: formatNumber(stats.totalUsers),
+        icon: Users,
+      },
+      {
+        title: "Orders this month",
+        value: formatNumber(stats.monthlyOrders),
+        icon: ShoppingCart,
+      },
+      {
+        title: "Revenue this month",
+        value: formatCurrency(stats.monthlyRevenue),
+        icon: DollarSign,
+      },
+    ]
+  : [];
+```
+
+只有成功取得 `stats` 后，数组才会包含卡片数据。
+
+`icon` 保存的是 React 图标组件。渲染数组时，可以把它赋值给首字母大写的 `Icon`，再作为组件使用。
+
+渲染卡片:
+
+将 Stats Success 中临时的：
+
+```
+<p>stats</p>
+{/* 6 张统计卡片 */}
+```
+
+替换为：
+
+```tsx
+...
+
+function AdminDashboardPage() {
+...
+  // 统计卡片数据数组
+  const statCards = stats
+    ? [
+        {
+          title: "Total cars",
+          value: formatNumber(stats.totalCars),
+          icon: Car,
+        },
+        {
+          title: "Pending cars",
+          value: formatNumber(stats.pendingCars),
+          icon: Clock,
+        },
+        {
+          title: "Published cars",
+          value: formatNumber(stats.publishedCars),
+          icon: CheckCircle,
+        },
+        {
+          title: "Total users",
+          value: formatNumber(stats.totalUsers),
+          icon: Users,
+        },
+        {
+          title: "Orders this month",
+          value: formatNumber(stats.monthlyOrders),
+          icon: ShoppingCart,
+        },
+        {
+          title: "Revenue this month",
+          value: formatCurrency(stats.monthlyRevenue),
+          icon: DollarSign,
+        },
+      ]
+    : [];
+
+  return (
+    <div className="space-y-6">
+      {/* Stats Loading */}
+      ...
+
+      {/* Stats Error */}
+      ...
+
+      {/* Stats Success */}
+      {stats && (
+        <>
+          {/* 统计卡片 */}
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+            {statCards.map((item) => {
+              const Icon = item.icon;
+
+              return (
+                <Card key={item.title}>
+                  <CardContent className="flex items-center justify-between pt-5">
+                    <div>
+                      <p
+                        className="text-sm"
+                        style={{ color: "var(--color-text-secondary)" }}
+                      >
+                        {item.title}
+                      </p>
+
+                      <p
+                        className="mt-2 text-2xl font-semibold"
+                        style={{ color: "var(--color-text-primary)" }}
+                      >
+                        {item.value}
+                      </p>
+                    </div>
+
+                    <div
+                      className="flex h-11 w-11 items-center justify-center rounded-full"
+                      style={{
+                        color: "var(--color-accent)",
+                        backgroundColor: "var(--color-accent-light)",
+                      }}
+                    >
+                      <Icon className="h-5 w-5" aria-hidden="true" />
+                    </div>
+                  </CardContent>
+                </Card>
+              );
+            })}
+          </div>
+          {/* 趋势折线图：每日新增车辆 */}
+          {/* 趋势折线图：每日成交额 */}
+        </>
+      )}
+
+      {/* Audit Logs 独立区域 */}
+      <Card>
+        ...
+      </Card>
+    </div>
+  );
+}
+
+```
+
+现在 `stats` 成功返回时，页面会显示 6 张统计卡片。
+
+##### 渲染每日新增车辆折线图
+
+先完成第一张折线图，理解 Recharts 如何把数据字段映射到坐标轴和折线。
+
+补充 Card 组件：
+
+```
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+```
+
+引入折线图需要的 Recharts 组件：
+
+```
+import {
+  CartesianGrid,
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
+```
+
+这些组件分别负责：
+
+```
+ResponsiveContainer → 图表跟随父容器宽度变化
+LineChart           → 折线图容器
+CartesianGrid       → 图表背景网格
+XAxis               → 日期横轴
+YAxis               → 数量纵轴
+Tooltip             → 鼠标悬停提示
+Line                → 实际折线
+```
+
+渲染趋势折线图：每日新增车辆
+
+```tsx
+<Card>
+  <CardHeader>
+    <CardTitle>Daily new cars</CardTitle>
+    <CardDescription>
+      New cars added during the last 30 days
+    </CardDescription>
+  </CardHeader>
+
+  <CardContent>
+    <div
+      className="h-72 w-full"
+      role="img"
+      aria-label="Daily new cars during the last 30 days"
+    >
+      <ResponsiveContainer width="100%" height="100%">
+        <LineChart
+          data={stats.dailyNewCars}
+          margin={{ top: 5, right: 10, left: 0, bottom: 0 }}
+          accessibilityLayer
+        >
+          <CartesianGrid
+            stroke="var(--color-border)"
+            strokeDasharray="3 3"
+          />
+
+          <XAxis
+            dataKey="date"
+            tickFormatter={formatChartDate}
+            tick={{
+              fill: "var(--color-text-secondary)",
+              fontSize: 12,
+            }}
+          />
+
+          <YAxis
+            allowDecimals={false}
+            width={50}
+            tick={{
+              fill: "var(--color-text-secondary)",
+              fontSize: 12,
+            }}
+          />
+
+          <Tooltip
+            labelFormatter={(label) => formatChartDate(String(label))}
+            formatter={(value) => [
+              formatNumber(Number(value)),
+              "New cars",
+            ]}
+            contentStyle={{
+              backgroundColor: "var(--color-surface)",
+              borderColor: "var(--color-border)",
+              borderRadius: "var(--radius-md)",
+            }}
+          />
+
+          <Line
+            type="linear"
+            dataKey="count"
+            stroke="var(--color-accent)"
+            strokeWidth={2}
+            dot={false}
+            activeDot={{ r: 4 }}
+          />
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
+  </CardContent>
+</Card>
+```
+
+数据来源是：
+
+```
+data={stats.dailyNewCars}
+```
+
+其中每个元素的结构为：
+
+```
+{
+  date: string;
+  count: number;
+}
+```
+
+因此：
+
+```
+<XAxis dataKey="date" />
+<Line dataKey="count" />
+```
+
+分别读取 `date` 和 `count`。
+
+`ResponsiveContainer` 自身没有固定高度，所以外层必须提供：
+
+```
+className="h-72 w-full"
+```
+
+否则图表可能没有可用的绘制高度。
+
+##### 渲染每日成交额折线图
+
+第二张折线图的布局与第一张一致，但使用的数据和数值格式不同：
+
+```
+dailyNewCars → count → 普通数字
+dailyRevenue → revenue → NZD 金额
+```
+
+渲染趋势折线图：每日成交额， 并将2个折线图合并成双列图表区域：
+
+```tsx
+<div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+  {/* 趋势折线图：每日新增车辆 */}
+  <Card>
+    <CardHeader>
+      <CardTitle>Daily new cars</CardTitle>
+      <CardDescription>
+        New cars added during the last 30 days
+      </CardDescription>
+    </CardHeader>
+
+    <CardContent>
+      <div
+        className="h-72 w-full"
+        role="img"
+        aria-label="Daily new cars during the last 30 days"
+      >
+        <ResponsiveContainer width="100%" height="100%">
+          <LineChart
+            data={stats.dailyNewCars}
+            margin={{ top: 5, right: 10, left: 0, bottom: 0 }}
+            accessibilityLayer
+          >
+            <CartesianGrid
+              stroke="var(--color-border)"
+              strokeDasharray="3 3"
+            />
+
+            <XAxis
+              dataKey="date"
+              tickFormatter={formatChartDate}
+              tick={{
+                fill: "var(--color-text-secondary)",
+                fontSize: 12,
+              }}
+            />
+
+            <YAxis
+              allowDecimals={false}
+              width={50}
+              tick={{
+                fill: "var(--color-text-secondary)",
+                fontSize: 12,
+              }}
+            />
+
+            <Tooltip
+              labelFormatter={(label) => formatChartDate(String(label))}
+              formatter={(value) => [
+                formatNumber(Number(value)),
+                "New cars",
+              ]}
+              contentStyle={{
+                backgroundColor: "var(--color-surface)",
+                borderColor: "var(--color-border)",
+                borderRadius: "var(--radius-md)",
+              }}
+            />
+
+            <Line
+              type="linear"
+              dataKey="count"
+              stroke="var(--color-accent)"
+              strokeWidth={2}
+              dot={false}
+              activeDot={{ r: 4 }}
+            />
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+    </CardContent>
+  </Card>
+
+  {/* 趋势折线图：每日成交额 */}
+  <Card>
+    <CardHeader>
+      <CardTitle>Daily revenue</CardTitle>
+      <CardDescription>
+        Completed order revenue during the last 30 days
+      </CardDescription>
+    </CardHeader>
+
+    <CardContent>
+      <div
+        className="h-72 w-full"
+        role="img"
+        aria-label="Daily revenue during the last 30 days"
+      >
+        <ResponsiveContainer width="100%" height="100%">
+          <LineChart
+            data={stats.dailyRevenue}
+            margin={{ top: 5, right: 10, left: 0, bottom: 0 }}
+            accessibilityLayer
+          >
+            <CartesianGrid
+              stroke="var(--color-border)"
+              strokeDasharray="3 3"
+            />
+
+            <XAxis
+              dataKey="date"
+              tickFormatter={formatChartDate}
+              tick={{
+                fill: "var(--color-text-secondary)",
+                fontSize: 12,
+              }}
+            />
+
+            <YAxis
+              width={70}
+              tickFormatter={(value) => formatNumber(Number(value))}
+              tick={{
+                fill: "var(--color-text-secondary)",
+                fontSize: 12,
+              }}
+            />
+
+            <Tooltip
+              labelFormatter={(label) => formatChartDate(String(label))}
+              formatter={(value) => [
+                formatCurrency(Number(value)),
+                "Revenue",
+              ]}
+              contentStyle={{
+                backgroundColor: "var(--color-surface)",
+                borderColor: "var(--color-border)",
+                borderRadius: "var(--radius-md)",
+              }}
+            />
+
+            <Line
+              type="linear"
+              dataKey="revenue"
+              stroke="var(--color-primary)"
+              strokeWidth={2}
+              dot={false}
+              activeDot={{ r: 4 }}
+            />
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+    </CardContent>
+  </Card>
+</div>
+```
+
+`xl:grid-cols-2` 表示：
+
+- 小屏幕中上下排列；
+- 大屏幕中左右排列。
+
+##### 渲染品牌分布饼图
+
+品牌分布接口已经按照车辆数量降序返回前 10 个品牌。
+
+饼图需要让不同品牌使用不同颜色，因此在渲染之前，为每条数据补充 `fill` 属性。
+
+先引入饼图组件，在现有 Recharts import 中增加：
+
+```
+Legend,
+Pie,
+PieChart,
+```
+
+完整的 Recharts import 变为：
+
+```
+import {
+  CartesianGrid,
+  Legend,
+  Line,
+  LineChart,
+  Pie,
+  PieChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
+```
+
+定义饼图颜色，在组件内的 `brandChartData` 之前加入：
+
+```tsx
+const PIE_COLORS = [
+  "#c0392b",
+  "#1c1c1e",
+  "#d97706",
+  "#2563eb",
+  "#16a34a",
+  "#7c3aed",
+  "#0891b2",
+  "#db2777",
+  "#65a30d",
+  "#64748b",
+];
+```
+
+接口最多返回 10 个品牌，因此准备 10 种颜色。
+
+整理饼图数据, 在 `statCards` 后面加入：
+
+```
+const brandChartData =
+  stats?.brandDistribution.map((item, index) => ({
+    ...item,
+    fill: PIE_COLORS[index % PIE_COLORS.length],
+  })) ?? [];
+```
+
+原始数据：
+
+```
+{
+  brand: string;
+  count: number;
+}
+```
+
+整理后增加了 `fill`：
+
+```
+{
+  brand: string;
+  count: number;
+  fill: string;
+}
+```
+
+渲染饼图，在两个折线图区域下面加入：
+
+```tsx
+<Card>
+  <CardHeader>
+    <CardTitle>Brand distribution</CardTitle>
+    <CardDescription>
+      Top 10 brands by number of active listings
+    </CardDescription>
+  </CardHeader>
+
+  <CardContent>
+    {brandChartData.length === 0 ? (
+      <p
+        className="py-16 text-center text-sm"
+        style={{ color: "var(--color-text-secondary)" }}
+      >
+        No brand data available.
+      </p>
+    ) : (
+      <div
+        className="h-80 w-full"
+        role="img"
+        aria-label="Top 10 car brands by number of active listings"
+      >
+        <ResponsiveContainer width="100%" height="100%">
+          <PieChart accessibilityLayer>
+            <Pie
+              data={brandChartData}
+              dataKey="count"
+              nameKey="brand"
+              cx="50%"
+              cy="50%"
+              innerRadius={55}
+              outerRadius={105}
+              paddingAngle={2}
+            />
+
+            <Tooltip
+              formatter={(value) => formatNumber(Number(value))}
+              contentStyle={{
+                backgroundColor: "var(--color-surface)",
+                borderColor: "var(--color-border)",
+                borderRadius: "var(--radius-md)",
+              }}
+            />
+
+            <Legend />
+          </PieChart>
+        </ResponsiveContainer>
+      </div>
+    )}
+  </CardContent>
+</Card>
+```
+
+`Pie` 的字段映射为：
+
+```
+dataKey="count"
+nameKey="brand"
+```
+
+因此：
+
+- `count` 决定每个扇区的大小；
+- `brand` 作为 Tooltip 和 Legend 中的品牌名称。
+
+##### 渲染审计日志表格
+
+统计区域和审计日志使用不同的查询，因此审计日志继续独立处理自己的 Loading、Error、Empty 和 Success 状态。
+
+先引入需要的现有公共组件，增加：
+
+```
+import EmptyState from "@/components/EmptyState";
+import Pagination from "@/components/Pagination";
+```
+
+增加表格组件：
+
+```
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+```
+
+在现有的 `lucide-react` import 中增加：
+
+```
+FileClock,
+```
+
+图标 import 变为：
+
+```
+import {
+  Car,
+  CheckCircle,
+  Clock,
+  DollarSign,
+  FileClock,
+  ShoppingCart,
+  Users,
+} from "lucide-react";
+```
+
+渲染审计日志占位区域， 将页面底部现有的 Audit Logs `<Card>` 完整替换为：
+
+```tsx
+<Card>
+  <CardHeader>
+    <CardTitle>Audit logs</CardTitle>
+    <CardDescription>
+      Recent administrative activity on the platform
+    </CardDescription>
+  </CardHeader>
+
+  <CardContent>
+    {/* Audit Loading */}
+    {auditLogsIsLoading && (
+      <div className="space-y-3">
+        {Array.from({ length: 5 }).map((_, index) => (
+          <Skeleton key={index} className="h-10" />
+        ))}
+      </div>
+    )}
+
+    {/* Audit Error */}
+    {auditLogsError && (
+      <div
+        className="py-10 text-center text-sm"
+        style={{ color: "var(--color-danger)" }}
+      >
+        Failed to load audit logs. Please try again.
+      </div>
+    )}
+
+    {/* Audit Empty */}
+    {!auditLogsIsLoading &&
+      !auditLogsError &&
+      auditLogs &&
+      auditLogs.items.length === 0 && (
+        <EmptyState
+          icon={<FileClock className="h-8 w-8" />}
+          title="No audit logs"
+          description="Administrative activity will appear here."
+          className="py-10"
+        />
+      )}
+
+    {/* Audit Success */}
+    {!auditLogsIsLoading &&
+      !auditLogsError &&
+      auditLogs &&
+      auditLogs.items.length > 0 && (
+        <>
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Date</TableHead>
+                <TableHead>Admin</TableHead>
+                <TableHead>Action</TableHead>
+                <TableHead>Entity</TableHead>
+                <TableHead>Detail</TableHead>
+              </TableRow>
+            </TableHeader>
+
+            <TableBody>
+              {auditLogs.items.map((item) => (
+                <TableRow key={item.id}>
+                  <TableCell>{formatAuditDate(item.createdAt)}</TableCell>
+
+                  <TableCell>{item.adminUsername}</TableCell>
+
+                  <TableCell>{item.action}</TableCell>
+
+                  <TableCell>
+                    {item.entityType} #{item.entityId}
+                  </TableCell>
+
+                  <TableCell className="max-w-sm whitespace-normal">
+                    {item.detail ?? "—"}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+
+          <div className="mt-6">
+            <Pagination totalPages={auditLogs.totalPages} />
+          </div>
+        </>
+      )}
+  </CardContent>
+</Card>
+```
+
+表格中的：
+
+```
+<TableRow key={item.id}>
+```
+
+使用审计日志自身的 `id` 作为 React 列表键。
+
+分页继续使用项目已有的 `Pagination`。点击分页按钮后，它会更新 URL 中的：
+
+```
+?page=2
+```
+
+`page` 改变后，审计日志的 Query Key 也会改变：
+
+```
+["admin", "audit-logs", { page, pageSize: PAGE_SIZE }]
+```
+
+TanStack Query 随后请求对应页的数据。统计 Query Key 没有变化，因此统计接口不会因为审计日志翻页而重新请求。
+
+##### 验证数据渲染
+
+启动前端和后端后，依次检查：
+
+1. 页面显示 6 张统计卡片。
+2. 数量使用千分位格式。
+3. 月度成交额显示为新西兰元。
+4. 每日新增车辆折线图显示 30 个日期桶。
+5. 每日成交额折线图的 Tooltip 显示 NZD 金额。
+6. 饼图显示最多 10 个品牌和对应图例。
+7. 审计日志正确显示时间、Admin、操作、实体和详情。
+8. 审计日志没有数据时显示 Empty State。
+9. 审计日志分页只更新日志，不影响统计区域。
+
+最后运行：
+
+```
+cd uucars-web
+npm run build
+npm run lint
+```
+
+如果 build 和 lint 均通过，说明当前页面的 TypeScript 类型、Recharts 属性和组件引用正确，并且没有引入新的 lint 问题。
+
+
+
+### 11. 完整验证
+
+#### 后端
+
+```
+dotnet build
+dotnet test --filter AdminStats
+dotnet test
+```
+
+#### 前端
+
+```
+cd uucars-web
+npm run build
+npm run lint
+```
+
+#### 手动验收
+
+```
+□ Admin 登录后 /admin 跳到 /admin/dashboard
+□ 普通用户不能访问 Admin Dashboard
+□ 6 张卡片显示
+□ totalCars 排除 Deleted
+□ publishedCars 不包含 Sold
+□ monthlyRevenue 只统计 Completed
+□ 两个折线图各有 30 个日期
+□ 零数据日期没有消失
+□ 品牌只显示前 10
+□ 品牌无数据时显示 Empty State
+□ Audit Logs 正确分页
+□ 日志翻页没有重新请求 Stats
+□ 金额使用 NZD
+□ 日期和数字使用 en-NZ
+□ 手机宽度没有横向溢出
+□ Redis 命中后不重复执行统计查询
+```
+
+
+
+### 12. Git 提交
+
+```
+git commit -m "feat: admin statistics dashboard with charts and audit logs"
+git push origin feature/v3-admin-dashboard
+```
+
+验证完成后按标准流程合并：
+
+```
+git checkout develop
+git pull --ff-only origin develop
+git merge --no-ff feature/v3-admin-dashboard \
+  -m "merge: feature/v3-admin-dashboard into develop"
+git push origin develop
+
+git branch -d feature/v3-admin-dashboard
+git push origin --delete feature/v3-admin-dashboard
+```
+
+
+
+### Step 71 完成状态
+
+```
+概念理解：
+□ 理解 SQL Aggregate 与普通列表查询的区别
+□ 理解 Count/Sum 为什么应在数据库执行
+□ 理解 GroupBy 如何生成日期和品牌聚合
+□ 理解 UTC 半开区间避免时间精度边界问题
+□ 理解 TimeProvider 如何让当前时间可测试
+□ 理解为什么数据库 GroupBy 不会返回零数据日期
+□ 理解为什么补零属于 Service 业务组合
+□ 理解稳定排序对图表颜色和顺序的重要性
+□ 理解 Dashboard DTO 与 Repository 查询结果的区别
+□ 理解为什么缓存完整 DTO 而不是分别缓存每个字段
+□ 理解 ResponsiveContainer 依赖父容器高度
+□ 理解 Recharts dataKey 如何映射对象属性
+□ 理解 Stats 与 Audit Logs 应使用独立 Query key
+
+后端实现：
+□ AdminStatsResponse
+□ IAdminStatsRepository
+□ EfAdminStatsRepository
+□ AdminStatsService
+□ TimeProvider
+□ UTC 月度统计
+□ 近 30 天每日统计
+□ 日期补零
+□ 品牌 Top 10
+□ 5 分钟 Redis 缓存
+□ GET /admin/stats
+□ Admin 授权
+
+前端实现：
+□ Recharts
+□ AdminStats TypeScript contract
+□ adminApi.getStats
+□ adminApi.getAuditLogs
+□ Admin Dashboard 路由与 tab
+□ 6 张统计卡片
+□ 2 个 LineChart
+□ 1 个 PieChart
+□ Audit Logs 表格与分页
+□ en-NZ / NZD
+□ loading/error/empty 状态
+
+测试：
+□ Service 单元测试
+□ API 集成测试
+```
+
 
 
 ## fixed Issues 
