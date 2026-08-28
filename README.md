@@ -1,12 +1,12 @@
 # UUcars Marketplace
 
-UUcars is a personal full-stack portfolio project that models a C2C used-car marketplace. It began as a layered ASP.NET Core API, grew into a deployed React application, and now includes production-oriented capabilities such as Redis caching, rate limiting, background jobs, refresh-token rotation, optimistic concurrency, automated testing and real-time notifications.
+UUcars is a personal full-stack portfolio project that models a C2C used-car marketplace. It began as a layered ASP.NET Core API, grew into a deployed React application, and now includes production-oriented capabilities such as Redis caching, rate limiting, background jobs, refresh-token rotation, optimistic concurrency, automated testing, real-time notifications and an Admin analytics dashboard.
 
 The repository is organised as a progressive learning project. The detailed development notes preserve that history; the current code, EF Core migrations, configuration and tests define the implemented system.
 
 ## Current status
 
-The application currently implements V1, V2 and V3 through **Step 70**.
+The application currently implements V1, V2 and V3 through **Step 71**.
 
 | Version | Scope | Status |
 |---|---|---|
@@ -15,8 +15,8 @@ The application currently implements V1, V2 and V3 through **Step 70**.
 | V2.1 | UI design system, responsive layout and vehicle cover images | Complete — `v2.1` |
 | V3.1 | Query optimisation, Redis, rate limiting, Hangfire, refresh tokens, concurrency and security | Complete — `v3.1` |
 | V3.2 | Image workflow, autosave, optimistic favourites, search improvements and frontend testing | Complete — `v3.2` |
-| V3 Step 70 | Persistent SignalR notifications | Complete |
-| V3 Step 71–75 | Admin dashboard, Google OAuth, delivery optimisation, Web Vitals and project close-out | Roadmap |
+| V3 Step 70–71 | Persistent SignalR notifications and Admin analytics dashboard | Complete |
+| V3 Step 72–75 | Google OAuth, delivery optimisation, Web Vitals and project close-out | Roadmap |
 
 ## What the application supports
 
@@ -55,8 +55,12 @@ The application currently implements V1, V2 and V3 through **Step 70**.
 
 ### Platform capabilities
 
-- Redis cache-aside for vehicle queries with database fallback
-- Targeted cache invalidation after business changes
+- Admin analytics dashboard with six core metrics, two 30-day trend charts and a top-10 brand distribution chart
+- Paginated Admin audit-log viewing
+- UTC month boundaries and continuous 30-day UTC date buckets for statistics
+- Redis cache-aside for vehicle queries and Admin statistics, with database fallback
+- Five-minute shared cache for the complete Admin statistics response
+- Targeted vehicle-list cache invalidation after relevant business changes
 - Hangfire background email jobs and expired-token cleanup
 - Serilog structured logging
 - Azure Application Insights integration
@@ -105,7 +109,7 @@ HTTP request
 | Backend | ASP.NET Core 9, C#, Entity Framework Core 9, SQL Server |
 | Authentication | JWT Bearer authentication, refresh-token rotation, ASP.NET Core PasswordHasher |
 | Frontend | React 19, TypeScript 6, Vite 8, React Router 7 |
-| UI | Tailwind CSS 4, shadcn/ui, Radix UI, Lucide React, Embla Carousel |
+| UI | Tailwind CSS 4, shadcn/ui, Radix UI, Lucide React, Embla Carousel, Recharts |
 | State and data | Zustand, TanStack Query 5, Axios |
 | Forms | React Hook Form, Zod |
 | Infrastructure | Redis, Hangfire, Cloudflare R2, Resend, SignalR |
@@ -181,7 +185,7 @@ The API uses a common `ApiResponse<T>` envelope. The principal routes are:
 | Orders | `POST /orders`, `POST /orders/{id}/cancel`, `POST /orders/{id}/complete`, `GET /orders/my-purchases`, `GET /orders/my-sales` |
 | Reviews | `POST /reviews`, `GET /reviews/seller/{sellerId}` |
 | Notifications | `GET /notifications`, `PUT /notifications/{id}/read`, `PUT /notifications/read-all` |
-| Admin | `GET /admin/cars/pending`, `POST /admin/cars/{id}/approve`, `POST /admin/cars/{id}/reject`, `DELETE /admin/cars/{id}`, `GET /admin/audit-logs` |
+| Admin | `GET /admin/stats`, `GET /admin/cars/pending`, `POST /admin/cars/{id}/approve`, `POST /admin/cars/{id}/reject`, `DELETE /admin/cars/{id}`, `GET /admin/audit-logs` |
 | SignalR | `/hubs/notification` |
 
 In Development, interactive Scalar documentation is available at:
@@ -376,7 +380,6 @@ The database schema is maintained against the current EF Core migrations and mod
 
 The remaining V3 outline covers:
 
-- Admin analytics dashboard
 - Google OAuth login
 - CI/CD hardening
 - Bundle analysis and Web Vitals
