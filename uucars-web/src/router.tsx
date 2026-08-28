@@ -1,5 +1,5 @@
 // src/router.tsx
-import { createBrowserRouter } from "react-router-dom";
+import { createBrowserRouter, Navigate } from "react-router-dom";
 import ProtectedRoute from "@/components/ProtectedRoute";
 import AdminRoute from "@/components/AdminRoute";
 
@@ -30,6 +30,7 @@ import AdminPendingPage from "@/pages/AdminPendingPage";
 import Layout from "./components/Layout";
 
 import ErrorBoundary from "@/components/ErrorBoundary";
+import AdminDashboardPage from "@/pages/AdminDashboardPage";
 
 // 辅助函数：减少重复的 <ErrorBoundary><Page /></ErrorBoundary> 写法
 // 等价于 <ErrorBoundary><SomePage /></ErrorBoundary>
@@ -97,7 +98,11 @@ export const router = createBrowserRouter([
             path: "/admin",
             element: withEB(<AdminPage />),
             children: [
-              { index: true, element: withEB(<AdminPendingPage />) },
+              {
+                index: true,
+                element: <Navigate to="dashboard" replace />,
+              },
+              { path: "dashboard", element: withEB(<AdminDashboardPage />) },
               { path: "pending", element: withEB(<AdminPendingPage />) },
             ],
           },

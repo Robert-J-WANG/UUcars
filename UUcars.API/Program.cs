@@ -213,6 +213,12 @@ try
     builder.Services.AddScoped<INotificationRepository, EfNotificationRepository>();
     builder.Services.AddScoped<INotificationService, NotificationService>();
 
+    // AdminDashboard模块
+    builder.Services.AddScoped<IAdminStatsRepository, EfAdminStatsRepository>();
+    builder.Services.AddScoped<AdminStatsService>();
+    // 注册系统时钟
+    builder.Services.AddSingleton<TimeProvider>(TimeProvider.System);
+
     // =============================================
     // 构建应用
     // =============================================

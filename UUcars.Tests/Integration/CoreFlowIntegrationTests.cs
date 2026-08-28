@@ -1,5 +1,8 @@
 using System.Net;
 using Microsoft.EntityFrameworkCore;
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Entities;
+using UUcars.API.Entities.Enums;
 
 namespace UUcars.Tests.Integration;
 
@@ -242,6 +245,281 @@ public class CoreFlowIntegrationTests : IntegrationTestBase
 
         var response = await Client.GetAsync("/admin/cars/pending");
 
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+    }
+
+    // ===== Admin Dashboard =====
+
+    [Fact]
+    public async Task GetAdminStats_AsAdmin_ShouldReturnCorrectStatistics()
+    {
+        // Arrange
+        var nowUtc = DateTime.UtcNow;
+        var todayUtc = nowUtc.Date;
+
+        var startOfMonth = new DateTime(
+            nowUtc.Year,
+            nowUtc.Month,
+            1,
+            0, 0, 0,
+            DateTimeKind.Utc);
+
+        var startOfNextMonth = startOfMonth.AddMonths(1);
+
+        await using var db = Factory.GetDbContext();
+
+        var seller = new User
+        {
+            Username = "stats-seller",
+            Email = "stats-seller@example.com",
+            PasswordHash = "test-hash",
+            Role = UserRole.User,
+            EmailConfirmed = true,
+            CreatedAt = nowUtc,
+            UpdatedAt = nowUtc
+        };
+
+        var buyer = new User
+        {
+            Username = "stats-buyer",
+            Email = "stats-buyer@example.com",
+            PasswordHash = "test-hash",
+            Role = UserRole.User,
+            EmailConfirmed = true,
+            CreatedAt = nowUtc,
+            UpdatedAt = nowUtc
+        };
+
+        db.Users.AddRange(seller, buyer);
+        await db.SaveChangesAsync();
+
+        // Published + Sold 共 11 个品牌。
+        // Toyota 有 3 辆，其余品牌各 1 辆。
+        // Top 10 排序后，ZzzTestBrand 应被排除。
+        var marketCarDefinitions = new (string Brand, CarStatus Status)[]
+        {
+            ("Toyota", CarStatus.Published),
+            ("Toyota", CarStatus.Published),
+            ("Toyota", CarStatus.Sold),
+            ("Mazda", CarStatus.Published),
+            ("Honda", CarStatus.Published),
+            ("Ford", CarStatus.Published),
+            ("BMW", CarStatus.Published),
+            ("Audi", CarStatus.Published),
+            ("Nissan", CarStatus.Published),
+            ("Hyundai", CarStatus.Published),
+            ("Kia", CarStatus.Published),
+            ("Suzuki", CarStatus.Published),
+            ("ZzzTestBrand", CarStatus.Published)
+        };
+
+        var marketCars = marketCarDefinitions
+            .Select((item, index) => new Car
+            {
+                Title = $"{item.Brand} test car {index + 1}",
+                Brand = item.Brand,
+                Model = "Test Model",
+                Year = 2020,
+                Price = 10000m,
+                Mileage = 50000,
+                SellerId = seller.Id,
+                Status = item.Status,
+                CreatedAt = nowUtc,
+                UpdatedAt = nowUtc
+            })
+            .ToList();
+
+        var pendingCar = new Car
+        {
+            Title = "Pending test car",
+            Brand = "PendingBrand",
+            Model = "Test Model",
+            Year = 2020,
+            Price = 10000m,
+            Mileage = 50000,
+            SellerId = seller.Id,
+            Status = CarStatus.PendingReview,
+            CreatedAt = nowUtc,
+            UpdatedAt = nowUtc
+        };
+
+        var draftCar = new Car
+        {
+            Title = "Draft test car",
+            Brand = "DraftBrand",
+            Model = "Test Model",
+            Year = 2020,
+            Price = 10000m,
+            Mileage = 50000,
+            SellerId = seller.Id,
+            Status = CarStatus.Draft,
+            CreatedAt = nowUtc,
+            UpdatedAt = nowUtc
+        };
+
+        var deletedCar = new Car
+        {
+            Title = "Deleted test car",
+            Brand = "DeletedBrand",
+            Model = "Test Model",
+            Year = 2020,
+            Price = 10000m,
+            Mileage = 50000,
+            SellerId = seller.Id,
+            Status = CarStatus.Deleted,
+            CreatedAt = nowUtc,
+            UpdatedAt = nowUtc
+        };
+
+        db.Cars.AddRange(marketCars);
+        db.Cars.AddRange(pendingCar, draftCar, deletedCar);
+        await db.SaveChangesAsync();
+
+        var soldCar = marketCars.Single(car => car.Status == CarStatus.Sold);
+
+        db.Orders.AddRange(
+            // 本月第一刻创建：计入 monthlyOrders。
+            // 本月完成：计入 monthlyRevenue。
+            new Order
+            {
+                CarId = soldCar.Id,
+                BuyerId = buyer.Id,
+                SellerId = seller.Id,
+                Price = 10000m,
+                Status = OrderStatus.Completed,
+                CreatedAt = startOfMonth,
+                UpdatedAt = nowUtc
+            },
+
+            // Pending 订单计入 monthlyOrders，
+            // 但不计入 monthlyRevenue。
+            new Order
+            {
+                CarId = soldCar.Id,
+                BuyerId = buyer.Id,
+                SellerId = seller.Id,
+                Price = 5000m,
+                Status = OrderStatus.Pending,
+                CreatedAt = startOfMonth,
+                UpdatedAt = nowUtc
+            },
+
+            // 上月创建，不计入 monthlyOrders；
+            // 本月完成，所以计入 monthlyRevenue。
+            new Order
+            {
+                CarId = soldCar.Id,
+                BuyerId = buyer.Id,
+                SellerId = seller.Id,
+                Price = 20000m,
+                Status = OrderStatus.Completed,
+                CreatedAt = startOfMonth.AddTicks(-1),
+                UpdatedAt = nowUtc
+            },
+
+            // 下月第一刻创建并完成，
+            // 不进入当前月份的订单量和成交额。
+            new Order
+            {
+                CarId = soldCar.Id,
+                BuyerId = buyer.Id,
+                SellerId = seller.Id,
+                Price = 40000m,
+                Status = OrderStatus.Completed,
+                CreatedAt = startOfNextMonth,
+                UpdatedAt = startOfNextMonth
+            });
+
+        await db.SaveChangesAsync();
+
+        // 使用测试数据库中已经存在的 Admin 登录
+        var loginResponse = await Client.PostAsync(
+            "/auth/login",
+            JsonContent(new
+            {
+                email = "admin@uucars.com",
+                password = "Admin@123456"
+            }));
+
+        var adminToken =
+            (await DeserializeAsync<ApiResponse<LoginData>>(loginResponse))
+            ?.Data?.Token;
+
+        SetBearerToken(adminToken!);
+
+        // Act
+        var response = await Client.GetAsync("/admin/stats");
+
+        // Assert
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var result =
+            await DeserializeAsync<ApiResponse<AdminStatsResponse>>(response);
+
+        Assert.NotNull(result);
+        Assert.True(result.Success);
+        Assert.NotNull(result.Data);
+
+        var stats = result.Data;
+
+        // 13 辆 Published/Sold + Pending + Draft；
+        // Deleted 不计入 totalCars。
+        Assert.Equal(15, stats.TotalCars);
+        Assert.Equal(1, stats.PendingCars);
+        Assert.Equal(12, stats.PublishedCars);
+
+        // 测试数据库保留 1 个 Admin，再加入 seller 和 buyer。
+        Assert.Equal(3, stats.TotalUsers);
+
+        // 当前月创建了 2 个订单；
+        // 当前月完成金额为 10000 + 20000。
+        Assert.Equal(2, stats.MonthlyOrders);
+        Assert.Equal(30000m, stats.MonthlyRevenue);
+
+        // Service 应返回连续的最近 30 个 UTC 日期。
+        Assert.Equal(30, stats.DailyNewCars.Count);
+        Assert.Equal(30, stats.DailyRevenue.Count);
+        Assert.Equal(
+            DateOnly.FromDateTime(todayUtc.AddDays(-29)),
+            stats.DailyNewCars[0].Date);
+        Assert.Equal(
+            DateOnly.FromDateTime(todayUtc),
+            stats.DailyNewCars[^1].Date);
+
+        // 所有 16 辆车都在今天创建。
+        // dailyNewCars 记录创建事件，因此 Deleted 也包含在内。
+        Assert.Equal(
+            16,
+            stats.DailyNewCars.Single(item => item.Date == DateOnly.FromDateTime(todayUtc)).Count);
+
+        // 两个 Completed 订单在今天完成。
+        Assert.Equal(
+            30000m,
+            stats.DailyRevenue.Single(item => item.Date == DateOnly.FromDateTime(todayUtc)).Revenue);
+
+        // 品牌只返回前 10。
+        Assert.Equal(10, stats.BrandDistribution.Count);
+        Assert.Equal("Toyota", stats.BrandDistribution[0].Brand);
+        Assert.Equal(3, stats.BrandDistribution[0].Count);
+        Assert.DoesNotContain(
+            stats.BrandDistribution,
+            item => item.Brand == "ZzzTestBrand");
+    }
+
+    [Fact]
+    public async Task GetAdminStats_WithNonAdminToken_ShouldReturn403()
+    {
+        // Arrange
+        var userToken = await RegisterAndLoginAsync(
+            "stats-user@example.com",
+            "stats-user");
+
+        SetBearerToken(userToken);
+
+        // Act
+        var response = await Client.GetAsync("/admin/stats");
+
+        // Assert
         Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
     }
 }
