@@ -53,6 +53,25 @@ public class FakeUserRepository : IUserRepository
         return Task.FromResult(user);
     }
 
+    public Task<User> AddWithExternalLoginAsync(
+        User user,
+        ExternalLogin externalLogin,
+        CancellationToken cancellationToken = default)
+    {
+        // 模拟数据库为新 User 分配主键。
+        user.Id = _store.Count + 1;
+
+        // 模拟 EF Core 保存关系后为 ExternalLogin 补齐关联字段。
+        externalLogin.Id = 1;
+        externalLogin.UserId = user.Id;
+        externalLogin.User = user;
+
+        user.ExternalLogins.Add(externalLogin);
+        _store[user.Email.ToLowerInvariant()] = user;
+
+        return Task.FromResult(user);
+    }
+
     // 供测试用：预先插入数据，模拟"数据库里已有这条记录"
     public void Seed(User user)
     {

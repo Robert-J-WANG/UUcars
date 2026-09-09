@@ -8,7 +8,10 @@ import { useAuthStore } from "@/stores/authStore";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import PasswordInput from "@/components/PasswordInput";
 import { Car } from "lucide-react";
+import type { LoginResponse } from "@/types";
+import GoogleSignInButton from "@/components/GoogleSignInButton";
 
 // 定义验证规则
 const loginSchema = z.object({
@@ -46,6 +49,20 @@ export default function LoginPage() {
   const state = loction.state as LocationState | null;
   const from = state?.from?.pathname;
 
+  const completeAuthentication = (result: LoginResponse) => {
+    // 保存后端返回的 UUcars User 和 Access Token
+    setAuth(result.user, result.token);
+
+    // // 回到受保护页面；没有来源页时按角色进入默认页面
+    if (from) {
+      navigate(from, { replace: true });
+    } else if (result.user.role === "Admin") {
+      navigate("/admin", { replace: true });
+    } else {
+      navigate("/", { replace: true });
+    }
+  };
+
   // onSubmit 只在 RHF 验证通过后才会被调用
   // data 是表单所有字段的值，类型是 LoginForm
   const onSubmit = async (data: LoginForm) => {
@@ -55,20 +72,7 @@ export default function LoginPage() {
     try {
       // 调用登录 API
       const result = await authApi.login(data);
-
-      // 登录成功：把用户信息和 Token 存入 Zustand
-      // setAuth 内部会同时写入 localStorage
-      setAuth(result.user, result.token);
-
-      // 跳转
-      // 有来源页就跳回去，没有的话 Admin 跳管理页、普通用户跳首页
-      if (from) {
-        navigate(from, { replace: true });
-      } else if (result.user.role === "Admin") {
-        navigate("/admin", { replace: true });
-      } else {
-        navigate("/", { replace: true });
-      }
+      completeAuthentication(result);
     } catch (error) {
       // Axios 拦截器已经把错误提取成 Error 对象
       // 直接读 message 显示给用户
@@ -77,6 +81,7 @@ export default function LoginPage() {
       }
     }
   };
+
   return (
     <div
       className="flex min-h-screen items-center justify-center px-4 py-12"
@@ -137,6 +142,7 @@ export default function LoginPage() {
             boxShadow: "var(--shadow-lg)",
           }}
         >
+          {/* 本地登录表格 */}
           <form
             onSubmit={handleSubmit(onSubmit)}
             noValidate
@@ -197,9 +203,8 @@ export default function LoginPage() {
                   Forgot password?
                 </Link>
               </div>
-              <Input
+              <PasswordInput
                 id="password"
-                type="password"
                 placeholder="••••••••"
                 autoComplete="current-password"
                 {...register("password")}
@@ -245,6 +250,22 @@ export default function LoginPage() {
               )}
             </Button>
           </form>
+
+          {/* 分割线 */}
+          <div className="my-6 flex items-center gap-3">
+            <div className="h-px flex-1 bg-[var(--color-border-strong)]" />
+
+            <span className="shrink-0 text-sm text-muted-foreground">
+              Or continue with
+            </span>
+
+            <div className="h-px flex-1 bg-[var(--color-border-strong)]" />
+          </div>
+
+          {/* Google登录 */}
+          <div className="flex justify-center">
+            <GoogleSignInButton onAuthenticated={completeAuthentication} />
+          </div>
         </div>
 
         <p

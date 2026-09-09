@@ -5,7 +5,7 @@ import { z } from "zod";
 import { useSearchParams, Link, useNavigate } from "react-router-dom";
 import { authApi } from "@/api";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
+import PasswordInput from "@/components/PasswordInput";
 import { Label } from "@/components/ui/label";
 import {
   Card,
@@ -80,10 +80,10 @@ export default function ResetPasswordPage() {
 
             <div className="space-y-2">
               <Label htmlFor="newPassword">New password</Label>
-              <Input
+              <PasswordInput
                 id="newPassword"
-                type="password"
                 placeholder="••••••••"
+                autoComplete="new-password"
                 {...register("newPassword")}
               />
               {errors.newPassword && (
@@ -95,10 +95,10 @@ export default function ResetPasswordPage() {
 
             <div className="space-y-2">
               <Label htmlFor="confirmPassword">Confirm password</Label>
-              <Input
+              <PasswordInput
                 id="confirmPassword"
-                type="password"
                 placeholder="••••••••"
+                autoComplete="new-password"
                 {...register("confirmPassword")}
               />
               {/* refine 的错误和普通字段错误一样，通过 errors 读取 */}

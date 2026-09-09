@@ -1,3 +1,4 @@
+using System.IdentityModel.Tokens.Jwt;
 using Hangfire;
 using Microsoft.AspNetCore.Identity;
 using UUcars.API.Auth;
@@ -96,8 +97,10 @@ public class UserService
         // 1. 按邮箱查找用户
         var user = await _userRepository.GetByEmailAsync(email, cancellationToken);
 
-        // 2. 用户不存在：抛出和密码错误一样的异常，不透露"邮箱不存在"
-        if (user == null) throw new InvalidCredentialsException();
+        // 2. 账号不存在或没有站内密码，都按凭据错误处理，不进入密码校验
+        if (user == null ||
+            string.IsNullOrWhiteSpace(user.PasswordHash))
+            throw new InvalidCredentialsException();
 
         // 3. 验证密码
         // VerifyHashedPassword 做的事：
@@ -124,14 +127,17 @@ public class UserService
 
         // 4. 验证通过，生成 JWT Token
         var token = _jwtTokenGenerator.GenerateToken(user);
-
+        // 从token中读取过期时间
+        var expiresAt = new JwtSecurityTokenHandler()
+            .ReadJwtToken(token)
+            .ValidTo;
         _logger.LogInformation("User logged in: {Email}", user.Email);
 
         return new LoginResponse
         {
             Token = token,
             // ExpiresAt 和 JwtTokenGenerator 里的 expires 保持一致
-            ExpiresAt = DateTime.UtcNow.AddMinutes(60),
+            ExpiresAt = expiresAt,
             User = MapToResponse(user)
         };
     }
@@ -240,13 +246,19 @@ public class UserService
             return;
         }
 
-        // 未验证邮箱的账号不允许重置密码
-        // 原因：如果允许未验证账号重置密码，攻击者可以用别人的邮箱注册，
-        // 然后通过密码重置拿到 Token，等于变相控制了这个邮箱对应的账号
+        // 当前密码重置流程只处理邮箱已验证的账号
         if (!user.EmailConfirmed)
         {
             _logger.LogWarning(
                 "Password reset requested for unverified email: {Email}", email);
+            return;
+        }
+
+        // 没有站内密码就不发送重置邮件，避免通过此入口增加密码登录方式
+        if (string.IsNullOrWhiteSpace(user.PasswordHash))
+        {
+            _logger.LogWarning(
+                "Password reset is not allowed!");
             return;
         }
 

@@ -13,6 +13,7 @@ using UUcars.API.Entities;
 using UUcars.API.Entities.Enums;
 using UUcars.API.Services.Cache;
 using UUcars.API.Services.Email;
+using UUcars.API.Services.ExternalLogin;
 using UUcars.Tests.Fakes;
 using UUcars.Tests.Services;
 
@@ -27,9 +28,7 @@ public class SqlServerTestFactory : WebApplicationFactory<Program>, IAsyncLifeti
     private readonly MsSqlContainer _sqlContainer = new MsSqlBuilder("mcr.microsoft.com/mssql/server:2022-latest")
         .WithPassword("TestStrong!Passw0rd")
         .Build();
-
-    // ✅ 移除：不再需要 FakeEmail
-    // public FakeEmailService FakeEmail { get; } = new();
+    
 
     // ✅ 新增：暴露 DbContext 查询能力，供 IntegrationTestBase 直接查 Token
     public AppDbContext GetDbContext()
@@ -68,13 +67,7 @@ public class SqlServerTestFactory : WebApplicationFactory<Program>, IAsyncLifeti
             // _sqlContainer.GetConnectionString() 返回容器的动态连接字符串
             services.AddDbContext<AppDbContext>(options =>
                 options.UseSqlServer(_sqlContainer.GetConnectionString()));
-
-
-            // ✅ 移除：不再需要替换 IEmailService 为 FakeEmailService
-            // var emailDescriptor = services.SingleOrDefault(...)
-            // services.Remove(emailDescriptor);
-            // services.AddSingleton<IEmailService>(FakeEmail);
-
+            
             // ✅ 新增：替换 IBackgroundJobClient 为 Fake
             // 原因：不能在测试里真正调用 Hangfire（需要 SQL Server Hangfire 系统表）
             // FakeBackgroundJobClient 静默处理入队，不真正执行任务
@@ -114,6 +107,24 @@ public class SqlServerTestFactory : WebApplicationFactory<Program>, IAsyncLifeti
                     options.AddPolicy(policyName, _ =>
                         RateLimitPartition.GetNoLimiter("no-limit"));
             });
+            
+            // =================================================
+            // Google 登录：
+            // 测试服务器不请求真实 Google，改为注入固定结果的 Fake
+            // =================================================
+            var googleServiceDescriptor = services.SingleOrDefault(
+                descriptor => descriptor.ServiceType ==
+                              typeof(IGoogleIdTokenService));
+
+            if (googleServiceDescriptor != null)
+            {
+                services.Remove(googleServiceDescriptor);
+            }
+
+            services.AddSingleton<
+                IGoogleIdTokenService,
+                FakeGoogleIdTokenService>();
+            
         });
 
         // 使用测试环境，避免加载生产配置
@@ -167,6 +178,11 @@ public class SqlServerTestFactory : WebApplicationFactory<Program>, IAsyncLifeti
         context.Orders.RemoveRange(context.Orders);
         context.CarImages.RemoveRange(context.CarImages);
         context.Cars.RemoveRange(context.Cars);
+
+        // ExternalLogin 依赖 User，必须在删除普通用户前先清理
+        // 避免外键约束冲突
+        context.ExternalLogins.RemoveRange(context.ExternalLogins);
+
         // 只删除普通用户，保留 Admin
         context.Users.RemoveRange(context.Users.Where(u => u.Role != UserRole.Admin));
         await context.SaveChangesAsync();
