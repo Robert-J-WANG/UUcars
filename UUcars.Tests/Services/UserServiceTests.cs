@@ -183,6 +183,33 @@ public class UserServiceTests
             "Test@123456"
         ));
     }
+    
+    // 验证：Google-only 用户不能使用任意密码通过本地登录。
+    [Fact]
+    public async Task LoginAsync_WithGoogleOnlyUser_ShouldRejectPasswordLogin()
+    {
+        // Google-only 用户没有 PasswordHash，不能通过本地密码入口登录。
+        var repository = new FakeUserRepository();
+
+        repository.Seed(new User
+        {
+            Id = 1,
+            Username = "google-user",
+            Email = "google-user@gmail.com",
+            PasswordHash = null,
+            Role = UserRole.User,
+            EmailConfirmed = true,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        });
+
+        var (service, _) = CreateService(repository);
+
+        await Assert.ThrowsAsync<InvalidCredentialsException>(
+            () => service.LoginAsync(
+                "google-user@gmail.com",
+                "AnyPassword@123"));
+    }
 
     // ===== 邮箱验证测试 =====
 
@@ -414,5 +441,35 @@ public class UserServiceTests
             "expired-reset-token",
             "NewPassword@123"
         ));
+    }
+    
+    // 验证：Google-only 用户不能经由忘记密码流程获得本地密码。
+    [Fact]
+    public async Task ForgotPasswordAsync_WithGoogleOnlyUser_ShouldNotEnqueueJob()
+    {
+        // 没有本地密码时，忘记密码流程不应创建重置 Token 或发送邮件任务。
+        var repository = new FakeUserRepository();
+
+        repository.Seed(new User
+        {
+            Id = 1,
+            Username = "google-user",
+            Email = "google-user@gmail.com",
+            PasswordHash = null,
+            Role = UserRole.User,
+            EmailConfirmed = true,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        });
+
+        var (service, jobClient) = CreateService(repository);
+
+        await service.ForgotPasswordAsync("google-user@gmail.com");
+
+        var user = await repository.GetByEmailAsync(
+            "google-user@gmail.com");
+
+        Assert.Empty(jobClient.EnqueuedJobs);
+        Assert.Null(user!.ResetPasswordToken);
     }
 }

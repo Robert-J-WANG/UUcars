@@ -28,6 +28,9 @@ public class AppDbContext : DbContext
     // 注册refresh token
     public DbSet<RefreshToken> RefreshTokens => Set<RefreshToken>();
 
+    // 第三方授权登录
+    public DbSet<ExternalLogin> ExternalLogins => Set<ExternalLogin>();
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         base.OnModelCreating(modelBuilder);

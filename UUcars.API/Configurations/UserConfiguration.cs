@@ -30,8 +30,8 @@ public class UserConfiguration : IEntityTypeConfiguration<User>
 
         builder.Property(u => u.EmailConfirmationTokenExpiry);
 
-        builder.Property(u => u.PasswordHash)
-            .IsRequired()
+        // 可空
+        builder.Property(user => user.PasswordHash)
             .HasMaxLength(256);
 
         // Step 39 新增

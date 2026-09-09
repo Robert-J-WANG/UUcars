@@ -20239,6 +20239,4334 @@ git push origin --delete feature/v3-admin-dashboard
 
 
 
+以下为重新按 Step 71 风格整理的 Step 72 笔记草案。
+
+
+
+## Step 72 · Google OpenID Connect（OIDC）第三方登录
+
+### 这一步做什么
+
+目前 UUcars 已完成本地认证流程：
+
+```
+注册
+→ 邮箱验证
+→ Email + Password 登录
+→ JWT Access Token
+→ Refresh Token Cookie
+```
+
+但用户只能使用 UUcars 自己保存的密码登录。
+
+本步骤增加 Google 登录。用户在 Login 或 Register 页面点击同一个 Google 按钮后，由 Google 确认身份；UUcars 后端验证 Google 返回的 ID Token，再建立 UUcars 自己的登录会话。
+
+最终数据流：
+
+```
+Google Login Button
+        ↓
+Google 返回 ID Token
+        ↓
+POST /auth/google
+        ↓
+GoogleIdTokenService
+        ↓
+ExternalLoginService
+        ↓
+User + ExternalLogin
+        ↓
+现有 JWT + Refresh Token Cookie
+        ↓
+Zustand auth state
+```
+
+本步骤会学习：
+
+- OpenID Connect 登录中的 ID Token；
+- `sub`、Issuer、Audience 和 Email Verified；
+- 第三方身份与本地 User 的关联；
+- EF Core 一对多关系与唯一索引；
+- 后端验证外部 Token；
+- 复用现有 JWT 和 Refresh Token 登录流程；
+- Mock 外部验证器进行单元测试和集成测试；
+- React 中接入 Google 登录按钮。
+
+
+
+### 1. 切出功能分支
+
+先检查当前状态：
+
+```
+git status --short --branch
+```
+
+确认当前在干净的 `develop` 后：
+
+```
+git pull --ff-only origin develop
+git checkout -b feature/v3-google-oidc-login
+git push -u origin feature/v3-google-oidc-login
+```
+
+
+
+### 2. Google 登录流程
+
+Google 登录不是把用户的 Google 密码交给 UUcars，而是让 Google 先确认用户身份，再把确认结果交给 UUcars。
+
+整个过程中有三个参与者：
+
+```
+用户
+Google
+UUcars
+```
+
+它们各自负责的事情不同：
+
+```
+用户
+→ 选择要使用的 Google 账号
+
+Google
+→ 完成账号验证
+→ 向 UUcars 提供一份身份凭证
+
+UUcars
+→ 验证这份凭证是否可信
+→ 根据 Google 身份找到对应的站内用户
+→ 建立 UUcars 自己的登录状态
+```
+
+因此，Google 只负责证明“当前用户是谁”。用户进入 UUcars 后使用的登录状态，仍然由 UUcars 自己创建和管理。
+
+#### 2.1 Google 登录失败
+
+如果用户取消、关闭窗口或 Google 登录失败：
+
+```
+Google 不会返回有效身份凭证
+→ UUcars 无法继续登录
+→ 页面提示本次登录没有完成
+```
+
+#### 2.2 Google 返回 ID Token
+
+如果 Google 成功确认用户，前端会收到：
+
+```
+ID Token
+```
+
+这个 ID Token 是 Google 签发的 JWT，里面包含类似：
+
+```
+{
+  "iss": "https://accounts.google.com",
+  "aud": "uucars-client-id.apps.googleusercontent.com",
+  "sub": "10769150350006150715113082367",
+  "email": "alice@example.com",
+  "email_verified": true,
+  "name": "Alice"
+}
+```
+
+几个字段的含义：
+
+```
+iss：谁签发这个 Token
+aud：这个 Token 是签发给哪个应用的
+sub：Google Account 的稳定唯一标识
+email：Google 当前返回的邮箱
+email_verified：Google 是否已确认用户控制这个邮箱
+```
+
+**其中最重要的是：**
+
+```
+Google 用户身份 = sub
+```
+
+而不是：
+
+```
+Google 用户身份 = email
+```
+
+因为邮箱可能改变，而 `sub` 用来稳定标识同一个 Google Account。
+
+前端不能只取出其中的邮箱或用户名交给 UUcars，因为浏览器传来的普通字段可以被修改。它需要把完整的 ID Token 发送给后端：
+
+```
+POST /auth/google
+{
+  "idToken": "..."
+}
+```
+
+#### 2.3 UUcars 后端验证 Token
+
+收到 ID Token 后，UUcars 后端首先验证这份凭证是否可信，主要确认：
+
+```
+它是否由 Google 签发
+内容是否被修改过
+是否签发给 UUcars 使用
+是否仍在有效期内
+```
+
+失败时：
+
+```
+UUcars 不接受这份身份凭证
+→ 本次登录失败
+```
+
+验证通过后，UUcars 才能信任 Token 中由 Google 提供的身份数据，例如：
+
+```
+sub = G123
+email = alice@example.com
+```
+
+#### 2.4 后端找到对应 UUcars 用户
+
+Google 身份和 UUcars 站内用户是两个不同概念：
+
+```
+Google 身份
+→ 由 Google 的 sub 标识
+
+UUcars 用户
+→ 由 UUcars 自己的站内编号标识
+```
+
+因此，验证 Google 身份后，UUcars 还需要确定这个 Google 身份对应哪个站内用户。
+
+如果这个 Google 身份以前使用过 UUcars：
+
+```
+找到原来对应的 UUcars 用户
+→ 登录原账号
+```
+
+如果这是这个 Google 身份第一次使用 UUcars：
+
+```
+根据经过验证的身份信息判断应使用已有站内账号
+或创建一个新的 UUcars 用户
+```
+
+无论最终对应已有用户还是新用户，UUcars 都需要记住这个对应关系。以后同一个 Google 身份再次登录时，就可以直接找到原来的站内账号。
+
+#### 2.5 创建 UUcars 登录会话
+
+找到对应的 UUcars 用户后，后端建立站内登录会话：
+
+```
+生成 UUcars JWT Access Token
+→ 创建 Refresh Token
+→ 写入 HttpOnly Cookie
+→ 把登录结果返回前端
+```
+
+前端收到 UUcars 的登录结果后，再保存前端登录状态并进入相应页面。
+
+所以完整原理是：
+
+```
+用户选择 Google 账号
+→ Google 确认用户身份
+→ Google 返回 ID Token
+→ UUcars 后端验证 ID Token
+→ 确定对应的 UUcars 用户
+→ UUcars 建立自己的登录会话
+```
+
+
+
+### 3. 创建 Google OAuth Client 并准备配置
+
+Google 登录按钮需要一个 Google OAuth Client ID。
+
+这个 Client ID 用来标识：
+
+```
+“正在请求 Google 登录的是 UUcars 网站”
+```
+
+它不限制只能由创建项目的 Google 账号登录 UUcars。
+
+#### 3.1 创建 Google Cloud Project
+
+先登录 Google Cloud Console：
+
+```
+https://console.cloud.google.com/
+```
+
+创建独立项目：
+
+```
+Project name：UUcars
+```
+
+创建后确认顶部项目选择器显示：
+
+```
+UUcars
+```
+
+#### 3.2 配置 Google Auth Platform 品牌信息
+
+进入：
+
+```
+Google Auth Platform
+→ 品牌塑造
+```
+
+填写：
+
+```
+应用名称：UUcars
+用户支持邮箱：自己的 Google 邮箱
+开发者联系信息：自己的 Google 邮箱
+```
+
+`应用名称` 是用户在 Google 登录授权界面中看到的名称。
+
+当前不需要上传 Logo，也不需要配置 Google API 权限。
+
+#### 3.3 设置目标对象和测试用户
+
+进入：
+
+```
+Google Auth Platform
+→ 目标对象
+```
+
+选择：
+
+```
+外部（External）
+```
+
+含义是：
+
+```
+UUcars 未来可以允许任何 Google 账号登录。
+```
+
+新建项目通常处于：
+
+```
+Testing
+```
+
+在 Testing 状态下，只有被加入 Test users 的 Google 账号才能测试登录。
+
+因此在：
+
+```
+测试用户
+→ 添加用户
+```
+
+加入自己的测试 Google 邮箱。
+
+开发期间可再加入其他测试账号。
+
+#### 3.4 创建 Web OAuth Client
+
+进入：
+
+```
+Google Auth Platform
+→ 客户端
+→ 创建客户端
+```
+
+填写：
+
+```
+应用类型：Web 应用
+名称：UUcars Local Development
+```
+
+名称只用于 Google Cloud Console 内部识别，不会显示给最终用户。
+
+#### 3.5 配置 Authorized JavaScript origins
+
+在：
+
+```
+已获授权的 JavaScript 来源
+```
+
+点击：
+
+```
+添加 URI
+```
+
+加入：
+
+```
+http://localhost
+http://localhost:5173
+```
+
+这里填写的是 React + Vite 前端页面地址，不是后端 API 地址。
+
+```
+正确：http://localhost:5173
+错误：http://localhost:5065
+```
+
+Google 登录按钮在浏览器中的 React 页面运行，因此 Google 需要确认：
+
+```
+这个前端来源可以使用 UUcars 的 Client ID。
+```
+
+如果以后 Vite 实际启动在其他端口，例如：
+
+```
+http://localhost:5174
+```
+
+再将该地址加入 JavaScript origins。
+
+#### 3.6 不配置 Redirect URI
+
+在：
+
+```
+已获授权的重定向 URI
+```
+
+保持空白。
+
+本项目使用流程是：
+
+```
+Google popup
+→ React 收到 ID Token
+→ React 调用 POST /auth/google
+```
+
+不是：
+
+```
+Google 重定向到后端 URL
+```
+
+因此当前不需要 Redirect URI。
+
+#### 3.7 保存 Client ID
+
+点击：
+
+```
+创建
+```
+
+创建后会显示：
+
+```
+客户端 ID
+客户端密钥
+```
+
+只复制：
+
+```
+客户端 ID
+```
+
+不要使用、下载或保存：
+
+```
+客户端密钥
+```
+
+本步骤的 Google popup 登录不需要 Client Secret。
+
+#### 3.8 配置本地前后端
+
+在 `uucars-web/.env.local` 中加入：
+
+```
+VITE_GOOGLE_CLIENT_ID=your-client-id.apps.googleusercontent.com
+```
+
+在后端 User Secrets 中加入相同值：
+
+```
+dotnet user-secrets set "GoogleAuth:ClientId" \
+  "1017312818794-93b9fkeegcnfbohbc9j68s7b073ensja.apps.googleusercontent.com" \
+  --project UUcars.API
+```
+
+前端使用 Client ID 初始化 Google 登录组件。
+
+后端使用同一个 Client ID 验证 Google ID Token 的：
+
+```
+aud
+```
+
+确保该 Token 确实是签发给 UUcars 的。
+
+
+
+### 4. 前端接收 Google 返回的 Credential
+
+上面通过设置我们已经获取了 Google OAuth Client ID，并把它保存到：
+
+```
+VITE_GOOGLE_CLIENT_ID
+```
+
+但环境变量本身不会让 React 自动拥有 Google 登录功能。前端还需要：
+
+```
+加载 Google Identity Services
+→ 使用 Client ID 初始化 Google 登录
+→ 显示 Google 登录按钮
+→ 接收 Google 登录结果
+```
+
+#### 4.1 安装 React Google OAuth 包
+
+安装：
+
+```
+cd uucars-web
+npm install @react-oauth/google
+```
+
+这个包主要提供两个组件：
+
+```
+GoogleOAuthProvider
+→ 初始化 Google 登录环境
+→ 保存 Client ID
+→ 加载 Google Identity Services
+→ 把配置提供给内部组件
+
+GoogleLogin
+→ 显示 Google 官方登录按钮
+→ 用户完成 Google 登录后触发回调
+```
+
+#### 4.2 使用 GoogleOAuthProvider 初始化登录环境
+
+`GoogleLogin` 需要知道：
+
+```
+当前网站使用哪个 Google Client ID
+Google Identity Services 是否已经加载完成
+```
+
+如果每个登录按钮都单独读取和初始化这些配置，会产生重复代码。
+
+`GoogleOAuthProvider` 使用 React Context 把同一份 Google 配置提供给内部组件：
+
+```
+GoogleOAuthProvider
+└── UUcars React 应用
+    ├── LoginPage
+    │   └── GoogleLogin
+    └── RegisterPage
+        └── GoogleLogin
+```
+
+因此在 `uucars-web/src/main.tsx` 中引入：
+
+```tsx
+import { GoogleOAuthProvider } from "@react-oauth/google";
+```
+
+读取 Client ID：
+
+```tsx
+const googleClientId = import.meta.env.VITE_GOOGLE_CLIENT_ID;
+
+if (!googleClientId) {
+  throw new Error("VITE_GOOGLE_CLIENT_ID is not configured.");
+}
+```
+
+然后包裹现有应用：
+
+```tsx
+createRoot(document.getElementById("root")!).render(
+  <StrictMode>
+    <GoogleOAuthProvider clientId={googleClientId}>
+      <QueryClientProvider client={queryClient}>
+        <AuthInitializer>
+          <RouterProvider router={router} />
+        </AuthInitializer>
+
+        <Toaster position="bottom-right" />
+      </QueryClientProvider>
+    </GoogleOAuthProvider>
+  </StrictMode>,
+);
+```
+
+这里的 `clientId` 告诉 Google：
+
+```
+这个页面正在代表 UUcars 请求用户登录
+```
+
+被 Provider 包裹后，内部任何位置中的 `GoogleLogin` 才能读取这份配置。
+
+#### 4.3 在 LoginPage 中暂时接收 Google 返回值
+
+现在先在 `LoginPage` 中直接加入 `GoogleLogin`，确认前端实际收到的数据类型。
+
+引入：
+
+```
+import {
+  GoogleLogin,
+  type CredentialResponse,
+} from "@react-oauth/google";
+import { toast } from "sonner";
+```
+
+定义成功回调：
+
+```tsx
+const handleGoogleSuccess = (response: CredentialResponse) => {
+    if (!response.credential) {
+      toast.error("Google did not return an ID token.");
+      return;
+    }
+    console.log("Google response:", response);
+  };
+```
+
+在本地登录表单下方暂时加入：
+
+```tsx
+<div className="my-6 flex items-center gap-3">
+  <div className="h-px flex-1 bg-[var(--color-border-strong)]" />
+
+  <span className="text-sm text-muted-foreground">
+    Or continue with
+  </span>
+
+  <div className="h-px flex-1 bg-[var(--color-border-strong)]" />
+</div>
+
+<GoogleLogin
+  onSuccess={handleGoogleSuccess}
+  onError={() => {
+    toast.error("Google sign-in was cancelled or failed.");
+  }}
+/>
+```
+
+启动前端：
+
+```
+npm run dev
+```
+
+访问：
+
+```
+http://localhost:5173/login
+```
+
+点击 Google 按钮并选择测试账号。
+
+Google 成功确认用户后，收到 `CredentialResponse`对象：
+
+```objc
+{
+    "credential": "eyJhbGciOiJSUzI...r3aA",
+    "clientId": "1017312818794...nsja.apps.googleusercontent.com",
+    "select_by": "btn"
+}
+```
+
+这里没有直接得到：
+
+```
+sub
+email
+name
+```
+
+真正的用户身份数据被放在：
+
+```
+response.credential
+```
+
+这个就是 Google ID Token
+
+
+
+### 5. 在后端验证 Google ID Token
+
+前端得到的 `credential` 只是一个字符串。虽然它内部包含 Google 用户信息，但 UUcars 后端不能直接相信前端传来的内容。攻击者也可以自己构造请求，并提交伪造字符串。
+
+因此后端需要对这个字符串进行解析并验证，比如需要确认：
+
+```
+Token 是否由 Google 签名
+Token 是否签发给 UUcars
+Token 是否已经过期
+Token 中是否包含有效的用户身份
+```
+
+验证通过后，才能把 Google Token 转换为 UUcars 可以使用的身份数据。
+
+#### 5.1 安装 Google 验证库
+
+安装：
+
+```
+dotnet add UUcars.API package Google.Apis.Auth
+```
+
+这个包提供了验证方法：
+
+```
+GoogleJsonWebSignature.ValidateAsync(...)
+```
+
+它同时完成**解析和验证**：
+
+1. 拆开 Token，解码其中的 JSON，并转换成 SDK 定义的 `Payload` 对象。
+2. 使用 Google 公钥验证签名，确认内容没有被篡改。
+3. 检查签发者和时间等条件。
+4. 检查通过后，返回 `Payload`；失败则抛出异常。
+
+因此，它不是只把字符串转换成对象。**能取得返回结果，说明 SDK 已执行的验证已经通过。**
+
+Google 公钥的获取和缓存由 SDK 处理，不需要自己实现。
+
+#### 5.2 解析ID Token
+
+后端需要从请求体接收 Token，因此先定义请求 DTO。
+
+创建 `UUcars.API/DTOs/Requests/GoogleLoginRequest.cs`
+
+```c#
+using System.ComponentModel.DataAnnotations;
+
+namespace UUcars.API.DTOs.Requests;
+
+public class GoogleLoginRequest
+{
+    [Required(ErrorMessage = "Google ID token is required.")]
+    public string IdToken { get; set; } = string.Empty;
+}
+```
+
+这样，前端发送的请求 Body 为：
+
+```json
+{
+  "idToken": "response.credential"
+}
+```
+
+这里的 `[Required]` 只检查请求是否提供了 Token，**不负责判断 Token 是否真实有效**。
+
+如果收到的字符串不是合法 JWT，接口需要返回认证失败, 因此我们也定义 `InvalidGoogleIdTokenException`异常类。 新建 `UUcars.API/Exceptions/InvalidGoogleIdTokenException.cs`：
+
+```c#
+namespace UUcars.API.Exceptions;
+
+public class InvalidGoogleIdTokenException : AppException
+{
+    public InvalidGoogleIdTokenException()
+        : base(
+            StatusCodes.Status401Unauthorized,
+            "Google authentication failed.")
+    {
+    }
+}
+```
+
+把解析逻辑放在 Service 中， 创建`UUcars.API/Services/ExternalLogin/GoogleIdTokenService.cs `，并临时编写解析逻辑。
+
+可以使用`GoogleJsonWebSignature.ValidateAsync`这个方法， 调用后的返回结果:
+
+```c#
+<GoogleJsonWebSignature.Payload> payload
+```
+
+这个 `payload` 就是对 ID Token 解析后的数据。
+
+先创建接口方法， 方便测试时使用这个解析认证的能力。
+
+新建 ``UUcars.API/Services/ExternalLogin/IGoogleIdTokenService.cs ``
+
+```c#
+using Google.Apis.Auth;
+
+namespace UUcars.API.Services.ExternalLogin;
+
+public interface IGoogleIdTokenService
+{
+    public Task<GoogleJsonWebSignature.Payload> ValidateAsync(string idToken,
+        CancellationToken cancellationToken = default);
+}
+```
+
+实现接口
+
+```c#
+using Google.Apis.Auth;
+
+namespace UUcars.API.Services.ExternalLogin;
+
+public class GoogleIdTokenService:IGoogleIdTokenService
+{
+    public async Task<GoogleJsonWebSignature.Payload> ValidateAsync(string idToken,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            return await GoogleJsonWebSignature.ValidateAsync(idToken);
+        }
+       catch (InvalidJwtException)
+        {
+            throw new InvalidGoogleIdTokenException();
+        }
+    }
+}
+```
+
+这里返回的 `GoogleJsonWebSignature.Payload` 是 **SDK 已经定义好的类型**
+
+`Program.cs`中注册 `GoogleIdTokenService`：
+
+```c#
+builder.Services.AddScoped<IGoogleIdTokenService, GoogleIdTokenService>();
+```
+
+`AuthController`中添加 `post /auth/google  `接口， 注入上面的GoogleIdTokenService方法，实现临时解析
+
+```c#
+[ApiController]
+[Route("auth")]
+public class AuthController : ControllerBase
+{
+    ...
+
+    private readonly IGoogleIdTokenService _googleIdTokenService;
+
+    public AuthController(UserService userService, RefreshTokenService refreshTokenService,
+        IWebHostEnvironment environment, IGoogleIdTokenService googleIdTokenService)
+    {
+       ...
+        _googleIdTokenService = googleIdTokenService;
+    }
+
+...
+
+    [HttpPost("google")]
+    public async Task<IActionResult> GoogleLogin(
+        [FromBody] GoogleLoginRequest request)
+    {
+        var payload =
+            await _googleIdTokenService.ValidateAsync(request.IdToken);
+        return Ok(ApiResponse<GoogleJsonWebSignature.Payload>.Ok(payload, "Parse successful."));
+    }
+
+...
+   
+}
+```
+
+Scalar或者Postman中发送 Http请求，传入前端获取的idToken字符串，解析结果为：
+
+```json
+{
+  "success": true,
+  "data": {
+    "scope": null,
+    "prn": null,
+    "hostedDomain": null,
+    "email": "rwial666@gmail.com",
+    "emailVerified": true,
+    "name": "rwial1",
+    "givenName": "rwial1",
+    "familyName": null,
+    "picture": "https://lh3.googleusercontent.com/a/ACg8ocIQMxcLKdoGGF05NhXT5KPP875_0GdZus4tsESrdZ2Bex4ihg=s96-c",
+    "locale": null,
+    "issuer": "https://accounts.google.com",
+    "subject": "101832463461530622420",
+    "audience": "1017312818794-93b9fkeegcnfbohbc9j68s7b073ensja.apps.googleusercontent.com",
+    "targetAudience": null,
+    "expirationTimeSeconds": 1788482294,
+    "notBeforeTimeSeconds": 1788478394,
+    "issuedAtTimeSeconds": 1788478694,
+    "jwtId": "36e3d8ec5017dd5571acaffab9a351974863a5bd",
+    "nonce": null,
+    "type": null,
+    "audienceAsList": [
+      "1017312818794-93b9fkeegcnfbohbc9j68s7b073ensja.apps.googleusercontent.com"
+    ]
+  },
+  "message": "Parse successful.",
+  "errors": null
+}
+```
+
+主要字段对应关系为：
+
+| 返回属性                | Token 中的字段   | 含义                      |
+| ----- | ---- | - |
+| `issuer`                | `iss`            | 签发者                    |
+| `audience`              | `aud`            | Token 的接收应用          |
+| `subject`               | `sub`            | Google 用户编号           |
+| `email`                 | `email`          | 邮箱                      |
+| `emailVerified`         | `email_verified` | Google 提供的邮箱验证状态 |
+| `name`                  | `name`           | 显示名称                  |
+| `expirationTimeSeconds` | `exp`            | 到期时间                  |
+| `issuedAtTimeSeconds`   | `iat`            | 签发时间                  |
+
+返回对象中有些属性可能为 `null`，因为 SDK 的模型包含多种字段，而当前 Token 不一定提供所有字段。
+
+**签名验证保护的是 Token 携带的数据，不是要求每个属性都非空，也不是要求 `EmailVerified` 必须为 `true`。**
+
+#### 5.3 配置 Audience，确认 Token 签发给 UUcars
+
+上面返回的数据中的 `audience`， 它对应的是前端发送google登录时，传入进组件中的
+
+```tsx
+const googleClientId = import.meta.env.VITE_GOOGLE_CLIENT_ID;
+
+ <GoogleOAuthProvider clientId={googleClientId}>
+    ...
+ </GoogleOAuthProvider>   
+```
+
+它表示Google 将这个 Token 签发给哪个应用。
+
+但上面的验证还没有确认这个 Token 是否确实签发给 UUcars 使用。
+
+因此还需要指定 UUcars 的 Client ID，验证 Token 中的 Audience。
+
+`GoogleJsonWebSignature.ValidateAsync()` 还有另一个重载
+
+```c#
+public static Task<Payload> ValidateAsync(
+    string jwt,
+    GoogleJsonWebSignature.ValidationSettings validationSettings)
+```
+
+可以传入配置对象 `GoogleJsonWebSignature.ValidationSettings validationSettings` 指定额外的验证条件，其中 `Audience` 用来配置允许接收这个 Token 的 Client ID：
+
+```c#
+Audience = UUcars 的 Google Client ID
+```
+
+UUcars 使用的 Google Client ID 已经保存进 `user-secrets` 中：
+
+```c#
+GoogleAuth:ClientId = 1017312818794-93b9fkeegcnfbohbc9j68s7b073ensja.apps.googleusercontent.com
+```
+
+编写配置类 `GoogleAuthSettings`， 用于获取 `GoogleAuth:ClientId`:
+
+```c#
+namespace UUcars.API.Configurations;
+
+public class GoogleAuthSettings
+{
+    public string ClientId { get; set; } = string.Empty;
+}
+```
+
+在 [Program.cs](/Users/aqiang/Desktop/myGitHub/upload/dotNet Projects/UUcars/UUcars.API/Program.cs) 中绑定：
+
+```c#
+builder.Services.Configure<GoogleAuthSettings>(
+    builder.Configuration.GetSection("GoogleAuth"));
+```
+
+把配置中的 `GoogleAuth` 部分绑定到 `GoogleAuthSettings`，
+
+使 Service 可以通过 `IOptions<GoogleAuthSettings>` 取得 Client ID。
+
+完成验证配置对象的条件设置：
+
+```c#
+public class GoogleIdTokenService
+{
+    private readonly GoogleAuthSettings _settings;
+    
+    public GoogleIdTokenService(IOptions<GoogleAuthSettings> options)
+    {
+        _settings = options.Value;
+    }
+    
+    public async Task<GoogleJsonWebSignature.Payload> ValidateAsync(string idToken,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var validationSettings = new GoogleJsonWebSignature.ValidationSettings()
+            {
+                Audience = [ _settings.ClientId]
+            };
+            return await GoogleJsonWebSignature.ValidateAsync(idToken, validationSettings);
+        }
+        catch(InvalidJwtException)
+        {
+            throw new InvalidGoogleIdTokenException();
+        }
+    }
+}
+```
+
+一旦设置了配置对象，当后端的ClientId与 id token里的 Audience不一致时， 验证就不能通过。
+
+对于当前单个 Audience 的情况：
+
+```
+Token 的 aud 与后端配置的 Client ID 相同
+→ Audience 检查通过
+
+Token 的 aud 属于其他应用
+→ 验证失败，抛出 InvalidJwtException
+```
+
+前端使用 Client ID，是向 Google **申请发给 UUcars 的 Token**；后端使用同一个值，是**检查收到的 Token 是否确实发给 UUcars**。
+
+
+
+### 6. 设计 ExternalLogin 数据模型
+
+上面取得的 `payload.Subject` 是 Google 用户编号，但 UUcars 的车辆、收藏等数据关联的是站内 `User.Id`。这两个编号不是同一个东西。
+
+因此，需要保存一条对应关系：这个 Google 账号对应哪个 UUcars 用户。以后再次取得同一个 Google 用户编号，就可以通过这条记录找到站内账号。
+
+我们把这条关联记录定义为 `ExternalLogin`。
+
+经过后端验证后，现在已经确定真正需要长期保存的第三方身份是：
+
+| 字段              | 来源和作用                               |
+| ----- | ---- |
+| `Provider`        | UUcars 设置为 `"Google"`，表示认证提供方 |
+| `ProviderSubject` | 来自 SDK 返回的 `payload.Subject`        |
+| `UserId`          | 对应的 UUcars 用户编号                   |
+
+例如：
+
+```
+Provider = Google
+Subject = 10769150350006150715113082367
+UserId = 123
+```
+
+`Provider` 不是 Google Payload 返回的属性，而是我们为了记录认证来源定义的字段。
+
+数据库需要表达：
+
+```
+Google 的这个 Subject
+属于哪个 UUcars User
+```
+
+#### 6.1 User 与 ExternalLogin 的关系
+
+关系为：
+
+```
+User 1 ──── * ExternalLogin
+```
+
+含义是：
+
+```
+一个 UUcars User
+可以没有 ExternalLogin
+也可以拥有一条或多条 ExternalLogin
+```
+
+本地密码用户：
+
+```
+User
+└── ExternalLogins = []
+```
+
+本地密码用户可以没有关联记录，因此 `ExternalLogins` 是空集合；数据库中没有该用户对应的 `ExternalLogins` 行。
+
+Google 用户：
+
+```
+User
+└── ExternalLogins
+    └── Google + Subject
+```
+
+#### 6.2 新建 ExternalLogin 实体
+
+新建 `UUcars.API/Entities/ExternalLogin.cs`：
+
+```c#
+
+namespace UUcars.API.Entities;
+
+public class ExternalLogin
+{
+    public int Id { get; set; }
+
+    // 第三方身份提供方，例如 Google
+    public string Provider { get; set; } = string.Empty;
+
+    // 第三方平台返回的稳定用户编号，例如 Google sub
+    public string ProviderSubject { get; set; } = string.Empty;
+
+    public int UserId { get; set; }
+
+    public User User { get; set; } = null!;
+
+    public DateTime CreatedAt { get; set; }
+}
+```
+
+这里保存的是：
+
+```
+Provider + ProviderSubject → UserId
+```
+
+不把 Google Email 当成关联主键。
+
+`ExternalLogin` 不继承 `BaseEntity`，因为这条关联创建后不会频繁修改，不需要单独保存 `UpdatedAt`。
+
+#### 6.3 更新 User 实体
+
+Google 首次登录创建的 User 没有 UUcars 密码，因此修改：
+
+```
+UUcars.API/Entities/User.cs
+```
+
+将：
+
+```
+public string PasswordHash { get; set; } = string.Empty;
+```
+
+改为：
+
+```
+// Google 首次登录创建的用户没有 UUcars 本地密码
+public string? PasswordHash { get; set; }
+```
+
+然后加入导航属性：
+
+```
+// 本地用户可以没有关联记录；第三方登录用户保存对应的关联记录
+public ICollection<ExternalLogin> ExternalLogins { get; set; } = [];
+```
+
+这里的可空关系分别是：
+
+```
+本地用户
+PasswordHash = 有值
+ExternalLogins = 空集合
+
+Google-only 用户
+PasswordHash = null
+ExternalLogins = 包含 Google 记录
+
+本地账号后来使用 Google 登录
+PasswordHash = 有值
+ExternalLogins = 包含 Google 记录
+```
+
+#### 6.4 配置 ExternalLogin
+
+新建 `UUcars.API/Configurations/ExternalLoginConfiguration.cs`：
+
+```c#
+
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+using UUcars.API.Entities;
+
+namespace UUcars.API.Configurations;
+
+public class ExternalLoginConfiguration
+    : IEntityTypeConfiguration<ExternalLogin>
+{
+    public void Configure(
+        EntityTypeBuilder<ExternalLogin> builder)
+    {
+        builder.HasKey(login => login.Id);
+
+        builder.Property(login => login.Provider)
+            .IsRequired()
+            .HasMaxLength(30);
+
+        builder.Property(login => login.ProviderSubject)
+            .IsRequired()
+            .HasMaxLength(255);
+
+        builder.Property(login => login.CreatedAt)
+            .IsRequired();
+
+        builder.HasIndex(login => new
+            {
+                login.Provider,
+                login.ProviderSubject
+            })
+            .IsUnique()
+            .HasDatabaseName(
+                "IX_ExternalLogins_Provider_ProviderSubject");
+
+        builder.HasIndex(login => login.UserId)
+            .HasDatabaseName("IX_ExternalLogins_UserId");
+
+        builder.HasOne(login => login.User)
+            .WithMany(user => user.ExternalLogins)
+            .HasForeignKey(login => login.UserId)
+            .OnDelete(DeleteBehavior.Cascade);
+    }
+}
+```
+
+联合唯一索引保证：
+
+```
+Google + 同一个 Subject
+```
+
+最多只能关联到一个 UUcars User。
+
+删除 User 时使用 `Cascade`，因为失去所属 User 后，这条外部登录记录也没有独立保留价值。
+
+#### 6.5 允许 PasswordHash 为 NULL
+
+在 `UserConfiguration` 中将：
+
+```c#
+builder.Property(user => user.PasswordHash)
+    .IsRequired()
+    .HasMaxLength(256);
+```
+
+改为：
+
+```c#
+builder.Property(user => user.PasswordHash)
+    .HasMaxLength(256);
+```
+
+属性声明为 `string?`后，移除 EF 配置中的 `.IsRequired()`，使 `PasswordHash` 成为可空字段。
+
+#### 6.6 注册 DbSet
+
+在 `AppDbContext` 中加入：
+
+```c#
+public DbSet<ExternalLogin> ExternalLogins
+    => Set<ExternalLogin>();
+```
+
+#### 6.7 生成 Migration
+
+执行：
+
+```
+dotnet ef migrations add AddExternalLoginsForGoogleOidc \
+  --project UUcars.API \
+  --startup-project UUcars.API
+```
+
+更新本地数据库：
+
+```
+dotnet ef database update \
+  --project UUcars.API \
+  --startup-project UUcars.API
+```
+
+
+
+### 7. 实现 ExternalLogin Repository
+
+数据库已经能够保存第三方身份关联，但业务代码还缺少两个操作：
+
+```
+根据 Provider + Subject 查找关联
+保存新的 ExternalLogin
+```
+
+这些是数据库访问操作，因此放进 Repository。
+
+#### 7.1 定义 IExternalLoginRepository
+
+新建 `UUcars.API/Repositories/IExternalLoginRepository.cs`：
+
+```c#
+
+using UUcars.API.Entities;
+
+namespace UUcars.API.Repositories;
+
+public interface IExternalLoginRepository
+{
+    // 查找第三方账号的关联记录，同时加载对应的 UUcars 用户
+    Task<ExternalLogin?> GetByProviderAndSubjectAsync(
+        string provider,
+        string providerSubject,
+        CancellationToken cancellationToken = default);
+
+    // 保存新的第三方账号关联
+    Task<ExternalLogin> AddAsync(
+        ExternalLogin externalLogin,
+        CancellationToken cancellationToken = default);
+}
+```
+
+#### 7.2 实现 EfExternalLoginRepository
+
+新建 `UUcars.API/Repositories/EfExternalLoginRepository.cs`：
+
+```c#
+using Microsoft.EntityFrameworkCore;
+using UUcars.API.Data;
+using UUcars.API.Entities;
+
+namespace UUcars.API.Repositories;
+
+public class EfExternalLoginRepository
+    : IExternalLoginRepository
+{
+    private readonly AppDbContext _context;
+
+    public EfExternalLoginRepository(AppDbContext context)
+    {
+        _context = context;
+    }
+
+    public async Task<ExternalLogin?>
+        GetByProviderAndSubjectAsync(
+            string provider,
+            string providerSubject,
+            CancellationToken cancellationToken = default)
+    {
+        return await _context.ExternalLogins
+            .Include(login => login.User)
+            .FirstOrDefaultAsync(
+                login =>
+                    login.Provider == provider &&
+                    login.ProviderSubject == providerSubject,
+                cancellationToken);
+    }
+
+    public async Task<ExternalLogin> AddAsync(
+        ExternalLogin externalLogin,
+        CancellationToken cancellationToken = default)
+    {
+        _context.ExternalLogins.Add(externalLogin);
+        await _context.SaveChangesAsync(cancellationToken);
+
+        return externalLogin;
+    }
+}
+```
+
+查询中使用：
+
+```
+.Include(login => login.User)
+```
+
+因为查到 ExternalLogin 后，真正需要登录的是它关联的：
+
+```
+User
+```
+
+`ExternalLogin` 中保存了 `UserId` 外键，但外键有值不代表 `User` 对象已经加载。这里使用 `Include`，让查询结果同时包含关联的用户。
+
+#### 7.3 同时保存新 User 和 ExternalLogin
+
+全新的 Google 用户需要在同一次数据库保存中创建：
+
+```
+User
+ExternalLogin
+```
+
+如果先保存 User，再单独保存 ExternalLogin，中间失败时可能只留下一个没有登录方式的 Google User。
+
+为了明确表达“同时保存新用户和第三方关联”这个操作，在 `IUserRepository` 中增加一个专用方法:
+
+```c#
+Task<User> AddWithExternalLoginAsync(
+    User user,
+    ExternalLogin externalLogin,
+    CancellationToken cancellationToken = default);
+```
+
+这个方法只用于：
+
+```
+首次使用第三方登录创建的新 User
+```
+
+本地注册仍然使用原来的：
+
+```
+AddAsync(User user)
+```
+
+在 `EfUserRepository` 中实现：
+
+```c#
+public async Task<User> AddWithExternalLoginAsync(
+    User user,
+    ExternalLogin externalLogin,
+    CancellationToken cancellationToken = default)
+{
+    // 在内存中建立关系
+    user.ExternalLogins.Add(externalLogin);
+	// 让 EF Core 跟踪整个新增对象关系
+    _context.Users.Add(user);
+    //在同一次事务中保存
+    await _context.SaveChangesAsync(cancellationToken);
+
+    return user;
+}
+```
+
+`user.ExternalLogins.Add(...)` 建立了实体关系。
+
+EF Core 会在一次 `SaveChangesAsync()` 中执行：
+
+```
+INSERT Users
+→ 取得新 UserId
+→ INSERT ExternalLogins
+```
+
+#### 7.4 注册 Repository
+
+在 `Program.cs` 中加入：
+
+```c#
+builder.Services.AddScoped<
+    IExternalLoginRepository,
+    EfExternalLoginRepository>();
+```
+
+
+
+### 8. 实现 ExternalLoginService
+
+本节在 `ExternalLoginService` 中组织登录业务：先调用 `GoogleIdTokenService` 验证 Token，再根据返回的 Google 身份查找或创建对应的 UUcars 账号，最后生成站内 Access Token 并返回登录结果。
+
+账号匹配规则放在业务 Service 中，数据库查询和保存仍由 Repository 完成。
+
+新建 `UUcars.API/Services/ExternalLogin/ExternalLoginService.cs`：
+
+```c#
+namespace UUcars.API.Services.ExternalLogin;
+
+public class ExternalLoginService
+{
+}
+```
+
+新建2个方法：
+
+- `FindOrCreateUserAsync()` - 根据验证后的 Google 身份，查找或创建对应的 UUcars 用户
+- `LoginAsync()` - 调用 Token 验证和账户处理方法，生成站内 Token 并返回登录结果
+
+```c#
+public class ExternalLoginService
+{
+    public async Task<LoginResponse> LoginAsync(string idToken, CancellationToken cancellationToken)
+    {
+        // 处理登录逻辑
+    }
+
+    private async Task<User?> FindOrCreateUserAsync(GoogleJsonWebSignature.Payload payload,
+        CancellationToken cancellationToken = default)
+    {
+        // 查找或创建对应的 UUcars 用户
+    }
+}
+```
+
+#### 8.1 获取验证后的 Payload 数据
+
+处理站内账号之前，需要取得验证后的 Google 身份数据，因此先在业务入口中调用 `GoogleIdTokenService`。
+
+```c#
+public class ExternalLoginService
+{
+    private readonly IGoogleIdTokenService _googleIdTokenService;
+
+    public ExternalLoginService(IGoogleIdTokenService googleIdTokenService)
+    {
+        _googleIdTokenService = googleIdTokenService;
+    }
+
+    public async Task<LoginResponse> LoginAsync(string idToken,
+        CancellationToken cancellationToken = default)
+    {
+        // 获取认证后的payload
+        var payload = await _googleIdTokenService.ValidateAsync(idToken, cancellationToken);
+        
+        // 查询关联用户的逻辑
+    }
+    
+    
+}
+```
+
+取得 Payload 后，首先要回答：
+
+> 这个 Google 账号是否已经关联了一个 UUcars 账号？
+
+把账户查询和创建逻辑封装进 `FindOrCreateUserAsync()`，将验证后取得的 `payload` 传给它：
+
+```c#
+public class ExternalLoginService
+{
+    private readonly IGoogleIdTokenService _googleIdTokenService;
+
+    public ExternalLoginService(IGoogleIdTokenService googleIdTokenService)
+    {
+        _googleIdTokenService = googleIdTokenService;
+    }
+
+    public async Task<LoginResponse> LoginAsync(string idToken, CancellationToken cancellationToken)
+    {
+        // 获取认证后的payload
+        var payload = await _googleIdTokenService.ValidateAsync(idToken, cancellationToken);
+        
+        // 查询关联用户
+        var user=await FindOrCreateUserAsync(payload, cancellationToken);
+    }
+    
+    
+    private async Task<User?> FindOrCreateUserAsync(GoogleJsonWebSignature.Payload payload,
+        CancellationToken cancellationToken = default)
+    {
+        // ... 
+    }
+    
+}
+```
+
+
+
+#### 8.2 查找或创建站内用户
+
+先查询 Google 账号的关联记录；找到时返回关联的站内用户，未找到时再根据邮箱处理账号。
+
+##### 1. 已经存在第三方关联记录
+
+使用：
+
+```
+Provider = Google
+ProviderSubject = payload.Subject
+```
+
+进行查询 `ExternalLogin`。
+
+Repository 已经通过 `Include` 加载关联的 `User`，因此找到关联后，可以直接取得对应用户。
+
+```c#
+public class ExternalLoginService
+{
+    private readonly IGoogleIdTokenService _googleIdTokenService;
+    private readonly IExternalLoginRepository _externalLoginRepository;
+
+    public ExternalLoginService(IGoogleIdTokenService googleIdTokenService,
+        IExternalLoginRepository externalLoginRepository)
+    {
+        _googleIdTokenService = googleIdTokenService;
+        _externalLoginRepository = externalLoginRepository;
+    }
+
+    public async Task<LoginResponse> LoginAsync(string idToken, CancellationToken cancellationToken)
+    {
+       ...
+    }
+
+    private async Task<User?> FindOrCreateUserAsync(GoogleJsonWebSignature.Payload payload,
+        CancellationToken cancellationToken = default)
+    {
+        // 查询关联用户的逻辑
+        // 1. 已经存在第三方关联——————————————————————————————
+
+        var existingLogin = await _externalLoginRepository.GetByProviderAndSubjectAsync(GoogleProvider,
+            payload.Subject,
+            cancellationToken);
+
+        if (existingLogin != null) return existingLogin.User;
+    }
+}
+```
+
+##### 2. 没有第三方关联记录时，根据邮箱处理账号
+
+没有关联记录，说明 UUcars 尚未记录这个 Google 账号对应哪个站内用户。
+
+这时需要根据邮箱判断：
+
+```
+站内已有同邮箱账号 → 判断是否允许关联
+
+站内没有同邮箱账号 → 创建账号和关联
+```
+
+**先明确邮箱要求**
+
+当前用户模型要求邮箱，因此在使用邮箱之前，需要检查：
+
+- 邮箱有值；
+- Google 返回的 `EmailVerified` 为 `true`；
+- 邮箱长度不超过数据库规定的 100 个字符。
+
+邮箱统一转换为小写，与现有本地注册保持一致。
+
+此外，不能仅凭任意 Google 账号的邮箱字段自动关联站内账号。Google 对 Gmail，以及已验证且带有 `HostedDomain` 的 Workspace 邮箱，能够提供当前邮箱归属依据；其他邮箱即使返回 `EmailVerified = true`，也可能只是过去验证过。
+
+这里采用以下业务规则：
+
+- 首次接入只在上述邮箱归属条件满足时继续。
+- 同邮箱站内账号已经验证，才允许自动关联。
+- 同邮箱站内账号尚未验证，返回冲突，不自动激活。
+
+未验证的本地账号可能由其他人填写该邮箱并设置密码。直接激活并保留原密码，会让那份密码也获得登录能力。
+
+**定义邮箱业务异常**：
+
+1. 邮箱条件不满足时，返回 `403`。
+
+    ```c#
+    namespace UUcars.API.Exceptions;
+    
+    public class ExternalLoginNotAllowedException : AppException
+    {
+        public ExternalLoginNotAllowedException(string message)
+            : base(StatusCodes.Status403Forbidden, message)
+        {
+        }
+    }
+    ```
+
+2. 同邮箱账号存在，但不能自动关联时，返回 `409`。
+
+    ```c#
+    namespace UUcars.API.Exceptions;
+    
+    public class ExternalLoginConflictException : AppException
+    {
+        public ExternalLoginConflictException()
+            : base(
+                StatusCodes.Status409Conflict,
+                "This email is already registered and cannot be linked automatically.")
+        {
+        }
+    }
+    ```
+
+这两个异常表示业务条件不满足，与第 5 节的 Token 验证失败分开。
+
+**补全邮箱的业务逻辑**：
+
+```c#
+public class ExternalLoginService
+{
+    private readonly IGoogleIdTokenService _googleIdTokenService;
+    private readonly IExternalLoginRepository _externalLoginRepository;
+    
+    public ExternalLoginService(IGoogleIdTokenService googleIdTokenService,
+        IExternalLoginRepository externalLoginRepository)
+    {
+        _googleIdTokenService = googleIdTokenService;
+        _externalLoginRepository = externalLoginRepository;
+    }
+
+    public async Task<LoginResponse> LoginAsync(string idToken, CancellationToken cancellationToken)
+    {
+        ...
+    }
+
+    private async Task<User?> FindOrCreateUserAsync(GoogleJsonWebSignature.Payload payload,
+        CancellationToken cancellationToken = default)
+    {
+        // 查询关联用户的逻辑
+        // 1. 已经存在第三方关联——————————————————————————————
+
+        var existingLogin = await _externalLoginRepository.GetByProviderAndSubjectAsync(GoogleProvider,
+            payload.Subject,
+            cancellationToken);
+
+        if (existingLogin != null) return existingLogin.User;
+
+        // 2. 没有关联用户——————————————————————————————
+        
+        // 处理邮件的逻辑
+        if (string.IsNullOrWhiteSpace(payload.Email) ||
+            !payload.EmailVerified)
+            throw new ExternalLoginNotAllowedException(
+                "A verified email address is required.");
+
+        var email = payload.Email.Trim().ToLowerInvariant();
+        if (email.Length > 100)
+            throw new ExternalLoginNotAllowedException(
+                "The email address exceeds the supported length.");
+        var googleConfirmsEmailOwnership =
+            email.EndsWith("@gmail.com", StringComparison.Ordinal) ||
+            !string.IsNullOrWhiteSpace(payload.HostedDomain);
+
+        if (!googleConfirmsEmailOwnership)
+            throw new ExternalLoginNotAllowedException(
+                "Please use email registration or your existing sign-in method.");
+    }
+}
+```
+
+**根据站内是否存在同邮箱账号进行判断**
+
+情况1：找到同邮箱的站内账号。这里只判断账号是否存在，不判断它最初通过哪种方式注册。
+
+```c#
+public class ExternalLoginService
+{
+    private const string GoogleProvider = "Google";
+    private readonly IGoogleIdTokenService _googleIdTokenService;
+    private readonly IExternalLoginRepository _externalLoginRepository;
+    private readonly IUserRepository _userRepository;
+
+
+    public ExternalLoginService(IGoogleIdTokenService googleIdTokenService,
+        IExternalLoginRepository externalLoginRepository, IUserRepository userRepository)
+    {
+        _googleIdTokenService = googleIdTokenService;
+        _externalLoginRepository = externalLoginRepository;
+        _userRepository = userRepository;
+    }
+
+    public async Task<LoginResponse> LoginAsync(string idToken, CancellationToken cancellationToken)
+    {
+        ...
+    }
+
+    private async Task<User?> FindOrCreateUserAsync(GoogleJsonWebSignature.Payload payload,
+        CancellationToken cancellationToken = default)
+    {
+        // 查询关联用户的逻辑
+        // 1. 已经存在第三方关联——————————————————————————————
+
+        var existingLogin = await _externalLoginRepository.GetByProviderAndSubjectAsync(GoogleProvider,
+            payload.Subject,
+            cancellationToken);
+
+        if (existingLogin != null) return existingLogin.User;
+
+        // 2. 没有关联用户——————————————————————————————
+        // 处理邮件的逻辑
+        if (string.IsNullOrWhiteSpace(payload.Email) ||
+            !payload.EmailVerified)
+            throw new ExternalLoginNotAllowedException(
+                "A verified email address is required.");
+
+        var email = payload.Email.Trim().ToLowerInvariant();
+        if (email.Length > 100)
+            throw new ExternalLoginNotAllowedException(
+                "The email address exceeds the supported length.");
+        var googleConfirmsEmailOwnership =
+            email.EndsWith("@gmail.com", StringComparison.Ordinal) ||
+            !string.IsNullOrWhiteSpace(payload.HostedDomain);
+
+        if (!googleConfirmsEmailOwnership)
+            throw new ExternalLoginNotAllowedException(
+                "Please use email registration or your existing sign-in method.");
+
+        // 查询是否存在同邮箱的站内账号
+        var existingUser = await _userRepository.GetByEmailAsync(
+            email,
+            cancellationToken);
+        // 找到同邮箱的站内账号
+        if (existingUser != null)
+        {
+            // 站内账号的邮箱未验证，抛出冲突异常
+            if (!existingUser.EmailConfirmed) throw new ExternalLoginConflictException();
+            // 站内账号的邮箱已验证，保存第三方关联记录
+            var externalLogin = new ExternalLogin
+            {
+                Provider = GoogleProvider,
+                ProviderSubject = payload.Subject,
+                UserId = existingUser.Id,
+                CreatedAt = DateTime.UtcNow
+            };
+            await _externalLoginRepository.AddAsync(externalLogin, cancellationToken);
+
+            return existingUser;
+        }
+    }
+}
+```
+
+情况2：未找到同邮箱的站内账号，创建 `User` 和 `ExternalLogin`。新用户的字段赋值如下：
+
+| 用户字段         | 赋值依据                                 |
+| ---- | ---- |
+| `Username`       | 优先使用 Google 名称，没有则使用邮箱前缀 |
+| `Email`          | 规范化后的邮箱                           |
+| `PasswordHash`   | 没有设置站内密码，因此为 `null`          |
+| `Role`           | 新用户为普通用户                         |
+| `EmailConfirmed` | 已通过本分支的邮箱状态及归属检查         |
+| 时间字段         | 当前 UTC 时间                            |
+
+用户名最多保留 50 个字符，与现有模型一致；邮箱不能截断，否则会变成另一个地址。
+
+```c#
+public class ExternalLoginService
+{
+    private const string GoogleProvider = "Google";
+    private readonly IGoogleIdTokenService _googleIdTokenService;
+    private readonly IExternalLoginRepository _externalLoginRepository;
+    private readonly IUserRepository _userRepository;
+
+
+    public ExternalLoginService(IGoogleIdTokenService googleIdTokenService,
+        IExternalLoginRepository externalLoginRepository, IUserRepository userRepository)
+    {
+        _googleIdTokenService = googleIdTokenService;
+        _externalLoginRepository = externalLoginRepository;
+        _userRepository = userRepository;
+    }
+
+    public async Task<LoginResponse> LoginAsync(string idToken, CancellationToken cancellationToken)
+    {
+       ...
+    }
+
+    private async Task<User?> FindOrCreateUserAsync(GoogleJsonWebSignature.Payload payload,
+        CancellationToken cancellationToken = default)
+    {
+        // 查询关联用户的逻辑
+        // 1. 已经存在第三方关联——————————————————————————————
+
+        var existingLogin = await _externalLoginRepository.GetByProviderAndSubjectAsync(GoogleProvider,
+            payload.Subject,
+            cancellationToken);
+
+        if (existingLogin != null) return existingLogin.User;
+
+        // 2. 没有关联用户——————————————————————————————
+        // 处理邮件的逻辑
+        if (string.IsNullOrWhiteSpace(payload.Email) ||
+            !payload.EmailVerified)
+            throw new ExternalLoginNotAllowedException(
+                "A verified email address is required.");
+
+        var email = payload.Email.Trim().ToLowerInvariant();
+        if (email.Length > 100)
+            throw new ExternalLoginNotAllowedException(
+                "The email address exceeds the supported length.");
+        var googleConfirmsEmailOwnership =
+            email.EndsWith("@gmail.com", StringComparison.Ordinal) ||
+            !string.IsNullOrWhiteSpace(payload.HostedDomain);
+
+        if (!googleConfirmsEmailOwnership)
+            throw new ExternalLoginNotAllowedException(
+                "Please use email registration or your existing sign-in method.");
+
+        // 查询是否存在同邮箱的站内账号
+        var existingUser = await _userRepository.GetByEmailAsync(
+            email,
+            cancellationToken);
+        // 找到同邮箱的站内账号
+        if (existingUser != null)
+        {
+            // 站内账号的邮箱未验证，抛出冲突异常
+            if (!existingUser.EmailConfirmed) throw new ExternalLoginConflictException();
+            // 站内账号的邮箱已验证，保存第三方关联记录
+            var externalLogin = new ExternalLogin
+            {
+                Provider = GoogleProvider,
+                ProviderSubject = payload.Subject,
+                UserId = existingUser.Id,
+                CreatedAt = DateTime.UtcNow
+            };
+            await _externalLoginRepository.AddAsync(externalLogin, cancellationToken);
+
+            return existingUser;
+        }
+
+        // 未找到同邮箱的站内账号，同时创建用户和第三方关联记录
+        var username = string.IsNullOrWhiteSpace(payload.Name)
+            ? email.Split('@')[0]
+            : payload.Name.Trim();
+        
+        var user = new User
+        {
+            Username = username[..Math.Min(username.Length, 50)],
+            Email = email,
+            PasswordHash = null,
+            Role = UserRole.User,
+            EmailConfirmed = true,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+        var newExternalLogin = new ExternalLogin
+        {
+            Provider = GoogleProvider,
+            ProviderSubject = payload.Subject,
+            CreatedAt = DateTime.UtcNow
+        };
+
+        return await _userRepository.AddWithExternalLoginAsync(user, newExternalLogin, cancellationToken);
+    }
+}
+```
+
+#### 8.3 实现用户登录
+
+账户处理方法已经能够返回对应的站内用户，接下来根据这个用户生成登录结果，包括：
+
+- 根据站内用户生成 Access Token
+
+    使用已有的`JwtTokenGenerator`类
+
+- 返回 LoginResponse
+
+    其中的 `ExpiresAt` 从刚生成的 UUcars Token 中读取，不再单独计算
+
+`FindOrCreateUserAsync()` 成功时返回用户，失败时抛出异常，没有返回 `null` 的分支，因此最终返回类型使用 `Task<User>`。
+
+完善登录逻辑：
+
+```c#
+public class ExternalLoginService
+{
+    private const string GoogleProvider = "Google";
+    private readonly IGoogleIdTokenService _googleIdTokenService;
+    private readonly IExternalLoginRepository _externalLoginRepository;
+    private readonly IUserRepository _userRepository;
+    private readonly JwtTokenGenerator _jwtTokenGenerator;
+
+
+    public ExternalLoginService(IGoogleIdTokenService googleIdTokenService,
+        IExternalLoginRepository externalLoginRepository, IUserRepository userRepository,
+        JwtTokenGenerator jwtTokenGenerator)
+    {
+        _googleIdTokenService = googleIdTokenService;
+        _externalLoginRepository = externalLoginRepository;
+        _userRepository = userRepository;
+        _jwtTokenGenerator = jwtTokenGenerator;
+    }
+
+    public async Task<LoginResponse> LoginAsync(string idToken, CancellationToken cancellationToken)
+    {
+        // 获取认证后的payload
+        var payload = await _googleIdTokenService.ValidateAsync(idToken, cancellationToken);
+
+        // 查询关联用户的逻辑
+        var user = await FindOrCreateUserAsync(payload, cancellationToken);
+
+        // 生成用户的Access Token
+        var token = _jwtTokenGenerator.GenerateToken(user);
+        // 读取 过期时间
+        var expiresAt = new JwtSecurityTokenHandler()
+            .ReadJwtToken(token)
+            .ValidTo;
+
+        // 返回登录结果LoginResponse
+        return new LoginResponse
+        {
+            Token = token,
+            ExpiresAt = expiresAt,
+            User = new UserResponse
+            {
+                Id = user.Id,
+                Username = user.Username,
+                Email = user.Email,
+                Role = user.Role.ToString(),
+                CreatedAt = user.CreatedAt
+            }
+        };
+    }
+
+    private async Task<User> FindOrCreateUserAsync(GoogleJsonWebSignature.Payload payload,
+        CancellationToken cancellationToken = default)
+    {
+        ...
+    }
+}
+```
+
+最后在 `Program.cs` 注册：
+
+```
+builder.Services.AddScoped<ExternalLoginService>();
+```
+
+
+
+### 9. 接通 Google 登录接口并建立 UUcars 会话
+
+第 5 节的 `POST /auth/google` 目前只返回 Google Payload。第 8 节已经能够根据 Token 完成账号处理，并返回 `LoginResponse`。
+
+现在将接口接入业务 Service，再沿用本地登录的 Refresh Token 和 Cookie 处理。
+
+#### 9.1 将接口依赖改为 ExternalLoginService
+
+Controller 不再直接调用 `GoogleIdTokenService`。Token 验证已经由 `ExternalLoginService.LoginAsync()` 组织执行。
+
+在 [AuthController.cs](/Users/aqiang/Desktop/myGitHub/upload/dotNet Projects/UUcars/UUcars.API/Controllers/AuthController.cs) 中，使用`ExternalLoginService`:
+
+```c#
+[ApiController]
+[Route("auth")]
+public class AuthController : ControllerBase
+{
+    private readonly UserService _userService;
+    private readonly RefreshTokenService _refreshTokenService;
+    private readonly IWebHostEnvironment _environment;
+    private readonly ExternalLoginService _externalLoginService;
+
+    public AuthController(
+        UserService userService,
+        RefreshTokenService refreshTokenService,
+        IWebHostEnvironment environment,
+        ExternalLoginService externalLoginService
+    )
+    {
+        _userService = userService;
+        _refreshTokenService = refreshTokenService;
+        _environment = environment;
+        _externalLoginService = externalLoginService;
+    }
+
+    ...
+
+    [HttpPost("google")]
+    public async Task<IActionResult> GoogleLogin(
+        [FromBody] GoogleLoginRequest request, CancellationToken cancellationToken)
+    {
+        var result = await _externalLoginService.LoginAsync(request.IdToken, cancellationToken);
+        return Ok(ApiResponse<LoginResponse>.Ok(result, "sign-in successful."));
+    }
+
+
+    ...
+}
+```
+
+#### 9.2 复用登录成功后的会话处理
+
+业务 Service 返回的 `LoginResponse` 包含：
+
+```
+Access Token
+Access Token 的到期时间
+站内用户资料
+```
+
+为了让浏览器在 Access Token 过期后继续刷新登录状态，还需要创建 Refresh Token。
+
+现有本地登录已经完成这三步：
+
+```
+创建并保存 Refresh Token
+→ 写入 HttpOnly Cookie
+→ 返回 LoginResponse
+```
+
+Google 登录也需要相同处理，因此把这段代码提取为 Controller 的私有方法。
+
+在 `AuthController` 中加入：
+
+```c#
+private async Task<IActionResult> CompleteLoginAsync(
+    LoginResponse result,
+    string message,
+    CancellationToken cancellationToken)
+{
+    var refreshToken =
+        await _refreshTokenService.CreateRefreshTokenAsync(
+            result.User.Id,
+            cancellationToken);
+
+    SetRefreshTokenCookie(
+        refreshToken.Token,
+        refreshToken.ExpiresAt);
+
+    return Ok(
+        ApiResponse<LoginResponse>.Ok(
+            result,
+            message));
+}
+```
+
+这里使用 `result.User.Id`，因为 Refresh Token 关联的是已经完成认证的站内用户。
+
+`SetRefreshTokenCookie()` 沿用 Controller 中已有的实现。两个到期时间分别属于不同对象：
+
+| 值                       | 用途                                      |
+| ---- | ---- |
+| `result.ExpiresAt`       | Access Token 的到期时间                   |
+| `refreshToken.ExpiresAt` | Refresh Token 的到期时间，用于设置 Cookie |
+
+Refresh Token 不加入响应 Body，而是通过 `Set-Cookie` 响应头交给浏览器保存。
+
+#### 9.3 更新 Google 和本地登录接口
+
+**更新 Google 登录接口**
+
+将原有 `GoogleLogin()` 替换为：
+
+```c#
+[HttpPost("google")]
+[EnableRateLimiting(RateLimitPolicies.Login)]
+public async Task<IActionResult> GoogleLogin(
+    [FromBody] GoogleLoginRequest request,
+    CancellationToken cancellationToken)
+{
+    var result = await _externalLoginService.LoginAsync(
+        request.IdToken,
+        cancellationToken);
+
+    return await CompleteLoginAsync(
+        result,
+        "Google sign-in successful.",
+        cancellationToken);
+}
+```
+
+这里沿用本地登录的限流策略。
+
+执行顺序为：
+
+```
+接收 Google ID Token
+→ ExternalLoginService 完成认证和账号处理
+→ 取得 LoginResponse
+→ 创建 Refresh Token 并写入 Cookie
+→ 返回 HTTP 200
+```
+
+如果业务方法抛出异常，代码不会继续执行 `CompleteLoginAsync()`，也不会为这次失败的请求创建 Refresh Token。
+
+**更新本地密码登录接口**
+
+本地登录仍由 `UserService` 验证邮箱和密码，只把成功后的重复代码替换为共同方法：
+
+```c#
+[HttpPost("login")]
+[EnableRateLimiting(RateLimitPolicies.Login)]
+public async Task<IActionResult> Login(
+    [FromBody] LoginRequest request,
+    CancellationToken cancellationToken)
+{
+    var result = await _userService.LoginAsync(
+        request.Email,
+        request.Password,
+        cancellationToken);
+
+    return await CompleteLoginAsync(
+        result,
+        "Login successful.",
+        cancellationToken);
+}
+```
+
+两种登录方式现在只在认证业务上不同，成功后的 Refresh Token、Cookie 和响应处理保持一致。
+
+#### 9.4 让本地密码登录正确处理无密码账号
+
+Google 注册创建的用户可能没有站内密码：
+
+```
+PasswordHash = null
+```
+
+现有 `UserService.LoginAsync()` 查询到用户后，会直接调用：
+
+```c#
+_passwordHasher.VerifyHashedPassword(
+    user,
+    user.PasswordHash,
+    password);
+```
+
+没有密码哈希的账号不能执行这一步，应直接按凭据错误处理。
+
+在 [UserService.cs](/Users/aqiang/Desktop/myGitHub/upload/dotNet Projects/UUcars/UUcars.API/Services/UserService.cs) 的 `LoginAsync()` 中，将用户不存在判断改为：
+
+```c#
+var user = await _userRepository.GetByEmailAsync(
+    email,
+    cancellationToken);
+
+if (user == null ||
+    string.IsNullOrWhiteSpace(user.PasswordHash))
+{
+    throw new InvalidCredentialsException();
+}
+```
+
+后面的密码验证和登录结果生成保持不变。
+
+这样：
+
+```
+只有 Google 登录方式，没有站内密码
+→ 密码登录返回 401
+
+原本有站内密码，后来关联 Google
+→ 仍然可以使用原密码登录
+```
+
+判断依据是账号是否有 `PasswordHash`，而不是有没有 `ExternalLogin`。
+
+#### 9.5 调整忘记密码流程
+
+当前“忘记密码”用于重置账号已有的站内密码。对于没有站内密码的账号，不通过这个入口自动增加密码登录方式。
+
+在 `UserService.ForgotPasswordAsync()` 中，保留现有的：
+
+```
+用户不存在 → 返回
+邮箱未验证 → 返回
+```
+
+在这两个判断之后、生成 `resetToken` 之前，加入：
+
+```
+if (string.IsNullOrWhiteSpace(user.PasswordHash))
+{
+    _logger.LogWarning(
+                "Password reset is not allowed!" );
+            return;
+}
+```
+
+后面的重置 Token 生成、保存和邮件发送逻辑保持不变。
+
+Controller 仍然返回现有统一提示：
+
+```
+If this email is registered, a password reset link has been sent.
+```
+
+因此，调用方不会通过响应内容得知这个邮箱是否存在，或者账号有没有密码。
+
+#### 9.6 验证接口与会话
+
+先编译 API：
+
+```
+dotnet build UUcars.API
+```
+
+启动后端：
+
+```
+dotnet run --project UUcars.API
+```
+
+**验证 Google 登录**
+
+从前端取得新的 `response.credential`，在 Postman 中请求：
+
+```
+POST /auth/google
+Content-Type: application/json
+```
+
+请求体：
+
+```
+{
+  "idToken": "替换为实际取得的 Google ID Token"
+}
+```
+
+成功后检查：
+
+- 状态码为 `200`。
+- `data.token` 是 UUcars 签发的 Access Token。
+- `data.expiresAt` 与该 Token 中的到期时间一致。
+- `data.user` 是对应的站内用户。
+- 响应头包含 `Set-Cookie`，Cookie 名称为 `refreshToken`，带有 `HttpOnly`。
+
+**验证 Refresh Token**
+
+保持同一个 Postman 客户端和 API 地址，让它携带刚保存的 Cookie，发送：
+
+```
+POST /auth/refresh
+```
+
+不需要请求 Body。
+
+成功后应返回新的 `accessToken`，并通过 `Set-Cookie` 更新 Refresh Token。说明这次 Google 登录已经接入项目现有的刷新流程。
+
+**验证两种登录方式的兼容性**
+
+| 操作                                 | 预期结果                                  |
+| ---- | ---- |
+| 原有已验证账号使用正确密码登录       | `200`，仍然设置 Refresh Token Cookie      |
+| 无站内密码的 Google 用户尝试密码登录 | `401`，而不是服务器异常                   |
+| 无站内密码的用户请求忘记密码         | 返回统一提示，不生成重置 Token            |
+| 提交无法通过验证的 Google Token      | `401`，不为本次请求签发新的 Refresh Token |
+
+至此，Google 登录接口返回的不再是供观察的 Payload，而是与本地登录采用相同响应和 Cookie 机制的 UUcars 登录结果。
+
+
+
+### 10. 后端测试
+
+第 8 节的 `ExternalLoginService` 负责两件事：
+
+```
+调用 GoogleIdTokenService 验证 ID Token
+→ 根据验证后的 Payload 查找或创建 UUcars User
+```
+
+测试账户匹配逻辑时，不应真的请求 Google。我们只需要让测试提供一个“已经通过 Google 验证的 Payload”，再检查 UUcars 如何处理这个身份。
+
+#### 10.1 创建测试用的 FakeGoogleIdTokenService
+
+生产环境注入真实的 `GoogleIdTokenService`；测试环境注入假的实现，直接提供指定 Payload。
+
+新建 `UUcars.Tests/Fakes/FakeGoogleIdTokenService.cs`：
+
+```c#
+using Google.Apis.Auth;
+using UUcars.API.Exceptions;
+using UUcars.API.Services.ExternalLogin;
+
+namespace UUcars.Tests.Fakes;
+
+public class FakeGoogleIdTokenService : IGoogleIdTokenService
+{
+    // 单元测试可传入不同 Payload；集成测试使用默认 Google 用户。
+    private readonly GoogleJsonWebSignature.Payload _payload;
+
+    public FakeGoogleIdTokenService(
+        GoogleJsonWebSignature.Payload? payload = null)
+    {
+        _payload = payload ?? new GoogleJsonWebSignature.Payload
+        {
+            Subject = "fake-google-subject",
+            Email = "google-user@gmail.com",
+            EmailVerified = true,
+            Name = "Google Test User"
+        };
+    }
+
+    public Task<GoogleJsonWebSignature.Payload> ValidateAsync(
+        string idToken,
+        CancellationToken cancellationToken = default)
+    {
+        // 用固定字符串模拟 Google 验证失败。
+        if (idToken == "invalid-google-token")
+        {
+            throw new InvalidGoogleIdTokenException();
+        }
+
+        // 测试只关心 UUcars 如何处理已验证身份，不重复测试 Google SDK。
+        return Task.FromResult(_payload);
+    }
+}
+```
+
+这个 Fake 不解析 Token 字符串。它只模拟两种结果：
+
+```
+普通测试 Token
+→ 返回预先准备好的 Google Payload
+
+invalid-google-token
+→ 模拟 Google 验证失败
+```
+
+#### 10.2 创建 FakeExternalLoginRepository
+
+新建 `UUcars.Tests/Fakes/FakeExternalLoginRepository.cs`：
+
+```c#
+using UUcars.API.Entities;
+using UUcars.API.Repositories;
+
+namespace UUcars.Tests.Fakes;
+
+public class FakeExternalLoginRepository
+    : IExternalLoginRepository
+{
+    // 用内存集合保存 Google 身份与 UUcars User 的关联记录。
+    private readonly List<ExternalLogin> _store = [];
+
+    public Task<ExternalLogin?> GetByProviderAndSubjectAsync(
+        string provider,
+        string providerSubject,
+        CancellationToken cancellationToken = default)
+    {
+        var externalLogin = _store.FirstOrDefault(item =>
+            item.Provider == provider &&
+            item.ProviderSubject == providerSubject);
+
+        return Task.FromResult(externalLogin);
+    }
+
+    public Task<ExternalLogin> AddAsync(
+        ExternalLogin externalLogin,
+        CancellationToken cancellationToken = default)
+    {
+        externalLogin.Id = _store.Count + 1;
+        _store.Add(externalLogin);
+
+        return Task.FromResult(externalLogin);
+    }
+
+    public void Seed(ExternalLogin externalLogin)
+    {
+        // 预先放入已有的关联记录，用于模拟老用户再次 Google 登录。
+        _store.Add(externalLogin);
+    }
+
+    public IReadOnlyList<ExternalLogin> Items => _store;
+}
+```
+
+#### 10.3 更新 FakeUserRepository
+
+`IUserRepository` 已增加 `AddWithExternalLoginAsync()`，测试用的 Repository 也必须实现这个方法。
+
+在 `FakeUserRepository` 中加入：
+
+```c#
+public Task<User> AddWithExternalLoginAsync(
+    User user,
+    ExternalLogin externalLogin,
+    CancellationToken cancellationToken = default)
+{
+    // 模拟数据库为新 User 分配主键。
+    user.Id = _store.Count + 1;
+
+    // 模拟 EF Core 保存关系后为 ExternalLogin 补齐关联字段。
+    externalLogin.Id = 1;
+    externalLogin.UserId = user.Id;
+    externalLogin.User = user;
+
+    user.ExternalLogins.Add(externalLogin);
+    _store[user.Email.ToLowerInvariant()] = user;
+
+    return Task.FromResult(user);
+}
+```
+
+这个方法模拟一次保存两个对象：
+
+```
+新 User
++
+对应的 ExternalLogin
+```
+
+#### 10.4 测试账户匹配逻辑
+
+新建 `UUcars.Tests/Services/ExternalLoginServiceTests.cs`：
+
+```c#
+using Google.Apis.Auth;
+using Microsoft.Extensions.Options;
+using UUcars.API.Auth;
+using UUcars.API.Entities;
+using UUcars.API.Entities.Enums;
+using UUcars.API.Exceptions;
+using UUcars.API.Services.ExternalLogin;
+using UUcars.Tests.Fakes;
+
+namespace UUcars.Tests.Services;
+
+public class ExternalLoginServiceTests
+{
+    // 每个测试传入自己的已验证 Payload，隔离真实 Google 网络请求。
+    private static ExternalLoginService CreateService(
+        GoogleJsonWebSignature.Payload payload,
+        FakeUserRepository users,
+        FakeExternalLoginRepository externalLogins)
+    {
+        var jwtSettings = Options.Create(new JwtSettings
+        {
+            Secret = "test-secret-key-at-least-32-characters!",
+            ExpiresInMinutes = 60,
+            Issuer = "UUcars.Tests",
+            Audience = "UUcars.Tests"
+        });
+
+        return new ExternalLoginService(
+            new FakeGoogleIdTokenService(payload),
+            externalLogins,
+            users,
+            new JwtTokenGenerator(jwtSettings));
+    }
+
+    // 验证：同一 Google Subject 再次登录时，必须回到原先关联的 UUcars User。
+    [Fact]
+    public async Task LoginAsync_WithKnownGoogleSubject_ShouldUseLinkedUser()
+    {
+        // Arrange：准备已有的 Provider + Subject 关联记录。
+        var users = new FakeUserRepository();
+        var externalLogins = new FakeExternalLoginRepository();
+
+        var user = new User
+        {
+            Id = 1,
+            Username = "alice",
+            Email = "alice@gmail.com",
+            PasswordHash = "existing-hash",
+            Role = UserRole.User,
+            EmailConfirmed = true,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        externalLogins.Seed(new ExternalLogin
+        {
+            Id = 1,
+            Provider = "Google",
+            ProviderSubject = "known-google-subject",
+            UserId = user.Id,
+            User = user,
+            CreatedAt = DateTime.UtcNow
+        });
+
+        var payload = new GoogleJsonWebSignature.Payload
+        {
+            Subject = "known-google-subject"
+        };
+
+        var service = CreateService(
+            payload,
+            users,
+            externalLogins);
+
+        // Act：模拟该 Google 身份再次登录。
+        var result = await service.LoginAsync(
+            "valid-google-token",
+            CancellationToken.None);
+
+        // Assert：不创建第二条关联，直接返回原 User。
+        Assert.Equal(user.Id, result.User.Id);
+        Assert.NotEmpty(result.Token);
+        Assert.Single(externalLogins.Items);
+    }
+
+    // 验证：已验证的本地账号可按同一 Gmail 地址新增 Google 登录关联。
+    [Fact]
+    public async Task LoginAsync_WithConfirmedLocalUser_ShouldCreateGoogleLink()
+    {
+        // Arrange：已有可安全复用的本地 User。
+        var users = new FakeUserRepository();
+        var externalLogins = new FakeExternalLoginRepository();
+
+        var user = new User
+        {
+            Id = 1,
+            Username = "alice",
+            Email = "alice@gmail.com",
+            PasswordHash = "existing-hash",
+            Role = UserRole.User,
+            EmailConfirmed = true,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        users.Seed(user);
+
+        var payload = new GoogleJsonWebSignature.Payload
+        {
+            Subject = "new-google-subject",
+            Email = "alice@gmail.com",
+            EmailVerified = true,
+            Name = "Alice"
+        };
+
+        var service = CreateService(
+            payload,
+            users,
+            externalLogins);
+
+        // Act：使用同邮箱的 Google Payload 登录。
+        var result = await service.LoginAsync(
+            "valid-google-token",
+            CancellationToken.None);
+
+        // Assert：仍使用原 User，并新增一条 Google 关联。
+        var externalLogin = Assert.Single(externalLogins.Items);
+
+        Assert.Equal(user.Id, result.User.Id);
+        Assert.Equal(user.Id, externalLogin.UserId);
+        Assert.Equal("Google", externalLogin.Provider);
+        Assert.Equal("new-google-subject", externalLogin.ProviderSubject);
+    }
+
+    // 验证：首次 Google 登录会创建无 PasswordHash 的 User 及其关联记录。
+    [Fact]
+    public async Task LoginAsync_WithNewGoogleUser_ShouldCreateUserAndLink()
+    {
+        // Arrange：Repository 中不存在同邮箱 User，也不存在关联记录。
+        var users = new FakeUserRepository();
+        var externalLogins = new FakeExternalLoginRepository();
+
+        var payload = new GoogleJsonWebSignature.Payload
+        {
+            Subject = "new-google-subject",
+            Email = "new-user@gmail.com",
+            EmailVerified = true,
+            Name = "New Google User"
+        };
+
+        var service = CreateService(
+            payload,
+            users,
+            externalLogins);
+
+        // Act：首次使用该 Google 身份登录。
+        var result = await service.LoginAsync(
+            "valid-google-token",
+            CancellationToken.None);
+
+        var user = await users.GetByEmailAsync(
+            "new-user@gmail.com");
+
+        // Assert：新 User 没有本地密码，并保存对应的 Google Subject。
+        Assert.NotNull(user);
+        Assert.Equal(user.Id, result.User.Id);
+        Assert.Null(user.PasswordHash);
+        Assert.True(user.EmailConfirmed);
+
+        var externalLogin = Assert.Single(user.ExternalLogins);
+
+        Assert.Equal("Google", externalLogin.Provider);
+        Assert.Equal("new-google-subject", externalLogin.ProviderSubject);
+    }
+
+    // 验证：未验证的本地同邮箱账号不能被 Google 登录自动关联。
+    [Fact]
+    public async Task LoginAsync_WithUnconfirmedLocalUser_ShouldThrowConflict()
+    {
+        // Arrange：邮箱相同，但本地账号尚未完成邮箱验证。
+        var users = new FakeUserRepository();
+        var externalLogins = new FakeExternalLoginRepository();
+
+        users.Seed(new User
+        {
+            Id = 1,
+            Username = "alice",
+            Email = "alice@gmail.com",
+            PasswordHash = "existing-hash",
+            Role = UserRole.User,
+            EmailConfirmed = false,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        });
+
+        var payload = new GoogleJsonWebSignature.Payload
+        {
+            Subject = "new-google-subject",
+            Email = "alice@gmail.com",
+            EmailVerified = true,
+            Name = "Alice"
+        };
+
+        var service = CreateService(
+            payload,
+            users,
+            externalLogins);
+
+        // Act / Assert：登录被拒绝，且不会写入关联记录。
+        await Assert.ThrowsAsync<ExternalLoginConflictException>(
+            () => service.LoginAsync(
+                "valid-google-token",
+                CancellationToken.None));
+
+        Assert.Empty(externalLogins.Items);
+    }
+}
+```
+
+这四个测试覆盖账户处理时真正会改变结果的四条路径：
+
+```
+已有 Google 关联
+→ 使用关联的 UUcars User
+
+已验证的本地同邮箱账号
+→ 创建关联，再登录原 User
+
+全新 Google 身份
+→ 创建 User 和 ExternalLogin
+
+未验证的本地同邮箱账号
+→ 返回冲突，不自动关联
+```
+
+#### 10.5 补充 Google-only 用户的密码流程测试
+
+在 `UserServiceTests` 的登录测试区域加入：
+
+```c#
+// 验证：Google-only 用户不能使用任意密码通过本地登录。
+[Fact]
+public async Task LoginAsync_WithGoogleOnlyUser_ShouldRejectPasswordLogin()
+{
+    // Arrange：Google-only User 没有 PasswordHash。
+    var repository = new FakeUserRepository();
+
+    repository.Seed(new User
+    {
+        Id = 1,
+        Username = "google-user",
+        Email = "google-user@gmail.com",
+        PasswordHash = null,
+        Role = UserRole.User,
+        EmailConfirmed = true,
+        CreatedAt = DateTime.UtcNow,
+        UpdatedAt = DateTime.UtcNow
+    });
+
+    var (service, _) = CreateService(repository);
+
+    // Act / Assert：本地密码登录统一按凭据错误拒绝。
+    await Assert.ThrowsAsync<InvalidCredentialsException>(
+        () => service.LoginAsync(
+            "google-user@gmail.com",
+            "AnyPassword@123"));
+}
+```
+
+在密码重置测试区域加入：
+
+```c#
+// 验证：Google-only 用户不能经由忘记密码流程获得本地密码。
+[Fact]
+public async Task ForgotPasswordAsync_WithGoogleOnlyUser_ShouldNotEnqueueJob()
+{
+    // Arrange：Google-only User 已验证邮箱，但没有 PasswordHash。
+    var repository = new FakeUserRepository();
+
+    repository.Seed(new User
+    {
+        Id = 1,
+        Username = "google-user",
+        Email = "google-user@gmail.com",
+        PasswordHash = null,
+        Role = UserRole.User,
+        EmailConfirmed = true,
+        CreatedAt = DateTime.UtcNow,
+        UpdatedAt = DateTime.UtcNow
+    });
+
+    var (service, jobClient) = CreateService(repository);
+
+    // Act：请求重置密码。
+    await service.ForgotPasswordAsync("google-user@gmail.com");
+
+    var user = await repository.GetByEmailAsync(
+        "google-user@gmail.com");
+
+    // Assert：不生成 Token，也不发送重置邮件任务。
+    Assert.Empty(jobClient.EnqueuedJobs);
+    Assert.Null(user!.ResetPasswordToken);
+}
+```
+
+#### 10.6 测试 Google 登录接口
+
+集成测试需要真实经过：
+
+```
+HTTP Request
+→ AuthController
+→ ExternalLoginService
+→ EF Core / SQL Server
+→ JWT
+→ Refresh Token Cookie
+```
+
+但不需要在测试时登录真实 Google 账号，所以在测试服务器中替换 `IGoogleIdTokenService`。
+
+在 `SqlServerTestFactory.cs` 中加入：
+
+```c#
+...
+using UUcars.API.Services.ExternalLogin;
+...
+
+// 自定义的 WebApplicationFactory
+// 在测试启动时自动拉起 SQL Server 容器，测试结束后自动销毁
+public class SqlServerTestFactory : WebApplicationFactory<Program>, IAsyncLifetime
+{
+    ...
+    // ConfigureWebHost：在 WebApplicationFactory 构建应用时调用
+    // 在这里替换 DI 服务，把生产用的 SQL Server 换成测试容器
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    {
+        builder.ConfigureServices(services =>
+        {
+            ...
+            
+            // =================================================
+            // Google 登录：
+            // 测试服务器不请求真实 Google，改为注入固定结果的 Fake
+            // =================================================
+            var googleServiceDescriptor = services.SingleOrDefault(
+                descriptor => descriptor.ServiceType ==
+                              typeof(IGoogleIdTokenService));
+
+            if (googleServiceDescriptor != null)
+            {
+                services.Remove(googleServiceDescriptor);
+            }
+
+            services.AddSingleton<
+                IGoogleIdTokenService,
+                FakeGoogleIdTokenService>();
+        });
+
+        // 使用测试环境，避免加载生产配置
+        builder.UseEnvironment("Testing");
+    }
+
+    ...
+}
+
+```
+
+然后在 `CleanDatabaseAsync()` 中，删除 `Users` 前加入：
+
+```c#
+public class SqlServerTestFactory : WebApplicationFactory<Program>, IAsyncLifetime
+{
+    ...
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    {
+       ...
+    }
+
+    // 清理数据库：每个测试方法结束后调用
+    // 删除所有业务数据，但保留表结构和 Admin 账号
+    // 这样下一个测试面对的是干净的数据库
+    public async Task CleanDatabaseAsync()
+    {
+        ...
+
+        // ExternalLogin 依赖 User，必须在删除普通用户前先清理
+        // 避免外键约束冲突
+        context.ExternalLogins.RemoveRange(context.ExternalLogins);
+
+        // 只删除普通用户，保留 Admin
+        context.Users.RemoveRange(context.Users.Where(u => u.Role != UserRole.Admin));
+        await context.SaveChangesAsync();
+    }
+}
+
+```
+
+在 `CoreFlowIntegrationTests.cs` 中加入：
+
+```c#
+// [Collection] 让这个测试类使用共享的 SqlServerTestFactory
+// 同一个 Collection 里的所有测试类共享同一个数据库容器
+// 避免每个测试类都启动一个新容器（启动容器需要几秒钟，非常耗时）
+[Collection("Integration")]
+public class CoreFlowIntegrationTests : IntegrationTestBase
+{
+    public CoreFlowIntegrationTests(SqlServerTestFactory factory)
+        : base(factory)
+    {
+    }
+
+    // =========================================================
+    // 本地认证：注册、邮箱验证和密码登录
+    // =========================================================
+
+    ...
+
+    // =========================================================
+    // Google 认证：Google 身份映射为 UUcars 会话
+    // =========================================================
+
+    [Fact]
+    public async Task GoogleLogin_WithValidToken_ShouldCreateSession()
+    {
+        // FakeGoogleIdTokenService 为普通测试 Token 返回固定、已验证的 Google Payload。
+        var response = await Client.PostAsync(
+            "/auth/google",
+            JsonContent(new
+            {
+                idToken = "valid-google-token"
+            }));
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        // 响应 Body 返回 UUcars Access Token。
+        var result =
+            await DeserializeAsync<ApiResponse<LoginData>>(response);
+
+        Assert.NotNull(result?.Data);
+        Assert.NotEmpty(result!.Data!.Token);
+
+        // Refresh Token 只通过 HttpOnly Cookie 返回，不出现在响应 Body。
+        Assert.Contains(
+            response.Headers.GetValues("Set-Cookie"),
+            value => value.StartsWith(
+                "refreshToken=",
+                StringComparison.OrdinalIgnoreCase));
+
+        await using var db = Factory.GetDbContext();
+
+        // 首次 Google 登录应保存一个没有本地密码的 User 和关联记录。
+        var user = await db.Users
+            .Include(item => item.ExternalLogins)
+            .SingleAsync(item =>
+                item.Email == "google-user@gmail.com");
+
+        Assert.Null(user.PasswordHash);
+        Assert.True(user.EmailConfirmed);
+
+        var externalLogin = Assert.Single(user.ExternalLogins);
+        Assert.Equal("Google", externalLogin.Provider);
+        Assert.Equal("fake-google-subject", externalLogin.ProviderSubject);
+
+        // 返回的 Access Token 可以访问现有的受保护接口。
+        SetBearerToken(result.Data.Token);
+
+        var currentUserResponse =
+            await Client.GetAsync("/users/me");
+
+        Assert.Equal(HttpStatusCode.OK, currentUserResponse.StatusCode);
+    }
+
+    
+    // =========================================================
+    // 认证保护：受保护接口必须要求有效 UUcars Access Token
+    // =========================================================
+
+    ...
+
+    // =========================================================
+    // 核心业务链路：发布车辆、审核、下单和取消订单
+    // =========================================================
+
+    ...
+
+    // =========================================================
+    // Admin Dashboard：平台统计和角色授权
+    // =========================================================
+
+    ...
+}
+
+```
+
+再加入无效 Token 的测试：
+
+```c#
+[Collection("Integration")]
+public class CoreFlowIntegrationTests : IntegrationTestBase
+{
+    ...
+
+    // =========================================================
+    // Google 认证：Google 身份映射为 UUcars 会话
+    // =========================================================
+
+    [Fact]
+    public async Task GoogleLogin_WithValidToken_ShouldCreateSession()
+    {
+        ...
+    }
+
+    [Fact]
+    public async Task GoogleLogin_WithInvalidToken_ShouldReturn401()
+    {
+        // FakeGoogleIdTokenService 对该固定值模拟 Google 验证失败。
+        var response = await Client.PostAsync(
+            "/auth/google",
+            JsonContent(new
+            {
+                idToken = "invalid-google-token"
+            }));
+
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+
+        await using var db = Factory.GetDbContext();
+
+        // 验证失败时，不应创建 User、ExternalLogin 或登录会话。
+        Assert.False(await db.Users.AnyAsync(item =>
+            item.Email == "google-user@gmail.com"));
+        Assert.False(await db.ExternalLogins.AnyAsync());
+    }
+    ...
+}
+
+```
+
+#### 10.7 编译和测试
+
+先运行本步骤相关测试：
+
+```
+dotnet test --filter "FullyQualifiedName~ExternalLoginServiceTests|FullyQualifiedName~GoogleLogin"
+```
+
+再运行完整后端测试：
+
+```
+dotnet build
+dotnet test
+```
+
+这一步验证的是 UUcars 对 Google 已验证身份的处理、登录会话建立，以及本地密码流程不会错误处理 Google-only 用户。
+
+
+
+### 11. 完成前端 Google 登录流程
+
+第 4 节已经确认，Google 登录成功后，前端可以取得 Google ID Token：
+
+```
+response.credential
+```
+
+第 9 节已经完成后端接口：
+
+```
+POST /auth/google
+```
+
+后端接收 ID Token 后，会完成：
+
+```
+验证 Google 身份
+→ 找到或创建 UUcars User
+→ 创建 UUcars Access Token 和 Refresh Token
+→ 返回 LoginResponse
+```
+
+因此现在需要完成前端完整的登录流程：
+
+```
+credential
+→ authApi.googleLogin
+→ POST /auth/google
+→ 后端返回 LoginResponse
+→ 页面保存 UUcars 登录状态
+→ 页面按自身规则跳转
+```
+
+#### 11.1 Google 登录的前端API请求接口
+
+在 `uucars-web/src/api/auth.ts` 的 `authApi` 中加入：
+
+```tsx
+import apiClient from "./client";
+import type {
+  LoginRequest,
+  LoginResponse,
+  RegisterRequest,
+  User,
+  ApiResponse,
+} from "@/types";
+
+export const authApi = {
+  ...
+
+  // 新增Google 登录接口
+  googleLogin: async (idToken: string): Promise<LoginResponse> => {
+    const response = await apiClient.post<ApiResponse<LoginResponse>>(
+      "/auth/google",
+      { idToken },
+    );
+    return response.data.data!;
+  }
+};
+
+```
+
+请求 Body 是：
+
+```
+{
+  "idToken": "credential"
+}
+```
+
+现在两种登录请求的输入不同：
+
+```
+本地登录
+→ email + password
+
+Google 登录
+→ idToken
+```
+
+但成功后的输出相同：
+
+```
+LoginResponse
+```
+
+#### 11.2 处理登录请求的 401
+
+Google 登录接口可能返回：
+
+```
+401 Unauthorized
+```
+
+例如 Google ID Token 无效、过期，或后端验证失败。
+
+但当前 Axios 响应拦截器看到任何 `401`，都会尝试 `POST /auth/refresh`：
+
+```ts
+// src/api/client.ts
+const apiClient = axios.create({
+  ...
+});
+
+// =============================================
+// 响应拦截器：统一处理响应和错误
+// =============================================
+apiClient.interceptors.response.use(
+  (response) => {
+    ...
+    // =============================================
+    // 处理 401 Token 过期：自动刷新后重试
+    // =============================================
+    if (
+      error.response?.status === 401 &&
+      !originalRequest._retry
+    ) {
+      originalRequest._retry = true;
+
+      try {
+        const response = await axios.post(
+          `${import.meta.env.VITE_API_BASE_URL}/auth/refresh`,
+          null,
+          { withCredentials: true },
+        );
+       ...
+      } catch {
+        ...
+      }
+    }
+
+   ...
+);
+
+export default apiClient;
+```
+
+这是为了处理已经登录的用户访问受保护接口时，UUcars Access Token 过期的情况。
+
+例如：
+
+```
+用户已登录
+→ GET /users/me
+→ Access Token 过期
+→ 401
+→ /auth/refresh
+→ 使用新 Token 重试 GET /users/me
+```
+
+但登录请求的 `401` 含义不同：
+
+```
+POST /auth/login
+→ 密码错误
+
+POST /auth/google
+→ Google Token 无效
+```
+
+这两种情况都**不是已有 UUcars 会话过期，因此不应该触发刷新。**
+
+因此触发刷新时，把这2种情况排除。定义变量 `isSignInRequest`, 用来标识当前失败请求是否是登录请求, 触发刷新的条件中排除：
+
+```ts
+// =============================================
+// 响应拦截器：统一处理响应和错误
+// =============================================
+apiClient.interceptors.response.use(
+(response) => {
+...
+
+// 定义登录的请求
+const isSignInRequest =
+  originalRequest.url === "/auth/login" ||
+  originalRequest.url === "/auth/google";
+
+// =============================================
+// 处理 401 Token 过期：自动刷新后重试
+// =============================================
+if (
+  error.response?.status === 401 &&
+  !originalRequest._retry &&
+  !isSignInRequest
+) {
+  originalRequest._retry = true;
+
+  try {
+    const response = await axios.post(
+      `${import.meta.env.VITE_API_BASE_URL}/auth/refresh`,
+      null,
+      { withCredentials: true },
+    );
+   ...
+  } catch {
+    ...
+  }
+}
+```
+
+修改后：
+
+```
+受保护接口返回 401
+→ 尝试刷新现有会话
+
+本地登录或 Google 登录返回 401
+→ 直接把登录失败错误交给调用页面
+```
+
+这样后面 Google 登录组件捕获到的才是正确错误，而不是一次无意义的刷新失败。
+
+#### 11.3 封装 Google 登录按钮
+
+第 4 节为了观察 Google 返回的数据，暂时把：
+
+```
+GoogleLogin
+handleGoogleSuccess
+console.log(response)
+```
+
+直接放在 `LoginPage` 中。
+
+现在 `credential` 已经确认，且 `authApi.googleLogin()` 已经存在。下一步可以在这个回调中直接调用后端。
+
+但 Google 登录入口不仅出现在 `LoginPage`，也会出现在 `RegisterPage`。
+
+两个页面都会重复这一段过程：
+
+```
+Google 返回 credential
+→ 调用 authApi.googleLogin
+→ 处理 Google 取消或后端错误
+→ 得到 LoginResponse
+```
+
+如果把这些代码继续留在 `LoginPage`，再实现 `RegisterPage` 时就需要复制一次。
+
+因此现在提取一个 `GoogleSignInButton`。它只负责：
+
+```
+Google 登录按钮
+→ credential
+→ 调用 UUcars 后端
+→ 返回 LoginResponse
+```
+
+页面跳转不放在这个组件中，因为两个页面成功后的去向不同。
+
+新建 `uucars-web/src/components/GoogleSignInButton.tsx`：
+
+```tsx
+import { GoogleLogin, type CredentialResponse } from "@react-oauth/google";
+import { toast } from "sonner";
+import { authApi } from "@/api";
+import type { LoginResponse } from "@/types";
+
+interface GoogleSignInButtonProps {
+  // 回调函数：Google 登录成功后，把 UUcars 的登录结果交给页面。
+  onAuthenticated: (result: LoginResponse) => void;
+}
+
+function GoogleSignInButton({ onAuthenticated }: GoogleSignInButtonProps) {
+  const handleSuccess = async (response: CredentialResponse) => {
+    // credential 才是需要发送给 UUcars 后端的 Google ID Token。
+    if (!response.credential) {
+      toast.error("Google did not return an ID token.");
+      return;
+    }
+
+    try {
+      // 后端验证 Google Token，并返回 UUcars 的登录结果。
+      const result = await authApi.googleLogin(response.credential);
+
+      // 页面决定成功后如何保存状态和跳转。
+      onAuthenticated(result);
+    } catch (error) {
+      // Axios 拦截器已将后端错误转换为 Error。
+      toast.error(
+        error instanceof Error ? error.message : "Google sign-in failed.",
+      );
+    }
+  };
+
+  return (
+    <GoogleLogin
+      type="icon"
+      shape="circle"
+      size="large"
+      theme="outline"
+      onSuccess={(response) => {
+        void handleSuccess(response);
+      }}
+      onError={() => {
+        // 用户取消弹窗或 Google 页面本身失败时，不会调用后端。
+        toast.error("Google sign-in was cancelled or failed.");
+      }}
+    />
+  );
+}
+
+export default GoogleSignInButton;
+
+
+```
+
+`onAuthenticated` 是组件暴露给页面的回调。
+
+当组件成功拿到后端返回的：
+
+```
+LoginResponse
+```
+
+它会执行：
+
+```
+onAuthenticated(result)
+```
+
+由页面决定回调函数里的逻辑：
+
+```
+保存状态
+跳转位置
+```
+
+#### 11.4 LoginPage 接入 Google 登录
+
+`LoginPage` 需要使用`GoogleSignInButton`组件时， 需要先提供一个回调函数，用来接收这个登录结果，并按当前页面原有的规则执行后续的登录逻辑：
+
+- 保存登录状态
+- 完成跳转
+
+定义google登录的回调函数 `completeAuthentication`：
+
+```ts
+const completeAuthentication = (
+  result: LoginResponse,
+) => {
+  // 保存后端返回的 UUcars User 和 Access Token
+  setAuth(result.user, result.token);
+
+  // // 回到受保护页面；没有来源页时按角色进入默认页面
+  if (from) {
+    navigate(from, { replace: true });
+  } else if (result.user.role === "Admin") {
+    navigate("/admin", { replace: true });
+  } else {
+    navigate("/", { replace: true });
+  }
+};
+```
+
+使用 `GoogleSignInButton` 组件：
+
+```tsx
+...
+import GoogleSignInButton from "@/components/GoogleSignInButton";
+...
+
+export default function LoginPage() {
+  ...
+
+  const completeAuthentication = (result: LoginResponse) => {
+    ...
+  };
+      
+  const onSubmit = async (data: LoginForm) => {
+   ...
+  };
+
+  return (
+    <div
+      className="flex min-h-screen items-center justify-center px-4 py-12"
+      style={{ backgroundColor: "var(--color-bg)" }}
+    >
+      {/* 背景装饰 */}
+      ...
+
+      <div className="relative w-full max-w-sm animate-fade-in-up">
+        {/* Logo */}
+        ...
+
+        {/* 表单卡片 */}
+        <div>
+          {/* 本地登录表格 */}
+          <form>
+            ...
+          </form>
+
+          {/* 分割线 */}
+          <div className="my-6 flex items-center gap-3">
+            <div className="h-px flex-1 bg-[var(--color-border-strong)]" />
+
+            <span className="shrink-0 text-sm text-muted-foreground">
+              Or continue with
+            </span>
+
+            <div className="h-px flex-1 bg-[var(--color-border-strong)]" />
+          </div>
+
+          {/* Google登录 */}
+          <div className="flex justify-center">
+            <GoogleSignInButton onAuthenticated={completeAuthentication} />
+          </div>
+        </div>
+          ...
+    </div>
+  );
+}
+```
+
+此时 Google 登录已经接入 `LoginPage`。
+
+但是本地密码登录的 `onSubmit()`里, 登录成功后的逻辑和`completeAuthentication`回调函数的逻辑相同：
+
+```ts
+
+const onSubmit = async (data: LoginForm) => {
+    // 清除上次的服务端错误
+    setServerError(null);
+
+    try {
+      // 调用登录 API
+      const result = await authApi.login(data);
+
+      // 登录成功：把用户信息和 Token 存入 Zustand
+      setAuth(result.user, result.token);
+
+      // 跳转
+      // 有来源页就跳回去，没有的话 Admin 跳管理页、普通用户跳首页
+      if (from) {
+        navigate(from, { replace: true });
+      } else if (result.user.role === "Admin") {
+        navigate("/admin", { replace: true });
+      } else {
+        navigate("/", { replace: true });
+      }
+    } catch (error) {
+      // Axios 拦截器已经把错误提取成 Error 对象
+      // 直接读 message 显示给用户
+      if (error instanceof Error) {
+        setServerError(error.message);
+      }
+    }
+};
+```
+
+因此可以直接使用这个回调逻辑：
+
+```ts
+
+const onSubmit = async (data: LoginForm) => {
+setServerError(null);
+    try {
+      const result = await authApi.login(data);
+      completeAuthentication(result);
+
+    } catch (error) {
+      if (error instanceof Error) {
+        setServerError(error.message);
+      }
+    }
+};
+```
+
+优化后，两条登录路径会在成功后汇合：
+
+```
+密码登录
+→ authApi.login
+→ completeAuthentication
+
+Google 登录
+→ authApi.googleLogin
+→ completeAuthentication
+```
+
+两者都会使用完全相同的 UUcars 登录状态和跳转规则。
+
+#### 11.5 RegisterPage 接入 Google 登录
+
+本地注册与 Google 登录的成功结果不同。
+
+本地注册成功后：
+
+```
+创建未验证 User
+→ 显示 Check your email
+→ 用户点击邮件中的验证链接
+```
+
+Google 登录成功后：
+
+```
+后端已完成 Google 身份验证
+→ 返回 LoginResponse
+→ 可以立即建立 UUcars 前端登录状态
+```
+
+因此 `RegisterPage` 不能把 Google 登录结果当作本地注册成功来处理。
+
+Google 登录成功后不应该执行：
+
+```
+setIsSuccess(true)
+```
+
+因为它不需要等待邮箱验证提示页。
+
+而应该执行：
+
+```
+setAuth
+→ 进入首页
+```
+
+定义Google 登录验证成功后处理的回调函数`completeGoogleAuthentication`：
+
+```ts
+const { setAuth } = useAuthStore();
+
+const completeGoogleAuthentication = (
+  result: LoginResponse,
+) => {
+  // Google 登录已经得到 UUcars User 和 Access Token。
+  setAuth(result.user, result.token);
+
+  // RegisterPage 没有来源页，成功后直接进入首页。
+  navigate("/", { replace: true });
+};
+```
+
+现有本地 `onSubmit()` 与 `isSuccess` 流程不变。
+
+使用 `GoogleSignInButton`组件：
+
+```tsx
+{/* Google登录 */}
+<div className="flex justify-center">
+    <GoogleSignInButton
+      onAuthenticated={completeGoogleAuthentication}
+    />
+</div>
+```
+
+至此，前端的完整流程变为：
+
+```
+LoginPage / RegisterPage
+→ GoogleSignInButton
+→ Google 返回 credential
+→ authApi.googleLogin
+→ POST /auth/google
+→ 后端返回 LoginResponse
+→ 页面保存 UUcars 登录状态
+→ 页面按自身规则跳转
+```
+
+#### 11.6 增加密码显示切换
+
+当前密码输入框使用：
+
+```tsx
+<Input type="password" />
+```
+
+浏览器会把输入内容显示为圆点。这样可以避免旁边的人直接看到密码，但用户也无法确认自己是否输错。
+
+因此在密码输入框右侧加入一个眼睛按钮：
+
+```
+密码隐藏时点击 Eye
+→ 显示密码
+
+密码显示时点击 EyeOff
+→ 再次隐藏密码
+```
+
+这个功能只需要改变输入框的 `type`：
+
+```tsx
+type={isPasswordVisible ? "text" : "password"}
+```
+
+它不会修改密码值，也不会改变 React Hook Form 的验证和提交过程。
+
+项目中已经有四个密码输入位置：
+
+```
+LoginPage：password
+RegisterPage：password
+ResetPasswordPage：newPassword
+ResetPasswordPage：confirmPassword
+```
+
+如果每个页面分别保存显示状态并绘制眼睛按钮，就会重复相同的交互代码。因此创建一个 `PasswordInput`，让组件自己管理显示状态；页面通过 props 和 `register()` 管理密码值。
+
+新建 `uucars-web/src/components/PasswordInput.tsx`：
+
+```tsx
+import { useState, type ComponentProps } from "react";
+import { Eye, EyeOff } from "lucide-react";
+import { Input } from "@/components/ui/input";
+import { cn } from "@/lib/utils";
+
+type PasswordInputProps = ComponentProps<"input">;
+
+function PasswordInput({ className, ...props }: PasswordInputProps) {
+  const [isPasswordVisible, setIsPasswordVisible] = useState(false);
+
+  return (
+    <div className="relative">
+      <Input
+        {...props}
+        type={isPasswordVisible ? "text" : "password"}
+        className={cn("pr-11", className)}
+      />
+
+      <button
+        type="button"
+        className="absolute inset-y-0 right-0 flex w-10 items-center justify-center text-[var(--color-text-muted)] transition-colors hover:text-[var(--color-text-primary)]"
+        onClick={() =>
+          setIsPasswordVisible((isVisible) => !isVisible)
+        }
+      >
+        {isPasswordVisible ? (
+          <EyeOff className="h-4 w-4" />
+        ) : (
+          <Eye className="h-4 w-4" />
+        )}
+      </button>
+    </div>
+  );
+}
+
+export default PasswordInput;
+```
+
+这里用 `ComponentProps<"input">` 接收普通输入框的属性，因此页面原有的：
+
+```
+id
+placeholder
+autoComplete
+React Hook Form register() 返回的属性
+```
+
+都可以继续传给内部的 `Input`。
+
+眼睛按钮必须使用：
+
+```tsx
+type="button"
+```
+
+否则它位于表单内部时，浏览器会把按钮当作提交按钮。
+
+输入框增加 `pr-11`，为右侧眼睛按钮留出空间，避免密码文字与图标重叠。
+
+在 `LoginPage`、`RegisterPage` 和 `ResetPasswordPage` 中引入：
+
+```tsx
+import PasswordInput from "@/components/PasswordInput";
+```
+
+然后用 `PasswordInput` 替换原来的密码 `Input`。例如登录页：
+
+```tsx
+<PasswordInput
+  id="password"
+  placeholder="••••••••"
+  autoComplete="current-password"
+  {...register("password")}
+/>
+```
+
+注册和重置密码使用：
+
+```tsx
+autoComplete="new-password"
+```
+
+组件内部只切换显示状态，页面原有的密码验证规则和提交数据保持不变。
+
+
+
+### 12. 前端测试
+
+第 10 节已经测试了后端账号处理和登录会话，第 11 节完成了前端接入。
+
+现在需要验证前端自己负责的两段逻辑：
+
+```
+GoogleSignInButton
+→ 把 credential 发送给后端
+→ 把 LoginResponse 交给页面
+
+LoginPage
+→ 接收 LoginResponse
+→ 保存登录状态
+→ 完成跳转
+```
+
+测试不需要真的打开 Google 弹窗，也不测试 Google 如何签发 ID Token。这些功能由 Google Identity Services 提供。
+
+#### 12.1 建立 GoogleSignInButton 的测试环境
+
+新建：
+
+```
+uucars-web/src/test/components/GoogleSignInButton.test.tsx
+```
+
+先引入测试当前组件需要的内容：
+
+```
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import GoogleSignInButton from "@/components/GoogleSignInButton";
+import { authApi } from "@/api";
+```
+
+组件内部会调用：
+
+```
+authApi.googleLogin()
+```
+
+测试不能发送真实 HTTP 请求，因此先替换这个方法：
+
+```ts
+// 测试时不发送真实 HTTP 请求。
+// 把 authApi.googleLogin 替换成可以控制和检查的 Mock 函数。
+vi.mock("@/api", () => ({
+  authApi: {
+    googleLogin: vi.fn(),
+  },
+}));
+```
+
+但是当前组件还会渲染 Google 提供的：
+
+```
+<GoogleLogin />
+```
+
+测试环境没有真实 Google 登录页面，也没有 `GoogleOAuthProvider`。因此将它替换为普通按钮：
+
+```ts
+// 测试环境不能打开真实的 Google 登录窗口，
+// 因此用一个普通按钮代替 GoogleLogin。
+vi.mock("@react-oauth/google", () => ({
+  GoogleLogin: ({
+    onSuccess,
+  }: {
+    onSuccess: (response: { credential?: string }) => void;
+  }) => (
+    <button
+      type="button"
+      onClick={() =>
+        // 点击按钮时，模拟 Google 登录成功，
+        // 并返回一个 credential。
+        onSuccess({
+          credential: "google-id-token",
+        })
+      }
+    >
+      Mock Google sign in
+    </button>
+  ),
+}));
+```
+
+点击这个按钮时，相当于模拟 Google 执行：
+
+```
+onSuccess({
+  credential: "google-id-token",
+});
+```
+
+现在测试可以控制 credential，而不依赖真实 Google 服务。
+
+#### 12.2 测试 credential 是否发送给后端
+
+测试的第一段数据流是：
+
+```
+Google 返回 credential
+→ GoogleSignInButton 调用 authApi.googleLogin()
+```
+
+先定义后端成功返回的结果：
+
+```ts
+// 模拟 UUcars 后端验证 Google ID Token 后返回的登录结果。
+// 因为组件会等待 googleLogin 完成，所以需要准备这个返回值。
+const loginResult: LoginResponse = {
+  token: "uucars-access-token",
+  expiresAt: "2026-09-03T12:00:00Z",
+  user: {
+    id: 2,
+    username: "Alice",
+    email: "alice@gmail.com",
+    role: "User",
+    createdAt: "2026-09-03T10:00:00Z",
+  },
+};
+```
+
+建立测试结构：
+
+```ts
+describe("GoogleSignInButton", () => {
+  beforeEach(() => {
+    // 清除上一个测试留下的 Mock 调用记录。
+    vi.clearAllMocks();
+  });
+  // 测试逻辑
+  ...
+});
+```
+
+然后加入第一个测试：
+
+```ts
+describe("GoogleSignInButton", () => {
+  beforeEach(() => {
+      
+    // 清除上一个测试留下的 Mock 调用记录。
+    vi.clearAllMocks();
+  });
+
+  /* -------------- 测试 1： ------------- */  
+  // 验证 Google 返回 credential 后，组件会把它传给 UUcars 的 Google 登录接口。
+  it("应该把 Google credential 发送给后端", async () => {
+      
+    // 1. 规定 Mock 接口本次调用成功，并返回上面准备好的 UUcars 登录结果。
+    vi.mocked(authApi.googleLogin).mockResolvedValueOnce(loginResult);
+
+    // 2. 渲染要测试的组件。
+    // 这个测试暂时不检查 onAuthenticated，所以传入一个空的 Mock 函数。
+    render(<GoogleSignInButton onAuthenticated={vi.fn()} />);
+
+    // 3. 用户点击模拟的 Google 登录按钮。
+    // 创建用户
+    const user = userEvent.setup();
+    // 点击后，Mock GoogleLogin 会返回 "google-id-token"。
+    await user.click(
+      screen.getByRole("button", {
+        name: /mock google sign in/i,
+      }),
+    );
+
+    // 4. 检查组件是否把 Google 返回的 credential原样传给了 authApi.googleLogin
+    await waitFor(() => {
+      expect(authApi.googleLogin).toHaveBeenCalledWith("google-id-token");
+    });
+  });
+});
+
+```
+
+这个测试只回答一个问题：
+
+```
+Google 返回的 credential
+是否被正确传给 authApi.googleLogin？
+```
+
+运行这个测试：
+
+```bash
+cd uucars-web
+
+npm test -- --run src/test/components/GoogleSignInButton.test.tsx
+```
+
+#### 12.3 测试 LoginResponse 是否交给页面
+
+`authApi.googleLogin()` 成功后，组件还会执行：
+
+```
+onAuthenticated(result);
+```
+
+这个回调负责把登录结果交还给使用组件的页面。
+
+创建一个 空的Mock 回调函数，记录 onAuthenticated 是否被调用以及收到的数据
+
+```ts
+const mockOnAuthenticated = vi.fn();
+```
+
+它只会：
+
+- 记录是否被调用；
+- 记录调用次数；
+- 记录每次收到的参数；
+- 默认返回 `undefined`。
+
+它不会执行真实的登录状态保存、页面跳转等业务逻辑。
+
+完整的测试逻辑：
+
+```ts
+  /* -------------- 测试 2： ------------- */
+  // 验证后端登录成功后，组件会把返回的登录结果交给页面
+  it("应该把 UUcars 登录结果交给页面", async () => {
+    // 1. 规定 Mock 接口本次调用成功，并返回准备好的 UUcars 登录结果
+    vi.mocked(authApi.googleLogin).mockResolvedValueOnce(loginResult);
+
+    // 2. 创建一个 Mock 回调函数，记录 onAuthenticated 是否被调用以及收到的数据
+    const mockOnAuthenticated = vi.fn();
+
+    // 3. 渲染组件，并把 Mock 回调函数传给 onAuthenticated
+    render(
+      <GoogleSignInButton onAuthenticated={mockOnAuthenticated} />,
+    );
+
+    // 4. 用户点击模拟的 Google 登录按钮。
+    const user = userEvent.setup();
+
+    await user.click(
+      screen.getByRole("button", {
+        name: /mock google sign in/i,
+      }),
+    );
+
+    // 5. 检查组件是否把后端返回的 loginResult 交给了页面。
+    await waitFor(() => {
+      expect(mockOnAuthenticated).toHaveBeenCalledWith(loginResult);
+    });
+  });
+```
+
+这个测试关注的不是 `credential`，而是后续数据流：
+
+```
+authApi.googleLogin 返回 loginResult
+→ GoogleSignInButton 调用 onAuthenticated(loginResult)
+```
+
+运行测试：
+
+```bash
+npm test -- --run src/test/components/GoogleSignInButton.test.tsx
+```
+
+现在成功路径已经被分成两个清楚的问题：
+
+```
+credential 是否发送给后端？
+LoginResponse 是否交给页面？
+```
+
+#### 12.4 测试后端拒绝登录的情况
+
+成功路径完成后，再考虑后端拒绝 ID Token 的情况：
+
+```
+authApi.googleLogin() 抛出错误
+→ 显示错误
+→ 不执行 onAuthenticated()
+```
+
+组件通过 `toast.error()` 显示错误，因此添加 Mock 错误函数：
+
+```ts
+
+// 测试环境不需要真正显示 Sonner 提示框。
+// 把 toast.error 替换成 Mock 函数，用来检查组件显示了什么错误。
+vi.mock("sonner", () => ({
+  toast: {
+    error: vi.fn(),
+  },
+}));
+```
+
+然后加入失败测试：
+
+```ts
+/* -------------- 测试 3： ------------- */
+  // 验证后端拒绝 Google 登录时，组件会显示错误，
+  // 并且不会把登录结果交给页面。
+  it("后端拒绝 Google 登录时应该显示错误", async () => {
+    // 1. 模拟后端验证失败。
+    // mockRejectedValueOnce 表示这次调用不会返回 LoginResponse，
+    // 而是返回一个被拒绝的 Promise，并抛出指定错误。
+    vi.mocked(authApi.googleLogin).mockRejectedValueOnce(
+      new Error("Invalid Google ID token"),
+    );
+
+    // 2. 创建 Mock 回调函数。
+    // 如果登录失败，这个函数不应该被调用。
+    const mockOnAuthenticated = vi.fn();
+
+    // 3. 渲染组件，并把 Mock 回调传给 onAuthenticated。
+    render(<GoogleSignInButton onAuthenticated={mockOnAuthenticated} />);
+
+    // 4. 用户点击模拟的 Google 登录按钮。
+    // Mock GoogleLogin 会把 "google-id-token" 交给组件。
+    const user = userEvent.setup();
+
+    await user.click(
+      screen.getByRole("button", {
+        name: /mock google sign in/i,
+      }),
+    );
+
+    // 5. googleLogin 是异步调用。
+    // 等待组件捕获错误后，检查 toast.error 收到的错误信息。
+    await waitFor(() => {
+      expect(toast.error).toHaveBeenCalledWith("Invalid Google ID token");
+    });
+
+    // 6. 后端没有返回登录结果，
+    // 因此组件不能调用登录成功回调。
+    expect(mockOnAuthenticated).not.toHaveBeenCalled();
+  });
+```
+
+运行测试
+
+```bash
+# 运行当前测试
+npm test -- --run \
+  src/test/components/GoogleSignInButton.test.tsx \
+  -t "后端拒绝 Google 登录时应该显示错误"
+
+# 运行全部测试
+npm test -- --run \
+  src/test/components/GoogleSignInButton.test.tsx
+```
+
+这里不继续测试 Google SDK 内部的弹窗、账号选择或 Token 生成，只验证 UUcars 对后端失败的处理。
+
+#### 12.5 测试 LoginPage 如何处理 Google 登录结果
+
+前三个测试已经确认 `GoogleSignInButton` 能够调用后端，并把 `LoginResponse` 交给页面。
+
+现在继续验证页面收到结果后的处理：
+
+```
+LoginPage 收到 LoginResponse
+→ setAuth(user, token)
+→ 跳转到登录后的页面
+```
+
+这里测试的是 `LoginPage`，不需要再次测试真实的 `GoogleSignInButton`。因此把它替换成一个普通按钮。点击按钮时，直接向 `LoginPage` 提供模拟的 `LoginResponse`。
+
+创建 `GoogleSignInButton`的 Mock 组件：
+
+```ts
+// 当前测试只关心 LoginPage 收到登录结果后如何处理。
+// 因此用普通按钮代替真实的 GoogleSignInButton。
+vi.mock("@/components/GoogleSignInButton", () => ({
+  default: ({
+    onAuthenticated,
+  }: {
+    onAuthenticated: (result: LoginResponse) => void;
+  }) => (
+    <button
+      type="button"
+      onClick={() =>
+        // 点击按钮时，模拟 GoogleSignInButton
+        // 已经取得后端返回的 UUcars 登录结果。
+        onAuthenticated({
+          token: "google-uucars-token",
+          expiresAt: "2026-09-03T12:00:00Z",
+          user: {
+            id: 2,
+            username: "Google User",
+            email: "google-user@gmail.com",
+            role: "User",
+            createdAt: "2026-09-03T10:00:00Z",
+          },
+        })
+      }
+    >
+      Mock Google sign in
+    </button>
+  ),
+}));
+```
+
+这个 Mock 不会调用 `authApi.googleLogin()`。
+
+它只模拟前三个测试已经确认的数据流结果：
+
+```
+GoogleSignInButton 已经取得 LoginResponse
+→ 调用 LoginPage 提供的 onAuthenticated
+```
+
+因此，现有的 `authApi` Mock 仍然只需要保留：
+
+```ts
+vi.mock("@/api", () => ({
+  authApi: {
+    login: vi.fn(),
+  },
+}));
+```
+
+添加测试：
+
+```ts
+  /* -------------- 测试 4： ------------- */
+  // 验证 LoginPage 收到 Google 登录结果后，
+  // 会保存用户和 Access Token，并跳转到首页。
+  it("Google 登录成功后应该保存状态并跳转", async () => {
+    // 1. 渲染 LoginPage。
+    // 页面中的 GoogleSignInButton 已经被替换成普通测试按钮。
+    renderLoginPage();
+
+    // 2. 用户点击模拟的 Google 登录按钮。
+    const user = userEvent.setup();
+
+    await user.click(
+      screen.getByRole("button", {
+        name: /mock google sign in/i,
+      }),
+    );
+
+    // 3. 检查 LoginPage 是否把后端返回的
+    // User 和 Access Token 保存到认证状态中。
+    expect(mockSetAuth).toHaveBeenCalledWith(
+      {
+        id: 2,
+        username: "Google User",
+        email: "google-user@gmail.com",
+        role: "User",
+        createdAt: "2026-09-03T10:00:00Z",
+      },
+      "google-uucars-token",
+    );
+
+    // 4. 当前没有来源页面，并且登录用户不是 Admin，
+    // 所以登录成功后应该进入首页。
+    expect(mockNavigate).toHaveBeenCalledWith("/", {
+      replace: true,
+    });
+  });
+```
+
+这里不需要 `waitFor()`，因为 Mock 按钮调用 `onAuthenticated()` 后，`setAuth()` 和 `navigate()` 都是同步执行的。`await user.click()` 完成后即可检查结果。
+
+运行测试：
+
+```bash
+# 单独运行这个测试
+npm test -- --run src/test/pages/LoginPage.test.tsx \
+  -t "Google 登录成功后应该保存状态并跳转"
+
+# 然后运行 LoginPage 的全部测试
+npm test -- --run src/test/pages/LoginPage.test.tsx
+```
+
+第四个测试验证的是：
+
+```
+Mock GoogleSignInButton 提供 LoginResponse
+→ LoginPage 执行 completeAuthentication
+→ setAuth(user, token)
+→ navigate("/")
+```
+
+#### 12.6 运行前端测试
+
+先运行本步骤直接相关的测试：
+
+```bash
+cd uucars-web
+
+npm test -- --run \
+  src/test/components/GoogleSignInButton.test.tsx \
+  src/test/pages/LoginPage.test.tsx
+```
+
+相关测试通过后，再运行完整前端测试：
+
+```bash
+npm test -- --run
+```
+
+#### 12.7 完整项目验证
+
+后端：
+
+```bash
+dotnet build
+dotnet test
+```
+
+前端：
+
+```bash
+cd uucars-web
+
+npm run lint
+npm run build
+npm test -- --run
+```
+
+#### 12.8 手动验证真实 Google 流程
+
+自动测试中的 Google 组件是 Mock，因此还需要使用真实测试账号确认：
+
+```
+□ Login 和 Register 页面可以打开 Google 账号选择窗口
+
+□ 全新 Google 用户可以登录
+  → 创建 User
+  → PasswordHash 为 NULL
+  → 创建 ExternalLogin
+
+□ 同一个 Google 账号再次登录
+  → 使用原来的 User
+  → 不创建重复记录
+
+□ 已验证的同邮箱本地账号使用 Google 登录
+  → 使用原来的 User
+  → 保存 Google 登录关联
+
+□ Google 登录后刷新页面
+  → Refresh Token 可以恢复登录状态
+
+□ 原有注册、邮箱验证和密码登录仍然正常
+```
+
+
+
+### Git 提交
+
+提交并推送：
+
+```bash
+git add .
+git commit -m "feat: add Google OIDC login"
+git push origin feature/v3-google-oidc-login
+```
+
+验证后合并回 `develop` 并删除功能分支：
+
+```bash
+git checkout develop
+git pull --ff-only origin develop
+
+git merge --no-ff feature/v3-google-oidc-login \
+  -m "merge: feature/v3-google-oidc-login into develop"
+
+git push origin develop
+
+git branch -d feature/v3-google-oidc-login
+git push origin --delete feature/v3-google-oidc-login
+```
+
+
+
+### Step 72 完成状态
+
+```
+概念理解：
+□ 理解 GoogleOAuthProvider 的作用
+□ 理解 CredentialResponse 中的 credential
+□ 理解 ID Token 与 Access Token 的区别
+□ 理解后端对 Google ID Token 的验证过程
+□ 理解 Google sub 是稳定的第三方身份标识
+□ 理解 User 与 ExternalLogin 的一对多关系
+□ 理解本地用户可以没有 ExternalLogin 记录
+□ 理解 Google-only 用户的 PasswordHash 可以为空
+□ 理解三个账户匹配分支
+□ 理解 Google 登录成功后仍使用 UUcars 自己的 JWT 会话
+
+后端实现：
+□ GoogleAuthSettings
+□ IGoogleIdTokenService / GoogleIdTokenService
+□ InvalidGoogleIdTokenException
+□ ExternalLogin Entity
+□ ExternalLoginConfiguration
+□ ExternalLogin Migration
+□ IExternalLoginRepository
+□ EfExternalLoginRepository
+□ ExternalLoginService
+□ POST /auth/google
+□ Google-only 密码登录保护
+□ Refresh Token Cookie 复用
+
+前端实现：
+□ @react-oauth/google
+□ GoogleOAuthProvider
+□ GoogleLogin
+□ authApi.googleLogin
+□ GoogleSignInButton
+□ LoginPage Google 登录
+□ RegisterPage Google 登录
+□ Axios 401 登录请求区分
+□ Zustand 登录状态更新
+
+测试：
+□ ExternalLoginService 核心分支单元测试
+□ Google-only 密码登录测试
+□ FakeGoogleIdTokenService
+□ Google 登录 API、数据库和 Cookie 集成测试
+□ GoogleSignInButton 与 LoginPage 组件测试
+□ 后端与前端完整验证
+```
+
 ## fixed Issues 
 
 ### Fix 1. 并发 Refresh Token 请求竞态条件（Refresh Token Rotation Race Condition）

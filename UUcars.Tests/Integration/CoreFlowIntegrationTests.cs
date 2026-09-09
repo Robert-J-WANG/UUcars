@@ -17,7 +17,9 @@ public class CoreFlowIntegrationTests : IntegrationTestBase
     {
     }
 
-    // ===== 用户注册和登录 =====
+    // =========================================================
+    // 本地认证：注册、邮箱验证和密码登录
+    // =========================================================
 
     [Fact]
     public async Task Register_WithValidData_ShouldReturn201()
@@ -91,7 +93,85 @@ public class CoreFlowIntegrationTests : IntegrationTestBase
         Assert.NotEmpty(result!.Data!.Token);
     }
 
-    // ===== 认证保护 =====
+    // =========================================================
+    // Google 认证：Google 身份映射为 UUcars 会话
+    // =========================================================
+
+    [Fact]
+    public async Task GoogleLogin_WithValidToken_ShouldCreateSession()
+    {
+        // FakeGoogleIdTokenService 为普通测试 Token 返回固定、已验证的 Google Payload。
+        var response = await Client.PostAsync(
+            "/auth/google",
+            JsonContent(new
+            {
+                idToken = "valid-google-token"
+            }));
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        // 响应 Body 返回 UUcars Access Token。
+        var result =
+            await DeserializeAsync<ApiResponse<LoginData>>(response);
+
+        Assert.NotNull(result?.Data);
+        Assert.NotEmpty(result!.Data!.Token);
+
+        // Refresh Token 只通过 HttpOnly Cookie 返回，不出现在响应 Body。
+        Assert.Contains(
+            response.Headers.GetValues("Set-Cookie"),
+            value => value.StartsWith(
+                "refreshToken=",
+                StringComparison.OrdinalIgnoreCase));
+
+        await using var db = Factory.GetDbContext();
+
+        // 首次 Google 登录应保存一个没有本地密码的 User 和关联记录。
+        var user = await db.Users
+            .Include(item => item.ExternalLogins)
+            .SingleAsync(item =>
+                item.Email == "google-user@gmail.com");
+
+        Assert.Null(user.PasswordHash);
+        Assert.True(user.EmailConfirmed);
+
+        var externalLogin = Assert.Single(user.ExternalLogins);
+        Assert.Equal("Google", externalLogin.Provider);
+        Assert.Equal("fake-google-subject", externalLogin.ProviderSubject);
+
+        // 返回的 Access Token 可以访问现有的受保护接口。
+        SetBearerToken(result.Data.Token);
+
+        var currentUserResponse =
+            await Client.GetAsync("/users/me");
+
+        Assert.Equal(HttpStatusCode.OK, currentUserResponse.StatusCode);
+    }
+
+    [Fact]
+    public async Task GoogleLogin_WithInvalidToken_ShouldReturn401()
+    {
+        // FakeGoogleIdTokenService 对该固定值模拟 Google 验证失败。
+        var response = await Client.PostAsync(
+            "/auth/google",
+            JsonContent(new
+            {
+                idToken = "invalid-google-token"
+            }));
+
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+
+        await using var db = Factory.GetDbContext();
+
+        // 验证失败时，不应创建 User、ExternalLogin 或登录会话。
+        Assert.False(await db.Users.AnyAsync(item =>
+            item.Email == "google-user@gmail.com"));
+        Assert.False(await db.ExternalLogins.AnyAsync());
+    }
+
+    // =========================================================
+    // 认证保护：受保护接口必须要求有效 UUcars Access Token
+    // =========================================================
 
     [Fact]
     public async Task GetMe_WithoutToken_ShouldReturn401()
@@ -115,7 +195,9 @@ public class CoreFlowIntegrationTests : IntegrationTestBase
         Assert.Equal("test@example.com", result?.Data?.Email);
     }
 
-    // ===== 核心业务链路 =====
+    // =========================================================
+    // 核心业务链路：发布车辆、审核、下单和取消订单
+    // =========================================================
 
     [Fact]
     public async Task FullFlow_RegisterLoginCreateCarSubmit_ShouldWork()
@@ -248,7 +330,9 @@ public class CoreFlowIntegrationTests : IntegrationTestBase
         Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
     }
 
-    // ===== Admin Dashboard =====
+    // =========================================================
+    // Admin Dashboard：平台统计和角色授权
+    // =========================================================
 
     [Fact]
     public async Task GetAdminStats_AsAdmin_ShouldReturnCorrectStatistics()

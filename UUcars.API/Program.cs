@@ -1,13 +1,13 @@
 using Hangfire;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Net.Http.Headers;
 using Scalar.AspNetCore;
 using Serilog;
 using Serilog.Sinks.ApplicationInsights.TelemetryConverters; // ← 新增
 using StackExchange.Redis;
 using UUcars.API.Auth;
 using UUcars.API.Auth.Hangfire;
+using UUcars.API.Configurations;
 using UUcars.API.Data;
 using UUcars.API.Entities;
 using UUcars.API.Extensions;
@@ -18,6 +18,7 @@ using UUcars.API.Services;
 using UUcars.API.Services.Audit;
 using UUcars.API.Services.Cache;
 using UUcars.API.Services.Email;
+using UUcars.API.Services.ExternalLogin;
 using UUcars.API.Services.Notifications;
 using UUcars.API.Services.Storage;
 
@@ -218,6 +219,14 @@ try
     builder.Services.AddScoped<AdminStatsService>();
     // 注册系统时钟
     builder.Services.AddSingleton<TimeProvider>(TimeProvider.System);
+
+    // 第三方授权登录
+    builder.Services.Configure<GoogleAuthSettings>(
+        builder.Configuration.GetSection("GoogleAuth"));
+    builder.Services.AddScoped<IGoogleIdTokenService, GoogleIdTokenService>();
+    builder.Services.AddScoped<IExternalLoginRepository, EfExternalLoginRepository>();
+    builder.Services.AddScoped<ExternalLoginService>();
+
 
     // =============================================
     // 构建应用
