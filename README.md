@@ -1,12 +1,12 @@
 # UUcars Marketplace
 
-UUcars is a personal full-stack portfolio project that models a C2C used-car marketplace. It began as a layered ASP.NET Core API, grew into a deployed React application, and now includes production-oriented capabilities such as Redis caching, rate limiting, background jobs, refresh-token rotation, optimistic concurrency, automated testing, real-time notifications and an Admin analytics dashboard.
+UUcars is a personal full-stack portfolio project that models a C2C used-car marketplace. It began as a layered ASP.NET Core API, grew into a deployed React application, and now includes production-oriented capabilities such as Redis caching, rate limiting, background jobs, refresh-token rotation, Google OpenID Connect sign-in, optimistic concurrency, automated testing, real-time notifications and an Admin analytics dashboard.
 
 The repository is organised as a progressive learning project. The detailed development notes preserve that history; the current code, EF Core migrations, configuration and tests define the implemented system.
 
 ## Current status
 
-The application currently implements V1, V2 and V3 through **Step 71**.
+The application currently implements V1, V2 and V3 through **Step 72**.
 
 | Version | Scope | Status |
 |---|---|---|
@@ -15,14 +15,16 @@ The application currently implements V1, V2 and V3 through **Step 71**.
 | V2.1 | UI design system, responsive layout and vehicle cover images | Complete — `v2.1` |
 | V3.1 | Query optimisation, Redis, rate limiting, Hangfire, refresh tokens, concurrency and security | Complete — `v3.1` |
 | V3.2 | Image workflow, autosave, optimistic favourites, search improvements and frontend testing | Complete — `v3.2` |
-| V3 Step 70–71 | Persistent SignalR notifications and Admin analytics dashboard | Complete |
-| V3 Step 72–75 | Google OAuth, delivery optimisation, Web Vitals and project close-out | Roadmap |
+| V3 Step 70–72 | Persistent SignalR notifications, Admin analytics dashboard and Google OIDC sign-in | Complete |
+| V3 Step 73–75 | Delivery optimisation, Web Vitals and project close-out | Roadmap |
 
 ## What the application supports
 
 ### Accounts and security
 
 - Registration with email verification
+- Local email/password and Google OpenID Connect sign-in
+- External identity linking through the provider and its stable subject identifier
 - Resend verification and password-reset email flows through Resend
 - JWT access tokens
 - Refresh-token rotation with an HttpOnly cookie
@@ -79,9 +81,12 @@ flowchart LR
     Email["Resend"]
     Jobs["Hangfire"]
     Insights["Application Insights"]
+    Google["Google Identity Services"]
 
     Browser -->|"HTTPS / REST"| API
     Browser <-->|"SignalR"| API
+    Browser <-->|"OIDC sign-in"| Google
+    API -.->|"ID Token verification"| Google
     API --> SQL
     API --> Redis
     API --> R2
@@ -107,7 +112,7 @@ HTTP request
 | Area | Technologies |
 |---|---|
 | Backend | ASP.NET Core 9, C#, Entity Framework Core 9, SQL Server |
-| Authentication | JWT Bearer authentication, refresh-token rotation, ASP.NET Core PasswordHasher |
+| Authentication | JWT Bearer authentication, refresh-token rotation, Google OpenID Connect, ASP.NET Core PasswordHasher |
 | Frontend | React 19, TypeScript 6, Vite 8, React Router 7 |
 | UI | Tailwind CSS 4, shadcn/ui, Radix UI, Lucide React, Embla Carousel, Recharts |
 | State and data | Zustand, TanStack Query 5, Axios |
@@ -156,6 +161,7 @@ Favorites
 Orders
 Reviews
 RefreshTokens
+ExternalLogins
 AuditLogs
 Notifications
 ```
@@ -163,6 +169,8 @@ Notifications
 Important constraints include:
 
 - Unique user email addresses
+- Unique external identity on `ExternalLogins(Provider, ProviderSubject)`
+- Optional local password for users created through Google sign-in
 - Composite key on `Favorites(UserId, CarId)`
 - One review per order
 - Snapshot price and seller identity on an order
@@ -177,7 +185,7 @@ The API uses a common `ApiResponse<T>` envelope. The principal routes are:
 
 | Area | Routes |
 |---|---|
-| Authentication | `POST /auth/register`, `POST /auth/login`, `GET /auth/verify-email`, `POST /auth/resend-verification`, `POST /auth/forgot-password`, `POST /auth/reset-password`, `POST /auth/refresh`, `POST /auth/logout` |
+| Authentication | `POST /auth/register`, `POST /auth/login`, `POST /auth/google`, `GET /auth/verify-email`, `POST /auth/resend-verification`, `POST /auth/forgot-password`, `POST /auth/reset-password`, `POST /auth/refresh`, `POST /auth/logout` |
 | Current user | `GET /users/me`, `PUT /users/me` |
 | Vehicles | `GET /cars`, `GET /cars/{id}`, `POST /cars`, `PUT /cars/{id}`, `DELETE /cars/{id}`, `POST /cars/{id}/submit`, `GET /cars/my-listings` |
 | Vehicle images | `POST /cars/{id}/images`, `POST /cars/{id}/images/batch`, `PUT /cars/{id}/images/reorder`, `DELETE /cars/{id}/images/{imageId}` |
@@ -201,6 +209,7 @@ http://localhost:5065/scalar/v1
 - .NET 9 SDK
 - Node.js `^20.19.0` or `>=22.12.0`
 - Docker Desktop or another Docker-compatible runtime
+- A Google OAuth 2.0 Web client ID for real Google sign-in
 - Cloudflare R2 credentials for real image operations
 - A Resend API key for real email delivery
 
@@ -244,6 +253,10 @@ dotnet user-secrets --project UUcars.API set \
   "YOUR_LONG_RANDOM_JWT_SECRET"
 
 dotnet user-secrets --project UUcars.API set \
+  "GoogleAuth:ClientId" \
+  "YOUR_GOOGLE_CLIENT_ID"
+
+dotnet user-secrets --project UUcars.API set \
   "EmailSettings:ApiKey" \
   "YOUR_RESEND_API_KEY"
 
@@ -281,6 +294,7 @@ Create or update `uucars-web/.env.local`:
 
 ```dotenv
 VITE_API_BASE_URL=http://localhost:5065
+VITE_GOOGLE_CLIENT_ID=YOUR_GOOGLE_CLIENT_ID
 ```
 
 Then run:
@@ -380,7 +394,6 @@ The database schema is maintained against the current EF Core migrations and mod
 
 The remaining V3 outline covers:
 
-- Google OAuth login
 - CI/CD hardening
 - Bundle analysis and Web Vitals
 - Final documentation, release and portfolio presentation
