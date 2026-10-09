@@ -6,13 +6,11 @@ using UUcars.API.Entities.Enums;
 
 namespace UUcars.Tests.Integration;
 
-// [Collection] 让这个测试类使用共享的 SqlServerTestFactory
-// 同一个 Collection 里的所有测试类共享同一个数据库容器
-// 避免每个测试类都启动一个新容器（启动容器需要几秒钟，非常耗时）
+// 只保留通过 HTTP 验证 API 核心流程的测试步骤和断言。
 [Collection("Integration")]
 public class CoreFlowIntegrationTests : IntegrationTestBase
 {
-    public CoreFlowIntegrationTests(SqlServerTestFactory factory)
+    public CoreFlowIntegrationTests(ApiIntegrationTestFactory factory)
         : base(factory)
     {
     }
@@ -73,7 +71,7 @@ public class CoreFlowIntegrationTests : IntegrationTestBase
         }));
 
         // V3 更新：直接从数据库取 Token
-        await using var db = Factory.GetDbContext();
+        await using var db = CreateDbContext();
         var user = await db.Users
             .FirstOrDefaultAsync(u => u.Email == "test@example.com");
         var verifyToken = user!.EmailConfirmationToken;
@@ -124,7 +122,7 @@ public class CoreFlowIntegrationTests : IntegrationTestBase
                 "refreshToken=",
                 StringComparison.OrdinalIgnoreCase));
 
-        await using var db = Factory.GetDbContext();
+        await using var db = CreateDbContext();
 
         // 首次 Google 登录应保存一个没有本地密码的 User 和关联记录。
         var user = await db.Users
@@ -161,7 +159,7 @@ public class CoreFlowIntegrationTests : IntegrationTestBase
 
         Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
 
-        await using var db = Factory.GetDbContext();
+        await using var db = CreateDbContext();
 
         // 验证失败时，不应创建 User、ExternalLogin 或登录会话。
         Assert.False(await db.Users.AnyAsync(item =>
@@ -266,7 +264,7 @@ public class CoreFlowIntegrationTests : IntegrationTestBase
         await Client.PostAsync($"/cars/{car!.Id}/submit", null);
 
         // Step 2：Admin 登录并审核通过
-        // Admin 账号在 InitializeDatabaseAsync 里已经插入了
+        // Admin 测试账号由 IntegrationTestBase 在测试开始前准备。
         var adminLoginResponse = await Client.PostAsync("/auth/login", JsonContent(new
         {
             email = "admin@uucars.com",
@@ -350,7 +348,7 @@ public class CoreFlowIntegrationTests : IntegrationTestBase
 
         var startOfNextMonth = startOfMonth.AddMonths(1);
 
-        await using var db = Factory.GetDbContext();
+        await using var db = CreateDbContext();
 
         var seller = new User
         {

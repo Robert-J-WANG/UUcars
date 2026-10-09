@@ -7,22 +7,13 @@ namespace UUcars.API.Extensions;
 
 public static class AuthExtensions
 {
-    // 不能通过 IOptions<JwtSettings> 注入的方法使用jwtSettings配置
-    // 因为AddJwtAuthentication的功能还在注册阶段，不是在运行阶段，无法通过DI创建JwtSettings对象实例
-    /*
-     public static IServiceCollection AddJwtAuthentication(this IServiceCollection services,
-        IOptions<JwtSettings> jwtSettings)
-    {
-        return services;
-    }
-    */
-
-    // 先从配置系统读取 JwtSettings
-    // // 开发环境自动从 User Secrets 读取真实值（Step 03 已配置）
     public static IServiceCollection AddJwtAuthentication(this IServiceCollection services,
-        IConfiguration configuration)
+        IConfigurationSection jwtSection)
     {
-        var jwtSettings = configuration.GetSection("JwtSettings").Get<JwtSettings>()!;
+        // 先从配置系统读取
+        var jwtSettings = jwtSection.Get<JwtSettings>()
+                          ?? throw new InvalidOperationException(
+                              "JwtSettings is not configured.");
         services.AddAuthentication(options =>
             {
                 // DefaultAuthenticateScheme：指定默认用哪种方式来"认证"请求

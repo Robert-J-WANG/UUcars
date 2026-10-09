@@ -2,43 +2,49 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
+using UUcars.API.Data;
 
 namespace UUcars.Tests.Integration;
 
-// 集成测试基类
-// 提供统一的 HTTP 客户端和辅助方法
+// 管理每个集成测试共用的 Client、数据生命周期和辅助方法。
 public abstract class IntegrationTestBase : IAsyncLifetime
 {
-    // JSON 选项：反序列化时忽略大小写
     protected static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNameCaseInsensitive = true
     };
 
-    protected readonly HttpClient Client;
+    private readonly ApiIntegrationTestFactory _factory;
 
-    // 共享同一个 SqlServerTestFactory（共享同一个数据库容器）
-    protected readonly SqlServerTestFactory Factory;
+    protected HttpClient Client { get; }
 
-    protected IntegrationTestBase(SqlServerTestFactory factory)
+    protected IntegrationTestBase(ApiIntegrationTestFactory factory)
     {
-        Factory = factory;
+        _factory = factory;
         Client = factory.CreateClient();
     }
 
-    // 每个测试方法开始前：初始化数据库（只在第一次时执行 Migration）
     public async Task InitializeAsync()
     {
-        await Factory.InitializeDatabaseAsync();
+        await _factory.EnsureTestAdminAsync();
     }
 
-    // 每个测试方法结束后：清理数据，为下一个测试准备干净环境
     public async Task DisposeAsync()
     {
-        await Factory.CleanDatabaseAsync();
+        try
+        {
+            await _factory.CleanDatabaseAsync();
+        }
+        finally
+        {
+            Client.Dispose();
+        }
     }
 
-    // ===== 辅助方法 =====
+    protected AppDbContext CreateDbContext()
+    {
+        return _factory.CreateDbContext();
+    }
 
     // 构建 JSON 请求体
     protected static StringContent JsonContent(object data)
@@ -57,32 +63,25 @@ public abstract class IntegrationTestBase : IAsyncLifetime
         return JsonSerializer.Deserialize<T>(content, JsonOptions);
     }
 
-    // 注册用户并登录，返回 JWT Token
+    // 通过真实 API 完成注册、邮箱确认和登录，返回 UUcars JWT。
     protected async Task<string> RegisterAndLoginAsync(
         string email = "test@example.com",
         string username = "testuser",
         string password = "Test@123456")
     {
-        // Step 1：注册（EmailConfirmed = false，token 发到 FakeEmailService）
         await Client.PostAsync("/auth/register", JsonContent(new
         {
             username, email, password
         }));
 
-
-        // Step 2：直接从数据库取 EmailConfirmationToken
-        // V3 更新：邮件改为 Hangfire 异步入队，FakeEmailService 不再收到调用
-        // Token 已写入数据库，直接查比依赖 FakeEmailService 更可靠
-        await using var db = Factory.GetDbContext();
+        // 后台邮件任务不会在集成测试中执行，因此直接读取已经保存的验证 Token。
+        await using var db = CreateDbContext();
         var user = await db.Users
             .FirstOrDefaultAsync(u => u.Email == email.ToLower());
         var verifyToken = user!.EmailConfirmationToken;
 
-        // Step 3：验证邮箱
         await Client.GetAsync($"/auth/verify-email?token={verifyToken}");
 
-
-        // Step 4：EmailConfirmed = true，登录正常拿 JWT
         var loginResponse = await Client.PostAsync("/auth/login", JsonContent(new
         {
             email, password

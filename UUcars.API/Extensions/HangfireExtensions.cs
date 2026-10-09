@@ -1,6 +1,7 @@
 using Hangfire;
 using Hangfire.SqlServer;
-using UUcars.API.Services.Hangfire;
+using UUcars.API.Configurations;
+using UUcars.API.Services.BackgroundJobs;
 
 namespace UUcars.API.Extensions;
 
@@ -9,11 +10,8 @@ public static class HangfireExtensions
     public static IServiceCollection AddHangfireServices(this IServiceCollection services, IConfiguration configuration,
         IWebHostEnvironment environment)
     {
-        // ✅ Testing 环境完全跳过 Hangfire 配置
-        // 原因：AddHangfire 的 UseSqlServerStorage 会尝试连接数据库初始化系统表
-        // Testcontainers 的数据库里没有 Hangfire 系统表，直接崩溃
-        // Testing 环境只需要 FakeBackgroundJobClient（在 SqlServerTestFactory 里注册）
-        if (environment.IsEnvironment("Testing"))
+        // Testing 环境由 Integration Test Factory 注册 FakeBackgroundJobService。
+        if (environment.IsEnvironment(AppEnvironments.Testing))
             return services;
 
         // 获取数据库连接符
@@ -53,24 +51,17 @@ public static class HangfireExtensions
             options.Queues = new[] { "default" };
         });
 
+        services.AddScoped<IBackgroundJobService, HangfireBackgroundJobService>();
+
         return services;
     }
 
-    // 注册定时任务（Recurring Jobs）
-    // 在 app.UseHangfire() 里调用，确保在应用完全启动后执行
-    public static void UseHangfireJobs(this IApplicationBuilder app)
+    public static void UseBackgroundJobs(this IApplicationBuilder app)
     {
-        // 过期 Token 清理任务
-        // Cron.Daily = 每天凌晨 00:00 执行
-        // 凌晨执行原因：流量最低，对用户无感知
-        RecurringJob.AddOrUpdate<TokenCleanupService>(
-            "cleanup-expired-tokens", // 任务 ID（唯一标识，方便在 Dashboard 里识别）
-            service => service.CleanExpiredTokensAsync(),
-            Cron.Daily, // 执行频率
-            new RecurringJobOptions
-            {
-                TimeZone = TimeZoneInfo.Utc // 统一用 UTC，避免时区问题
-            }
-        );
+        using var scope = app.ApplicationServices.CreateScope();
+        var backgroundJobService = scope.ServiceProvider
+            .GetRequiredService<IBackgroundJobService>();
+
+        backgroundJobService.RegisterRecurringJobs();
     }
 }

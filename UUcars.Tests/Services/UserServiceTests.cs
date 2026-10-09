@@ -6,18 +6,14 @@ using UUcars.API.Entities;
 using UUcars.API.Entities.Enums;
 using UUcars.API.Exceptions;
 using UUcars.API.Services;
+using UUcars.API.Services.BackgroundJobs;
 using UUcars.Tests.Fakes;
 
 namespace UUcars.Tests.Services;
 
 public class UserServiceTests
 {
-    // v3 更新：
-    // - 返回 (service, fakeBackgroundJobClient) 元组
-    // - fakeEmailService 内部保留但不再从外部断言邮件内容
-    //   原因：邮件改为 Hangfire 异步入队，不再直接发送
-    //   Token 的验证改为从 FakeUserRepository 直接读取
-    private static (UserService Service, FakeBackgroundJobClient JobClient)
+    private static (UserService Service, FakeBackgroundJobService JobService)
         CreateService(FakeUserRepository repo)
     {
         var jwtSettings = Options.Create(new JwtSettings
@@ -28,19 +24,17 @@ public class UserServiceTests
             Audience = "TestAudience"
         });
 
-        var fakeEmailService = new FakeEmailService();
-        var fakeBackgroundJobClient = new FakeBackgroundJobClient();
+        var fakeBackgroundJobService = new FakeBackgroundJobService();
 
         var service = new UserService(
             repo,
             new PasswordHasher<User>(),
             new JwtTokenGenerator(jwtSettings),
-            fakeEmailService,
-            fakeBackgroundJobClient,
+            fakeBackgroundJobService,
             NullLogger<UserService>.Instance
         );
 
-        return (service, fakeBackgroundJobClient);
+        return (service, fakeBackgroundJobService);
     }
 
     // ===== 注册测试 =====
@@ -49,7 +43,7 @@ public class UserServiceTests
     public async Task RegisterAsync_WithNewEmail_ShouldReturnUserResponseAndEnqueueEmailJob()
     {
         var repo = new FakeUserRepository();
-        var (service, jobClient) = CreateService(repo);
+        var (service, jobService) = CreateService(repo);
 
         var result = await service.RegisterAsync(
             "testuser",
@@ -62,8 +56,10 @@ public class UserServiceTests
         Assert.Equal("User", result.Role);
 
         // V3 更新：验证邮件 Job 已入队（不再验证邮件是否直接发送）
-        Assert.Single(jobClient.EnqueuedJobs);
-        Assert.Contains("SendEmailVerificationAsync", jobClient.EnqueuedJobs);
+        Assert.Single(jobService.EnqueuedJobs);
+        Assert.Contains(
+            nameof(IBackgroundJobService.EnqueueEmailVerification),
+            jobService.EnqueuedJobs);
     }
 
     [Fact]
@@ -102,6 +98,8 @@ public class UserServiceTests
 
         var stored = await repo.GetByEmailAsync("test@example.com");
         Assert.NotNull(stored);
+        // 本地注册必须生成密码哈希；只有第三方登录用户的 PasswordHash 才可以为空
+        Assert.NotNull(stored.PasswordHash);
         Assert.NotEqual("Test@123456", stored.PasswordHash);
         Assert.True(stored.PasswordHash.Length > 20);
     }
@@ -183,7 +181,7 @@ public class UserServiceTests
             "Test@123456"
         ));
     }
-    
+
     // 验证：Google-only 用户不能使用任意密码通过本地登录。
     [Fact]
     public async Task LoginAsync_WithGoogleOnlyUser_ShouldRejectPasswordLogin()
@@ -205,10 +203,9 @@ public class UserServiceTests
 
         var (service, _) = CreateService(repository);
 
-        await Assert.ThrowsAsync<InvalidCredentialsException>(
-            () => service.LoginAsync(
-                "google-user@gmail.com",
-                "AnyPassword@123"));
+        await Assert.ThrowsAsync<InvalidCredentialsException>(() => service.LoginAsync(
+            "google-user@gmail.com",
+            "AnyPassword@123"));
     }
 
     // ===== 邮箱验证测试 =====
@@ -275,7 +272,7 @@ public class UserServiceTests
     public async Task ResendVerificationAsync_WithUnverifiedEmail_ShouldEnqueueEmailJob()
     {
         var repo = new FakeUserRepository();
-        var (service, jobClient) = CreateService(repo);
+        var (service, jobService) = CreateService(repo);
 
         await service.RegisterAsync(
             "testuser",
@@ -284,26 +281,28 @@ public class UserServiceTests
         );
 
         // 注册时已入队一次
-        Assert.Single(jobClient.EnqueuedJobs);
+        Assert.Single(jobService.EnqueuedJobs);
 
         await service.ResendVerificationAsync("test@example.com");
 
         // 重发后共入队两次
-        Assert.Equal(2, jobClient.EnqueuedJobs.Count);
-        Assert.All(jobClient.EnqueuedJobs,
-            job => Assert.Equal("SendEmailVerificationAsync", job));
+        Assert.Equal(2, jobService.EnqueuedJobs.Count);
+        Assert.All(jobService.EnqueuedJobs,
+            job => Assert.Equal(
+                nameof(IBackgroundJobService.EnqueueEmailVerification),
+                job));
     }
 
     [Fact]
     public async Task ResendVerificationAsync_WithNonExistentEmail_ShouldNotEnqueueJob()
     {
         var repo = new FakeUserRepository();
-        var (service, jobClient) = CreateService(repo);
+        var (service, jobService) = CreateService(repo);
 
         // 不存在的邮箱：静默返回，不入队
         await service.ResendVerificationAsync("nobody@example.com");
 
-        Assert.Empty(jobClient.EnqueuedJobs);
+        Assert.Empty(jobService.EnqueuedJobs);
     }
 
     // ===== 密码重置测试 =====
@@ -312,7 +311,7 @@ public class UserServiceTests
     public async Task ForgotPasswordAsync_WithValidVerifiedEmail_ShouldEnqueueResetEmailJob()
     {
         var repo = new FakeUserRepository();
-        var (service, jobClient) = CreateService(repo);
+        var (service, jobService) = CreateService(repo);
 
         // 注册 + 验证邮箱
         await service.RegisterAsync(
@@ -326,28 +325,30 @@ public class UserServiceTests
         // 发起重置密码
         await service.ForgotPasswordAsync("test@example.com");
 
-        // 注册时入队一次(SendEmailVerificationAsync)
-        // ForgotPassword 入队一次(SendPasswordResetAsync)
-        Assert.Equal(2, jobClient.EnqueuedJobs.Count);
-        Assert.Contains("SendPasswordResetAsync", jobClient.EnqueuedJobs);
+        // 注册时请求一次邮箱验证任务
+        // ForgotPassword 再请求一次密码重置任务
+        Assert.Equal(2, jobService.EnqueuedJobs.Count);
+        Assert.Contains(
+            nameof(IBackgroundJobService.EnqueuePasswordReset),
+            jobService.EnqueuedJobs);
     }
 
     [Fact]
     public async Task ForgotPasswordAsync_WithNonExistentEmail_ShouldNotEnqueueJob()
     {
         var repo = new FakeUserRepository();
-        var (service, jobClient) = CreateService(repo);
+        var (service, jobService) = CreateService(repo);
 
         await service.ForgotPasswordAsync("nobody@example.com");
 
-        Assert.Empty(jobClient.EnqueuedJobs);
+        Assert.Empty(jobService.EnqueuedJobs);
     }
 
     [Fact]
     public async Task ForgotPasswordAsync_WithUnverifiedEmail_ShouldNotEnqueueJob()
     {
         var repo = new FakeUserRepository();
-        var (service, jobClient) = CreateService(repo);
+        var (service, jobService) = CreateService(repo);
 
         // 注册但不验证邮箱
         await service.RegisterAsync(
@@ -357,12 +358,12 @@ public class UserServiceTests
         );
 
         // 清空注册时产生的入队记录，专注测试 ForgotPassword 的行为
-        jobClient.EnqueuedJobs.Clear();
+        jobService.EnqueuedJobs.Clear();
 
         // 未验证的账号不能重置密码，不应入队
         await service.ForgotPasswordAsync("test@example.com");
 
-        Assert.Empty(jobClient.EnqueuedJobs);
+        Assert.Empty(jobService.EnqueuedJobs);
     }
 
     [Fact]
@@ -442,7 +443,7 @@ public class UserServiceTests
             "NewPassword@123"
         ));
     }
-    
+
     // 验证：Google-only 用户不能经由忘记密码流程获得本地密码。
     [Fact]
     public async Task ForgotPasswordAsync_WithGoogleOnlyUser_ShouldNotEnqueueJob()
@@ -462,14 +463,14 @@ public class UserServiceTests
             UpdatedAt = DateTime.UtcNow
         });
 
-        var (service, jobClient) = CreateService(repository);
+        var (service, jobService) = CreateService(repository);
 
         await service.ForgotPasswordAsync("google-user@gmail.com");
 
         var user = await repository.GetByEmailAsync(
             "google-user@gmail.com");
 
-        Assert.Empty(jobClient.EnqueuedJobs);
+        Assert.Empty(jobService.EnqueuedJobs);
         Assert.Null(user!.ResetPasswordToken);
     }
 }
