@@ -14,6 +14,12 @@ public static class HangfireExtensions
         if (environment.IsEnvironment(AppEnvironments.Testing))
             return services;
 
+        if (environment.IsEnvironment(AppEnvironments.E2E))
+        {
+            services.AddScoped<IBackgroundJobService, E2EBackgroundJobService>();
+            return services;
+        }
+
         // 获取数据库连接符
         var connectionString = configuration.GetConnectionString("DefaultConnection") ??
                                throw new InvalidOperationException("Connection string 'DefaultConnection' not found.");

@@ -30,18 +30,28 @@ Log.Logger = new LoggerConfiguration()
 try
 {
     var builder = WebApplication.CreateBuilder(args);
+    // 让本地 E2E 环境显式读取同 User Secrets 配置
+    if (builder.Environment.IsEnvironment(AppEnvironments.E2E)) builder.Configuration.AddUserSecrets<Program>();
+
     // Serilog日志
     builder.Host.UseUUcarsSerilog();
 
     // =============================================
     // 读取启动所需配置
     // =============================================
+
+    // 根据当前环境选择数据库连接名称
+    var databaseConnectionName =
+        builder.Environment.IsEnvironment(AppEnvironments.E2E)
+            ? "E2EConnection"
+            : "DefaultConnection";
+
     var databaseConnectionString = builder.Configuration
-        .GetConnectionString("DefaultConnection");
+        .GetConnectionString(databaseConnectionName);
 
     if (string.IsNullOrWhiteSpace(databaseConnectionString))
         throw new InvalidOperationException(
-            "Connection string 'DefaultConnection' is not configured.");
+            $"Connection string '{databaseConnectionName}' is not configured.");
 
     var jwtSection = builder.Configuration
         .GetRequiredSection("JwtSettings");
@@ -151,7 +161,11 @@ try
             }
     }
 
-    if (!app.Environment.IsEnvironment(AppEnvironments.Testing)) app.UseBackgroundJobs();
+    var backgroundJobsEnabled =
+        !app.Environment.IsEnvironment(AppEnvironments.Testing) &&
+        !app.Environment.IsEnvironment(AppEnvironments.E2E);
+
+    if (backgroundJobsEnabled) app.UseBackgroundJobs();
 
     // =============================================
     // 中间件管道
@@ -163,7 +177,7 @@ try
     app.UseRateLimiter();
     app.UseAuthorization();
 
-    if (!app.Environment.IsEnvironment(AppEnvironments.Testing))
+    if (backgroundJobsEnabled)
         app.UseHangfireDashboard("/hangfire", new DashboardOptions
         {
             Authorization = app.Environment.IsDevelopment()
