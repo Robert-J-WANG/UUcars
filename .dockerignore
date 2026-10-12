@@ -24,3 +24,11 @@ logs/
 # Docker 文件本身
 Dockerfile
 docker-compose*.yml
+
+# 本机环境配置
+.env
+.env.*
+
+# 不参与 API Publish 的内容
+uucars-web/
+docs/
