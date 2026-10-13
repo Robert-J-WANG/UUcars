@@ -1,32 +1,35 @@
-name: CI/CD
+name: CI
 
 on:
+  # 功能分支也执行完整 CI，问题在合并前即可被发现。
   push:
-    branches: ["**"]      # 所有分支 push 都触发
+    branches: ["**"]
   pull_request:
     branches: [main, develop]
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/uucars-api
+# CI 只需要读取仓库内容；镜像推送和 Azure 权限属于 CD。
+permissions:
+  contents: read
 
 jobs:
   # =============================================
-  # Job 1：运行单元测试
+  # Job 1：构建后端并运行全部测试
   # 所有分支 push 都执行
   # =============================================
-  test:
-    name: Unit Tests
+  # 后端先完成编译，再运行 Unit Tests 和 Integration Tests。
+  # Integration Tests 使用 Testcontainers 自行创建临时 SQL Server。
+  backend:
+    name: Backend Build & Tests
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup .NET 9
+      - name: Setup .NET 10
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: "9.0.x"
+          dotnet-version: "10.0.x"
 
       - name: Restore dependencies
         run: dotnet restore
@@ -34,132 +37,129 @@ jobs:
       - name: Build
         run: dotnet build --no-restore
 
-      - name: Run unit tests
-        # 只跑单元测试（排除集成测试）
-        # 集成测试需要 Docker，CI 环境可以支持但配置较复杂
-        # V1 阶段只在 CI 里跑单元测试，集成测试在本地跑
-        run: dotnet test --no-build --filter "FullyQualifiedName!~Integration"
+      - name: Run backend tests
+        run: dotnet test --no-build
 
   # =============================================
-  # Job 2：构建并推送 Docker 镜像
-  # 只在 push 到 main 时执行
+  # Job 2：运行前端核心检查
+  # 所有分支 push 都执行
   # =============================================
-  build-and-push:
-    name: Build & Push Docker Image
+  # 前端与后端并行执行，依次验证代码规范、组件行为和 Production Build。
+  frontend:
+    name: Frontend Build & Tests
     runs-on: ubuntu-latest
-    needs: test           # 必须 test job 通过才执行
-    if: github.ref == 'refs/heads/main'   # 只在 main 分支触发
 
-    # 声明权限：使用内置 GITHUB_TOKEN 推送镜像到 ghcr.io
-    # 不需要手动创建任何 Secret 或 PAT
-    permissions:
-      contents: read
-      packages: write
+    defaults:
+      run:
+        working-directory: uucars-web
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}   # 内置 Token，自动注入，无需手动配置
-
-      # setup-buildx 必须在 build-push 之前
-      # 原因：type=gha 缓存依赖 BuildKit 的 buildx driver
-      # 默认的 docker driver 不支持缓存导出，会报错
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Extract metadata for Docker
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            # push 到 main 时打 latest 标签
-            type=raw,value=latest,enable={{is_default_branch}}
-            # 如果是 tag push（v1.0 这种），同时打版本标签
-            type=semver,pattern={{version}}
-            # 永远带上 commit SHA，方便回溯
-            type=sha,prefix=sha-
-
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          # 构建缓存：利用 GitHub Actions 缓存加速构建
-          # 依赖 setup-buildx 提供的 BuildKit driver 才能工作
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          
-          
-  # =============================================
-  # Job 3：部署到 Azure Container Apps
-  # 只在 build-and-push 成功后执行
-  # =============================================
-  deploy:
-    name: Deploy to Azure Container Apps
-    runs-on: ubuntu-latest
-    needs: build-and-push
-    if: github.ref == 'refs/heads/main'
-    
-    permissions:
-      id-token: write
-      contents: read
-    
-    steps:
-      - name: Log in to Azure
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Deploy to Container Apps
-        uses: azure/container-apps-deploy-action@v1
-        with:
-          resourceGroup: uucars-rg
-          containerAppName: uucars-api
-          imageToDeploy: ghcr.io/robert-j-wang/uucars-api:latest
-          
-          
-  e2e:
-    name: E2E Tests (Playwright)
-    runs-on: ubuntu-latest
-    needs: [ test, build-and-push ]
-    if: github.ref == 'refs/heads/main'
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Node.js
+      - name: Setup Node.js 24
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
 
       - name: Install dependencies
-        run: cd uucars-web && npm ci
+        run: npm ci
 
-      - name: Install Playwright browsers
-        run: cd uucars-web && npx playwright install --with-deps chromium
+      - name: Run ESLint
+        run: npm run lint
 
-      # TODO: 生产项目里这里应该连 Staging 环境（前后端已部署）运行
-      # 而不是在 CI 里临时启动服务——启动服务需要数据库、环境变量、Migration 等
-      # 当前跳过实际运行，只保留 job 结构
-      - name: Run E2E tests (skipped - needs Staging environment)
-        run: echo "E2E tests would run against Staging environment here"
+      - name: Run component tests
+        run: npm test -- --run
 
-      - name: Upload test artifacts on failure
-        uses: actions/upload-artifact@v4
-        if: failure()
+      - name: Build production bundle
+        run: npm run build
+
+  # =============================================
+  # Job 3：运行完整 E2E 测试
+  # 只有后端和前端检查都通过后，才建立完整运行环境执行浏览器流程
+  # =============================================
+  e2e:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+
+    # Playwright 负责启动 API 和 Vite；数据库与缓存由 Runner 提前创建。
+    services:
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          # 仅用于本次临时 CI 数据库，不是任何真实环境的密码。
+          MSSQL_SA_PASSWORD: "UUcars_CI_E2E_2026!"
+          MSSQL_PID: Developer
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd="/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'UUcars_CI_E2E_2026!' -Q 'SELECT 1' -C"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    env:
+      # E2E Launch Profile 设置 E2E 环境；该环境读取 E2EConnection。
+      # 双下划线会由 .NET 配置系统映射为分层配置键。
+      ConnectionStrings__E2EConnection: >-
+        Server=localhost,1433;Database=UUcarsE2EDB;User Id=sa;Password=UUcars_CI_E2E_2026!;TrustServerCertificate=True
+      JwtSettings__Secret: uucars-ci-e2e-signing-key-at-least-32-characters
+      # Vite Dev Server 不读取 .env.production，因此由 Job 显式提供公开 Client ID。
+      VITE_GOOGLE_CLIENT_ID: 1017312818794-93b9fkeegcnfbohbc9j68s7b073ensja.apps.googleusercontent.com
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # E2E 使用独立 Runner，不能复用前两个 Jobs 已安装的运行时。
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
         with:
-          name: playwright-screenshots
-          path: uucars-web/test-results/
-          retention-days: 7        
-          
-          
+          dotnet-version: "10.0.x"
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: uucars-web/package-lock.json
+
+      - name: Restore API dependencies
+        run: dotnet restore UUcars.API/UUcars.API.csproj
+
+      - name: Install frontend dependencies
+        working-directory: uucars-web
+        run: npm ci
+
+      - name: Install Chromium
+        working-directory: uucars-web
+        run: npx playwright install --with-deps chromium
+
+      # playwright.config.ts 会依次启动 E2E API、Vite Frontend 和 Chromium。
+      - name: Run E2E tests
+        working-directory: uucars-web
+        run: npm run e2e
+
+      # 成功时不保存临时文件；失败时保留报告、截图和错误上下文。
+      - name: Upload Playwright artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-artifacts
+          path: |
+            uucars-web/playwright-report/
+            uucars-web/test-results/
+          if-no-files-found: ignore
+          retention-days: 7
