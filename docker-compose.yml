@@ -6,33 +6,37 @@ services:
       ACCEPT_EULA: "Y"
       MSSQL_SA_PASSWORD: "${DB_PASSWORD}"   # 从 .env 文件读取，不硬编码
       MSSQL_PID: Developer
-    ports:
-      - "1433:1433"
+    # 仅供 Compose 网络内的 API 访问，不映射到宿主机端口
     volumes:
       # 数据持久化：容器重启后数据不丢失
       - sqlserver_data:/var/opt/mssql
     healthcheck:
       # 等待 SQL Server 真正就绪再启动 API
-      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P ${DB_PASSWORD} -Q 'SELECT 1' -C"]
+      test:
+        - CMD-SHELL
+        - >-
+          /opt/mssql-tools18/bin/sqlcmd
+          -S localhost
+          -U sa
+          -P "$$MSSQL_SA_PASSWORD"
+          -Q "SELECT 1"
+          -C
       interval: 10s
       timeout: 5s
       retries: 5
-  
-  
-  # ✅ 新增：Redis 缓存服务
+
+  # Redis 缓存容器
   redis:
-    image: redis:7-alpine         # alpine 版本更小，生产够用
-    ports:
-      - "6379:6379"
+    image: redis:7-alpine
+    # 仅供 Compose 网络内的 API 访问，不映射到宿主机端口
     volumes:
-      - redis_data:/data          # 数据持久化（可选，开发时可以不要）
+      - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
-  
-  
+
   # API 容器
   api:
     build:
@@ -43,25 +47,20 @@ services:
     environment:
       # 连接字符串：指向 sqlserver 容器（docker-compose 网络里用服务名访问）
       ConnectionStrings__DefaultConnection: "Server=sqlserver,1433;Database=UUcarsDB;User Id=sa;Password=${DB_PASSWORD};TrustServerCertificate=True"
-      # ✅ 新增 Redis 连接字符串
+      # Redis 连接字符串
       ConnectionStrings__Redis: "redis:6379"
       # JWT 配置
       JwtSettings__Secret: "${JWT_SECRET}"
-      JwtSettings__Issuer: "UUcars"
-      JwtSettings__Audience: "UUcarsUsers"
-      JwtSettings__ExpiresInMinutes: "60"
       # 使用 Production 环境
       ASPNETCORE_ENVIRONMENT: Production
     depends_on:
       sqlserver:
         condition: service_healthy    # 等 SQL Server 健康检查通过再启动
-      # ✅ 新增：等 Redis 健康检查通过再启动 API
+      # 等 Redis 健康检查通过再启动 API
       redis:
         condition: service_healthy
-    
-    restart: unless-stopped          # 除非手动停止，否则崩溃后自动重启
 
 # 数据卷：持久化数据库文件
 volumes:
   sqlserver_data:
-  redis_data:      # ✅ 新增
+  redis_data:
