@@ -20567,9 +20567,7 @@ UUcars 未来可以允许任何 Google 账号登录。
 Testing
 ```
 
-在 Testing 状态下，只有被加入 Test users 的 Google 账号才能测试登录。
-
-因此在：
+在开发阶段，仍然先在：
 
 ```
 测试用户
@@ -20579,6 +20577,10 @@ Testing
 加入自己的测试 Google 邮箱。
 
 开发期间可再加入其他测试账号。
+
+Google Console 会在 Testing 页面显示 Test users 和 OAuth user cap，但是否需要发布或验证还取决于实际请求的 Scope。本项目只使用 Google Identity Services 的 `openid`、`email` 和 `profile` 身份信息，不请求 Google API 的敏感或受限访问权限。Step 73 的生产验证会再使用未加入 Test users 的新账号核对实际行为，不在本节根据界面状态推测结果。
+
+参考：[Manage App Audience](https://support.google.com/cloud/answer/15549945) 与 [How user authorisation works](https://developers.google.com/identity/oauth2/web/guides/how-user-authz-works)。
 
 #### 3.4 创建 Web OAuth Client
 
@@ -20721,6 +20723,25 @@ aud
 ```
 
 确保该 Token 确实是签发给 UUcars 的。
+
+#### 3.9 生产环境配置
+
+本地配置成功不代表生产前后端自动获得 Client ID。部署到 Azure 后，同一个 Google OAuth Client ID 必须通过两条独立的配置路径提供：
+
+| 使用位置 | 配置 Key | 提供位置 | 作用 |
+| --- | --- | --- | --- |
+| React 生产构建 | `VITE_GOOGLE_CLIENT_ID` | `uucars-web/.env.production` | 初始化 Google 登录按钮 |
+| Azure Container Apps API | `GoogleAuth__ClientId` | Container App Environment Variable | 验证 ID Token 的 Audience |
+
+`VITE_GOOGLE_CLIENT_ID` 在 Vite 构建期写入浏览器代码；`GoogleAuth__ClientId` 是 ASP.NET Core 将双下划线映射为 `GoogleAuth:ClientId` 的生产运行时配置。两者的值必须一致，但存放位置不同。
+
+还需要在同一 Google OAuth Web Client 的 **Authorised JavaScript origins** 中添加 Azure Static Web Apps 的完整 Origin，例如：
+
+```text
+https://<static-web-app-host>.azurestaticapps.net
+```
+
+只填写 Scheme 和 Host，不添加 `/login` 路径。本项目继续使用 Popup ID Token 流程，因此不配置 Redirect URI，也不使用 Client Secret。
 
 
 
@@ -24565,6 +24586,5880 @@ git push origin --delete feature/v3-google-oidc-login
 □ Google 登录 API、数据库和 Cookie 集成测试
 □ GoogleSignInButton 与 LoginPage 组件测试
 □ 后端与前端完整验证
+```
+
+
+
+## Step 73 · 运行时升级与 CI/CD 完善
+
+### 目标与范围
+
+到 Step 72 为止，UUcars 的主要业务已经完成，并能在本地正常运行和测试：
+
+```text
+React Frontend
+→ ASP.NET Core API
+→ SQL Server / Redis
+→ Google OIDC、邮件、R2 等外部服务
+```
+
+项目也已经具备 Dockerfile、Docker Compose 和 GitHub Actions，为自动化 CI/CD 提供了基础。
+
+但是，这些工程配置是在不同开发阶段逐步加入的，仍可能存在版本过时、配置缺失或验证范围不一致等问题：
+
+```text
+本地后端项目
+→ 使用 .NET 9
+
+Docker Image
+→ 使用 .NET 9 SDK 和 Runtime
+
+GitHub Actions
+→ 使用 .NET 9 构建后端
+→ 只执行非 Integration Tests
+
+Frontend
+→ 本地有 Lint、Vitest 和 Production Build
+→ GitHub Actions 没有独立执行这些检查
+
+Playwright
+→ 本地已有真实测试
+→ GitHub Actions 中仍然只是占位任务
+```
+
+因此，本步骤需要统一升级和完善整个交付流程，避免出现以下脱节：
+
+```text
+本地项目已经升级
+→ Dockerfile 仍然使用旧 Runtime
+→ Docker Build 失败
+
+本地测试全部通过
+→ GitHub Runner 没有执行相同测试
+→ 问题直到合并后才被发现
+
+应用在本机可以读取 User Secrets
+→ Docker 和 GitHub Runner 没有这些配置
+→ 换一个运行位置就无法启动
+```
+
+完成这些工作后，本地开发、自动化验证和生产部署才能可靠衔接。
+
+本步骤按照同一份代码的真实交付顺序推进，主线如下：
+
+```text
+本地运行配置的完善
+        ↓
+本地构建
+        ↓
+本地核心测试和完整 E2E
+        ↓
+构建并启动 Docker 应用
+        ↓
+GitHub Actions 重现构建和测试
+        ↓
+GitHub Actions 执行完整 E2E
+        ↓
+通过 main 发布门禁部署到 Azure
+```
+
+这里会反复出现四个词：
+
+```text
+运行（Run）
+→ 启动应用，让 API 或页面真正提供服务
+
+构建（Build）
+→ 检查源码能否被编译和打包
+→ 后端生成 DLL 等发布文件
+→ 前端生成 dist 静态文件
+
+测试（Test）
+→ 使用自动化检查代码行为是否符合预期
+
+部署（Deploy）
+→ 把经过验证的 Image 或静态文件放到目标运行平台
+```
+
+它们是连续但不同的环节。构建成功只能证明代码能够生成产物，不代表应用一定能够启动；应用能够启动，也不代表所有业务流程都正确；测试通过后，还需要确认相同过程能够在一个全新的环境中重现。
+
+本步骤的目标不是增加新的业务功能，而是回答一个工程问题：
+
+```text
+同一份 UUcars 源码
+能否从开发电脑开始
+经过构建、测试、容器和 GitHub Runner
+稳定地到达可以发布的状态？
+```
+
+
+
+### 1. 准备功能分支
+
+从最新的 `develop` 切出功能分支：
+
+```bash
+git status --short --branch
+git checkout develop
+git pull --ff-only origin develop
+git checkout -b feature/v3-runtime-cicd
+git push -u origin feature/v3-runtime-cicd
+```
+
+检查结果：
+
+```bash
+git status --short --branch
+```
+
+```text
+feature/v3-runtime-cicd
+→ 跟踪 origin/feature/v3-runtime-cicd
+```
+
+
+
+### 2. 梳理项目交付流程
+
+在开始检查和完善配置之前，先完整梳理项目的交付流程。
+
+#### 2.1 明确各运行环境的职责
+
+代码从本地走到 Azure 的过程中涉及四个运行位置：
+
+```text
+开发电脑
+本地 Docker
+GitHub Runner
+Azure
+```
+
+它们使用同一份源代码，但承担的职责不同。
+
+##### 本地开发
+
+开发电脑是代码变化最先被验证的位置。
+
+后端可以直接运行：
+
+```bash
+dotnet run --project UUcars.API
+```
+
+前端可以启动 Vite Development Server：
+
+```bash
+cd uucars-web
+npm run dev
+```
+
+本地还会执行：
+
+```text
+后端 Restore 和 Build
+后端单元测试与集成测试
+前端 Lint、组件测试和 Production Build
+前后端连接后的 Playwright E2E
+```
+
+因此，本地环境首先回答：
+
+```text
+当前源码能不能运行？
+能不能构建？
+已有自动测试能不能通过？
+完整用户流程能不能走通？
+```
+
+这些问题都确认后，才有必要把应用放进容器。
+
+##### 本地 Docker
+
+本地 Docker 阶段主要处理后端 API。
+
+Dockerfile 会把 API 源码构建成 Image：
+
+```text
+API 源码
+→ 使用 .NET SDK Image 编译和发布
+→ 将发布产物复制到 ASP.NET Core Runtime Image
+→ 生成 uucars-api Image
+```
+
+Docker Compose 再启动：
+
+```text
+SQL Server Container
+Redis Container
+API Container
+```
+
+这一阶段主要回答：
+
+```text
+API 能不能被打包成 Image？
+Image 能不能脱离开发电脑中的 SDK 运行？
+容器内的 API 能不能连接 SQL Server 和 Redis？
+API 能不能返回基础响应？
+```
+
+本地已经执行过的完整测试不会因为 API 进入容器就全部重复一遍。Docker 阶段验证的是打包和容器运行，不是重新建立一套测试体系。
+
+这里还需要区分两种“测试中使用 Docker”的情况：
+
+```text
+Integration Tests 使用 Testcontainers
+→ 测试命令仍然在本机或 GitHub Runner 中执行
+→ Docker 只负责临时启动测试数据库
+
+Docker Compose 运行 API Image
+→ API 自己也进入容器
+→ 验证容器化后的应用能否启动
+```
+
+虽然两者都需要 Docker，但验证目标不同。
+
+##### GitHub Actions
+
+代码 Push 到 GitHub 后，Workflow 会获得一个新的 GitHub Runner。
+
+Runner 不是开发电脑的远程副本，它不会自动拥有：
+
+```text
+本机已经安装的 .NET SDK
+本机使用的 Node.js
+node_modules
+NuGet Restore 结果
+User Secrets
+本机正在运行的 SQL Server 和 Redis
+本地构建出来的 DLL 或 dist
+```
+
+因此，GitHub Actions 需要从源码重新开始：
+
+```text
+Checkout 源码
+→ 准备运行时
+→ 恢复依赖
+→ 重新构建
+→ 重新测试
+```
+
+这一步回答：
+
+```text
+项目是否只在当前开发电脑上能够运行？
+还是任何满足明确条件的全新环境都能重现结果？
+```
+
+当然测试还包括： Runner 临时启动 E2E 需要的完整环境，执行已经在本地验证过的 Playwright 流程。
+
+##### Azure 生产部署
+
+Azure 是最终运行应用的位置，但它不是 Step 73 的主要验证环境。
+
+当前后端发布过程是：
+
+```text
+GitHub Actions 构建 API Image
+→ 推送到 GitHub Container Registry
+→ Azure Container Apps 拉取并运行 Image
+```
+
+因此，Azure Container Apps 不需要再次安装 .NET SDK，也不会重新编译 API。运行所需的 .NET Runtime 已经包含在 Image 中。
+
+当前前端发布过程是：
+
+```text
+GitHub Actions / Static Web Apps Action 构建前端
+→ 生成 dist 静态文件
+→ Azure Static Web Apps 托管这些文件
+```
+
+前端部署完成后只是静态文件，不需要持续运行 Node.js Server。
+
+当前步骤只需要把部署前的构建、测试、配置输入和 Workflow 准备正确。Azure 部署后的检查再后面的步骤中进行。
+
+#### 2.2 检查现有 GitHub Actions Workflows
+
+GitHub Actions 配置位于：
+
+```text
+.github/workflows/
+```
+
+Step 72 完成时有两个 Workflow：
+
+```text
+ci.yml
+→ 后端测试、API Image 构建和 Azure Container Apps 部署
+→ 还包含一个 E2E 占位 Job
+
+azure-static-web-apps-black-coast-04ba93800.yml
+→ 构建并部署 React 前端到 Azure Static Web Apps
+```
+
+它们都是 YAML 文件。
+
+YAML 只负责用缩进、键值对和列表保存结构。真正赋予 `on`、`jobs`、`steps`、`uses` 和 `run` 含义的是 GitHub Actions。
+
+一个 Workflow 可以理解为：
+
+```text
+Workflow
+→ 一个 YAML 文件描述的一整套自动化流程
+
+Job
+→ Workflow 中一组相对独立的工作
+→ 每个 Job 默认获得自己的 Runner
+
+Step
+→ Job 内按顺序执行的一项操作
+```
+
+例如：
+
+```yaml
+jobs:
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build
+        run: dotnet build --no-restore
+```
+
+这里：
+
+```text
+test
+→ 自定义 Job ID
+→ GitHub 不会因为它叫 test 就自动执行测试
+
+name
+→ GitHub 页面中显示的名称
+
+runs-on
+→ Job 使用什么 Runner
+
+steps
+→ Job 内按顺序执行的步骤
+
+uses
+→ 调用已经封装好的 Action
+
+run
+→ 执行 Shell 命令
+```
+
+真正决定“执行测试”的是：
+
+```yaml
+run: dotnet test
+```
+
+而不是 Job ID 或显示名称。
+
+另外几个会在当前项目中用到的字段：
+
+```text
+
+on
+→ 什么时候启动整个 Workflow
+
+if
+→ 满足什么条件才运行当前 Job 或 Step
+
+needs
+→ 当前 Job 需要等待同一 Workflow 中的哪些 Job
+
+with
+→ 给 Action 提供参数
+
+env
+→ 为 Workflow、Job 或 Step 提供环境变量
+
+permissions
+→ 设置 GITHUB_TOKEN 或 OIDC 所需权限
+
+working-directory
+→ 指定 run 命令在哪个目录执行
+```
+
+现在阅读后端 Workflow 的触发条件：
+
+```yaml
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main, develop]
+```
+
+它表示：
+
+```text
+Push 到任意分支
+→ 触发 Workflow
+
+向 main 或 develop 发起或更新 Pull Request
+→ 触发 Workflow
+```
+
+当前项目的实际开发流程主要是：
+
+```text
+功能分支提交并 Push
+→ 检查 Workflow
+→ 本地 merge --no-ff 回 develop
+→ Push develop
+```
+
+所以 PR 触发已经存在，但不是当前每次开发必须经过的步骤。
+
+接着检查 `ci.yml` 中的四个 Job。
+
+##### `test`：后端构建与测试
+
+```text
+Checkout
+→ Setup .NET 9
+→ Restore
+→ Build
+→ 只运行非 Integration Tests
+```
+
+当前测试命令是：
+
+```yaml
+run: dotnet test --no-build --filter "FullyQualifiedName!~Integration"
+```
+
+这说明 Integration Tests 仍然只在本地运行，没有进入 CI。
+
+##### `build-and-push`：构建并推送镜像
+
+```yaml
+needs: test
+if: github.ref == 'refs/heads/main'
+```
+
+它只在 `main` 上运行，而且必须等待 `test` 通过。随后它会构建 API Image，并推送到 GHCR。
+
+##### `deploy`：部署 Container App
+
+```yaml
+needs: build-and-push
+if: github.ref == 'refs/heads/main'
+```
+
+它等待 Image 构建成功，再登录 Azure 并更新 Azure Container Apps。
+
+##### `e2e`：端到端测试占位
+
+当前 E2E Job 也只在 `main` 上运行，并且依赖：
+
+```yaml
+needs: [test, build-and-push]
+```
+
+但是它没有执行：
+
+```bash
+npm run e2e
+```
+
+实际只执行：
+
+```bash
+echo "E2E tests would run against Staging environment here"
+```
+
+因此，现在看到 E2E Job 绿色，只能证明占位命令执行成功，不能说明 Playwright 测试通过。
+
+再检查前端 Workflow：
+
+```text
+Push 到 main
+→ 构建并部署前端
+
+针对 main 的 Pull Request
+→ 创建或关闭 Static Web Apps Preview
+```
+
+它没有在普通功能分支和 `develop` 上执行前端 Lint、Vitest 和 Production Build。
+
+两个 Workflow 是独立文件：
+
+```text
+ci.yml 中的 needs
+→ 只能控制 ci.yml 里的 Job
+
+不能直接让 Static Web Apps Workflow
+→ 等待 ci.yml 中的 Backend 或 Frontend Job
+```
+
+这意味着后面整理发布条件时，必须明确区分：
+
+```text
+同一个 Workflow 内能够自动建立的 Job 依赖
+项目开发流程约定的合并条件
+两个独立 Workflow 的实际执行结果
+```
+
+#### 2.3 确定实施顺序
+
+阅读现有文件后，我们当前的配置情况：
+
+| 位置 | 当前状态 | 主要问题 |
+| --- | --- | --- |
+| 本地后端 | API 与 Tests 使用 `net9.0` | 需要统一升级并重新验证 |
+| 本地前端 | 有 Lint、Vitest、Build 和 Playwright | 未明确统一 Node.js 版本，完整流程需要重新验证 |
+| Docker | SDK 与 Runtime Image 使用 .NET 9 | 必须在本地升级通过后同步 |
+| Backend CI | .NET 9，只运行非 Integration Tests | 与本地测试范围不一致 |
+| Frontend CI | 没有独立质量检查 Job | 功能分支和 `develop` 不验证前端 |
+| CI E2E | 只执行占位 `echo` | 没有运行真实 Playwright |
+| 后端部署 | `main` 构建 Image 并部署 Container Apps | 留到 后面的步骤 观察真实发布结果 |
+| 前端部署 | 独立 Workflow 在 `main` 构建并部署 | 与后端 Workflow 没有跨文件 `needs` |
+
+这些问题不能同时修改，因为后面的环境依赖前面已经确认的结果。
+
+因此，后续严格按照下面的顺序推进：
+
+```text
+第一阶段：本地
+
+完善本地运行配置
+→ 整理 API 启动流程
+→ 验证本地 Build
+→ 运行单元、集成和前端组件测试
+→ 运行本地完整 E2E
+
+第二阶段：Docker
+
+同步已经确认的后端运行时
+→ 构建 API Image
+→ 配置并启动 Compose
+→ 检查容器和基础响应
+
+第三阶段：GitHub Actions
+
+让 Runner 使用本地已经确认的版本和命令
+→ 执行 Backend 与 Frontend 核心检查
+→ 重现本地已经通过的 E2E
+→ 核对交给生产部署流程的输入
+```
+
+
+
+### 3. 完善本地运行配置
+
+前面已经确定，代码变化首先要在本地完成运行、构建和测试，然后才进入 Docker 和 GitHub Actions。
+
+因此，现在先处理本地环境。这里暂时不修改 Dockerfile 和 Workflow，只确认开发电脑使用的运行时、依赖和配置来源。
+
+当前本地环境的状态是：
+
+```text
+Backend
+→ UUcars.API 和 UUcars.Tests 使用 .NET 9
+→ Microsoft Packages 主要使用 9.x
+
+Frontend
+→ 项目依赖已经使用较新的 Vite、TypeScript 和 React
+→ package.json 没有声明 Node.js 版本
+
+Local dependencies
+→ SQL Server 和 Redis 使用本地开发专用的独立 Containers
+→ 不与后面的 Docker Compose 环境共用数据
+
+Configuration
+→ appsettings.json 中混合了通用配置和本地开发配置
+→ 真实 Secret 保存在 User Secrets
+```
+
+本地环境需要先整理清楚，否则后面无法判断 Docker 或 GitHub Actions 中的失败究竟来自代码，还是来自版本和配置差异。
+
+#### 3.1 准备后端运行环境
+
+先检查本机安装的 .NET SDK：
+
+```bash
+dotnet --version
+dotnet --list-sdks
+```
+
+当前本机已经安装：
+
+```text
+.NET SDK 10.0.401
+```
+
+因此可以先在本地完成 .NET 10 升级，再把已经验证过的版本同步到 Docker 和 GitHub Actions。
+
+##### 更新项目目标框架
+
+API 和测试项目存在项目引用关系：
+
+```text
+UUcars.Tests
+→ 引用 UUcars.API
+```
+
+如果只升级 API，测试项目仍然停留在旧目标框架，后面恢复依赖和运行测试时就可能出现兼容问题。因此两个项目一起修改。
+
+在 `UUcars.API/UUcars.API.csproj` 中修改：
+
+```xml
+<TargetFramework>net10.0</TargetFramework>
+```
+
+在 `UUcars.Tests/UUcars.Tests.csproj` 中也修改：
+
+```xml
+<TargetFramework>net10.0</TargetFramework>
+```
+
+##### 更新配套 NuGet Packages
+
+目标框架升级后，ASP.NET Core、EF Core 和测试 Host 相关 Packages 也要使用对应的 10.x 版本。
+
+目标框架已经改变，但并不是把所有 Packages 都直接升级到最新版本。先执行：
+
+```bash
+dotnet list package --outdated
+```
+
+输出中的三列分别表示：
+
+```text
+Requested
+→ .csproj 当前直接请求的版本
+
+Resolved
+→ NuGet 实际解析并安装的版本
+
+Latest
+→ 当前可以取得的最新稳定版本
+```
+
+接下来先识别与目标框架直接配套的 Packages，而不是照着 `Latest` 一次升级所有依赖。ASP.NET Core、EF Core、Microsoft Extensions 和测试 Host 属于 .NET 运行时相关依赖，需要从 9.x 同步到 10.x；其他第三方 Packages 暂时保留原版本。
+
+后端项目需要同步的主要 Packages 是：
+
+```text
+Microsoft.AspNetCore.Authentication.JwtBearer
+Microsoft.AspNetCore.OpenApi
+Microsoft.EntityFrameworkCore
+Microsoft.EntityFrameworkCore.InMemory
+Microsoft.EntityFrameworkCore.SqlServer
+Microsoft.EntityFrameworkCore.Tools
+Microsoft.Extensions.Caching.StackExchangeRedis
+```
+
+测试项目需要同步：
+
+```text
+Microsoft.AspNetCore.Authentication.JwtBearer
+Microsoft.AspNetCore.Mvc.Testing
+Microsoft.EntityFrameworkCore.Design
+Microsoft.EntityFrameworkCore.InMemory
+```
+
+根据检查结果，手动把两个 `.csproj` 中这些 Package References 更新到当前 .NET 10 的稳定补丁版本 `10.0.12`。修改的是项目声明的版本号，Package 文件本身仍然由后面的 NuGet Restore 自动下载，不需要手动下载。
+
+测试项目中的 `Testcontainers.MsSql` 同时从 `4.11.0` 更新到 `4.14.0`。
+
+这里没有一次性升级所有第三方 Packages。当前只调整与 .NET 目标框架直接相关，或者本次恢复依赖实际需要调整的部分，避免把无关依赖升级混入当前问题。
+
+##### 恢复 NuGet 依赖
+
+修改目标框架和 Packages 后，先执行：
+
+```bash
+dotnet restore
+```
+
+第一次 Restore 出现 `NU1605`：
+
+```text
+Detected package downgrade:
+System.IdentityModel.Tokens.Jwt from 8.19.2 to 8.17.0
+```
+
+依赖关系是：
+
+```text
+Microsoft.AspNetCore.Authentication.JwtBearer 10.0.12
+→ Microsoft.IdentityModel.Protocols.OpenIdConnect 8.19.2
+→ System.IdentityModel.Tokens.Jwt >= 8.19.2
+
+UUcars.API
+→ 直接引用 System.IdentityModel.Tokens.Jwt 8.17.0
+```
+
+项目直接引用的 `8.17.0` 低于新认证 Package 要求的 `8.19.2`，NuGet 将这个版本回退视为错误。
+
+因此，在 `UUcars.API.csproj` 中把直接引用改为：
+
+```xml
+<PackageReference Include="System.IdentityModel.Tokens.Jwt"
+                  Version="8.19.2" />
+```
+
+再次执行：
+
+```bash
+dotnet restore
+```
+
+这次 Restore 可以完成，说明 .NET 10 项目所需的依赖已经能够正确解析。这里只确认依赖恢复，完整编译留到本地 Build 阶段单独验证。
+
+##### 准备本地 SQL Server 和 Redis
+
+本地运行 API 时，应用进程由开发电脑上的 .NET Runtime 执行，但数据库和缓存仍然需要先运行。
+
+项目之前已经为本地开发创建了两个独立 Containers：
+
+```text
+uucars-sqlserver
+uucars-redis
+```
+
+因此，这里直接启动这两个已有 Containers：
+
+```bash
+docker start uucars-sqlserver uucars-redis
+```
+
+然后检查它们是否正在运行：
+
+```bash
+docker ps \
+  --filter name=uucars-sqlserver \
+  --filter name=uucars-redis
+```
+
+API 在开发电脑上运行，因此访问的是 Docker 暴露到本机的端口：
+
+```text
+SQL Server
+→ localhost:1433
+
+Redis
+→ localhost:6379
+```
+
+这里不使用 `docker-compose.yml`。本地开发依赖和后面的完整 Docker 环境分别使用不同的 Containers，避免两个运行环境共用数据库、Redis 和持久化数据。
+
+本机运行的 API 通过 `localhost` 访问这两个独立 Containers。`sqlserver:1433` 和 `redis:6379` 是 Docker Compose 内部网络使用的地址，要等后面 API 自己进入 Container 后才会使用。
+
+完成这一步后，本地后端已经具备：
+
+```text
+.NET 10 SDK
+→ net10.0 API 和 Tests
+→ 可以恢复的 NuGet 依赖
+→ 可访问的本地 SQL Server 和 Redis
+```
+
+但应用启动还需要完整配置，因此下一步继续整理配置来源。
+
+#### 3.2 明确后端配置来源
+
+ASP.NET Core 应用并不是只读取一个 `appsettings.json`。
+
+`Program.cs` 中的：
+
+```csharp
+var builder = WebApplication.CreateBuilder(args);
+```
+
+除了创建应用 Builder，还会按照默认规则加载多个配置来源。Development 环境中，当前项目主要使用：
+
+```text
+appsettings.json
+→ appsettings.Development.json
+→ User Secrets
+→ 环境变量
+→ 命令行参数
+```
+
+同一个配置 Key 出现在多个来源时，后加载的值覆盖前面的值。
+
+例如：
+
+```text
+appsettings.json
+JwtSettings:Secret = PLACEHOLDER
+
+User Secrets
+JwtSettings:Secret = 本地真实值
+
+应用最终读取
+→ User Secrets 中的值
+```
+
+##### 确认当前环境名称
+
+本地通过 `dotnet run` 启动 API 时，`UUcars.API/Properties/launchSettings.json` 设置：
+
+```json
+"ASPNETCORE_ENVIRONMENT": "Development"
+```
+
+因此应用会继续加载：
+
+```text
+appsettings.Development.json
+Development 环境中的 User Secrets
+```
+
+`launchSettings.json` 当前只负责本地启动地址和环境名称，不在里面保存数据库密码、JWT Secret 或第三方服务密钥。
+
+##### 整理基础配置
+
+原来的 `appsettings.json` 同时包含通用配置、本地连接地址和部分占位值，而且没有完整列出 Google 与 Application Insights 配置。
+
+为了先看清楚 API 需要哪些配置，基础文件保留完整的配置结构：
+
+```text
+ConnectionStrings
+→ SQL Server、Redis
+
+JwtSettings
+→ Secret、有效时间、Issuer、Audience
+
+EmailSettings
+→ Resend ApiKey、发件人和前端地址
+
+StorageSettings
+→ Cloudflare R2 连接信息
+
+GoogleAuth
+→ Google Client ID
+
+ApplicationInsights
+→ Connection String
+```
+
+先整理数据库、Redis 和 JWT：
+
+```json
+"ConnectionStrings": {
+  "DefaultConnection": "PLACEHOLDER_OVERRIDE_IN_REAL_ENVIRONMENTS",
+  "Redis": "PLACEHOLDER_OVERRIDE_IN_REAL_ENVIRONMENTS"
+},
+"JwtSettings": {
+  "Secret": "PLACEHOLDER_OVERRIDE_WITH_USER_SECRETS",
+  "ExpiresInMinutes": 60,
+  "Issuer": "UUcars",
+  "Audience": "UUcarsUsers"
+}
+```
+
+再补全邮件配置：
+
+```json
+"EmailSettings": {
+  "ApiKey": "PLACEHOLDER_OVERRIDE_IN_REAL_ENVIRONMENTS",
+  "FromName": "UUcars",
+  "FromEmail": "PLACEHOLDER_OVERRIDE_IN_REAL_ENVIRONMENTS",
+  "BaseUrl": "PLACEHOLDER_OVERRIDE_IN_REAL_ENVIRONMENTS"
+}
+```
+
+最后补全 R2、Google 和 Application Insights：
+
+```json
+"StorageSettings": {
+  "AccessKeyId": "PLACEHOLDER_OVERRIDE_WITH_USER_SECRETS",
+  "SecretAccessKey": "PLACEHOLDER_OVERRIDE_WITH_USER_SECRETS",
+  "AccountId": "PLACEHOLDER_OVERRIDE_WITH_USER_SECRETS",
+  "BucketName": "uucars-images",
+  "PublicUrl": "PLACEHOLDER_OVERRIDE_WITH_USER_SECRETS"
+},
+"GoogleAuth": {
+  "ClientId": "PLACEHOLDER_OVERRIDE_IN_REAL_ENVIRONMENTS"
+},
+"ApplicationInsights": {
+  "ConnectionString": ""
+}
+```
+
+这里的 Placeholder 不是可以使用的真实配置。它们只让基础配置文件明确显示每个模块需要哪些 Key；不同运行环境再提供对应的实际值。
+
+`Serilog` 和 `AllowedHosts` 仍然保留在基础配置中，因为它们不是只属于本地开发的值。
+
+##### 整理开发环境配置
+
+本地开发特有、而且不属于 Secret 的值放进 `appsettings.Development.json`：
+
+```json
+"ConnectionStrings": {
+  "Redis": "localhost:6379"
+},
+"EmailSettings": {
+  "FromEmail": "onboarding@resend.dev",
+  "BaseUrl": "http://localhost:5173"
+},
+"Cors": {
+  "AllowedOrigins": [
+    "http://localhost:5173",
+    "http://localhost:3000"
+  ]
+}
+```
+
+Development 环境原有的详细 Serilog 日志级别继续保留。
+
+这里没有把 SQL Server 连接字符串写进 Development 文件，因为连接字符串包含本地数据库密码，仍然由 User Secrets 提供。
+
+##### 检查 User Secrets
+
+当前 API 项目已经配置 `UserSecretsId`。本地真实值继续保存在项目目录之外，不会提交到 Git。
+
+检查已配置的 Key：
+
+```bash
+dotnet user-secrets list --project UUcars.API
+```
+
+当前本地运行需要确认这些 Key 已经存在：
+
+```text
+ConnectionStrings:DefaultConnection
+JwtSettings:Secret
+EmailSettings:ApiKey
+StorageSettings:AccessKeyId
+StorageSettings:SecretAccessKey
+StorageSettings:AccountId
+StorageSettings:PublicUrl
+GoogleAuth:ClientId
+```
+
+当前笔记只记录 Key，不记录命令输出中的真实值。
+
+整理后，本地 Development 环境的配置来源可以概括为：
+
+| 配置 | 本地实际来源 |
+| --- | --- |
+| SQL Server 连接字符串 | User Secrets |
+| Redis 地址 | `appsettings.Development.json` |
+| JWT 普通参数 | `appsettings.json` |
+| JWT Secret | User Secrets |
+| Email 发件地址和前端地址 | `appsettings.Development.json` |
+| Email ApiKey | User Secrets |
+| R2 BucketName | `appsettings.json` |
+| R2 账号和访问凭据 | User Secrets |
+| Google Client ID | User Secrets |
+| Application Insights | 基础配置中的空值，本地不启用 |
+| CORS Origins | `appsettings.Development.json` |
+
+环境变量也是 ASP.NET Core 支持的配置来源。例如：
+
+```text
+JwtSettings__Secret
+```
+
+会映射到：
+
+```text
+JwtSettings:Secret
+```
+
+双下划线 `__` 用来表示配置层级。但是当前本地业务配置已经通过 Development 文件和 User Secrets 提供，所以不再额外设置一套同名环境变量。
+
+这一小节只确认配置结构和来源。配置是否能让整个 API 正确启动，会在整理启动流程后实际验证。
+
+
+#### 3.3 准备前端运行环境
+
+后端运行时明确后，再检查前端。
+
+先查看本机版本：
+
+```bash
+node --version
+npm --version
+```
+
+当前使用：
+
+```text
+Node.js 24
+```
+
+Step 72 的 `package.json` 没有记录 Node.js 要求。本地能够安装依赖，并不能保证后面的全新环境会自动选择同一个版本。
+
+因此，在 `package.json` 中加入：
+
+```json
+"engines": {
+  "node": "24.x"
+}
+```
+
+`engines` 用来说明这个项目期望使用的 Node.js 版本。它不会自动替开发电脑切换 Node.js，但 npm 和后面的自动化环境可以根据它检查或选择版本。
+
+##### 恢复前端依赖
+
+项目已经提交 `package-lock.json`，因此使用：
+
+```bash
+cd uucars-web
+npm ci
+```
+
+`npm ci` 严格按照 Lock File 安装依赖，不在安装过程中重新选择一套版本，更适合验证已有项目能否被重复安装。
+
+安装过程中出现的 Deprecation、Install Scripts 和 Audit 信息属于依赖警告，不等于安装失败。先确认 `npm ci` 的退出结果，再使用：
+
+```bash
+npm audit
+```
+
+第一次检查报告了多项依赖漏洞。这里不能直接执行 `npm audit fix --force`，而是先查看漏洞来自哪些直接依赖和间接依赖。
+
+检查发现 `shadcn` 被保存在 `dependencies` 中，但项目源码没有从这个 Package 导入任何运行时代码。shadcn/ui 的组件已经生成到项目源码中，CLI 本身不需要跟随浏览器应用一起安装，因此删除这个不再需要的运行依赖：
+
+```bash
+npm uninstall shadcn
+```
+
+以后需要继续生成 shadcn/ui 组件时，可以临时运行：
+
+```bash
+npx shadcn@latest add <component-name>
+```
+
+移除无用依赖后，再使用非破坏性修复：
+
+```bash
+npm audit fix
+```
+
+不使用 `--force`，避免为了清除警告直接引入可能包含 Breaking Changes 的主版本升级。
+
+剩余漏洞集中在 Vitest `4.1.10`、`@vitest/coverage-v8` 和间接依赖 `@vitest/mocker`。漏洞范围截至 `4.1.10`，同一主版本已经提供 `4.1.11`，因此不需要跨到 Vitest 5，只更新两个直接依赖：
+
+```bash
+npm install -D vitest@4.1.11 @vitest/coverage-v8@4.1.11
+```
+
+`@vitest/mocker` 由 Vitest 间接引入，会随 Vitest 一起更新。最终 `package.json` 中保持：
+
+```json
+"@vitest/coverage-v8": "^4.1.11",
+"vitest": "^4.1.11"
+```
+
+依赖调整完成后，再次执行：
+
+```bash
+npm audit
+```
+
+确认新的依赖树中是否仍然存在需要当前处理的漏洞。
+
+这里只确认前端运行时和依赖能够正确恢复。Lint、组件测试和 Production Build 仍然放在后面的独立阶段运行。
+
+##### 确认 Vite 本地配置
+
+前端代码实际读取两个环境变量：
+
+```text
+VITE_API_BASE_URL
+→ Axios、Refresh Token 和 SignalR 使用的 API 地址
+
+VITE_GOOGLE_CLIENT_ID
+→ Google OAuth Provider 使用的前端 Client ID
+```
+
+本地值保存在：
+
+```text
+uucars-web/.env.local
+```
+
+`.env.local` 已经被 `.gitignore` 排除，不会提交到仓库。
+
+为了让项目明确说明本地启动需要哪些变量，可以提供不含真实值的 `.env.example`：
+
+```dotenv
+VITE_API_BASE_URL=http://localhost:5065
+VITE_GOOGLE_CLIENT_ID=YOUR_GOOGLE_CLIENT_ID
+```
+
+开发者根据示例创建自己的 `.env.local`，再填入实际值。
+
+根目录 `.gitignore` 原本使用 `.env.*` 忽略所有环境文件。为了允许提交这个不含真实值的示例，在该规则后加入：
+
+```gitignore
+!uucars-web/.env.example
+```
+
+这样 `.env.local` 仍然不会进入 Git，而 `.env.example` 可以作为配置说明提交。
+
+这里要注意，只有以 `VITE_` 开头的变量才会被 Vite 暴露给前端代码。它们最终会进入浏览器能够读取的 JavaScript，因此不能用来保存：
+
+```text
+数据库密码
+JWT Secret
+Resend ApiKey
+R2 SecretAccessKey
+```
+
+Google Client ID 用来标识 OAuth Client，不是 Google Client Secret，所以可以作为前端构建变量。后端验证 Google ID Token 时使用同一个 Client ID，但本地后端的值来自 User Secrets，两边的配置来源不同。
+
+完成这一步后，本地前端已经明确：
+
+```text
+使用 Node.js 24
+→ package.json 声明版本要求
+→ npm ci 可以恢复依赖
+→ .env.local 提供本地公开配置
+→ Secret 不进入 Vite 环境变量
+```
+
+#### 3.4 验证本地运行配置
+
+最后分别检查后端和前端的准备结果。
+
+后端：
+
+```bash
+dotnet --version
+dotnet restore
+docker ps \
+  --filter name=uucars-sqlserver \
+  --filter name=uucars-redis
+dotnet user-secrets list --project UUcars.API
+```
+
+前端：
+
+```bash
+cd uucars-web
+node --version
+npm ci
+npm audit
+```
+
+本节验证完成后，应该得到：
+
+```text
+Backend
+→ API 与 Tests 使用 net10.0
+→ NuGet 依赖可以恢复
+→ SQL Server 和 Redis 可以从本机访问
+→ Development 配置与真实 Secret 来源明确
+
+Frontend
+→ 使用 Node.js 24
+→ npm 依赖可以重复安装
+→ 不需要的 shadcn CLI 运行依赖已经移除
+→ Vitest 4 使用包含安全修复的补丁版本
+→ 本地 Vite 变量来源明确
+→ 没有把后端 Secret 暴露给浏览器
+```
+
+到这里完成的是本地运行环境准备，还没有证明 API 能够正确完成整个启动过程。下一步从 `Program.cs` 开始，整理配置读取、服务注册和应用启动顺序。
+
+---
+
+### 4. 整理 API 启动流程
+
+第 3 节已经准备好本地运行所需的版本、依赖和配置值。本节继续检查 API 如何按正确顺序使用这些配置。
+
+当前 `Program.cs` 能够运行，却混合了配置读取、框架能力、基础设施、业务服务、数据库初始化和请求管道。先确定项目需要的目标启动顺序，再把现有代码迁移到这个结构中。
+
+设定的目标顺序是：
+
+```text
+Bootstrap Logger
+→ 创建 Builder 并加载配置
+→ 配置正式 Serilog
+→ 读取启动必需的配置
+→ 注册 ASP.NET Core 框架能力
+→ 注册基础设施
+→ 注册应用与业务服务
+→ Build Application
+→ 初始化数据库与后台任务
+→ 配置 Middleware
+→ 映射 Endpoints
+→ Run
+```
+
+这个顺序同时体现了两种关系：
+
+```text
+注册阶段
+→ 先准备配置，再按层次登记依赖
+→ 大部分 Add... 调用只登记创建规则，不会立即执行业务
+
+运行阶段
+→ 先完成启动时必须执行的初始化
+→ 再让 HTTP 请求进入 Middleware 和 Endpoint
+```
+
+#### 4.1 检查现有入口顺序
+
+整理前的入口主要存在以下问题：
+
+```text
+配置读取
+→ 数据库、JWT、Redis 等配置分散在各项注册内部
+→ 必需配置缺失时，部分位置不能给出明确错误
+
+服务注册
+→ 框架能力、基础设施和业务服务交错排列
+→ Email、Storage、Cache 的实现与直接依赖分散注册
+→ Redis 在注册阶段立即连接
+→ Testing 环境名称在多个位置手写
+
+Build 之后
+→ Hangfire 定时任务早于数据库初始化
+→ OpenAPI Endpoint 混在 Middleware 中间
+→ Rate Limiting 需要用户身份，却位于 Authentication 前面
+
+失败处理
+→ catch 记录 Fatal Log 后没有继续抛出异常
+```
+
+还要区分三种执行时机：
+
+```text
+普通 C# 语句
+→ 执行到该行时立即运行
+
+DI Factory
+→ 注册阶段只保存创建规则
+→ 服务第一次被解析时才执行
+
+Middleware 与 Endpoint
+→ 启动时登记到应用
+→ HTTP 请求到来后才参与处理
+```
+
+本节按目标结构从上到下整理，每完成一个阶段就编译检查，不一次性重写整个入口。
+
+#### 4.2 启动日志并创建 Builder
+
+API 还没有 Builder 时，正式 Serilog 不能读取完整配置和 DI 服务。因此入口最前面的 Bootstrap Logger 保留：
+
+```csharp
+Log.Logger = new LoggerConfiguration()
+    .WriteTo.Console()
+    .CreateBootstrapLogger();
+```
+
+它只负责覆盖最早的启动阶段。例如 JSON 配置格式错误导致 Builder 创建失败时，外层 `catch` 仍能通过当前 `Log.Logger` 输出 Fatal Log。
+
+随后进入 `try` 并创建 Builder：
+
+```csharp
+var builder = WebApplication.CreateBuilder(args);
+```
+
+这一步完成后，ASP.NET Core 已按默认规则加载配置，后面的代码统一从：
+
+```csharp
+builder.Configuration
+```
+
+读取最终结果，不需要分别读取 `appsettings.json`、Development 配置、User Secrets 或环境变量。
+
+正式 Serilog 的配置回调较长，但它内部只有一个职责：配置应用正式使用的日志系统。新建 `UUcars.API/Extensions/LoggingExtensions.cs`，将这段代码提取为 Host 扩展方法：
+
+```csharp
+public static class LoggingExtensions
+{
+    public static IHostBuilder UseUUcarsSerilog(this IHostBuilder host)
+    {
+        return host.UseSerilog((context, services, configuration) =>
+        {
+            configuration
+                .ReadFrom.Configuration(context.Configuration)
+                .ReadFrom.Services(services)
+                .WriteTo.Console()
+                .WriteTo.File(
+                    "logs/uucars-.log",
+                    rollingInterval: RollingInterval.Day,
+                    retainedFileCountLimit: 30);
+
+            var applicationInsightsConnectionString =
+                context.Configuration["ApplicationInsights:ConnectionString"];
+
+            if (string.IsNullOrWhiteSpace(applicationInsightsConnectionString))
+            {
+                return;
+            }
+
+            var telemetryConfiguration =
+                services.GetService<TelemetryConfiguration>();
+
+            if (telemetryConfiguration is null)
+            {
+                Console.WriteLine(
+                    "[WARNING] ApplicationInsights ConnectionString 已配置，" +
+                    "但 TelemetryConfiguration 服务未成功注册，AI 日志功能未启用。");
+                return;
+            }
+
+            configuration.WriteTo.ApplicationInsights(
+                telemetryConfiguration,
+                new TraceTelemetryConverter());
+        });
+    }
+}
+```
+
+回到 `Program.cs`，Builder 创建后只保留：
+
+```csharp
+builder.Host.UseUUcarsSerilog();
+```
+
+这个扩展方法只负责正式 Serilog 的配置，不包含 Bootstrap Logger，也不负责注册 Application Insights 服务。后面的 `AddApplicationInsightsTelemetry(...)` 仍属于基础设施注册；`UseSerilog` 的回调在 Host Build 时执行，因此能够从最终的 DI 容器读取 `TelemetryConfiguration`。
+
+到这里形成第一段稳定顺序：
+
+```text
+Bootstrap Logger
+→ CreateBuilder
+→ UseUUcarsSerilog
+```
+
+#### 4.3 读取启动所需配置
+
+Builder 创建后，先取得多个注册步骤共同依赖或启动时必须存在的配置。这样可以把“读取配置”和“使用配置”分开。
+
+数据库连接字符串是 API 启动的必要条件：
+
+```csharp
+var databaseConnectionString = builder.Configuration
+    .GetConnectionString("DefaultConnection");
+
+if (string.IsNullOrWhiteSpace(databaseConnectionString))
+{
+    throw new InvalidOperationException(
+        "Connection string 'DefaultConnection' is not configured.");
+}
+```
+
+这只能证明配置值存在。连接是否有效，要等 Build 后执行 Migration 时验证。
+
+JWT 配置同时供两个不同职责使用：
+
+```text
+JWT Bearer Authentication
+→ 验证请求携带的 Token
+
+JwtTokenGenerator
+→ 登录成功后生成 Token
+```
+
+它们必须使用同一组 `Secret`、`Issuer` 和 `Audience`，但不应该因为共享配置就合并成同一个服务。先取得同一个配置节，并登记强类型 Options：
+
+```csharp
+var jwtSection = builder.Configuration
+    .GetRequiredSection("JwtSettings");
+
+builder.Services.Configure<JwtSettings>(jwtSection);
+```
+
+`Configure<JwtSettings>` 只完成配置绑定。真正生成 Token 的 `JwtTokenGenerator` 仍留在后面的应用服务阶段；验证 Token 的 Authentication 则在框架能力阶段注册。
+
+项目自定义的 `Testing` 环境也属于启动约定。新建 `UUcars.API/Configurations/AppEnvironments.cs`：
+
+```csharp
+namespace UUcars.API.Configurations;
+
+public static class AppEnvironments
+{
+    public const string Testing = "Testing";
+}
+```
+
+然后将原先使用 `"Testing"` 的位置改为 `AppEnvironments.Testing`：
+
+| 文件 | 使用位置 |
+| --- | --- |
+| `UUcars.Tests/Integration/ApiIntegrationTestFactory.cs` | `builder.UseEnvironment(...)` |
+| `UUcars.API/Extensions/HangfireExtensions.cs` | 判断是否跳过真实 Hangfire |
+| `UUcars.API/Program.cs` | 判断是否挂载 Hangfire 功能 |
+
+这个常量只统一设置方与判断方使用的名称，不会自动创建配置文件或测试环境。
+
+先检查项目中是否还存在其他手写值：
+
+```bash
+grep -R -n --include='*.cs' '"Testing"' UUcars.API UUcars.Tests
+```
+
+结果应只保留 `AppEnvironments` 中的定义。
+
+#### 4.4 注册 ASP.NET Core 框架能力
+
+配置来源明确后，先注册承载 HTTP API 所需的框架能力。这一组描述“应用能够怎样接收和处理请求”，不包含具体业务模块：
+
+```csharp
+builder.Services.AddControllers();
+builder.Services.AddOpenApi();
+builder.Services.AddUUcarsCors(builder.Configuration);
+builder.Services.AddJwtAuthentication(jwtSection);
+builder.Services.AddRateLimiting();
+builder.Services.AddSignalR();
+builder.Services.AddHttpContextAccessor();
+```
+
+其中 Authentication 使用前面取得的 `jwtSection`。修改 `UUcars.API/Extensions/AuthExtensions.cs` 的参数：
+
+```csharp
+public static IServiceCollection AddJwtAuthentication(
+    this IServiceCollection services,
+    IConfigurationSection jwtSection)
+```
+
+方法内部直接绑定传入的配置节：
+
+```csharp
+var jwtSettings = jwtSection.Get<JwtSettings>()
+    ?? throw new InvalidOperationException(
+        "JwtSettings is not configured.");
+```
+
+后面的 `AddAuthentication`、`AddJwtBearer` 和 SignalR Query Token 处理保持不变。
+
+`AddJwtAuthentication` 在这里登记传入 Token 的验证规则；生成 Token 的 `JwtTokenGenerator` 留到应用服务阶段注册。
+
+完成这一阶段后先编译：
+
+```bash
+dotnet build UUcars.API/UUcars.API.csproj --no-restore
+```
+
+#### 4.5 注册基础设施
+
+框架能力之后，登记业务服务运行时依赖的数据库、缓存、邮件、存储和后台任务设施。
+
+##### 注册数据库访问
+
+使用 4.3 已检查的连接字符串登记 DbContext：
+
+```csharp
+builder.Services.AddDbContext<AppDbContext>(options =>
+    options.UseSqlServer(databaseConnectionString));
+```
+
+`AddDbContext` 只登记如何创建 `AppDbContext`，不会立即连接数据库，也不会执行 Migration。
+
+##### 注册邮件服务
+
+`ResendEmailService` 直接依赖 `IResend` 和 `IOptions<EmailSettings>`。现有 `AddEmailService` 已负责这些依赖，因此将具体实现也放入同一个扩展方法：
+
+```csharp
+services.AddScoped<IEmailService, ResendEmailService>();
+```
+
+然后删除 `Program.cs` 中重复的实现注册，只保留：
+
+```csharp
+builder.Services.AddEmailService(builder.Configuration);
+```
+
+注册服务不会发送邮件。真实网络请求仍在业务代码调用 `IEmailService` 时发生。
+
+##### 注册对象存储
+
+`R2StorageService` 直接依赖 `IAmazonS3` 和 `IOptions<StorageSettings>`。同样在 `AddStorageService` 中补齐：
+
+```csharp
+services.AddScoped<IStorageService, R2StorageService>();
+```
+
+删除 `Program.cs` 中重复的实现注册，只保留：
+
+```csharp
+builder.Services.AddStorageService(builder.Configuration);
+```
+
+##### 注册缓存
+
+`RedisCacheService` 需要 `IDistributedCache`、`IConnectionMultiplexer` 和 Logger。整理前的入口使用：
+
+```csharp
+ConnectionMultiplexer.Connect(redisConnectionString)
+```
+
+作为 `AddSingleton` 的实参。C# 会先计算实参，所以这会在注册阶段立即连接 Redis。
+
+新建 `UUcars.API/Extensions/CacheExtensions.cs`，集中登记缓存的完整依赖链：
+
+```csharp
+using StackExchange.Redis;
+using UUcars.API.Services.Cache;
+
+namespace UUcars.API.Extensions;
+
+public static class CacheExtensions
+{
+    public static IServiceCollection AddCacheServices(
+        this IServiceCollection services,
+        IConfiguration configuration)
+    {
+        var redisConnectionString = configuration
+            .GetConnectionString("Redis");
+
+        if (string.IsNullOrWhiteSpace(redisConnectionString))
+        {
+            throw new InvalidOperationException(
+                "Connection string 'Redis' is not configured.");
+        }
+
+        services.AddSingleton<IConnectionMultiplexer>(_ =>
+            ConnectionMultiplexer.Connect(redisConnectionString));
+
+        services.AddStackExchangeRedisCache(options =>
+        {
+            options.Configuration = redisConnectionString;
+            options.InstanceName = "uucars:";
+        });
+
+        services.AddSingleton<ICacheService, RedisCacheService>();
+
+        return services;
+    }
+}
+```
+
+Factory Lambda 保存创建规则，第一次解析 `IConnectionMultiplexer` 时才建立连接。删除原有 Redis 注册块和单独的 `ICacheService` 注册，入口改为：
+
+```csharp
+builder.Services.AddCacheServices(builder.Configuration);
+```
+
+原来的 `localhost:6379` 回退一并删除。缺少必要配置时应明确失败，不能悄悄连接另一个地址。
+
+##### 注册后台任务
+
+`UserService` 原来直接依赖 Hangfire 的 `IBackgroundJobClient`。这虽然能够把邮件加入队列，但业务代码必须知道 Hangfire 的调用方式，也需要直接指定后台执行的 `IEmailService` 方法。
+
+在 `Services/BackgroundJobs` 中增加项目自己的边界：
+
+```csharp
+public interface IBackgroundJobService
+{
+    void EnqueueEmailVerification(string email, string token);
+    void EnqueuePasswordReset(string email, string token);
+    void RegisterRecurringJobs();
+}
+```
+
+接口只表达当前应用需要完成的后台工作，不暴露 Hangfire 的 `Job`、`IBackgroundJobClient` 或 `IRecurringJobManager`。当前实现 `HangfireBackgroundJobService` 再把这些应用操作转换为 Hangfire 调用：
+
+```text
+EnqueueEmailVerification
+→ Hangfire 调用 IEmailService.SendEmailVerificationAsync
+
+EnqueuePasswordReset
+→ Hangfire 调用 IEmailService.SendPasswordResetAsync
+
+RegisterRecurringJobs
+→ 通过 IRecurringJobManager 登记 TokenCleanupService
+```
+
+`AddHangfireServices` 继续负责 Hangfire Storage、Server 和 Worker，并在最后登记适配器：
+
+```csharp
+services.AddScoped<IBackgroundJobService,
+    HangfireBackgroundJobService>();
+```
+
+入口仍然只需要调用基础设施注册方法：
+
+```csharp
+builder.Services.AddHangfireServices(
+    builder.Configuration,
+    builder.Environment);
+```
+
+##### 注册 Application Insights
+
+Application Insights 在当前项目中承担两项相关但不同的工作：
+
+```text
+AddApplicationInsightsTelemetry
+→ 登记 ASP.NET Core 请求、依赖和 Telemetry 服务
+
+Serilog Application Insights Sink
+→ 把 Serilog 日志发送到同一个 Application Insights 资源
+```
+
+Serilog Sink 已由 `UseUUcarsSerilog()` 配置。把入口文件中零散的 Telemetry 注册也移入 `LoggingExtensions`：
+
+```csharp
+public static IServiceCollection AddUUcarsApplicationInsights(
+    this IServiceCollection services,
+    IConfiguration configuration)
+{
+    var connectionString =
+        configuration["ApplicationInsights:ConnectionString"];
+
+    services.AddApplicationInsightsTelemetry(options =>
+    {
+        options.ConnectionString = connectionString;
+    });
+
+    return services;
+}
+```
+
+`Program.cs` 改为：
+
+```csharp
+builder.Services.AddSingleton<TimeProvider>(TimeProvider.System);
+builder.Services.AddUUcarsApplicationInsights(builder.Configuration);
+```
+
+这次整理没有改变 Application Insights 的启用规则。Connection String 为空时不发送远程 Telemetry；配置有效值后，ASP.NET Core Telemetry 和 Serilog Sink 才使用对应资源。
+
+经过整理后，Email、Storage、Cache、Background Jobs 和 Application Insights 都通过各自的扩展方法进入启动流程，`Program.cs` 只保留注册入口。
+
+完成基础设施注册后再次编译：
+
+```bash
+dotnet build UUcars.API/UUcars.API.csproj --no-restore
+```
+
+#### 4.6 按业务模块注册应用服务
+
+基础设施准备完成后，再登记使用这些设施的应用服务。这里按业务模块排列，每个模块把 Repository 放在 Service 前面，便于看出依赖方向：
+
+```text
+User
+→ IPasswordHasher<User>
+→ IUserRepository
+→ JwtTokenGenerator
+→ IBackgroundJobService
+→ UserService
+
+Car
+→ ICarRepository / ICarImageRepository
+→ CarService
+
+Favorite
+→ IFavoriteRepository
+→ FavoriteService
+
+Order
+→ IOrderRepository
+→ OrderService
+
+其余模块
+→ 保持 Repository / Service 的对应关系
+```
+
+`JwtTokenGenerator` 此时才注册：
+
+```csharp
+builder.Services.AddScoped<JwtTokenGenerator>();
+```
+
+它通过 `IOptions<JwtSettings>` 使用 4.3 的绑定结果，并由登录、Refresh Token 和外部登录业务调用。
+
+`UserService` 不再注入 `IBackgroundJobClient` 或仅为后台任务准备的 `IEmailService`。注册、重发验证邮件和忘记密码流程只调用项目自己的接口：
+
+```csharp
+_backgroundJobService.EnqueueEmailVerification(email, token);
+_backgroundJobService.EnqueuePasswordReset(email, token);
+```
+
+`UserService` 决定什么时候需要后台任务；`HangfireBackgroundJobService` 决定如何交给 Hangfire 执行。应用业务与具体后台任务产品由此分开。
+
+`CurrentUserService` 放在应用服务区域：
+
+```csharp
+builder.Services.AddScoped<CurrentUserService>();
+```
+
+它使用前面框架阶段登记的 `IHttpContextAccessor`，向业务代码提供当前用户信息。
+
+Google 登录模块依次注册 `IGoogleIdTokenService`、`IExternalLoginRepository` 和 `ExternalLoginService`。它们分别负责验证 Google ID Token、访问外部登录关联数据和组织登录业务；`GoogleAuthSettings` 已在前面的配置阶段完成绑定。
+
+完成全部应用服务注册后执行：
+
+```bash
+dotnet build UUcars.API/UUcars.API.csproj --no-restore
+```
+
+#### 4.7 构建 WebApplication
+
+配置、框架能力、基础设施和应用服务全部登记后，再构建应用：
+
+```csharp
+var app = builder.Build();
+```
+
+`Build` 会把 `builder.Services` 中的描述组装为应用使用的 Service Provider，并完成 Host 和正式 Serilog 的构建。
+
+Build 成功不表示所有服务都已经创建，也不表示数据库和 Redis 一定可连接。例如 Redis Factory 仍要等第一次解析时执行。此时 HTTP Server 也尚未开始监听。
+
+Build 之后才能通过 `app.Services` 创建 Scope，执行应用启动前必须完成的初始化。
+
+#### 4.8 初始化数据库并注册定时任务
+
+整理前的 Migration 位于 Endpoints 后面，而周期任务登记更早执行。两者都依赖 SQL Server，因此目标顺序应该先确认数据库可用，再登记定时任务。
+
+把现有 Migration 块移动到：
+
+```csharp
+var app = builder.Build();
+```
+
+之后，保留原有 `MigrateAsync`、五次尝试和三秒等待：
+
+```text
+Build
+→ 创建启动 Scope
+→ 解析 AppDbContext
+→ 连接 SQL Server
+→ 应用待执行的 Migration
+```
+
+启动时还没有 HTTP Request Scope，因此需要主动调用 `app.Services.CreateScope()`。这一步只应用已有 Migration，不修改实体，也不生成新 Migration。
+
+数据库初始化成功后，再登记应用需要的 Recurring Jobs：
+
+```csharp
+if (!app.Environment.IsEnvironment(AppEnvironments.Testing))
+{
+    app.UseBackgroundJobs();
+}
+```
+
+`UseBackgroundJobs()` 是启动初始化，不是 HTTP Middleware。它从已经构建好的 DI 容器取得 `IBackgroundJobService`，然后登记周期任务：
+
+```csharp
+using var scope = app.ApplicationServices.CreateScope();
+var backgroundJobService = scope.ServiceProvider
+    .GetRequiredService<IBackgroundJobService>();
+
+backgroundJobService.RegisterRecurringJobs();
+```
+
+具体的 `IRecurringJobManager.AddOrUpdate(...)` 留在 `HangfireBackgroundJobService` 内部。入口只知道应用需要登记后台任务，不再直接操作 Hangfire 的周期任务 API。
+
+任务登记仍位于数据库初始化之后，也不依赖 Dashboard 先完成配置。
+
+先验证代码结构：
+
+```bash
+dotnet build UUcars.API/UUcars.API.csproj --no-restore
+```
+
+#### 4.9 配置 Middleware 顺序
+
+启动初始化完成后，开始建立 HTTP 请求管道。Middleware 的顺序以“后面的步骤依赖前面已经准备好的什么”为标准：
+
+```csharp
+app.UseMiddleware<GlobalExceptionMiddleware>();
+app.UseSecurityHeaders();
+app.UseCors(CorsExtensions.PolicyName);
+app.UseAuthentication();
+app.UseRateLimiter();
+app.UseAuthorization();
+```
+
+对应关系是：
+
+```text
+Global Exception
+→ 捕获后续管道抛出的未处理异常
+
+Security Headers
+→ 为后续响应补充安全响应头
+
+CORS
+→ 先处理浏览器跨域与 Preflight 请求
+
+Authentication
+→ 验证 JWT 并建立 HttpContext.User
+
+Rate Limiting
+→ 已登录请求按用户分区，匿名请求按 IP 分区
+
+Authorization
+→ 使用已经建立的身份检查 Endpoint 权限
+```
+
+当前 Rate Limiting 的 Browse 和 Write 策略会读取 `HttpContext.User`，所以必须先执行 Authentication。这里只调整顺序，不修改限流额度、Token 验证规则或授权要求。
+
+Hangfire Dashboard 会处理 `/hangfire` 请求，因此属于请求管道，并放在 Authentication、Rate Limiting 和 Authorization 之后：
+
+```csharp
+if (!app.Environment.IsEnvironment(AppEnvironments.Testing))
+{
+    app.UseHangfireDashboard("/hangfire", new DashboardOptions
+    {
+        Authorization = app.Environment.IsDevelopment()
+            ? new[] { new HangfireLocalDevAuthorizationFilter() }
+            : new[] { new HangfireAdminAuthorizationFilter() }
+    });
+}
+```
+
+这与 4.8 的 `UseBackgroundJobs()` 分开后，数据库初始化、后台任务登记和 Dashboard 请求授权各自处于正确阶段。
+
+#### 4.10 映射应用端点并启动主机
+
+请求管道完成后，集中映射应用可以匹配的 Endpoints。
+
+开发环境下的 API 文档属于 Endpoint，不是 Middleware：
+
+```csharp
+if (app.Environment.IsDevelopment())
+{
+    app.MapOpenApi();
+    app.MapScalarApiReference(options =>
+        options
+            .WithTitle("UUcars API Documentation")
+            .WithTheme(ScalarTheme.Moon));
+}
+```
+
+随后映射业务 API 与 SignalR Hub：
+
+```csharp
+app.MapControllers();
+app.MapHub<NotificationHub>("/hubs/notification");
+```
+
+所有启动准备完成后才执行：
+
+```csharp
+app.Run();
+```
+
+执行到这里，Host 开始运行 HTTP Server 和后台服务，并等待应用停止。
+
+最后修正失败退出状态：
+
+```csharp
+catch (Exception ex)
+{
+    Log.Fatal(ex, "Application terminated unexpectedly during startup");
+    throw;
+}
+finally
+{
+    Log.CloseAndFlush();
+}
+```
+
+`throw;` 让启动失败返回非零状态；`Log.CloseAndFlush()` 在进程结束前刷新并关闭当前 Serilog Logger。早期失败时它可能仍是 Bootstrap Logger，正式日志建立后则是正式 Logger。
+
+文件末尾的 `public partial class Program` 保留，`WebApplicationFactory<Program>` 需要通过它建立集成测试 Host。
+
+#### 4.11 验证完整启动链路
+
+先确认第 3 节准备的独立开发容器仍在运行：
+
+```bash
+docker ps --filter name=uucars-sqlserver --filter name=uucars-redis
+```
+
+构建并使用现有 `http` Profile 启动 API：
+
+```bash
+dotnet build UUcars.API/UUcars.API.csproj --no-restore
+dotnet run --project UUcars.API --no-build --launch-profile http
+```
+
+启动日志应确认：
+
+```text
+Hosting environment: Development
+Starting Hangfire Server
+Now listening on: http://localhost:5065
+```
+
+Migration 当前没有单独输出成功日志；启动过程没有在 Migration 阶段抛出异常，并最终进入监听状态，就说明该启动初始化已经完成。
+
+另开终端请求开发环境的 OpenAPI Endpoint：
+
+```bash
+curl -i http://localhost:5065/openapi/v1.json
+```
+
+返回 `200 OK` 和 OpenAPI JSON，说明 Host 已监听端口，请求能够经过 Middleware 并匹配 Endpoint。
+
+OpenAPI 不会解析车辆业务和缓存依赖，再请求公开车辆列表：
+
+```bash
+curl -i "http://localhost:5065/cars?page=1&pageSize=20"
+```
+
+这个请求会进入 `CarsController` 与 `CarService`，并解析 Cache 和 Database 依赖。结合日志中的 `Cache MISS`、EF Core SQL 查询和最终的 `200 OK`，可以确认本地 Redis、SQL Server 与公开读取链路能够协同工作。
+
+这只是启动后的 Smoke Check，用于验证本节整理的配置与启动顺序。完整构建、自动测试和 E2E 分别在后续小节继续验证。使用 `Ctrl+C` 停止 API 后，本节完成。
+
+### 5. 验证本地构建
+
+前两节完成了本地运行环境和 API 启动流程整理，但“代码看起来正确”并不等于“项目能够生成可运行产物”。
+
+现在分别构建后端和前端：
+
+```text
+Backend Build
+→ 编译 API 与 Tests
+→ 生成 .NET Assemblies 和运行配置
+
+Frontend Build
+→ TypeScript 类型检查
+→ Vite 打包浏览器资源
+→ 生成 dist 静态文件
+```
+
+这一节只处理构建阶段发现的问题。业务行为是否正确，留给下一节的自动测试验证。
+
+#### 5.1 构建后端项目
+
+第 3 节已经完成 NuGet Restore，因此从仓库根目录执行：
+
+```bash
+dotnet build --no-restore
+```
+
+仓库根目录存在 `UUcars.sln`，所以这条命令会构建 Solution 中的两个项目：
+
+```text
+UUcars.API
+UUcars.Tests
+```
+
+`--no-restore` 表示使用前面已经恢复的依赖，不在 Build 阶段再次执行 Restore。这样如果构建失败，可以先把问题定位在编译，而不是依赖下载。
+
+##### 检查后端构建流程
+
+后端 Build 会依次检查：
+
+```text
+.NET 10 SDK 能否识别两个项目
+→ API 与 Tests 的 Package References 是否兼容
+→ C# 代码是否能够编译
+→ Tests 是否能够引用 API
+→ Nullable 和其他编译检查是否通过
+```
+
+默认构建配置是 `Debug`。成功后，主要产物位于：
+
+```text
+UUcars.API/bin/Debug/net10.0/
+UUcars.Tests/bin/Debug/net10.0/
+```
+
+其中：
+
+```text
+UUcars.API.dll
+→ 编译后的 API 程序集
+
+UUcars.API.runtimeconfig.json
+→ 应用运行所需的 .NET Runtime 信息
+
+UUcars.API.deps.json
+→ 应用依赖关系
+
+UUcars.Tests.dll
+→ 后面由 Test Runner 加载的测试程序集
+```
+
+`bin` 和 `obj` 都是可以重新生成的本地产物，已经被 `.gitignore` 排除，不提交到 Git。
+
+项目以前使用过 `net9.0`，所以目录中可能仍然存在旧的：
+
+```text
+bin/Debug/net9.0/
+```
+
+这不代表当前项目仍然构建到 .NET 9。判断本次结果时，要查看当前 `TargetFramework` 对应的 `net10.0` 目录和本次 Build 日志。
+
+##### 修正 Nullable 警告
+
+第一次 Build 成功，但测试项目出现：
+
+```text
+warning CS8602: Dereference of a possibly null reference
+```
+
+位置在：
+
+```text
+UUcars.Tests/Services/UserServiceTests.cs
+→ RegisterAsync_ShouldNotStorePasswordAsPlainText
+```
+
+这个测试从 Repository 重新读取刚注册的用户，然后检查数据库中保存的内容不是明文密码。原来的断言是：
+
+```csharp
+var stored = await repo.GetByEmailAsync("test@example.com");
+Assert.NotNull(stored);
+Assert.NotEqual("Test@123456", stored.PasswordHash);
+Assert.True(stored.PasswordHash.Length > 20);
+```
+
+`Assert.NotNull(stored)` 只证明用户对象不为空，并没有证明它的 `PasswordHash` 属性不为空。因此编译器在下面这行发现了风险：
+
+```csharp
+stored.PasswordHash.Length
+```
+
+`User.PasswordHash` 现在允许为空，因为只使用 Google 登录的用户没有本地密码。虽然这个测试走的是本地注册，开发者知道它应该生成密码哈希，但编译器只能根据属性类型判断，因此仍然认为 `PasswordHash` 可能为空。
+
+这个测试本来就需要验证“本地注册会生成密码哈希”，因此在检查密码内容和长度之前，先增加对 `stored.PasswordHash` 的非空断言。
+
+把原来的断言部分修改为：
+
+```csharp
+var stored = await repo.GetByEmailAsync("test@example.com");
+Assert.NotNull(stored);
+
+// 本地注册必须生成密码哈希；只有第三方登录用户的 PasswordHash 才可以为空。
+Assert.NotNull(stored.PasswordHash);
+Assert.NotEqual("Test@123456", stored.PasswordHash);
+Assert.True(stored.PasswordHash.Length > 20);
+```
+
+关键修改是新增这一行：
+
+```csharp
+Assert.NotNull(stored.PasswordHash);
+```
+
+执行到后面的断言时，编译器已经知道 `PasswordHash` 不是 `null`，因此可以安全访问它的内容和 `Length`。
+
+这里没有使用：
+
+```csharp
+stored.PasswordHash!.Length
+```
+
+`!` 只是要求编译器忽略风险，并没有验证运行时的实际值。`Assert.NotNull` 不仅消除 Nullable 警告，也表达了这个测试真正要求的业务结果：
+
+```text
+Google-only user
+→ PasswordHash 可以为空
+
+Local registration user
+→ PasswordHash 必须存在
+```
+
+再次执行：
+
+```bash
+dotnet build --no-restore
+```
+
+后端 Solution 可以使用 .NET 10 完成构建，并且这个 Nullable 警告不再出现。
+
+检查本次生成的产物：
+
+```bash
+ls -la UUcars.API/bin/Debug/net10.0
+ls -la UUcars.Tests/bin/Debug/net10.0
+```
+
+至少应该看到：
+
+```text
+UUcars.API.dll
+UUcars.API.deps.json
+UUcars.API.runtimeconfig.json
+UUcars.Tests.dll
+```
+
+这些文件已经证明 API 与 Tests 可以生成当前 `net10.0` 的开发阶段程序集，不需要手动复制或提交。
+
+这里没有执行 `dotnet publish`。Build 用来验证源码和生成开发阶段程序集；API Image 所需的 Publish 会在 Dockerfile 的构建阶段执行。
+
+#### 5.2 构建前端生产版本
+
+后端 Build 通过后，继续验证前端能否生成浏览器实际加载的 Production Bundle。进入前端目录：
+
+```bash
+cd uucars-web
+```
+
+`package.json` 中的 Build Script 是：
+
+```json
+"build": "tsc -b && vite build"
+```
+
+它包含两个连续阶段。
+
+##### 执行 TypeScript 编译
+
+```text
+tsc -b
+→ 按 tsconfig references 检查前端代码和 Vite 配置
+→ 出现 TypeScript Error 时停止
+```
+
+这里的 `-b` 是 TypeScript Build Mode。项目根 `tsconfig.json` 引用了：
+
+```text
+tsconfig.app.json
+→ React 应用代码
+
+tsconfig.node.json
+→ Vite 等 Node.js 配置代码
+```
+
+只有 TypeScript 检查通过，才会继续执行 Vite。
+
+##### 执行 Vite 生产构建
+
+```text
+vite build
+→ 读取 Production Mode 的 Vite 配置
+→ 处理 React、CSS、图片和其他静态资源
+→ 压缩并生成带 Hash 的文件名
+→ 输出到 dist
+```
+
+Build 时读取的 `VITE_` 变量会被写入生成的 JavaScript，而不是在浏览器打开页面时再从 `.env` 文件读取。因此，执行 Build 前先确认当前 Production Mode 的配置输入。
+
+当前前端使用：
+
+```text
+VITE_API_BASE_URL
+VITE_GOOGLE_CLIENT_ID
+```
+
+本地执行 Production Build 时：
+
+```text
+VITE_API_BASE_URL
+→ 来自 .env.production
+
+VITE_GOOGLE_CLIENT_ID
+→ 当前本地由 .env.local 提供
+```
+
+因此，本地构建只能证明当前开发电脑具备这些值。换到新的构建环境时，也必须在 Build 前提供相同的 Key。
+
+这些变量会进入浏览器 Bundle，所以只能保存可以公开的前端配置。修改它们后必须重新执行 Build，已有 `dist` 不会自动变化。
+
+确认 Build Script 与配置输入后执行：
+
+```bash
+npm run build
+```
+
+##### 修正 Vite 配置兼容性
+
+第一次执行 Build 时出现：
+
+```text
+Your Vite config uses features that are unsupported by
+configLoader: 'native'
+
+__dirname (vite.config.ts)
+Use import.meta.dirname instead
+```
+
+当前前端是 ESM 项目：
+
+```json
+"type": "module"
+```
+
+原来的 `vite.config.ts` 使用 CommonJS 的 `__dirname`：
+
+```ts
+import path from "path";
+
+alias: {
+  "@": path.resolve(__dirname, "./src"),
+}
+```
+
+Node.js 24 和当前 Vite 可以直接使用 ESM 的 `import.meta.dirname`，因此修改为：
+
+```ts
+import path from "node:path";
+
+alias: {
+  "@": path.resolve(import.meta.dirname, "./src"),
+}
+```
+
+这里没有通过设置 `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` 隐藏警告，而是把配置改为当前模块系统支持的写法。
+
+再次执行：
+
+```bash
+npm run build
+```
+
+Vite 配置兼容警告消失，前端能够继续生成 `dist`。构建过程中仍会报告：
+
+```text
+Some chunks are larger than 500 kB after minification
+```
+
+当前主要 JavaScript 文件大约是：
+
+```text
+1,230 kB minified
+366 kB gzip
+```
+
+这个警告不表示构建失败，也不应该通过提高 `chunkSizeWarningLimit` 隐藏。当前先记录实际大小，Bundle 拆分需要结合后续测量单独处理，不在本节改变前端加载结构。
+
+#### 5.3 检查前端构建产物
+
+Build Command 返回成功后，继续检查 Vite 实际写入 `dist` 的文件：
+
+```bash
+find dist -maxdepth 2 -type f
+```
+
+主要结构应该包括：
+
+```text
+dist/index.html
+dist/assets/*.js
+dist/assets/*.css
+dist/assets/*.{jpg,svg}
+dist/staticwebapp.config.json
+```
+
+资源文件名中的 Hash 用于缓存失效。源码变化后文件内容和 Hash 会变化，浏览器就会请求新的文件，而不是继续使用旧缓存。
+
+##### 统一 staticwebapp.config.json 的来源
+
+检查构建产物时发现仓库存在两个源文件：
+
+```text
+uucars-web/staticwebapp.config.json
+uucars-web/public/staticwebapp.config.json
+```
+
+两份内容并不一致，但 `dist/staticwebapp.config.json` 只来自 `public` 目录。原因是 Vite 对这两个位置的处理不同：
+
+```text
+public 目录中的文件
+→ Build 时原样复制到 dist 根目录
+
+项目根目录中的普通 JSON 文件
+→ 不会自动进入 dist
+```
+
+因此，保留 `public/staticwebapp.config.json` 作为唯一来源，并把完整配置写入该文件：
+
+```json
+{
+  "navigationFallback": {
+    "rewrite": "/index.html",
+    "exclude": [
+      "/assets/*",
+      "/*.{css,js,ico,png,jpg,svg}"
+    ]
+  }
+}
+```
+
+删除没有进入构建产物的重复文件：
+
+```text
+uucars-web/staticwebapp.config.json
+```
+
+重新构建并检查复制结果：
+
+```bash
+npm run build
+cat dist/staticwebapp.config.json
+```
+
+此时 `dist` 中的配置应与 `public/staticwebapp.config.json` 一致。
+
+Navigation Fallback 让静态托管服务在用户直接访问 React Router 路由时返回 `index.html`，再由前端 Router 处理 URL。`exclude` 防止真实的 JavaScript、CSS 和图片请求被改写成页面入口。这里只确认配置来源和构建结果；实际托管行为要在对应部署环境中验证。
+
+#### 5.4 预览前端生产版本
+
+`npm run dev` 使用源码启动 Development Server，不能证明 `dist` 能够被加载。
+
+使用：
+
+```bash
+npm run preview
+```
+
+Vite 默认在下面的地址提供 `dist`：
+
+```text
+http://localhost:4173
+```
+
+打开页面，确认：
+
+```text
+index.html 能够加载
+→ JavaScript 和 CSS 资源没有 404
+→ React 应用能够初始化
+→ 浏览器请求使用 Build 时写入的 VITE_API_BASE_URL
+```
+
+当前 Production Build 的 API 地址来自 `.env.production`，所以 Preview 不会因为本地 API 正在运行就自动改用 `localhost:5065`。本节只核对构建产物使用了预期地址，不把 Preview 当作本地前后端联调。
+
+也可以先检查首页响应：
+
+```bash
+curl -I http://localhost:4173
+```
+
+`vite preview` 不会读取 `staticwebapp.config.json` 的托管规则。这里验证的是 Vite 生成的浏览器 Bundle 能否运行；本节对静态配置的验证只确认它已经正确进入 `dist`。
+
+#### 5.5 确认本地构建结果
+
+完成后端 Build、前端 Production Build、产物检查与 Preview 后，本地构建结果可以汇总为：
+
+```text
+Backend
+→ API 和 Tests 生成 net10.0 Assemblies
+→ 实际 Nullable 警告已经按业务要求修正
+
+Frontend
+→ TypeScript Build 通过
+→ Vite Production Build 通过
+→ ESM 配置警告已修正
+→ dist 包含页面资源和唯一的 staticwebapp.config.json
+→ Production Preview 可以加载应用
+
+Known result
+→ JavaScript Bundle 较大，但不阻止当前构建
+```
+
+这一步只证明项目能够生成并加载构建产物，不能证明登录、数据库操作和页面交互都正确。下一步继续运行后端与前端自动测试。
+
+---
+
+### 6. 运行本地核心测试
+
+前一节已经证明前后端代码能够生成构建产物。现在继续回答另一个问题：
+
+```text
+代码可以编译
+≠
+业务行为仍然正确
+```
+
+当前项目在进入完整浏览器 E2E 之前，先完成四项本地检查：
+
+```text
+Backend Unit Tests
+→ 直接测试 Service 业务规则
+→ Repository 和外部依赖使用 Fake
+
+Backend Integration Tests
+→ 通过 HTTP 调用真实 API Pipeline
+→ 使用真实 SQL Server Testcontainer
+
+Frontend ESLint
+→ 检查静态代码、React Hooks 和 Fast Refresh 规则
+
+Frontend Component Tests
+→ 在 jsdom 中渲染组件和页面
+→ API、Router 和 Store 使用 Mock
+```
+
+这些检查验证的范围不同，因此按从快到慢、从独立模块到组合链路的顺序执行：
+
+```text
+Backend Unit Tests
+→ Backend Integration Tests
+→ Frontend ESLint
+→ Frontend Component Tests
+```
+
+Playwright 需要同时启动真实前端、API 和浏览器，留到下一节处理。
+
+#### 6.1 运行后端单元测试
+
+后端测试项目中，`Services` 目录主要保存单元测试：
+
+```text
+UserServiceTests
+CarServiceTests
+OrderServiceTests
+AdminCarServiceTests
+AdminStatsServiceTests
+ExternalLoginServiceTests
+```
+
+这些测试直接创建 Service，并注入 Fake Repository、Fake Cache、Fake Storage 或 Fake Notification Service。
+
+`UserServiceTests` 注入 `FakeBackgroundJobService`，验证业务是否请求了邮箱验证或密码重置任务，不需要引用 Hangfire 的测试类型。
+
+例如：
+
+```text
+ExternalLoginServiceTests
+→ 不启动 API Server
+→ 不请求 Google
+→ 使用 FakeGoogleIdTokenService 和 Fake Repositories
+→ 只验证已有账号关联、新用户创建和冲突等业务分支
+```
+
+因此单元测试不需要启动 SQL Server、Redis 或其他第三方服务。
+
+前一节已经完成 Build，可以直接运行编译后的非 Integration Tests：
+
+```bash
+dotnet test --no-build \
+  --filter 'FullyQualifiedName!~Integration'
+```
+
+这里：
+
+```text
+--no-build
+→ 使用第 5 节生成的测试程序集
+
+FullyQualifiedName!~Integration
+→ 排除完整名称中包含 Integration 的测试
+→ 当前只运行 Services 等单元测试
+```
+
+这一步重点确认两类变化没有破坏现有业务规则。
+
+第一，.NET 10 和 Package 升级没有改变现有 Service 行为。
+
+第二，Google 登录加入后，`PasswordHash` 允许为空，但本地密码登录规则仍然正确：
+
+```text
+本地注册用户
+→ 必须生成 PasswordHash
+
+Google-only 用户
+→ 没有 PasswordHash
+→ 不能使用密码登录
+```
+
+本次实际运行结果为：
+
+```text
+Passed: 53
+Failed: 0
+```
+
+这个结果说明独立业务类在运行时与依赖升级后仍然符合现有规则，但没有验证 Controller、Middleware、DI、EF Core 和真实数据库。下一步需要把这些部分组合起来测试。
+
+#### 6.2 整理集成测试运行边界
+
+单元测试只创建独立 Service，不能证明应用启动后，Controller、Middleware、Service、Repository 和数据库能够正确组合。因此，集成测试继续验证下面这条核心链路：
+
+```text
+HTTP Request
+→ ASP.NET Core Middleware
+→ Controller
+→ Service
+→ Repository
+→ EF Core
+→ SQL Server
+```
+
+这里不需要同时验证所有外部平台。当前集成测试的边界统一为：
+
+```text
+UUcars 核心链路
+→ 使用真实应用代码
+
+SQL Server
+→ 使用 Testcontainers 创建的真实临时数据库
+
+核心链路之外的外部依赖
+→ 不连接真实平台
+→ 在依赖注入容器中替换为 Fake
+```
+
+这样可以验证应用内部各层是否真正连通，又不会在测试期间连接 Redis、Google、Resend、Cloudflare R2 或启动 Hangfire Worker。
+
+集成测试目录中的文件按单向关系协作：
+
+```text
+IntegrationCollection.cs
+→ 声明整组测试共享 ApiIntegrationTestFactory
+
+CoreFlowIntegrationTests.cs
+→ 保存测试步骤和断言
+→ 继承 IntegrationTestBase
+
+IntegrationTestBase.cs
+→ 管理每个测试共用的 HttpClient、数据生命周期和辅助方法
+→ 使用 ApiIntegrationTestFactory
+
+ApiIntegrationTestFactory.cs
+→ 管理整套 API 测试环境
+→ 启动 SQL Server Testcontainer
+→ 根据 Program 创建 Testing API Host
+→ 替换测试环境中的依赖
+```
+
+依赖方向可以简化为：
+
+```text
+CoreFlowIntegrationTests
+→ IntegrationTestBase
+→ ApiIntegrationTestFactory
+→ Program + SQL Server Testcontainer
+```
+
+测试用例只描述业务行为；公共测试流程由 Base Class 提供；整套运行环境由 Factory 统一建立。各文件按单向依赖分工，测试初始化逻辑只保留一份。
+
+##### 共享 API 测试环境
+
+`IntegrationCollection` 告诉 xUnit，所有 `[Collection("Integration")]` 测试类共享同一个 `ApiIntegrationTestFactory`：
+
+```csharp
+[CollectionDefinition("Integration")]
+public class IntegrationCollection
+    : ICollectionFixture<ApiIntegrationTestFactory>
+{
+}
+```
+
+这里没有手写 `Start()` 入口。运行 `dotnet test` 后，xUnit 会发现带有 `[Fact]` 的测试，并根据 `[Collection("Integration")]` 创建对应的 Collection Fixture。
+
+Factory 实现了 `IAsyncLifetime`，所以 xUnit 创建它以后会自动调用 `InitializeAsync()`：
+
+```csharp
+public async Task InitializeAsync()
+{
+    await _sqlContainer.StartAsync();
+}
+```
+
+Testcontainers 随后通过本机 Docker Engine 创建临时 SQL Server Container。整个 Integration Collection 共用这一套数据库环境，不会为每个 Test Method 重新启动 Container。
+
+所有 Integration Tests 完成后，xUnit 自动调用 Factory 的 `DisposeAsync()`，停止临时 SQL Server：
+
+```csharp
+public new async Task DisposeAsync()
+{
+    await _sqlContainer.StopAsync();
+}
+```
+
+SQL Server Container 和 Testing API Host 都属于同一套集成测试环境。Factory 需要把 Container 生成的动态连接字符串注入 Test Host，因此由同一个 Factory 统一管理二者的生命周期。
+
+##### 创建测试 API 主机
+
+`ApiIntegrationTestFactory` 继承 `WebApplicationFactory<Program>`。它不是另一套应用入口，而是以真实 `Program.cs` 为基础创建专供测试使用的 Host：
+
+```csharp
+public class ApiIntegrationTestFactory
+    : WebApplicationFactory<Program>, IAsyncLifetime
+{
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    {
+        builder.UseEnvironment(AppEnvironments.Testing);
+
+        builder.ConfigureServices(services =>
+        {
+            ConfigureTestDatabase(services);
+            ReplaceExternalServices(services);
+            ConfigureTestRateLimiting(services);
+        });
+    }
+}
+```
+
+Factory 首先把 Host 环境设置为项目统一定义的 `Testing`：
+
+```csharp
+builder.UseEnvironment(AppEnvironments.Testing);
+```
+
+`Program.cs` 据此跳过不属于当前核心链路的 Hangfire Server、Worker、Recurring Jobs 和 Dashboard。`Testing` 不是 ASP.NET Core 的预设名称，因此 Factory 与 `Program.cs` 必须共同使用 `AppEnvironments.Testing`，不能分别手写字符串。
+
+当前没有单独的 `appsettings.Testing.json`。Test Host 仍会先读取基础配置，然后由 Factory 把运行集成测试所需的依赖替换掉。真正动态变化的 SQL Server Connection String 来自 Testcontainer，不需要为它创建固定配置文件。
+
+数据库替换保留真实 EF Core 和 SQL Server 行为，只改变连接目标：
+
+```csharp
+services.RemoveAll<DbContextOptions<AppDbContext>>();
+services.AddDbContext<AppDbContext>(options =>
+    options.UseSqlServer(_sqlContainer.GetConnectionString()));
+```
+
+核心链路之外的依赖则统一使用测试实现：
+
+```text
+IBackgroundJobService
+→ FakeBackgroundJobService
+
+ICacheService
+→ FakeCacheService
+
+IGoogleIdTokenService
+→ FakeGoogleIdTokenService
+
+IEmailService
+→ FakeEmailService
+
+IStorageService
+→ FakeStorageService
+```
+
+这些 Fake 保留应用需要的接口，使 DI 和业务流程可以继续运行，但不会连接真实外部平台。Rate Limiter 不是外部服务，它仍然保留在 Middleware Pipeline 中，只把测试策略改为 `NoLimiter`，避免整组重复请求互相消耗配额。
+
+因此，Factory 建立的是下面这套测试环境：
+
+```text
+真实 Program 和依赖注入
+→ 真实 Middleware、Controller、Service、Repository、JWT 和 EF Core
+→ Testcontainer 中的真实 SQL Server
+→ 外部依赖的 Fake 实现
+→ 不限制请求次数的测试限流策略
+```
+
+##### 统一测试初始化与清理
+
+`IntegrationTestBase` 不负责创建 Container 或重新配置 Host。它接收已经由 xUnit 创建的 Factory，并为每个测试实例创建 `HttpClient`：
+
+```csharp
+protected IntegrationTestBase(ApiIntegrationTestFactory factory)
+{
+    _factory = factory;
+    Client = factory.CreateClient();
+}
+```
+
+`CreateClient()` 会触发 `WebApplicationFactory` 构建 Testing Host。Host 仍然执行真实 `Program.cs`，因此应用启动阶段的 Migration 也会在临时 SQL Server 中完成。
+
+Base Class 同样实现 `IAsyncLifetime`。xUnit 会在每个 Test Method 前后自动调用：
+
+```text
+InitializeAsync
+→ 确认测试需要的 Admin 账号存在
+
+DisposeAsync
+→ 删除本次测试生成的业务数据
+→ 释放本次测试使用的 HttpClient
+```
+
+Migration 已经由 `Program.cs` 在 Test Host 启动时执行，因此 Base Class 和 Factory 不再重复执行 Migration。Factory 只负责准备 Admin 和清理数据。
+
+Base Class 还提供 `CreateDbContext()`、`RegisterAndLoginAsync()`、JSON 序列化和 Bearer Token 等公共辅助方法。它们隐藏重复的测试准备步骤，但不包含具体 Test Method 的断言。
+
+##### 精简核心业务测试
+
+`CoreFlowIntegrationTests` 继承 Base Class，并通过构造函数把共享 Factory 交给它：
+
+```csharp
+[Collection("Integration")]
+public class CoreFlowIntegrationTests : IntegrationTestBase
+{
+    public CoreFlowIntegrationTests(ApiIntegrationTestFactory factory)
+        : base(factory)
+    {
+    }
+}
+```
+
+具体测试只需要：
+
+```text
+通过 Client 发送 HTTP Request
+→ 检查 HTTP Response
+→ 必要时通过 CreateDbContext 检查数据库结果
+```
+
+`CoreFlowIntegrationTests` 不再直接管理 Factory、Container、Host 初始化和数据清理。至此，四个文件的职责保持单向且明确。
+
+先确认整理后的测试项目能够编译：
+
+```bash
+dotnet build UUcars.Tests/UUcars.Tests.csproj --no-restore
+```
+
+本次 Build 结果为：
+
+```text
+Warnings: 0
+Errors: 0
+```
+
+Build 通过只说明这些类型和引用能够正确组成测试项目。Container、Testing Host 和真实请求链路是否能够运行，还需要下一小节实际执行 Integration Tests。
+
+#### 6.3 运行后端集成测试
+
+集成测试需要 Testcontainers 通过本机 Docker Engine 启动 SQL Server，因此先确认 Docker Desktop 正在运行，再从仓库根目录执行：
+
+```bash
+dotnet test UUcars.Tests/UUcars.Tests.csproj --no-build \
+  --filter 'FullyQualifiedName~Integration'
+```
+
+执行后，各文件不是互相主动调用，而是由 xUnit 和 `WebApplicationFactory` 按生命周期依次触发：
+
+```text
+dotnet test 启动 xUnit
+→ xUnit 发现 CoreFlowIntegrationTests 中的 [Fact]
+→ 根据 [Collection("Integration")] 创建 ApiIntegrationTestFactory
+→ 调用 Factory.InitializeAsync()
+→ Testcontainers 启动临时 SQL Server
+→ xUnit 创建 CoreFlowIntegrationTests
+→ Base Class 构造函数调用 Factory.CreateClient()
+→ WebApplicationFactory 根据 Program 创建 Testing Host
+→ ConfigureWebHost 替换测试数据库和外部依赖
+→ Program 启动并对临时数据库执行 Migration
+→ xUnit 调用 Base Class.InitializeAsync()
+→ 准备 Admin 测试账号
+→ 执行具体 [Fact]
+```
+
+##### 验证注册与登录请求
+
+以 `RegisterAndLoginAsync()` 为例，它首先使用 Testing Host 的 `HttpClient` 调用真实注册接口：
+
+```text
+POST /auth/register
+→ Controller 接收请求
+→ UserService 执行业务规则
+→ EF Core Repository 写入临时 SQL Server
+→ Email Confirmation Token 保存到数据库
+→ FakeBackgroundJobService 接收应用的后台任务调用
+→ 不启动 Hangfire Worker，也不发送真实邮件
+```
+
+注册完成后，测试直接从临时数据库读取 Email Confirmation Token：
+
+```csharp
+await using var db = CreateDbContext();
+var user = await db.Users
+    .FirstOrDefaultAsync(user => user.Email == email.ToLower());
+
+var verifyToken = user!.EmailConfirmationToken;
+```
+
+然后继续调用真实 API：
+
+```text
+GET /auth/verify-email
+→ 更新真实数据库状态
+
+POST /auth/login
+→ 使用真实 PasswordHasher 检查密码
+→ 生成真实 UUcars JWT
+```
+
+`RegisterAndLoginAsync()` 返回 Access Token 后，具体测试把它放入 `Authorization` Header，再调用 `/users/me`、车辆、订单或 Admin 接口。请求会经过真实 Authentication Middleware，因此 JWT 的生成、解析和授权都属于当前核心链路。
+
+Google 登录测试使用同一套 Testing Host。区别只是 `FakeGoogleIdTokenService` 提供固定的 Google 身份结果，不向 Google 发送网络请求；后续的账号映射、数据库写入、JWT 和 Cookie 仍然使用真实应用代码。
+
+因此，集成测试保留的是 UUcars 自己需要负责的行为：
+
+```text
+Request Pipeline
+→ Authentication 与 Authorisation
+→ Controller 与 Service 业务流程
+→ Repository 与 EF Core
+→ SQL Server 数据结果
+```
+
+##### 清理测试环境
+
+每个 Test Method 完成后，xUnit 调用 `IntegrationTestBase.DisposeAsync()`。它删除本次创建的车辆、订单、外部登录和普通用户，但保留数据库结构与 Admin 测试账号。下一个测试因此可以复用同一个 Container，又不会继承上一个测试的业务数据。
+
+整组 Integration Tests 完成后，xUnit 再调用 Factory 的 `DisposeAsync()`：
+
+```text
+每个测试结束
+→ 清理本次业务数据并释放 HttpClient
+
+整组测试结束
+→ 停止临时 SQL Server Container
+```
+
+这组测试重点覆盖：
+
+```text
+注册、邮箱确认和密码登录
+Google 登录成功与失败
+JWT 认证后的 /users/me
+车辆创建和提交审核
+Admin 审核、订单和权限
+Admin Dashboard 数据
+401、403 和 409 等关键状态码
+```
+
+本次实际运行结果为：
+
+```text
+Passed: 12
+Failed: 0
+Skipped: 0
+```
+
+这个结果说明 .NET 10、Testing Host、真实 JWT、EF Core 10 和临时 SQL Server 组成的 API 核心链路能够工作。它验证的是 UUcars 应用行为，不代表外部平台本身已经通过测试。
+
+#### 6.4 运行前端 ESLint
+
+后端核心测试通过后，进入前端目录：
+
+```bash
+cd uucars-web
+```
+
+前一节的 `npm run build` 会运行 TypeScript 和 Vite，但不会执行 ESLint。因此先运行：
+
+```bash
+npm run lint
+```
+
+ESLint 不渲染页面，也不执行组件交互。它检查的是：
+
+```text
+ESLint 规则
+React Hooks 使用方式
+无效或可疑的 TypeScript / JavaScript 写法
+```
+
+依赖升级后，ESLint 使用了更新的 React Hooks 和 Fast Refresh 规则。第一次执行时，输出包括：
+
+```text
+coverage 目录中的 3 个生成文件 Warning
+→ 这些文件不属于项目源码
+
+CarForm 的 incompatible-library Warning
+→ React Compiler 跳过自动 Memoization
+
+badge.tsx 和 button.tsx 的 Fast Refresh Error
+→ 文件同时导出了 Component 和样式 Variants
+```
+
+这些信息分别来自生成文件、现有 UI 组件组织方式和 React Compiler 兼容检查，需要按照它们在项目中的实际作用逐项处理。
+
+##### 排除生成的覆盖率文件
+
+`coverage` 中的 JavaScript 是 Vitest 生成的覆盖率报告，不是项目源码。ESLint 扫描它们时会报告无意义的 `eslint-disable` 警告。
+
+在 `eslint.config.js` 的全局忽略项中同时排除：
+
+```js
+globalIgnores(["dist", "coverage"]),
+```
+
+这只排除可以重新生成的构建和覆盖率产物，不会跳过 `src` 中的代码。
+
+##### 保留 UI 组件所需导出
+
+`badge.tsx` 和 `button.tsx` 除了导出 React Component，还导出了 `badgeVariants`、`buttonVariants` 等样式配置。新的 Fast Refresh 规则会把这种写法报告为 Error。
+
+这些辅助导出是现有 UI 组件的正常用法，因此不全局关闭规则，只在 UI 组件目录增加范围明确的 Override：
+
+```js
+{
+  files: ['src/components/ui/**/*.{ts,tsx}'],
+  rules: {
+    'react-refresh/only-export-components': 'off',
+  },
+},
+```
+
+这样其他页面和业务组件仍然接受 Fast Refresh 检查。
+
+##### 保留现有收藏同步行为
+
+更新后的 React Hooks 规则还会检查 Effect 中同步更新 State 的写法。`CarDetailPage` 当前根据查询结果同步收藏状态，因此会触发：
+
+```text
+react-hooks/set-state-in-effect
+```
+
+当前版本先保持已经工作的收藏逻辑，不在测试流程整理过程中改写页面状态结构。因此在通用规则中保留现有配置：
+
+```js
+rules: {
+  "react-hooks/set-state-in-effect": "off",
+},
+```
+
+这只保持当前规则边界，不表示同步 `setState` 是所有 Effect 的通用写法。页面状态结构需要单独分析，不能为了让本节的 Lint 通过顺带改写功能代码。
+
+##### 确认剩余 ESLint 警告
+
+`CarForm` 使用 React Hook Form 的 `watch()`。React Compiler 规则会报告：
+
+```text
+Compilation Skipped: Use of incompatible library
+```
+
+这条 Warning 表示 React Compiler 不会自动 Memoize 这一段，不表示表单已经失效，也不会让 ESLint 返回失败。本步骤先保留现有 React Hook Form 实现并记录警告，不为了消除 Warning 重写表单。
+
+修改配置后再次执行：
+
+```bash
+npm run lint
+```
+
+最终结果应没有 ESLint Error。`CarForm` 的兼容性 Warning 可以保留，因为它说明 React Compiler 跳过这段自动优化，不会阻止现有表单运行。
+
+Lint 通过只能证明代码符合当前静态规则，不能证明页面行为正确，因此继续运行组件测试。
+
+#### 6.5 运行前端组件测试
+
+继续在 `uucars-web` 中执行完整 Vitest Suite：
+
+```bash
+npm test -- --run
+```
+
+这条命令可以拆成：
+
+```text
+npm test
+→ 执行 package.json 中的 vitest
+
+--
+→ 后面的参数交给 vitest，而不是 npm
+
+--run
+→ 执行一次完整测试后退出
+→ 不进入本地 Watch Mode
+```
+
+当前测试配置使用：
+
+```text
+jsdom
+→ 提供 document、window 等浏览器 API
+
+src/test/setup.ts
+→ 加载 @testing-library/jest-dom
+
+exclude: e2e/**
+→ Playwright Tests 不交给 Vitest
+```
+
+因此这一步会运行组件和页面测试，但不会运行 Playwright E2E。
+
+##### 修正 LoginPage 测试定位
+
+完整测试运行时，`LoginPage.test.tsx` 出现：
+
+```text
+Found multiple elements with the role "button"
+and name /sign in/i
+```
+
+测试页面中现在有两个按钮：
+
+```text
+Sign in
+Mock Google sign in
+```
+
+原来的查询：
+
+```ts
+screen.getByRole("button", {
+  name: /sign in/i,
+});
+```
+
+`/sign in/i` 表示名称中只要包含 `sign in` 就匹配，所以两个按钮都会被找到。Testing Library 不知道测试想点击哪一个，于是主动报错，而不是随机选择。
+
+这些测试要点击的是本地密码登录按钮，因此把 `LoginPage.test.tsx` 中对应的查询改为：
+
+```ts
+screen.getByRole("button", {
+  name: /^sign in$/i,
+});
+```
+
+正则中的：
+
+```text
+^
+→ 从名称开头开始
+
+$
+→ 在名称结尾结束
+```
+
+所以它只匹配完整名称 `Sign in`，不会匹配 `Mock Google sign in`。
+
+这次修改不改变组件，也不会为了让测试通过删除 Google 登录按钮。问题来自测试选择器已经不能准确表达目标，因此只修正测试定位方式。
+
+修改后重新运行整个 Vitest Suite：
+
+```bash
+npm test -- --run
+```
+
+完整运行比只运行 `LoginPage.test.tsx` 更适合作为最终结果，因为登录页面变化也可能影响其他组件测试和全局 Mock 配置。
+
+#### 6.6 确认本地核心测试结果
+
+上述检查全部完成后，本节结果可以汇总为：
+
+```text
+Backend Unit Tests
+→ 业务规则和异常分支
+→ 不依赖 Docker 或外部服务
+
+Backend Integration Tests
+→ 真实 API、JWT、EF Core 和 SQL Server
+→ 核心链路之外的外部依赖统一使用 Fake
+→ 需要 Docker 提供 Testcontainer
+
+Frontend Lint
+→ 检查静态代码、Hooks 和 Fast Refresh 规则
+→ 当前保留一个 React Hook Form 兼容性 Warning
+
+Frontend Vitest
+→ 组件渲染、表单、登录页面和前端状态处理
+→ 不启动真实后端
+```
+
+对应命令是：
+
+```bash
+# Backend Unit Tests
+dotnet test --no-build \
+  --filter 'FullyQualifiedName!~Integration'
+
+# Backend Integration Tests
+dotnet test --no-build \
+  --filter 'FullyQualifiedName~Integration'
+
+# Frontend
+cd uucars-web
+npm run lint
+npm test -- --run
+```
+
+这些检查完成后，可以确认本地的独立业务模块、API 核心组合和前端组件仍然正确。但它们还没有在真实浏览器中同时运行前后端，因此下一步继续执行 Playwright E2E Tests。
+
+
+---
+
+### 7. 运行本地 E2E 测试
+
+第 6 节已经完成后端单元测试、集成测试和前端组件测试。这些测试分别验证了各个部分，但还没有确认用户在真实浏览器中操作时，请求能否经过前端和 API 完成整条业务流程。
+
+E2E 测试从用户能够接触到的页面开始，由真实浏览器执行输入、点击和页面跳转。操作产生的请求继续经过前端、API 和数据存储，最后再由页面结果确认整条流程是否成立。
+
+五条核心用户流程已经编写在 `uucars-web/e2e/flows.spec.ts` 中，但目前还不具备完整执行条件。本节以这五条流程为载体，先从测试代码推导它们需要的数据库、API、前端和浏览器环境，再按依赖顺序启动各部分，最后由 Playwright 在 Chromium 中逐条验证。
+
+#### 7.1 明确 E2E 运行依赖
+
+当前项目使用 Playwright 执行 E2E 测试。Playwright 负责读取测试配置和测试文件，并在正式执行时控制 Chromium 完成页面操作。
+
+先从前端项目确认测试入口：
+
+```bash
+cd uucars-web
+npm run e2e -- --list
+```
+
+`package.json` 中的 `e2e` Script 对应：
+
+```text
+playwright test
+```
+
+`--list` 只读取 `playwright.config.ts` 并发现测试，不执行测试，也不启动 Chromium。当前可以识别出五条流程：
+
+```text
+1. 用户注册并看到邮箱验证提示
+2. 卖家创建车辆并提交审核
+3. Admin 审核车辆
+4. 买家浏览车辆并下单
+5. 卖家查看收到的订单
+```
+
+找到测试后，继续读取 `flows.spec.ts` 及其 API Helper，确认每条流程实际经过哪些部分：
+
+```text
+测试1：用户注册
+→ 浏览器完成注册
+→ API 写入用户和邮箱验证 Token
+→ 业务代码安排邮箱验证任务
+
+测试2：卖家发布车辆
+→ API Helper 创建并验证卖家
+→ 浏览器登录、创建车辆并提交审核
+
+测试3：Admin 审核车辆
+→ API Helper 准备待审核车辆
+→ 浏览器登录 Admin 并完成审核
+
+测试4：买家下单
+→ API Helper 准备已发布车辆和买家
+→ 浏览器完成购买
+
+测试5：卖家查看订单
+→ API Helper 准备卖家、车辆、买家和订单
+→ 浏览器确认卖家页面能够显示订单
+```
+
+由这五条流程可以确定，E2E 的主要请求链是：
+
+```text
+Chromium
+→ Vite Frontend
+→ ASP.NET Core API
+
+API 运行时需要
+→ SQL Server
+→ Redis
+→ JWT Authentication
+```
+
+注册流程会调用 `IBackgroundJobService`，但验证目标只是注册结果，不包括 Hangfire 和 Resend。因此 E2E 环境保留接口调用，但不启动真实后台任务和邮件服务。五条流程没有使用 Google Login 或图片上传，所以不连接 Google 和 Cloudflare R2。SignalR Hub 随 API 一起启动，也不需要单独准备进程。
+
+`playwright.config.ts` 没有配置 `webServer`，所以 Playwright 只负责启动 Chromium，不会替项目启动前端和 API。运行环境需要按依赖顺序准备：
+
+```text
+SQL Server / Redis
+→ E2E API
+→ Vite Frontend
+→ Playwright
+```
+
+#### 7.2 准备独立的 E2E 数据空间
+
+E2E API 仍然在本机运行，因此继续使用第 3 节准备的两个本地基础设施 Containers，不启动 Docker Compose 环境：
+
+```bash
+docker start uucars-sqlserver uucars-redis
+
+docker ps \
+  --filter name=uucars-sqlserver \
+  --filter name=uucars-redis
+```
+
+E2E 可以复用 SQL Server 和 Redis 的运行进程，但不能复用日常 Development 数据：
+
+```text
+Development
+→ SQL Server Database: UUcarsDB
+→ Redis Logical Database: 0
+
+E2E
+→ SQL Server Database: UUcarsE2EDB
+→ Redis Logical Database: 1
+```
+
+`UUcarsE2EDB` 会在 E2E API 第一次启动并执行 Migrations 时创建。确认两个 Containers 正在运行后，下一步为 API 建立独立的 E2E 配置。
+
+#### 7.3 配置独立的 E2E API
+
+Development API 会连接日常数据库并启动 Hangfire，不能直接供 E2E 使用。因此先在 `UUcars.API/Configurations/AppEnvironments.cs` 中增加独立环境名称：
+
+```csharp
+public static class AppEnvironments
+{
+    public const string Testing = "Testing";
+    public const string E2E = "E2E";
+}
+```
+
+再建立 `UUcars.API/appsettings.E2E.json`，保存可以提交的 E2E 公共配置：
+
+```json
+{
+  "ConnectionStrings": {
+    "Redis": "localhost:6379,defaultDatabase=1"
+  },
+  "Cors": {
+    "AllowedOrigins": [
+      "http://localhost:5173"
+    ]
+  }
+}
+```
+
+`appsettings.E2E.json` 只保存可以提交的公共配置。SQL Server Password 和 JWT Secret 继续保存在本机 User Secrets 中，不写入仓库文件。
+
+Development 和 E2E 使用同一个 API Project，因此可以共用已经存在的 `JwtSettings:Secret`。数据库则需要使用不同的配置 Key：
+
+```text
+ConnectionStrings:DefaultConnection
+→ Development 使用 UUcarsDB
+
+ConnectionStrings:E2EConnection
+→ E2E 使用 UUcarsE2EDB
+
+JwtSettings:Secret
+→ Development 和 E2E 共用
+```
+
+在仓库根目录一次性保存 E2E 数据库连接：
+
+```bash
+dotnet user-secrets set \
+  "ConnectionStrings:E2EConnection" \
+  "Server=localhost,1433;Database=UUcarsE2EDB;User Id=sa;Password=YourStrongPassw0rd;TrustServerCertificate=True" \
+  --project UUcars.API/UUcars.API.csproj
+```
+
+User Secrets 默认只在 Development 环境自动加载，因此 `Program.cs` 创建 Builder 后，让本地 E2E 环境显式读取同一份 User Secrets：
+
+```csharp
+var builder = WebApplication.CreateBuilder(args);
+
+if (builder.Environment.IsEnvironment(AppEnvironments.E2E))
+{
+    builder.Configuration.AddUserSecrets<Program>();
+}
+```
+
+然后根据当前环境选择数据库连接名称：
+
+```csharp
+var databaseConnectionName =
+    builder.Environment.IsEnvironment(AppEnvironments.E2E)
+        ? "E2EConnection"
+        : "DefaultConnection";
+
+var databaseConnectionString = builder.Configuration
+    .GetConnectionString(databaseConnectionName);
+
+if (string.IsNullOrWhiteSpace(databaseConnectionString))
+{
+    throw new InvalidOperationException(
+        $"Connection string '{databaseConnectionName}' is not configured.");
+}
+```
+
+这样 Development 继续连接 `UUcarsDB`，E2E 则连接 `UUcarsE2EDB`。两个环境使用相同的配置结构，但不会再通过启动命令临时覆盖同一个 `DefaultConnection`。
+
+第一条用户注册流程最终会由 `UserService` 调用：
+
+```text
+IBackgroundJobService.EnqueueEmailVerification(...)
+```
+
+当前 E2E 流程只验证注册结果，不验证后台任务执行和邮件投递。因此新增 `E2EBackgroundJobService` 实现同一个接口，但不向外部系统提交任务：
+
+```csharp
+public class E2EBackgroundJobService : IBackgroundJobService
+{
+    public void EnqueueEmailVerification(string email, string token)
+    {
+    }
+
+    public void EnqueuePasswordReset(string email, string token)
+    {
+    }
+
+    public void RegisterRecurringJobs()
+    {
+    }
+}
+```
+
+`IBackgroundJobService` 由 `AddHangfireServices` 扩展方法统一注册，因此在这里根据运行环境选择实现：
+
+```csharp
+public static class HangfireExtensions
+{
+    public static IServiceCollection AddHangfireServices(this IServiceCollection services, IConfiguration configuration,
+        IWebHostEnvironment environment)
+    {
+        // Testing 环境由 Integration Test Factory 注册 FakeBackgroundJobService。
+        if (environment.IsEnvironment(AppEnvironments.Testing))
+            return services;
+
+        // E2E 环境使用不提交真实任务的实现。
+        if (environment.IsEnvironment(AppEnvironments.E2E))
+        {
+            services.AddScoped<IBackgroundJobService, E2EBackgroundJobService>();
+            return services;
+        }
+
+        // ... 后面的配置
+    }
+}
+```
+
+这样既不注册 Hangfire Storage 和 Server，`UserService` 又仍然能够取得 `IBackgroundJobService`。
+
+`Program.cs` 还需要同时停止周期任务登记和 Hangfire Dashboard：
+
+```csharp
+var backgroundJobsEnabled =
+    !app.Environment.IsEnvironment(AppEnvironments.Testing) &&
+    !app.Environment.IsEnvironment(AppEnvironments.E2E);
+
+if (backgroundJobsEnabled)
+    app.UseBackgroundJobs();
+
+// Middleware 保持原有顺序
+
+if (backgroundJobsEnabled)
+{
+    app.UseHangfireDashboard("/hangfire", new DashboardOptions
+    {
+        Authorization = app.Environment.IsDevelopment()
+            ? new[] { new HangfireLocalDevAuthorizationFilter() }
+            : new[] { new HangfireAdminAuthorizationFilter() }
+    });
+}
+```
+
+完成这些配置后，E2E API 会使用独立数据空间，同时避开当前流程不验证的真实后台任务。下一步编译并启动这个环境。
+
+#### 7.4 编译并启动 E2E API
+
+第 7.3 节已经准备好 E2E 的公共配置、本机敏感配置和启动分支。现在为这个环境建立固定的本地启动方式，避免每次运行时重新输入环境名称、监听地址和数据库连接字符串。
+
+在 `UUcars.API/Properties/launchSettings.json` 的 `profiles` 中增加 `e2e` Profile：
+
+```json
+"e2e": {
+  "commandName": "Project",
+  "dotnetRunMessages": true,
+  "launchBrowser": false,
+  "applicationUrl": "http://localhost:5065",
+  "environmentVariables": {
+    "ASPNETCORE_ENVIRONMENT": "E2E"
+  }
+}
+```
+
+这个 Profile 只保存本地 E2E 的启动信息：
+
+```text
+ASPNETCORE_ENVIRONMENT=E2E
+→ 加载 appsettings.E2E.json
+→ 进入 AppEnvironments.E2E 对应的启动分支
+
+applicationUrl=http://localhost:5065
+→ 让 E2E API 固定监听 5065 端口
+```
+
+数据库连接和 JWT Secret 不放在 Launch Profile 中。API 启动后会从 User Secrets 读取 `ConnectionStrings:E2EConnection` 和 `JwtSettings:Secret`，再由 `Program.cs` 选择 E2E 数据库连接。
+
+在仓库根目录编译 API：
+
+```bash
+dotnet build UUcars.API/UUcars.API.csproj --no-restore
+```
+
+启动命令使用 `--no-build`，因此必须先完成这次编译。Build 成功后，在第一个终端使用 `e2e` Profile 启动 API：
+
+```bash
+dotnet run --project UUcars.API/UUcars.API.csproj \
+  --no-build \
+  --launch-profile e2e
+```
+
+启动过程使用的配置来源为：
+
+```text
+launchSettings.json 的 e2e Profile
+→ 环境名称和监听地址
+
+appsettings.E2E.json
+→ Redis Database 1 和前端 Origin
+
+本机 User Secrets
+→ UUcarsE2EDB 连接字符串和 JWT Secret
+```
+
+API 启动时会连接 `UUcarsE2EDB` 并执行现有 Migrations。
+
+启动完成后，从另一个终端检查公开接口：
+
+```bash
+curl -i "http://localhost:5065/cars?page=1&pageSize=1"
+```
+
+这个请求能够返回响应，说明 API 已开始监听，并且数据库初始化已经完成。然后检查 E2E 环境没有挂载 Hangfire Dashboard：
+
+```bash
+curl -I http://localhost:5065/hangfire
+```
+
+`/hangfire` 应返回 404，API 日志中也不应出现 Hangfire Server、Worker、Heartbeat 或真实 Resend 请求。满足这些条件后，才能确认当前运行的是独立的 E2E API，再继续启动前端。
+
+#### 7.5 启动前端并准备 Chromium
+
+在第二个终端启动前端，并明确指向第 7.4 节启动的 E2E API：
+
+```bash
+cd uucars-web
+VITE_API_BASE_URL=http://localhost:5065 npm run dev
+```
+
+`VITE_GOOGLE_CLIENT_ID` 继续由本机 `.env.local` 提供。看到 Vite 监听地址后检查前端入口：
+
+```bash
+curl -I http://localhost:5173
+```
+
+首次在本机运行 Playwright 时，还要安装对应的 Chromium：
+
+```bash
+npx playwright install chromium
+```
+
+至此，数据库、API、前端和 Chromium 已准备完成，可以从第一条用户流程开始验证。
+
+#### 7.6 验证用户注册流程
+
+先只运行第一条测试：
+
+```bash
+npm run e2e -- --grep "测试1：用户注册并收到验证提示"
+```
+
+这条测试经过：
+
+```text
+Chromium 打开 /register
+→ 用户填写并提交表单
+→ Frontend 调用 POST /auth/register
+→ API 保存用户和邮箱验证 Token
+→ E2EBackgroundJobService 接住后台任务调用
+→ 页面显示检查邮箱提示
+```
+
+邮件投递被 E2E 实现隔离，但注册接口、数据库写入和页面反馈仍然使用真实应用代码。页面显示 `check your email` 后，第一条流程完成。
+
+##### 配置 Playwright Web Servers
+
+当前流程完整执行时，需要手动同时启动前后端服务器，并手动执行测试命令。目的是先分别观察 API、前端和 Playwright 的输出。确认完整链路可以工作后，后面的重复执行不需要继续手动维护三个进程。
+
+Playwright 支持通过 `webServer` 启动多个应用进程。先建立 `uucars-web/e2e/config.ts`，集中保存 E2E 测试使用的两个公开地址：
+
+```ts
+export const E2E_API_BASE_URL = "http://localhost:5065";
+export const E2E_FRONTEND_BASE_URL = "http://localhost:5173";
+```
+
+`playwright.config.ts`、`e2e/helpers/api.ts` 和 `e2e/flows.spec.ts` 都从这里读取 API 地址，避免相同地址分散在多个测试文件中。
+
+然后在 `uucars-web/playwright.config.ts` 中导入地址并增加两个 `webServer`：
+
+```ts
+import {
+  E2E_API_BASE_URL,
+  E2E_FRONTEND_BASE_URL,
+} from "./e2e/config";
+
+// 其余配置
+
+use: {
+  baseURL: E2E_FRONTEND_BASE_URL,
+  screenshot: "only-on-failure",
+  trace: "on-first-retry",
+},
+
+webServer: [
+  {
+    name: "E2E API",
+    cwd: "..",
+    command:
+      "dotnet run --project UUcars.API/UUcars.API.csproj --launch-profile e2e",
+    url: `${E2E_API_BASE_URL}/cars?page=1&pageSize=1`,
+    reuseExistingServer: false,
+    timeout: 120_000,
+    gracefulShutdown: {
+      signal: "SIGINT",
+      timeout: 5_000,
+    },
+  },
+  {
+    name: "Vite Frontend",
+    command: "npm run dev -- --port 5173 --strictPort",
+    url: E2E_FRONTEND_BASE_URL,
+    env: {
+      VITE_API_BASE_URL: E2E_API_BASE_URL,
+    },
+    reuseExistingServer: false,
+    timeout: 120_000,
+    gracefulShutdown: {
+      signal: "SIGINT",
+      timeout: 5_000,
+    },
+  },
+],
+```
+
+`cwd: ".."` 让 API 命令从仓库根目录执行。API Server 通过第 7.4 节建立的 `e2e` Profile 取得环境名称和监听地址；两个 `url` 是就绪检查，API 和前端能够响应后，Playwright 才启动 Chromium。`reuseExistingServer: false` 防止测试误用已经运行的 Development Server。
+
+完成配置后，先停止前面手动启动的 API 和 Vite，确保 `5065` 和 `5173` 端口空闲，先从仓库根目录重新编译 API：
+
+```bash
+dotnet build UUcars.API/UUcars.API.csproj --no-restore
+```
+
+然后只需在一个终端运行：
+
+```bash
+cd uucars-web
+npm run e2e -- --grep "测试1：用户注册并收到验证提示"
+```
+
+Playwright 会依次启动 E2E API 和 Vite，等待二者可以访问，再执行浏览器测试；测试结束后自动关闭这两个进程。SQL Server 和 Redis Containers 仍然是整组 E2E 的数据基础设施，需要在运行测试前保持启动。
+
+#### 7.7 验证卖家发布流程
+
+第二条测试需要先准备已经验证邮箱的卖家。API Helper 按顺序调用：
+
+```text
+POST /auth/register
+→ GET /auth/test-verification-token
+→ GET /auth/verify-email
+→ POST /auth/login
+```
+
+`test-verification-token` 只允许本地 Development 和 E2E 环境访问：
+
+```csharp
+if (!_environment.IsDevelopment() &&
+    !_environment.IsEnvironment(AppEnvironments.E2E))
+{
+    return NotFound();
+}
+```
+
+卖家登录后，测试会通过 `page.goto("/cars/new")` 重新加载页面。Access Token 只保存在 Zustand 内存中，因此浏览器需要通过 Refresh Token Cookie 调用 `/auth/refresh` 恢复登录状态。
+
+E2E 使用本地 HTTP，Cookie 设置需要与 Development 使用相同的本地分支：
+
+```csharp
+/// <summary>
+/// 把 RefreshToken 写入 HttpOnly Cookie
+/// 登录成功和刷新 Token 时共用
+/// </summary>
+private void SetRefreshTokenCookie(string token, DateTime expiresAt)
+{
+    var cookieOptions = new CookieOptions
+    {
+       ...
+    };
+
+    // Development 和 E2E 都使用本地 HTTP，因此不能要求 Secure Cookie。
+    if (_environment.IsDevelopment() ||
+        _environment.IsEnvironment(AppEnvironments.E2E))
+    {
+        cookieOptions.SameSite = SameSiteMode.Strict;
+        cookieOptions.Secure = false;
+    }
+
+    Response.Cookies.Append("refreshToken", token, cookieOptions);
+}
+```
+
+重新编译并启动 E2E API 后，运行第二条测试：
+
+```bash
+npm run e2e -- --grep "测试2：卖家发布车辆并提交审核"
+```
+
+卖家完成登录、创建车辆和提交审核，并在车辆列表中看到 `Pending` 状态后，第二条流程完成。
+
+#### 7.8 验证 Admin 审核流程
+
+第二条流程结束在车辆待审核状态。第三条测试通过 API Helper 独立准备相同前提，再把验证重点推进到 Admin 审核。
+
+Admin 登录后的真实路由是：
+
+```text
+/admin
+→ /admin/dashboard
+
+/admin/pending
+→ 待审核车辆页面
+```
+
+因此测试先等待 Dashboard，再点击 `Pending Review`：
+
+```ts
+const loginPage = new LoginPage(page);
+await loginPage.loginAndWait(
+  ADMIN_EMAIL,
+  ADMIN_PASSWORD,
+  "/admin/dashboard",
+);
+
+await page
+  .getByRole("link", { name: /pending review/i })
+  .click();
+
+await page.waitForURL("/admin/pending");
+```
+
+单独运行第三条测试：
+
+```bash
+npm run e2e -- --grep "测试3：Admin 审核车辆通过"
+```
+
+目标车辆出现在待审核列表中，并在点击 `Approve` 后消失，第三条流程完成。
+
+#### 7.9 验证买家下单流程
+
+第三条流程结束在车辆已发布状态。第四条测试独立准备卖家、已发布车辆和买家，再把验证重点推进到买家下单：
+
+```text
+Buyer 在 Browser 中登录
+→ 打开车辆详情页
+→ 点击 Buy now
+→ 确认购买
+→ 页面显示下单成功提示
+```
+
+单独运行：
+
+```bash
+npm run e2e -- --grep "测试4：买家浏览车辆并下单"
+```
+
+API Helper 只建立测试前提；浏览车辆、确认购买和创建订单仍然通过真实页面完成。页面显示下单成功提示后，第四条流程完成。
+
+#### 7.10 验证卖家查看订单流程
+
+第四条流程结束在订单已创建状态。第五条测试独立准备卖家、车辆、买家和订单，再确认卖家能否看到交易结果：
+
+```text
+Seller 在 Browser 中登录
+→ 打开 /profile/sales
+→ 页面加载销售订单
+→ 显示目标车辆标题
+```
+
+单独运行：
+
+```bash
+npm run e2e -- --grep "测试5：卖家查看收到的订单"
+```
+
+目标车辆标题出现在销售订单页面后，第五条流程完成。
+
+#### 7.11 完成 E2E 全量回归
+
+五条流程单独验证后，还要确认它们在同一个 Suite 中串行执行时不会互相影响。重启 E2E API，清空当前进程中的限流计数，然后执行：
+
+```bash
+npm run e2e
+```
+
+当前配置使用：
+
+```text
+fullyParallel: false
+workers: 1
+retries: 0
+```
+
+五条测试按文件顺序运行，不会并行操作同一个 Admin 账号；请求数量也低于限流阈值，因此不需要关闭限流。
+
+如果执行失败，依次检查 Playwright 终端、失败 Screenshot、HTML Report 和 API Serilog 输出。最终结果以 `npm run e2e` 的真实输出为准。
+
+完整执行结束后，再确认：
+
+```text
+API 使用 E2E 环境
+→ SQL Server 连接 UUcarsE2EDB
+→ Redis 使用 Logical Database 1
+→ 没有启动 Hangfire Server、Worker 和 Dashboard
+→ 没有调用真实 Resend 邮件投递
+```
+
+测试结束后，在 API 和 Vite 终端分别按 `Ctrl+C`。SQL Server 和 Redis 可以继续供本地开发使用；不再需要时执行：
+
+```bash
+docker stop uucars-sqlserver uucars-redis
+```
+
+完成本节后，本地验证链形成连续过程：
+
+```text
+本地运行
+→ Backend / Frontend Build
+→ Unit / Integration / Component Tests
+→ Browser E2E
+```
+
+下一节继续使用这份已经在本机验证过的源码构建 Docker Image。
+
+### 8. 构建 Docker 镜像
+
+第 7 节已经确认当前源码能够在本机完成真实用户流程。现在继续使用同一份源码，把后端 API 制作成 Docker Image。
+
+当前生产架构由 Azure Static Web Apps 托管前端，因此不为 React 前端创建镜像。本节只构建后端 API 镜像。
+
+Dockerfile 是 Docker 构建镜像时读取的指令文件。它本身不是镜像，也不会直接启动 API。三者的关系是：
+
+```text
+Dockerfile
+→ docker build 按顺序执行其中的指令
+→ 生成 Docker Image
+→ 后续再由 Image 创建并启动 Container
+```
+
+Dockerfile 中的指令按从上到下的顺序执行。主要的指令包含：
+
+- `FROM` 确定当前阶段使用的基础镜像
+- `WORKDIR` 设置后续命令的工作目录
+- `COPY` 把 Build Context 中的文件复制进镜像；Build Context 是 `docker build` 提交给 Docker Builder 的文件范围
+- `RUN` 在构建阶段执行命令
+- `EXPOSE` 声明镜像预期开放的容器端口
+- `ENV` 设置应用运行时使用的环境变量
+- `ENTRYPOINT` 则确定容器启动后运行的进程
+
+当前 API 适合使用两阶段构建。第一阶段使用完整的 .NET SDK 恢复依赖并发布项目；第二阶段只保留 ASP.NET Runtime 和 Publish 产物。这样最终镜像不需要包含 SDK、项目源码和测试文件。
+
+结合当前项目目录，Dockerfile 的目标结构是：
+
+```dockerfile
+# Build Stage：恢复依赖并生成 Publish 产物
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+WORKDIR /src
+
+COPY UUcars.API/UUcars.API.csproj UUcars.API/
+RUN dotnet restore UUcars.API/UUcars.API.csproj
+
+COPY . .
+RUN dotnet publish UUcars.API/UUcars.API.csproj \
+    -c Release \
+    -o /app/publish \
+    --no-restore
+
+# Final Stage：使用较小的 Runtime Image 运行 API
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS final
+WORKDIR /app
+
+RUN mkdir -p /app/logs
+COPY --from=build /app/publish .
+
+EXPOSE 8080
+ENV ASPNETCORE_HTTP_PORTS=8080
+ENTRYPOINT ["dotnet", "UUcars.API.dll"]
+```
+
+其中，先复制 `.csproj` 并执行 Restore，再复制其余源码，可以在依赖没有变化时复用 Restore Layer。`COPY --from=build /app/publish .` 是两个阶段之间的连接点，它只把第一阶段生成的 Publish 产物复制到 Final Stage，不带入 SDK 和源码。
+
+`RUN mkdir -p /app/logs` 为当前项目的 Serilog 文件日志准备容器内目录；`EXPOSE 8080` 声明镜像预期使用的容器端口，`ENV ASPNETCORE_HTTP_PORTS=8080` 才让 ASP.NET Core 在容器内监听 `8080`。
+
+`COPY . .` 会读取仓库根目录中的 Build Context，因此还需要由 `.dockerignore` 排除前端、测试产物、本机配置和学习文档，避免无关文件进入构建过程。
+
+有了这份结构基准，接下来先检查仓库中原有的 Dockerfile 是否仍与当前 API 一致，再根据检查结果完成修改和构建：
+
+```text
+已经通过本地验证的 API 源码
+→ 检查现有 Dockerfile 是否仍与项目版本一致
+→ 修正 Docker Build 使用的版本和输入文件
+→ 构建 uucars-api:local
+→ 检查镜像的 Runtime、启动入口和端口
+```
+
+本节只生成并检查镜像。数据库、Redis、运行环境配置和容器网络在第 9 节接入，因此这里不启动 API 服务。
+
+#### 8.1 检查 Dockerfile 运行时版本
+
+第 5 节构建后端时已经确认，当前 API 的目标框架是：
+
+```xml
+<TargetFramework>net10.0</TargetFramework>
+```
+
+Dockerfile 也必须使用能够构建和运行 `.NET 10` 应用的 Base Image。先在仓库根目录检查项目版本和 Dockerfile：
+
+```bash
+grep -nE "TargetFramework|^FROM|dotnet restore|dotnet publish|ENTRYPOINT" \
+  UUcars.API/UUcars.API.csproj Dockerfile
+```
+
+检查结果会显示 API 已经以 `net10.0` 为目标框架，但 Build Stage 和 Final Stage 的 Base Image 仍然是 `9.0`：
+
+```dockerfile
+FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
+
+# ...
+
+FROM mcr.microsoft.com/dotnet/aspnet:9.0 AS final
+```
+
+这说明本机 Build 已经升级，但 Docker Build 仍停留在旧版本。确认问题后，下一步只修改 Dockerfile 和 Docker Build Context，不在这里执行镜像构建。
+
+#### 8.2 更新 Docker 构建版本与输入
+
+先修改仓库根目录的 `Dockerfile`。
+
+Build Stage 负责生成 `net10.0` Publish 产物，因此把 Build Stage 的 Base Image 更新为：
+
+```dockerfile
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+```
+
+Final Stage 负责运行这个产物，也需要使用相同主版本：
+
+```dockerfile
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS final
+```
+
+Dockerfile 中原有的 Restore、Publish、`EXPOSE` 和 `ENTRYPOINT` 保持不变。修改后的关系是：
+
+```text
+SDK 10
+→ 生成 net10.0 Publish 产物
+
+ASP.NET Runtime 10
+→ 运行该产物
+```
+
+接着修改仓库根目录的 `.dockerignore`。当前文件已经排除了 Git、测试项目、`bin`、`obj` 和日志，但还没有排除根目录 `.env`、前端项目和学习文档。
+
+增加：
+
+```dockerignore
+# 本机环境配置
+.env
+.env.*
+
+# 不参与 API Publish 的内容
+uucars-web/
+docs/
+```
+
+`Dockerfile` 后面会执行 `COPY . .`，`.dockerignore` 决定哪些文件能够进入 Docker Build Context。这里保留 API 源码和公共 `appsettings` 配置，排除本机敏感配置以及不参与 API Publish 的内容。
+
+数据库密码、JWT Secret、Resend Key 和 R2 Credentials 不写入 Dockerfile，也不复制进镜像。它们将在后面启动容器时作为运行配置提供。
+
+两个文件修改完成后，在终端执行静态检查：
+
+```bash
+grep -nE '^FROM' Dockerfile
+
+grep -nE '^\.env|^uucars-web/|^docs/' .dockerignore
+```
+
+第一条命令应显示两个 `10.0` Base Image；第二条命令应显示刚增加的 Build Context 排除规则。确认修改正确后，再进入镜像构建。
+
+```text
+6:FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+33:FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS final
+29:.env
+30:.env.*
+33:uucars-web/
+34:docs/
+```
+
+#### 8.3 构建并检查 API 镜像
+
+现在 Dockerfile 已经与 API 版本一致，Build Context 也只保留镜像需要的输入。先确认 Docker Engine 正在运行：
+
+```bash
+docker version
+```
+
+然后在仓库根目录执行镜像构建：
+
+```bash
+docker build --progress=plain -t uucars-api:local .
+```
+
+这条命令中：
+
+```text
+--progress=plain
+→ 显示完整构建日志
+
+-t uucars-api:local
+→ 把生成的镜像命名为 uucars-api，Tag 设为 local
+
+.
+→ 使用仓库根目录作为 Docker Build Context
+```
+
+Docker 会按 Dockerfile 的顺序完成：
+
+```text
+读取经过 .dockerignore 过滤的 Build Context
+→ 使用 SDK 10 Restore 和 Publish API
+→ 把 Publish 产物复制到 ASP.NET Runtime 10
+→ 生成 uucars-api:local
+```
+
+构建命令成功结束后，确认镜像已经存在：
+
+```bash
+docker image ls uucars-api:local
+```
+
+然后检查镜像保存的启动入口和容器内部端口：
+
+```bash
+docker image inspect uucars-api:local \
+  --format 'Entrypoint={{json .Config.Entrypoint}} Ports={{json .Config.ExposedPorts}}'
+```
+
+结果应对应 Dockerfile 中的：
+
+```text
+Entrypoint=["dotnet","UUcars.API.dll"]
+Ports={"8080/tcp":{}}
+```
+
+这里的 `8080` 仍然只是容器内部端口，还没有映射到开发电脑。
+
+最后只启动镜像里的 `dotnet` 命令，确认 Final Stage 使用的是 `.NET 10` Runtime：
+
+```bash
+docker run --rm --entrypoint dotnet \
+  uucars-api:local --list-runtimes
+```
+
+这条命令不会启动 `UUcars.API.dll`，因此不需要数据库、Redis 或 Secret。输出包含 `.NET 10` 的 `Microsoft.NETCore.App` 和 `Microsoft.AspNetCore.App` 后，本节完成。
+
+此时已经得到版本一致的 `uucars-api:local` 镜像，并完成 Dockerfile 的独立验证。
+
+后面的Compose 会重新构建 API，验证完成后可以删除该镜像：
+
+```bash
+docker image rm uucars-api:local
+```
+
+删除 `uucars-api:local` 不会影响 Dockerfile 或 Build Cache。Compose 使用同一份 Dockerfile 和当前源码重新构建 API，再接入 SQL Server、Redis、运行配置和端口映射。
+
+
+
+### 9. 验证 Docker Compose 运行环境
+
+第 8 节已经确认 Dockerfile 能够正确构建 API 镜像，但单个镜像还不能组成完整的后端运行环境。第 9 节继续使用这份 Dockerfile，由 Compose 构建 API，并把它与 SQL Server 和 Redis 一起启动。
+
+Dockerfile 解决的是“如何构建一个镜像”，Docker Compose 解决的是“如何让多个镜像共同组成一套运行环境”：
+
+```text
+Dockerfile
+→ 构建单个 Docker Image
+
+docker-compose.yml
+→ 描述运行时需要哪些 Services
+→ 指定每个 Service 使用的 Image、配置、数据和依赖关系
+→ 由 docker compose 创建并管理整组 Containers
+```
+
+Compose 使用声明式配置。`docker-compose.yml` 描述目标运行状态，`docker compose up` 再根据这份配置创建缺少的 Network、Volumes 和 Containers。它不会把三个程序合并成一个镜像，而是让每个 Service 保持独立进程，并通过 Compose Network 相互连接。
+
+当前 API 启动时会读取数据库和 Redis 连接配置，立即执行 EF Core Migrations，并在 Production 环境注册 Hangfire；公开车辆请求随后还会通过 Redis 读取或建立缓存。因此，本项目的后端容器环境需要三个 Services：
+
+```text
+sqlserver
+→ 使用 SQL Server Image
+→ 保存业务数据和 Hangfire 数据
+
+redis
+→ 使用 Redis Image
+→ 保存 API Cache
+
+api
+→ 使用仓库中的 Dockerfile 构建 API Image
+→ 连接 sqlserver 和 redis
+→ 只把 API 端口公开给开发电脑
+```
+
+Compose 会自动为这三个 Services 创建默认 Network。Service Name 同时成为 Network 内部的主机名，因此实际连接方向是：
+
+```text
+开发电脑 localhost:8080
+→ api:8080
+
+api
+→ sqlserver:1433
+→ redis:6379
+```
+
+在 API Container 中，`localhost` 只指向 API Container 自己，不能表示另外两个 Containers。只有开发电脑访问映射端口时才使用 `localhost:8080`。
+
+`docker-compose.yml` 的根节点主要由 `services` 和 `volumes` 组成，各项配置共同服务于同一条运行链：
+
+- `services` 定义需要运行的独立进程，Service Name 也是内部网络地址
+- `image` 指定创建该 Container 使用的镜像；`build` 则要求 Compose 先重新构建镜像
+- `environment` 在 Container 启动时提供运行配置，不会写回 Image
+- `ports` 使用 `宿主机端口:容器端口`，只负责把需要外部访问的端口映射出来
+- `volumes` 把数据保存在 Container 生命周期之外，重新创建 Container 后仍可复用
+- `healthcheck` 判断 Service 是否已经能够接受连接，而不只是进程是否存在
+- `depends_on` 根据依赖状态安排启动顺序；与 `service_healthy` 配合后才会等待 Healthcheck 通过
+
+结合当前项目，目标 `docker-compose.yml` 应保持以下结构：
+
+```text
+services:
+  sqlserver:
+    → SQL Server Image
+    → Environment、Volume、Healthcheck
+
+  redis:
+    → Redis Image
+    → Volume、Healthcheck
+
+  api:
+    → Dockerfile Build
+    → Port、Environment、Depends On
+
+volumes:
+  → SQL Server Data
+  → Redis Data
+```
+
+API 由 Compose 根据现有 Dockerfile 构建。只有 API 向开发电脑公开端口，SQL Server 和 Redis 只在 Compose Network 内提供服务。具体配置在确认本地环境参数后再写入文件。
+
+有了这份目标结构，后续按同一条运行链推进：
+
+```text
+检查现有 Compose 与目标结构的差异
+→ 确认现有 .env 已提供运行变量
+→ 让 Compose 根据 Dockerfile 构建 API
+→ 等待 SQL Server 和 Redis 就绪
+→ 启动 API 并完成 Migrations 与 Hangfire 初始化
+→ 通过宿主机 8080 验证公开接口
+```
+
+本节只验证后端容器运行链。React 前端仍由本机 Vite 或 Azure Static Web Apps 提供，不加入 Compose；Resend、Cloudflare R2、Google Login 和 Application Insights 也不在这里进行功能验证。
+
+#### 9.1 检查现有 Compose 结构
+
+目标结构已经明确，先读取现有文件并检查 Compose 的解析结果，不启动任何 Container：
+
+```bash
+cat docker-compose.yml
+docker compose config --quiet
+docker compose config --services
+docker compose config --images
+```
+
+修改前的文件能够通过语法检查，API 的 `build` 也已经指向第 8 节检查过的 Dockerfile。仍需调整的是 SQL Server 和 Redis 的访问范围：
+
+```text
+api 使用 build
+→ 保留，由 Compose 根据当前代码构建 API Image
+
+sqlserver 和 redis 映射 1433、6379 到宿主机
+→ 容易与第 7 节使用的本地 Containers 占用相同端口
+```
+
+Compose 的结构问题已经明确。修改文件前，先确认当前 `.env` 能为目标结构提供所需变量，再完善三个 Services 的运行配置。
+
+#### 9.2 核对 Compose 本地配置
+
+第 7 节在开发电脑上直接运行 API，因此 .NET 可以从当前用户目录读取 User Secrets。第 9 节改为运行 API Container 后，执行 API 的已经是 Container 内部进程，它不能读取宿主机用户目录中的 User Secrets。
+
+数据库密码和 JWT Secret 仍然不能写入 Dockerfile、Image 或可以提交的 `docker-compose.yml`。因此，Compose 使用根目录 `.env` 保存当前开发电脑的真实值，再在创建 Containers 时把这些值填入 Compose 配置。
+
+这里存在两个连续步骤：
+
+```text
+仓库根目录 .env
+→ 保存 Compose 变量
+
+docker-compose.yml
+→ 使用 ${变量名} 引用这些变量
+→ Compose 创建 Container 前完成替换
+```
+
+Compose 不会把 `.env` 整个复制进 Image 或 Container，也不会自动把其中所有变量都传给应用。只有 `docker-compose.yml` 明确引用的值才会继续进入对应 Service。
+
+当前目标模板中，两项配置的传递方向是：
+
+```text
+.env 的 DB_PASSWORD
+→ sqlserver.environment.MSSQL_SA_PASSWORD
+→ SQL Server 使用该密码启动
+
+.env 的 DB_PASSWORD
+→ api.environment.ConnectionStrings__DefaultConnection
+→ API 使用同一密码连接 sqlserver
+
+.env 的 JWT_SECRET
+→ api.environment.JwtSettings__Secret
+→ .NET 映射为 JwtSettings:Secret
+```
+
+因此，从仓库根目录运行 `docker compose` 时，不需要执行 `source .env`，也不需要把变量重新写在命令中。Compose 会自动读取同目录的 `.env`，再解析 `docker-compose.yml` 中的 `${DB_PASSWORD}` 和 `${JWT_SECRET}`。
+
+理解配置传递过程后，再检查当前仓库是否已经具备这两个输入。
+
+确认本地根目录下是否有 `.env` 文件，并包含：
+
+```
+DB_PASSWORD=YourStrongPassw0rd
+JWT_SECRET=your-jwt-secret-key-at-least-32-characters
+```
+
+确认根目录下的 `.gitignore` 已添加 `.env`，保证 Git 会忽略其中的真实值。
+
+#### 9.3 构建并启动 API 容器
+
+环境参数确认后，保留 API 原有的 `build`，让 Compose 使用第 8 节检查过的 Dockerfile 构建当前代码。SQL Server 和 Redis 删除宿主机端口映射，只通过 Service Name 在 Compose Network 内接受 API 连接。
+
+API 启动时会执行 EF Core Migrations，并在 Production 环境初始化 Hangfire，因此 SQL Server 和 Redis 继续保留 Healthchecks，API 通过 `depends_on` 等待两个依赖进入 `healthy`。数据库密码和 JWT Secret 则按第 9.2 节确认的路径从 `.env` 传入。
+
+调整后的完整 `docker-compose.yml` 如下：
+
+```yaml
+services:
+  # SQL Server 数据库容器
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "${DB_PASSWORD}"   # 从 .env 文件读取，不硬编码
+      MSSQL_PID: Developer
+    # 仅供 Compose 网络内的 API 访问，不映射到宿主机端口
+    volumes:
+      # 数据持久化：容器重启后数据不丢失
+      - sqlserver_data:/var/opt/mssql
+    healthcheck:
+      # 等待 SQL Server 真正就绪再启动 API
+      test:
+        - CMD-SHELL
+        - >-
+          /opt/mssql-tools18/bin/sqlcmd
+          -S localhost
+          -U sa
+          -P "$$MSSQL_SA_PASSWORD"
+          -Q "SELECT 1"
+          -C
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis 缓存容器
+  redis:
+    image: redis:7-alpine
+    # 仅供 Compose 网络内的 API 访问，不映射到宿主机端口
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # API 容器
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      # 连接字符串：指向 sqlserver 容器（docker-compose 网络里用服务名访问）
+      ConnectionStrings__DefaultConnection: "Server=sqlserver,1433;Database=UUcarsDB;User Id=sa;Password=${DB_PASSWORD};TrustServerCertificate=True"
+      # Redis 连接字符串
+      ConnectionStrings__Redis: "redis:6379"
+      # JWT 配置
+      JwtSettings__Secret: "${JWT_SECRET}"
+      # 使用 Production 环境
+      ASPNETCORE_ENVIRONMENT: Production
+    depends_on:
+      sqlserver:
+        condition: service_healthy    # 等 SQL Server 健康检查通过再启动
+      # 等 Redis 健康检查通过再启动 API
+      redis:
+        condition: service_healthy
+
+# 数据卷：持久化数据库文件
+volumes:
+  sqlserver_data:
+  redis_data:
+
+```
+
+Healthcheck 中的 `$$MSSQL_SA_PASSWORD` 会把一个 `$` 保留到 SQL Server Container 内，再读取已经传入的 `MSSQL_SA_PASSWORD`。
+
+此时先让 Compose 解析最终配置：
+
+```bash
+docker compose config --quiet
+docker compose config --services
+docker compose config --images
+```
+
+应识别出：
+
+```text
+Services
+→ sqlserver
+→ redis
+→ api
+
+Images
+→ mcr.microsoft.com/mssql/server:2022-latest
+→ redis:7-alpine
+→ uucars-api
+```
+
+`config --quiet` 检查配置能否被解析，`config --services` 确认三个 Services 没有遗漏，`config --images` 则显示 Compose 将为 API 使用的镜像名称。三项结果都符合预期后，才能在下一小节构建并启动这套后端容器环境。
+
+#### 9.4 启动完整的后端容器链
+
+配置解析通过后，从仓库根目录构建 API 并启动三个 Services：
+
+```bash
+docker compose up -d --build
+```
+
+Compose 会按以下顺序推进：
+
+```text
+根据 Dockerfile 构建当前 API Image
+→ 创建默认 Network 和两个 Named Volumes
+→ 启动 sqlserver 与 redis
+→ 等待两个 Healthchecks 通过
+→ 使用刚构建的 Image 创建 api Container
+→ API 连接数据库并执行 Migrations
+→ Hangfire 创建所需表并注册周期任务
+→ API 开始监听 Container 端口 8080
+```
+
+启动命令返回后，先检查实际状态：
+
+```bash
+docker compose ps
+docker compose logs --tail=100 sqlserver redis api
+```
+
+`sqlserver` 和 `redis` 应进入 `healthy`，`api` 应保持 `Up`。第一次使用空的 SQL Server Volume 时，API 日志中出现 EF Core Migrations 和 Hangfire SQL Objects 初始化属于正常启动过程；如果 API 退出，则根据同一段日志定位连接字符串、Password 或启动配置问题，不继续执行接口验证。
+
+#### 9.5 验证容器响应并停止环境
+
+Containers 都保持运行后，从开发电脑访问映射到 API Container 的公开接口：
+
+```bash
+curl -i "http://localhost:8080/cars?page=1&pageSize=1"
+```
+
+如果使用新的 SQL Server Volume，数据库中可以暂时没有车辆，但请求仍应返回 `HTTP 200` 和项目统一的 `ApiResponse` 结构。首次请求或缓存未命中时，调用链为：
+
+```text
+开发电脑 localhost:8080
+→ api Container
+→ Redis Cache
+→ SQL Server Database
+→ api Container 返回 HTTP Response
+```
+
+验证完成后停止本次环境：
+
+```bash
+docker compose down
+```
+
+`down` 会删除三个 Containers 和 Compose Network，但保留 `sqlserver_data`、`redis_data` 以及 Compose 构建的 API Image。下次执行 `docker compose up -d --build` 时，数据库和缓存数据仍然存在，API Image 则会根据当前代码重新构建。
+
+只有需要彻底重置本地 Compose 数据时才执行：
+
+```bash
+docker compose down -v
+```
+
+`-v` 会同时删除两个 Named Volumes，其中的数据库和缓存数据无法通过下一次启动恢复。
+
+本节完成后，第 8 节检查过的 Dockerfile 已经由 Compose 用于构建 API，并在完整的后端容器环境中完成基础响应验证。下一节沿用已经验证过的本地 Build、Tests 和 Docker 结果，把相同的检查顺序迁移到 GitHub Actions Runner。
+
+---
+
+### 10. 在 GitHub Actions 中建立完整 CI
+
+第 5 至 9 节已经在开发电脑中依次验证了 Backend Build、Backend Tests、Frontend Checks、五条浏览器 E2E 流程和 Docker 运行链。现在需要继续跟踪同一个 Commit，确认它离开本地环境后，也能在一台全新的 GitHub Actions Runner 中得到相同结果。
+
+GitHub Actions 会根据 `.github/workflows/*.yml` 创建 Workflow。一次 Workflow Run 可以包含多个 Jobs；每个 Job 使用独立 Runner，并按 `steps` 中的顺序执行。没有依赖关系的 Jobs 可以并行，`needs` 则表示后一个 Job 只能在前置 Jobs 成功后继续。
+
+```yaml
+name: Workflow Name
+
+on:
+  push:
+
+jobs:
+  first-job:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: first-command
+
+  next-job:
+    runs-on: ubuntu-latest
+    needs: first-job
+    steps:
+      - run: next-command
+```
+
+其中，`on` 决定何时创建 Workflow Run，`jobs` 定义本次运行包含哪些独立工作，`steps` 是单个 Job 内部的执行顺序，`needs` 负责连接前后阶段。
+
+本节的载体是当前功能分支上的同一个 Commit。它先分别通过 Backend 与 Frontend 检查，再进入需要完整运行环境的 E2E Job：
+
+```text
+功能分支 Push
+→ CI Workflow
+├── Backend Job
+│   → .NET 10
+│   → Restore、Build
+│   → Unit + Integration Tests
+│
+├── Frontend Job
+│   → Node.js 24
+│   → npm ci
+│   → ESLint、Vitest、Production Build
+│
+└── E2E Job 等待 Backend 与 Frontend
+    → 启动临时 SQL Server 与 Redis
+    → Playwright 启动 E2E API 与 Vite Frontend
+    → Chromium 执行五条核心用户流程
+
+三个 Jobs 全部成功
+→ 当前 Commit 通过完整 CI
+```
+
+CI 到这里结束，不构建发布镜像，也不部署 Azure。第 11 节再让通过完整 CI 的 `main` Commit 生成部署产物并完成发布，这样测试失败的代码不能进入部署阶段。
+
+#### 10.1 检查现有 CI Workflow
+
+在修改 Workflow 之前，先把现有配置与前面已经验证过的项目要求进行对照。在仓库根目录执行：
+
+```bash
+grep -n "TargetFramework" \
+  UUcars.API/UUcars.API.csproj \
+  UUcars.Tests/UUcars.Tests.csproj
+
+node -p "require('./uucars-web/package.json').engines.node"
+```
+
+项目文件当前运行时要求：
+
+```text
+UUcars.API
+→ net10.0
+
+UUcars.Tests
+→ net10.0
+
+uucars-web
+→ Node.js 24.x
+```
+
+现有 `.github/workflows/ci.yml` 仍保留早期配置：
+
+```yaml
+- name: Setup .NET 9
+  uses: actions/setup-dotnet@v4
+  with:
+    dotnet-version: "9.0.x"
+
+- name: Run unit tests
+  run: dotnet test --no-build --filter "FullyQualifiedName!~Integration"
+```
+
+详细的对照结果如下：
+
+##### 后端构建与测试 Job
+
+1. **构建环境**
+
+   当前 API 和 Tests 都以 `net10.0` 为目标框架，但现有 Job 安装的是 `.NET 9`。Runner 的 SDK 版本需要更新为 `.NET 10`，才能重现当前后端构建。
+
+2. **Unit Tests**
+
+   现有 `dotnet test` 命令能够运行 Unit Tests，但 Job 名称和注释仍停留在早期的“只运行单元测试”阶段。修改后仍保留这些 Tests，并让 Job 名称反映它会验证完整后端。
+
+3. **Integration Tests**
+
+   现有 Filter 主动排除了 `UUcars.Tests.Integration`。这些 Tests 已经通过 Testcontainers 管理自己的临时 SQL Server，不需要在 Workflow 中另外声明固定数据库 Service。它们的启动过程是：
+
+   ```text
+   dotnet test
+   → xUnit 发现 CoreFlowIntegrationTests
+   → xUnit 根据 IntegrationCollection 的声明创建 ApiIntegrationTestFactory
+   → Factory 通过 Testcontainers 启动临时 SQL Server
+   → Test Host 使用 Testing 环境连接临时数据库
+   → 测试完成后停止 Container
+   ```
+
+   `Testing` 环境不会读取开发电脑中的 User Secrets。`ApiIntegrationTestFactory` 会注入 Testcontainers Connection String，并把 Cache、Background Job、Google Token、Email 和 Storage 等外部依赖替换为 Fake。因此 Runner 只需要能够运行 Docker，不需要复制开发电脑的数据库密码、JWT Secret、Resend Key 或 R2 Credentials。
+
+##### 前端构建与测试 Job
+
+1. **运行时与检查范围**
+
+   现有文件只在占位的 E2E Job 中安装 Node.js，并没有独立执行 ESLint、Vitest 和 Production Build。该 Job 使用的 Node.js 20 也低于 `uucars-web/package.json` 声明的 Node.js 24，因此需要新增独立的 Frontend 核心检查。
+
+2. **Build 配置来源**
+
+   全新 Runner 不会取得被 Git 忽略的 `uucars-web/.env.local`。当前 `uucars-web/.env.production` 已经提交 Production API 地址，但 `src/main.tsx` 还会读取 `VITE_GOOGLE_CLIENT_ID`。
+
+   Google Client ID 是浏览器可以看到的公开标识，不是 Google Client Secret，因此可以补充到 `.env.production`，让 Runner 在 Production Build 时直接读取。
+
+##### E2E 测试 Job
+
+现有 E2E Job 依赖 `test` 和 `build-and-push`，并且只输出占位信息，没有执行 Playwright。第 7 节已经验证了五条本地流程，因此可以把相同的运行过程迁移到 Runner，在 Backend 与 Frontend 检查成功后执行，作为发布之前的最后一项 CI 检查。
+
+因此，本节需要进行的最小修改已经明确：
+
+```text
+现有 test Job
+→ 更新为 backend，使用 .NET 10
+→ 执行全部 Backend Tests
+
+新增 frontend Job
+→ 使用 Node.js 24
+→ 从 .env.production 读取公开配置
+→ 重放本地 Frontend 核心检查
+
+现有 e2e Job
+→ 等待 Backend 与 Frontend 都成功
+→ 重建第 7 节运行环境，执行五条流程
+
+现有 build-and-push 与 deploy Jobs
+→ 从 CI 移出，由第 11 节的 CD Workflow 承担
+```
+
+CI 负责验证 Commit，CD 使用通过 CI 的版本生成部署产物并发布。分开后，功能分支可以完成全部测试，部署只在满足发布条件时执行。
+
+#### 10.2 更新 CI Workflow
+
+##### 更新后端 Job
+
+当前 `test` Job 已经包含 Checkout、Restore、Build 和 Test 四个阶段，因此不重新建立另一套后端流程。直接在原位置将 Job ID 改为 `backend`，更新显示名称和 SDK，并删除排除 Integration Tests 的 Filter。
+
+修改完成后，Backend Job 为：
+
+```yaml
+  # =============================================
+  # Job 1：构建后端并运行全部测试
+  # 所有分支 push 都执行
+  # =============================================
+  backend:
+    name: Backend Build & Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --no-restore
+
+      - name: Run backend tests
+        run: dotnet test --no-build
+```
+
+修改之后的验证顺序：Restore 先准备 NuGet Packages，Build 编译 API 与 Tests，最后的 Test 复用 Build 产物。Test 不再过滤掉集成测试，因此 xUnit 会同时运行 Unit Tests 和 Integration Tests；其中临时 SQL Server 仍由 `ApiIntegrationTestFactory` 通过 Testcontainers 启动，不需要在 Workflow 中重复声明数据库 Service。
+
+##### 新增前端 Job
+
+Backend Job 完成后，接着处理 Frontend。全新的 GitHub Runner 只能取得已经提交到仓库的文件，不能读取本机被 Git 忽略的 `uucars-web/.env.local`，因此 Production Build 使用的公开配置需要保存在已经被 Git 跟踪的 `uucars-web/.env.production`。
+
+当前文件已经包含 Production API 地址。在其后补充 Google OAuth Client ID：
+
+```env
+VITE_API_BASE_URL=https://uucars-api.graycoast-b9103d3d.australiaeast.azurecontainerapps.io
+VITE_GOOGLE_CLIENT_ID=1017312818794-93b9fkeegcnfbohbc9j68s7b073ensja.apps.googleusercontent.com
+```
+
+Google Client ID 会随 Vite Build 进入浏览器 Bundle，它是识别 OAuth Application 的公开标识，不是 Google Client Secret，因此可以保存在 `.env.production`。本地开发继续使用 `.env.local`；Runner 中没有该文件，Production Build 从已提交的 `.env.production` 读取这些值。
+
+Production 配置来源明确后，在 `backend` 后增加同级的 `frontend`。这个 Job 从 `uucars-web` 目录依次重放已经在本地确认过的依赖安装、ESLint、Component Tests 和 Production Build。
+
+新增后的 Frontend Job 为：
+
+```yaml
+  # =============================================
+  # Job 2：运行前端核心检查
+  # 所有分支 push 都执行
+  # =============================================
+  frontend:
+    name: Frontend Build & Tests
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: uucars-web
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npm run lint
+
+      - name: Run component tests
+        run: npm test -- --run
+
+      - name: Build production bundle
+        run: npm run build
+```
+
+`working-directory` 让所有 `run` Commands 从 `uucars-web` 执行。`npm ci` 按 `package-lock.json` 安装依赖，Vitest 使用 `--run` 完成后退出，最后由 Vite 自动读取 `.env.production` 生成 Production Bundle。`vite.config.ts` 已经排除 `e2e/**`，所以这里不会提前执行 Playwright。
+
+`frontend` 不依赖 `backend`，`backend` 也不依赖 `frontend`。GitHub Actions 可以同时运行两个 Job，分别验证后端与前端，任何一边失败都不会掩盖另一边的结果。
+
+##### 从 CI 拆分发布流程
+
+两项核心检查建立后，将 `build-and-push`、`deploy` 及其使用的顶层 `REGISTRY`、`IMAGE_NAME` 配置从 `ci.yml` 移出；对应发布过程在第 11 节编写到 `cd.yml`。同时先移除旧的占位 `e2e` Job，第 10.3 节再加入真实 E2E，避免它继续引用旧的 `test` 和 `build-and-push`。
+
+文件顶部改为以下内容，随后保留前面完成的两个 Jobs：
+
+```yaml
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+```
+
+当前功能分支的修改推送到远端后，打开 GitHub Actions 中对应的 CI Run，确认 Backend 与 Frontend 分别完成构建和测试。两项检查通过后，再在同一个 Workflow 中接入完整 E2E。
+
+#### 10.3 在 E2E Job 中重建测试链路
+
+Backend 与 Frontend 已经分别确认源码能够构建和测试，但这两项结果还没有证明浏览器能够经过前端和 API 完成整条业务流程。因此，同一个 Commit 接下来进入 E2E Job，重新建立第 7 节已经在本地验证过的运行链。
+
+这条运行链由两个部分共同完成：
+
+```text
+GitHub Actions
+→ 创建 SQL Server 与 Redis Service Containers
+
+Playwright
+→ 启动 E2E API
+→ 启动 Vite Frontend
+→ 启动 Chromium
+→ 执行五条核心用户流程
+```
+
+E2E 只有在 Backend 与 Frontend 都成功后才有执行意义，因此先用 `needs` 建立依赖关系：
+
+```yaml
+  e2e:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+```
+
+##### 启动 SQL Server 与 Redis 服务
+
+`playwright.config.ts` 只负责启动 API 和前端，不负责创建它们依赖的 SQL Server 与 Redis。E2E Job 因此先声明两个 Service Containers，并通过 Health Check 等待它们真正可以连接：
+
+```yaml
+    services:
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_SA_PASSWORD: "UUcars_CI_E2E_2026!"
+          MSSQL_PID: Developer
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd="/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'UUcars_CI_E2E_2026!' -Q 'SELECT 1' -C"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+```
+
+E2E Job 直接运行在 Ubuntu Runner 上，所以两个 Container 需要把端口映射到 Runner；随后启动的 API 才能通过 `localhost:1433` 和 `localhost:6379` 连接它们。
+
+这里的 SQL Server Password 只用于本次隔离 Runner 中的临时数据库。Job 结束后 Container 与数据都会被删除，因此它不是开发、测试或生产环境的真实 Secret。
+
+##### 配置 E2E API 数据库连接
+
+SQL Server 已经可以连接，但 API 还不知道本次 Job 应该使用哪个数据库。通过 Job 环境变量提供 `E2EConnection`，同时提供只用于本次测试生成和验证 Token 的 JWT Secret：
+
+```yaml
+    env:
+      ConnectionStrings__E2EConnection: >-
+        Server=localhost,1433;Database=UUcarsE2EDB;User Id=sa;Password=UUcars_CI_E2E_2026!;TrustServerCertificate=True
+      JwtSettings__Secret: uucars-ci-e2e-signing-key-at-least-32-characters
+      VITE_GOOGLE_CLIENT_ID: 1017312818794-93b9fkeegcnfbohbc9j68s7b073ensja.apps.googleusercontent.com
+```
+
+`ConnectionStrings__E2EConnection` 中的双下划线会由 .NET 配置系统映射为 `ConnectionStrings:E2EConnection`，与 `Program.cs` 在 E2E 环境选择的连接名称一致。Redis 地址已经保存在 `appsettings.E2E.json` 中，因此这里只需启动对应的 Redis Container，不再重复声明相同配置。
+
+前端 E2E 使用 Vite Development Server，它不会读取 `.env.production`。`src/main.tsx` 又要求 `VITE_GOOGLE_CLIENT_ID` 非空，所以 Job 环境变量显式提供与 `.env.production` 相同的公开 Client ID。Playwright 启动 Vite 时会把该环境变量继续传给前端进程。
+
+E2E Launch Profile 已经设置 `ASPNETCORE_ENVIRONMENT=E2E` 和 `http://localhost:5065`，Workflow 不需要重复声明。API 启动后会读取上面的 `E2EConnection`，对 `UUcarsE2EDB` 执行现有 Migrations，并写入测试登录所需的 Admin Seed Data。
+
+##### 在独立 Runner 上执行 Playwright
+
+E2E Job 使用自己的 Runner，不能复用 Backend 或 Frontend Jobs 中安装的运行时和依赖。因此，在数据库、缓存和配置都准备好以后，再安装 `.NET 10`、Node.js 24、前端依赖和 Chromium：
+
+```yaml
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: uucars-web/package-lock.json
+
+      - name: Restore API dependencies
+        run: dotnet restore UUcars.API/UUcars.API.csproj
+
+      - name: Install frontend dependencies
+        working-directory: uucars-web
+        run: npm ci
+
+      - name: Install Chromium
+        working-directory: uucars-web
+        run: npx playwright install --with-deps chromium
+
+      - name: Run E2E tests
+        working-directory: uucars-web
+        run: npm run e2e
+```
+
+`npm run e2e` 读取第 7 节已经验证的 `playwright.config.ts`。其中的第一个 `webServer` 使用 `e2e` Launch Profile 启动 API，并等待公开车辆接口可访问；第二个 `webServer` 再启动 Vite Frontend。两个地址都准备完成后，Chromium 才会串行执行 `flows.spec.ts` 中的五条流程。
+
+因此，Workflow 只负责准备 Runner、SQL Server、Redis 和运行配置；API 与前端仍由 Playwright 使用本地验证过的命令启动，不另外维护第二套启动脚本。
+
+##### 上传 Playwright 失败产物
+
+如果任一流程失败，在 Job 结束前保存 HTML Report、截图和错误上下文：
+
+```yaml
+      - name: Upload Playwright artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-artifacts
+          path: |
+            uucars-web/playwright-report/
+            uucars-web/test-results/
+          if-no-files-found: ignore
+          retention-days: 7
+```
+
+测试成功时不需要保留这些临时文件；测试失败时，可以从对应 Workflow Run 下载 `playwright-artifacts`，查看失败页面、请求上下文和测试报告。
+
+完整的ci流程如下：
+
+```yaml
+name: CI
+
+on:
+  # 功能分支也执行完整 CI，问题在合并前即可被发现。
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main, develop]
+
+# CI 只需要读取仓库内容；镜像推送和 Azure 权限属于 CD。
+permissions:
+  contents: read
+
+jobs:
+  # =============================================
+  # Job 1：构建后端并运行全部测试
+  # 所有分支 push 都执行
+  # =============================================
+  # 后端先完成编译，再运行 Unit Tests 和 Integration Tests。
+  # Integration Tests 使用 Testcontainers 自行创建临时 SQL Server。
+  backend:
+    name: Backend Build & Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --no-restore
+
+      - name: Run backend tests
+        run: dotnet test --no-build
+
+  # =============================================
+  # Job 2：运行前端核心检查
+  # 所有分支 push 都执行
+  # =============================================
+  # 前端与后端并行执行，依次验证代码规范、组件行为和 Production Build。
+  frontend:
+    name: Frontend Build & Tests
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: uucars-web
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npm run lint
+
+      - name: Run component tests
+        run: npm test -- --run
+
+      - name: Build production bundle
+        run: npm run build
+
+  # =============================================
+  # Job 3：运行完整 E2E 测试
+  # 只有后端和前端检查都通过后，才建立完整运行环境执行浏览器流程
+  # =============================================
+  e2e:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+
+    # Playwright 负责启动 API 和 Vite；数据库与缓存由 Runner 提前创建。
+    services:
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          # 仅用于本次临时 CI 数据库，不是任何真实环境的密码。
+          MSSQL_SA_PASSWORD: "UUcars_CI_E2E_2026!"
+          MSSQL_PID: Developer
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd="/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'UUcars_CI_E2E_2026!' -Q 'SELECT 1' -C"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    env:
+      # E2E Launch Profile 设置 E2E 环境；该环境读取 E2EConnection。
+      # 双下划线会由 .NET 配置系统映射为分层配置键。
+      ConnectionStrings__E2EConnection: >-
+        Server=localhost,1433;Database=UUcarsE2EDB;User Id=sa;Password=UUcars_CI_E2E_2026!;TrustServerCertificate=True
+      JwtSettings__Secret: uucars-ci-e2e-signing-key-at-least-32-characters
+      # Vite Dev Server 不读取 .env.production，因此由 Job 显式提供公开 Client ID。
+      VITE_GOOGLE_CLIENT_ID: 1017312818794-93b9fkeegcnfbohbc9j68s7b073ensja.apps.googleusercontent.com
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # E2E 使用独立 Runner，不能复用前两个 Jobs 已安装的运行时。
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: uucars-web/package-lock.json
+
+      - name: Restore API dependencies
+        run: dotnet restore UUcars.API/UUcars.API.csproj
+
+      - name: Install frontend dependencies
+        working-directory: uucars-web
+        run: npm ci
+
+      - name: Install Chromium
+        working-directory: uucars-web
+        run: npx playwright install --with-deps chromium
+
+      # playwright.config.ts 会依次启动 E2E API、Vite Frontend 和 Chromium。
+      - name: Run E2E tests
+        working-directory: uucars-web
+        run: npm run e2e
+
+      # 成功时不保存临时文件；失败时保留报告、截图和错误上下文。
+      - name: Upload Playwright artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-artifacts
+          path: |
+            uucars-web/playwright-report/
+            uucars-web/test-results/
+          if-no-files-found: ignore
+          retention-days: 7
+
+```
+
+完成后，`ci.yml` 的执行关系为：
+
+```text
+backend ──┐
+          ├──→ e2e
+frontend ─┘
+```
+
+Backend 与 Frontend 先并行验证各自部分，E2E 再验证它们组合后的真实业务链。三个 Jobs 全部通过后，当前 Commit 才完成 CI，并可以作为后面 CD Workflow 的输入。
+
+#### 10.4 验证完整 CI
+
+`ci.yml` 在本地能够通过语法检查，只能证明文件结构有效，不能证明 GitHub Runner、Service Containers 和 Playwright 能够真正协作。GitHub Actions 只会处理已经推送到远端的 Commit，因此需要建立一个临时分支，承载本次 CI 配置并产生真实的 Workflow Run。
+
+这个分支只用于验证，不直接更新 `main` 或 `develop`。验证成功后，再把已经通过 CI 的 Commit 合并回当前功能分支并删除临时分支。
+
+##### 创建临时 CI 验证分支
+
+先确认当前仍位于 `feature/v3-runtime-cicd`，再从这里创建临时分支：
+
+```bash
+git branch --show-current
+git status --short
+
+git switch -c feature/step73-ci-validation
+```
+
+只提交本节已经完成的 CI 配置和 Frontend Production 公开配置，不把测试报告或其他未完成修改混入验证 Commit：
+
+```bash
+git add .github/workflows/ci.yml uucars-web/.env.production
+git commit -m "test: validate complete ci workflow"
+git push -u origin feature/step73-ci-validation
+```
+
+当前 Workflow 对所有分支的 `push` 生效，因此不需要创建 Pull Request。推送完成后，进入：
+
+```text
+GitHub Repository
+→ Actions
+→ CI
+→ feature/step73-ci-validation 对应的最新 Workflow Run
+```
+
+先核对页面显示的 Branch 和 Commit 与刚才推送的内容一致，再检查三个 Jobs。Backend 与 Frontend 应同时开始；只有二者都成功后，E2E 才会开始。
+
+##### 核对后端 Job
+
+进入 `Backend Build & Tests`，确认 Runner 实际安装 `.NET 10`，Build 同时编译 API 与 Tests，`dotnet test --no-build` 没有 Filter。Integration Tests 的日志中应出现 Testcontainers 启动和回收临时 SQL Server 的过程。
+
+实际测试数量和结果以本次 Workflow 日志为准，不在运行前预设。只有完整 Test Command 成功结束，Backend Job 才算通过。
+
+##### 核对前端 Job
+
+进入 `Frontend Build & Tests`，确认 Node.js 为 `24.x`，随后 `npm ci`、ESLint、Vitest 和 Production Build 依次成功。Build 成功说明全新 Runner 能从已提交的 Production 配置生成前端产物，而不是依赖开发电脑中的 `.env.local`。
+
+##### 核对 E2E 测试 Job
+
+进入 `E2E Tests`，先确认 SQL Server 与 Redis Service Containers 通过 Health Check，再确认 Playwright 成功启动 E2E API 和 Vite Frontend。最终结果必须显示五条核心用户流程被真实执行，而不是输出占位信息或显示 Skipped。
+
+如果 E2E 失败，先根据失败 Step 判断是 Service、API、Frontend 还是浏览器流程的问题，再下载 `playwright-artifacts` 查看报告和截图。修复后由同一个 CI 流程重新验证，不能把占位命令或跳过执行记录为成功。
+
+三个 Jobs 全部显示 Success 后，当前 Commit 才完成完整 CI。此时还没有生成发布镜像，也没有连接 Azure；第 11 节将以这个通过 CI 的 Commit 为输入，建立独立 CD Workflow。
+
+##### 合并验证结果并删除临时分支
+
+验证成功后，切回原功能分支，并通过 Fast-forward Merge 保留刚才已经通过 CI 的 Commit：
+
+```bash
+git switch feature/v3-runtime-cicd
+git merge --ff-only feature/step73-ci-validation
+```
+
+确认功能分支已经包含该 Commit 后，再删除远端和本地临时分支：
+
+```bash
+git log -1 --oneline
+git push origin --delete feature/step73-ci-validation
+git branch -d feature/step73-ci-validation
+```
+
+临时分支被删除不会删除 Workflow Run。GitHub Actions 中仍然保留本次运行记录，可以继续通过 Commit SHA、Job 日志和失败产物追溯本次验证。
+
+
+
+---
+
+### 11. 通过 GitHub Actions 发布到 Azure
+
+第 10 节已经在 GitHub Runner 中验证了 Backend、Frontend 和完整 E2E。CI 成功只能证明代码通过检查，不能证明同一版本已正确部署到 Azure，也不能证明线上前后端能够协作。因此，本节把通过 CI 的提交转换为部署产物，并验证生产环境的实际响应。
+
+CI 负责检查代码，CD 负责构建并部署通过检查的版本。本项目由 GitHub 生成 Frontend dist 和 Backend Image 两个产物：dist 直接上传到 Azure Static Web Apps，镜像推送到 GitHub Container Registry（GHCR），再由 Azure Container Apps 运行该版本。
+
+完整发布链为：
+
+```text
+起点：功能分支的 Backend、Frontend 和完整 E2E 已通过 CI
+→ 为发布到 main 建立合并门禁
+→ 让 main 的成功 CI 将准确的 Commit SHA 交给 CD
+→ 为该提交生成 Frontend dist 和 Backend Image
+→ 配置 Azure 部署及部署后的自动冒烟检查
+→ 通过 develop → main 的 PR 执行一次真实发布
+→ 从公开地址验证部署结果
+终点：同一提交的前后端完成部署，并通过生产冒烟检查
+```
+
+日常功能分支仍按现有方式合并到 `develop`，Push 后执行 CI；发布到 `main` 时使用 PR。
+
+#### 11.1 建立 main 发布门禁
+
+当前 CI 会在代码 Push 后执行检查，但此时提交已经进入目标分支。如果允许直接 Push 到 `main`，后续检查失败也无法阻止该提交成为生产发布来源。
+
+因此，`main` 不再接收直接 Push，而是只接收本仓库 `develop` 发起的 PR。一次发布需要依次满足：
+
+```text
+develop 发起 PR
+→ GitHub Actions 执行完整 CI
+→ Ruleset 检查来源和测试结果
+→ 全部通过后才允许合并到 main
+```
+
+PR 用来声明准备合并的代码，GitHub Actions 负责生成检查结果，Ruleset 负责根据这些结果阻止或允许合并。三者共同组成发布门禁；仅有成功或失败的 Workflow，并不能限制代码进入 `main`。
+
+##### 限制发布 PR 来源
+
+当前 `.github/workflows/ci.yml` 已经监听以 `main` 为目标的 PR，因此发布 PR 会执行现有的 Backend、Frontend 和 E2E。还需要增加一项来源检查，防止其他功能分支或外部 Fork 直接向 `main` 发起发布。
+
+在 `jobs:` 下增加以下 Job，与现有 `backend`、`frontend`、`e2e` 平级，并保留原有 Job 1、Job 2、Job 3 及其注释：
+
+```yaml
+  # 发布来源检查：只约束目标为 main 的 PR。
+  release-source:
+    name: Validate Release Source
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Require develop from this repository
+        env:
+          SOURCE_BRANCH: ${{ github.head_ref }}
+          SOURCE_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          TARGET_REPOSITORY: ${{ github.repository }}
+        run: |
+          if [ "$SOURCE_BRANCH" != "develop" ] ||
+             [ "$SOURCE_REPOSITORY" != "$TARGET_REPOSITORY" ]; then
+            echo "::error::Release PRs must come from develop in this repository."
+            exit 1
+          fi
+          echo "Release source verified."
+```
+
+这个 Job 只在 PR 的目标分支为 `main` 时运行，并同时检查：
+
+```text
+来源分支必须是 develop
+来源仓库必须是当前 UUcars 仓库
+```
+
+两项条件共同成立，才能证明这次合并来自本项目的正式开发基线。普通 Push 和以 `develop` 为目标的 PR 不承担发布职责，因此不会执行这项检查。
+
+PR 信息先写入环境变量，再由 Shell 比较，避免把 GitHub 事件中的分支或仓库名称直接拼接到脚本中。该检查只读取事件信息，不需要 Checkout，也不依赖其他测试 Job。
+
+##### 配置 Required Checks
+
+来源检查只能报告成功或失败，还需要 Ruleset 把检查结果变成 `main` 的合并条件。在 GitHub 仓库中打开 `Settings → Rules → Rulesets → New branch ruleset`，建立以下规则：
+
+| 设置 | 本项目使用的值 |
+| --- | --- |
+| Ruleset name | `Protect main` |
+| Enforcement status | `Active` |
+| Target branches | 只包含 `main` |
+| Bypass list | 留空 |
+| Require a pull request before merging | 开启，Required approvals 为 `0` |
+| Require status checks to pass | 开启 |
+| Require branches to be up to date before merging | 开启 |
+| Block force pushes / Restrict deletions | 开启 |
+| Require linear history | 不开启 |
+
+这是个人项目，没有必须等待其他成员审批，因此 Required approvals 保持 `0`；PR 在这里承担的是检查和发布门禁，而不是团队 Code Review 流程。
+
+将以下四项 Job 名称设为必需检查：
+
+```text
+Validate Release Source
+Backend Build & Tests
+Frontend Build & Tests
+E2E Tests
+```
+
+其中三个测试检查已经存在。`Validate Release Source` 首次运行后才会出现在 Ruleset 的检查列表中，因此可先保存另外三项检查；首次发布 PR 生成该记录后，再把它加入必需检查，然后合并。
+
+`Require branches to be up to date before merging` 要求 PR 的来源分支包含目标分支的最新状态，避免 `develop` 在落后于 `main` 时直接发布。保存后重新打开 Ruleset，确认状态为 Active，并且 Target branches 只包含 `main`。日常功能分支仍然汇入 `develop`，这条规则只保护生产发布入口。[Ruleset 设置说明](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/creating-rulesets-for-a-repository)
+
+##### 保留发布分支关系
+
+发布记录需要显示 `develop` 在什么时间进入了 `main`。在 `Settings → General → Pull Requests` 中保留 `Allow merge commits`，发布时使用 `Create a merge commit`。
+
+不要开启自动删除 Head Branch。发布 PR 的 Head Branch 是持续使用的 `develop`，合并完成后仍要作为下一轮开发的基线。
+
+完成后，`main` 的入口应满足：
+
+```text
+只能通过 PR 合并
+→ PR 只能来自本仓库的 develop
+→ Backend、Frontend 和 E2E 必须全部通过
+→ 来源检查必须通过
+→ develop 必须包含 main 的最新状态
+```
+
+这一步只建立发布门禁，不执行生产部署。
+
+#### 11.2 使用 main CI 结果触发 CD
+
+发布 PR 合并后，`main` 会形成新的发布提交，并触发一次完整 CI。只有这次 CI 成功，提交才具备部署资格。
+
+仓库中现有的 `.github/workflows/azure-static-web-apps-black-coast-04ba93800.yml` 会在 `main` Push 时直接部署前端，也会处理 PR 预览。它不等待 Backend、Frontend 和 E2E 全部通过，继续保留会让前端部署绕过统一的发布门禁。
+
+因此，本项目只保留一条生产发布链：
+
+```text
+发布 PR 合并到 main
+→ main 执行完整 CI
+→ CI 成功后启动 CD
+```
+
+##### 禁用旧前端部署入口
+
+在 GitHub 仓库的 `Actions` 中选择 `Azure Static Web Apps CI/CD`，通过菜单执行 `Disable workflow`。页面显示 Disabled 后，旧 Workflow 不会再接收新的触发事件；已经开始的运行不会因为停用而自动终止，需要单独确认其状态。
+
+停用 Workflow 不会删除已经上线的 Static Web App。随后在编辑器中删除：
+
+```text
+.github/workflows/azure-static-web-apps-black-coast-04ba93800.yml
+```
+
+删除 Workflow 文件也不会删除 Repository Secret。保留它原先使用的 Deployment Token：
+
+```text
+AZURE_STATIC_WEB_APPS_API_TOKEN_BLACK_COAST_04BA93800
+```
+
+这样只移除旧的自动部署入口，不改变现有 Azure Static Web App，也不重新创建部署凭据。[停用 Workflow](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/disable-and-enable-workflows)
+
+##### 连接 CI 与 CD
+
+独立的 CD Workflow 需要在 CI 完成后启动。`needs` 只能连接同一个 Workflow 内的 Jobs，因此这里使用 `workflow_run`，让 GitHub 在指定 Workflow 完成后创建新的 CD 运行。
+
+`workflow_run` 使用默认分支中的 Workflow 定义。在 GitHub 仓库的 `Settings → General → Default branch` 中确认默认分支是 `main`。CD 文件进入 `main` 后，才会开始接收后续的 CI 完成事件。
+
+新增 `.github/workflows/cd.yml`，先写入文件顶部的触发配置：
+
+```yaml
+name: CD
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+```
+
+`workflows: [CI]` 对应 `ci.yml` 顶部的 `name: CI`，不是 Workflow 文件名。`branches: [main]` 只接收 CI 在 `main` 上完成的事件，不把功能分支的 CI 当成发布许可。
+
+`types: [completed]` 表示 CI 无论成功还是失败都会产生完成事件，因此发布 Job 仍必须检查本次 CI 的结论为 `success`。
+
+`RELEASE_SHA` 保存刚完成 CI 的 `head_sha`。构建和部署都使用这个 SHA，而不是 CD 自己的 `github.sha`，也不在运行途中重新读取可能已经变化的 `main`。这样 CI 检查、部署产物和生产版本始终指向同一个提交。
+
+完成后，仓库只保留新的 CD 入口。它等待 `main` 的 CI 完成事件，并携带该次 CI 对应的提交 SHA；旧 Static Web Apps Workflow 不再独立部署前端。[workflow_run 行为](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_run)
+
+#### 11.3 为同一提交生成前后端部署产物
+
+CD 接收 `main` 的 CI 完成事件并取得 `RELEASE_SHA`。前端 `dist` 和后端镜像分别由 `build-frontend` 与 `build-backend` 构建；两个 Job 都 Checkout 同一个 `RELEASE_SHA`，保证产物来自同一份已通过 CI 的代码。
+
+两个构建 Job 互不依赖，可以并行运行：
+
+```text
+                 ┌→ build-frontend → Frontend Artifact
+RELEASE_SHA ─────┤
+                 └→ build-backend  → GHCR Image
+```
+
+##### 构建并保存前端 dist
+
+在 `cd.yml` 的触发配置后增加 `jobs:` 和 `build-frontend`。这个 Job 先确认事件来自本仓库 `main` 的成功 Push，再 Checkout 对应的 `RELEASE_SHA`：
+
+```yaml
+jobs:
+  # =============================================
+  # Job 1：为通过 main CI 的提交生成前端部署产物
+  # =============================================
+  build-frontend:
+    name: Build Frontend Artifact
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout verified commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_SHA }}
+```
+
+四个入口条件共同限定发布来源：
+
+```text
+CI 结论为 success
+→ CI 由 Push 触发
+→ CI 运行在 main
+→ CI 来自当前仓库
+```
+
+任意条件不成立，`build-frontend` 都不会执行。这个 Job 只需要读取源码，因此仅授予 `contents: read`，不取得写入 GHCR 或访问 Azure 的权限。
+
+前端 `package.json` 要求 Node.js 24，`npm run build` 会完成 TypeScript 编译和 Vite Production Build。构建继续读取已提交的 `uucars-web/.env.production`，使 API 地址和公开的 Google Client ID 与生产配置保持一致。
+
+部署 Job 会运行在另一个 Runner，不能直接访问当前 Runner 的 `dist`。因此，前端构建完成后还要记录版本信息，再把整个 `dist` 上传为本次 CD Run 的 Artifact。
+
+在 Checkout Step 后继续追加：
+
+```yaml
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install frontend dependencies
+        working-directory: uucars-web
+        run: npm ci
+
+      - name: Build frontend release
+        working-directory: uucars-web
+        run: npm run build
+
+      - name: Record frontend release
+        working-directory: uucars-web
+        run: |
+          node -e 'require("node:fs").writeFileSync("dist/release.json", JSON.stringify({ commit: process.env.RELEASE_SHA }))'
+          test -s dist/index.html
+          test -s dist/staticwebapp.config.json
+
+      - name: Upload frontend artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-${{ env.RELEASE_SHA }}
+          path: uucars-web/dist/
+          if-no-files-found: error
+          retention-days: 7
+```
+
+`release.json` 只记录 `RELEASE_SHA`，不包含 Secret，也不需要加入前端源码。部署完成后读取这个文件，可以区分线上页面来自当前提交还是旧版本。
+
+`test -s` 同时确认入口文件和 Static Web Apps 配置已经进入产物。`staticwebapp.config.json` 来自 `uucars-web/public/`，Vite 构建时会把它复制到 `dist`，用于保留前端路由回退配置。任一文件缺失都会在上传 Artifact 前终止构建。
+
+Artifact 名称包含 `RELEASE_SHA`，部署 Job 可以准确下载本次运行生成的前端产物；`retention-days: 7` 只控制 GitHub 保存构建产物的时间，不影响已经部署的网站。
+
+##### 构建并推送后端镜像
+
+后端不需要等待前端构建完成。`build-backend` 独立 Checkout 同一个 `RELEASE_SHA`，再使用仓库根目录的现有 Dockerfile 构建镜像。Build Context 仍是仓库根目录，因此项目引用和 `.dockerignore` 继续按已经验证的结构工作。
+
+镜像需要存放在 Azure 能够拉取的 Registry，因此这里使用 GHCR。GitHub Runner 通过本次运行的 `GITHUB_TOKEN` 推送，不需要手动创建镜像推送 Token。
+
+在 `build-frontend` 后增加同级的 `build-backend` Job：
+
+```yaml
+  # =============================================
+  # Job 2：为通过 main CI 的提交生成后端镜像
+  # =============================================
+  build-backend:
+    name: Build Backend Image
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      image: ${{ steps.image.outputs.name }}
+      digest: ${{ steps.publish.outputs.digest }}
+
+    steps:
+      - name: Checkout verified commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_SHA }}
+
+      - name: Set image name
+        id: image
+        env:
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          owner_lower=$(printf '%s' "$REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          echo "name=ghcr.io/$owner_lower/uucars-api" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push API image
+        id: publish
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.image.outputs.name }}:${{ env.RELEASE_SHA }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ env.RELEASE_SHA }}
+```
+
+`build-backend` 使用与前端相同的四项入口条件，但权限彼此独立。`contents: read` 用于 Checkout，`packages: write` 只用于向 GHCR 推送镜像；它不需要访问前端 Artifact。
+
+Registry 路径必须使用小写，所以先转换 Owner 名称；当前项目对应 `ghcr.io/robert-j-wang/uucars-api`。完整 SHA 标签说明镜像来自哪个提交，Digest 则标识实际镜像内容。部署使用 `镜像名@Digest`，避免同名标签被重新构建后指向其他内容。[GHCR 权限与 Digest](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)
+
+如果已有同名 Package，在 GitHub 的 Package Settings 中确认当前仓库拥有 Actions 写权限；如果还不存在，这次 Push 会创建 Package。`GITHUB_TOKEN` 只用于当前 Workflow 向 GHCR 写入镜像，不保存为长期 Secret。
+
+两个 Job 的最终关系应为：
+
+```text
+build-frontend
+→ Checkout RELEASE_SHA
+→ 构建 dist
+→ 记录版本并上传 Artifact
+
+build-backend
+→ Checkout RELEASE_SHA
+→ 构建并推送 RELEASE_SHA 标签镜像
+→ 输出镜像名称和 Digest
+```
+
+检查 `build-backend.outputs.image` 对应 `id: image`，`build-backend.outputs.digest` 对应 `id: publish`。两个 Job 没有 `needs` 关系，可以并行运行；只有两个 Job 都成功，前端 Artifact 和后端镜像才共同构成本次发布产物。
+
+#### 11.4 配置 Azure 部署与自动冒烟检查
+
+`build-frontend` 和 `build-backend` 已经为同一个 `RELEASE_SHA` 生成前端 Artifact 与后端镜像。现在把这两份产物交给现有 Azure 资源，并从公网验证实际运行结果。
+
+前端发送的业务请求依赖 API，因此部署按依赖方向推进：
+
+```text
+更新后端镜像
+→ 上传同一提交的前端 Artifact
+→ 验证 API、页面和发布版本
+```
+
+##### 建立生产部署 Job
+
+后端部署需要知道现有 Container App 的资源组和应用名称。在 GitHub 仓库的 `Settings → Secrets and variables → Actions → Variables` 中增加：
+
+| Repository Variable | 值 |
+| --- | --- |
+| `AZURE_RESOURCE_GROUP` | `uucars-rg` |
+| `AZURE_CONTAINER_APP` | `uucars-api` |
+
+这两个 Variable 只负责定位 Azure 中已有的 Container App，不包含密码，也不改变 Container App 内部的数据库、JWT、邮件或 Storage 配置。
+
+> **变量作用域：** 这两个名称只保存在 **Repository variables**。`deploy` Job 没有声明 `environment: production`，所以 `${{ vars.AZURE_RESOURCE_GROUP }}` 和 `${{ vars.AZURE_CONTAINER_APP }}` 读取 Repository 作用域，并继续使用现有的 `main` Branch OIDC Subject。`production` Environment 不保留同名变量。
+
+随后在 `build-backend` 后增加同级的 `deploy` Job。它同时等待两份产物，并使用同一个 Concurrency Group 串行修改生产环境：
+
+```yaml
+  # =============================================
+  # Job 3：部署同一提交的前后端，并验证公开响应
+  # =============================================
+  deploy:
+    name: Deploy Production
+    needs:
+      - build-frontend
+      - build-backend
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+
+    concurrency:
+      group: uucars-production
+      cancel-in-progress: false
+
+    env:
+      RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+      CONTAINER_APP: ${{ vars.AZURE_CONTAINER_APP }}
+      RELEASE_IMAGE: ${{ needs.build-backend.outputs.image }}@${{ needs.build-backend.outputs.digest }}
+```
+
+`needs` 保证前端构建和后端构建都成功后才进入部署。`RELEASE_IMAGE` 使用后端 Job 输出的镜像名与 Digest，不依赖可能被覆盖的普通 Tag。
+
+`concurrency` 保证同一时间只有一个生产部署运行；`cancel-in-progress: false` 不会在部署途中强制终止已有运行。每次 CD 都继续使用触发它的 `RELEASE_SHA`，前端 Artifact 和后端镜像不会混用其他提交。
+
+##### 部署后端镜像
+
+后端首先上线，因为新前端只能在对应 API 可用后对外提供服务。
+
+上一版后端部署已经完成 Azure OIDC 配置：
+
+```text
+GitHub main Branch
+→ 原有 Azure App Registration
+→ Container Apps Contributor
+→ uucars-api
+```
+
+当前 `deploy` Job 仍由 `main` 的 CI 成功事件触发，因此继续使用现有的 `main` Branch Federated Credential，不需要创建新的 App Registration 或 Federated Credential。
+
+GitHub Repository Secrets 中已有的三个 ID 继续供 `azure/login` 使用：
+
+```text
+AZURE_CLIENT_ID
+AZURE_TENANT_ID
+AZURE_SUBSCRIPTION_ID
+```
+
+Repository Variables 说明要更新哪个 Container App，Repository Secrets 说明以哪个 Azure 身份登录。两者都直接读取已有配置，不需要在本节重新建立 Azure 权限。
+
+在 `deploy` 中增加后端部署步骤：
+
+```yaml
+    steps:
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy API image
+        uses: azure/container-apps-deploy-action@v1
+        with:
+          resourceGroup: ${{ env.RESOURCE_GROUP }}
+          containerAppName: ${{ env.CONTAINER_APP }}
+          imageToDeploy: ${{ env.RELEASE_IMAGE }}
+
+      - name: Read deployed API URL
+        id: backend
+        shell: bash
+        run: |
+          az extension add --name containerapp --upgrade --only-show-errors
+          fqdn=$(az containerapp show \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$CONTAINER_APP" \
+            --query properties.configuration.ingress.fqdn \
+            --output tsv)
+          test -n "$fqdn"
+          echo "api_url=https://$fqdn" >> "$GITHUB_OUTPUT"
+```
+
+`azure/login` 使用已有 OIDC 身份登录，`azure/container-apps-deploy-action` 把 Container App 更新为本次 `RELEASE_IMAGE`。`RESOURCE_GROUP` 和 `CONTAINER_APP` 说明更新哪个 Azure 资源；`AZURE_CLIENT_ID`、`AZURE_TENANT_ID` 和 `AZURE_SUBSCRIPTION_ID` 说明 GitHub 登录哪个 Azure 身份和订阅。
+
+官方 Deploy Action 会更新现有 Container App，不覆盖 Portal 中已经保存的数据库、JWT、Redis、邮件和 Storage 配置。[Container Apps Deploy Action](https://github.com/Azure/container-apps-deploy-action#container-app-name-and-resource-group-provided)
+
+最后一个 Step 只读取部署后的公开 API 地址，交给本节末尾的冒烟检查。
+
+##### 上传同一提交的前端 Artifact
+
+后端镜像更新步骤完成后，再部署 `build-frontend` 生成的页面。Static Web Apps 使用自己的 Deployment Token 接收预构建的 `dist`，不使用后端的 Azure OIDC 身份。
+
+在 Azure Portal 的 Static Web App 中打开 `Manage deployment token`，确认 Token 有效，并把它保存为 GitHub Repository Secret：
+
+```text
+AZURE_STATIC_WEB_APPS_API_TOKEN_BLACK_COAST_04BA93800
+```
+
+该 Secret 只用于上传这个 Static Web App，与后端使用的 Azure OIDC 身份无关。
+
+在 `Read deployed API URL` 后，下载当前 CD Run 的前端 Artifact，核对其中的入口、路由配置和提交信息，再执行上传：
+
+```yaml
+      - name: Download frontend artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-${{ env.RELEASE_SHA }}
+          path: frontend-dist
+
+      - name: Check frontend artifact
+        run: |
+          test -s frontend-dist/index.html
+          test -s frontend-dist/staticwebapp.config.json
+          jq -e --arg commit "$RELEASE_SHA" \
+            '.commit == $commit' frontend-dist/release.json
+
+      - name: Deploy frontend
+        id: frontend
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN_BLACK_COAST_04BA93800 }}
+          action: upload
+          app_location: frontend-dist
+          api_location: ""
+          output_location: ""
+          skip_app_build: true
+```
+
+Artifact 名称中的 `RELEASE_SHA` 与构建时一致，`release.json` 再确认下载到的页面来自本次提交。`app_location` 直接指向预构建的 `dist`，因此使用 `skip_app_build: true`，并把 `output_location` 留空。API 已部署在 Container Apps，`api_location` 也保持为空。[上传预构建前端](https://learn.microsoft.com/en-us/azure/static-web-apps/build-configuration#skip-building-front-end-app)
+
+`Azure/static-web-apps-deploy@v1` 会输出本次部署对应的 `static_web_app_url`，后面的验证直接读取这个输出，不重复写死前端地址。[Action 输出定义](https://github.com/Azure/static-web-apps-deploy/blob/v1/action.yml)
+
+##### 验证本次生产发布
+
+此时后端 Revision 和前端页面都已更新，但 Job 成功还必须以公网响应为准。本项目已有无需登录的车辆列表接口：
+
+```text
+GET /cars?page=1&pageSize=1
+→ HTTP 200
+→ success: true
+→ data.items: 数组，可以为空
+```
+
+因此可以用它确认 API 已完成启动，不需要为了 CD 另外新增 Health Endpoint。前端同时检查首页入口和 `release.json`，确保访问到的不是旧页面。
+
+在 `Deploy frontend` 后追加最后一个 Step：
+
+```yaml
+      - name: Smoke test production
+        shell: bash
+        env:
+          API_URL: ${{ steps.backend.outputs.api_url }}
+          FRONTEND_URL: ${{ steps.frontend.outputs.static_web_app_url }}
+        run: |
+          set -euo pipefail
+          test -n "$API_URL"
+          test -n "$FRONTEND_URL"
+
+          api_response="$RUNNER_TEMP/smoke-cars.json"
+          page_response="$RUNNER_TEMP/smoke-index.html"
+          release_response="$RUNNER_TEMP/smoke-release.json"
+
+          for attempt in $(seq 1 12); do
+            if curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
+                 "${API_URL%/}/cars?page=1&pageSize=1" -o "$api_response" &&
+               jq -e '.success == true and (.data.items | type == "array")' \
+                 "$api_response" >/dev/null &&
+               curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
+                 "${FRONTEND_URL%/}/" -o "$page_response" &&
+               grep -q 'id="root"' "$page_response" &&
+               curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
+                 "${FRONTEND_URL%/}/release.json?commit=$RELEASE_SHA" \
+                 -o "$release_response" &&
+               jq -e --arg commit "$RELEASE_SHA" '.commit == $commit' \
+                 "$release_response" >/dev/null; then
+              echo "Production smoke checks passed for $RELEASE_SHA"
+              exit 0
+            fi
+
+            echo "Waiting for production responses: $attempt/12"
+            sleep 10
+          done
+
+          echo "::error::Production smoke checks failed."
+          exit 1
+```
+
+`curl --fail` 会把 HTTP 错误转换为命令失败；后续内容检查继续确认 API 返回预期结构、前端入口存在，并且 `release.json` 对应当前 `RELEASE_SHA`。有限重试用于等待服务启动和部署传播，超过次数后 Job 直接失败，不使用 `continue-on-error` 隐藏结果。
+
+最终 `deploy` Job 形成一条连续发布链：
+
+```text
+等待同一 RELEASE_SHA 的两份产物
+→ 使用官方 Action 更新 API 镜像
+→ 上传前端 Artifact
+→ 从公网验证 API、页面和版本
+```
+
+后端与前端不是原子部署。如果前端上传或冒烟检查失败，Workflow 会保留准确的失败位置，但不会自动回滚已经就绪的后端 Revision；只有最后一个 Step 通过，当前 CD Run 才能视为完整发布。
+
+#### 11.5 执行首次完整 CI/CD 发布
+
+配置完成后，按以下路径执行首次真实发布：
+
+```text
+feature/v3-runtime-cicd
+→ develop
+→ develop 向 main 发起发布 PR
+→ main CI
+→ CD
+```
+
+##### 提交发布 Workflow
+
+先确认当前位于 `feature/v3-runtime-cicd`：
+
+```bash
+git branch --show-current
+git status --short
+```
+
+命令按代码块依次执行；每一块成功且结果符合预期后，再执行下一块。
+
+只提交 `.github/workflows` 中已经完成的 CI/CD 修改，不包含仍在整理的笔记和其他本地文件：
+
+```bash
+git add -A -- .github/workflows
+git status --short -- .github/workflows
+```
+
+暂存结果必须只有本节的三个 Workflow 变化：
+
+```text
+D  .github/workflows/azure-static-web-apps-black-coast-04ba93800.yml
+A  .github/workflows/cd.yml
+M  .github/workflows/ci.yml
+```
+
+确认状态正确后再提交；`commit` 失败时，`push` 不会继续：
+
+```bash
+git commit -m "ci: add gated production deployment" &&
+git push origin feature/v3-runtime-cicd
+```
+
+功能分支 Push 只执行 CI。确认 `Backend Build & Tests`、`Frontend Build & Tests` 和 `E2E Tests` 全部通过；此时还不会部署生产环境。
+
+##### 合并到 develop 并创建发布 PR
+
+切换分支前，如果工作区仍有未提交的笔记或其他本地修改，先临时保存：
+
+```bash
+git stash push --include-untracked \
+  -m "step73-pending-docs-and-local-work" &&
+git rev-parse 'stash@{0}' &&
+git status --short
+```
+
+记录 `git rev-parse` 输出的完整 Stash Commit SHA，后面用 `<STASH_COMMIT>` 表示。此时 `git status --short` 应无输出；如果仍有未提交文件，先停止并检查，不切换分支。
+
+然后把最新 `main` 和功能分支依次汇入 `develop`。任一步失败，后续命令都不会继续：
+
+```bash
+git fetch origin &&
+git switch develop &&
+git pull --ff-only origin develop &&
+git merge --no-ff origin/main -m "merge: sync main into develop" &&
+git merge --no-ff feature/v3-runtime-cicd \
+  -m "merge: add Step 73 deployment workflow" &&
+git push origin develop
+```
+
+等待 `develop` 的 CI 通过，再在 GitHub 创建发布 PR：
+
+```text
+base: main
+compare: develop
+title: Release Step 73 CI/CD implementation
+```
+
+PR 会执行四项门禁检查：
+
+```text
+Validate Release Source      Success
+Backend Build & Tests        Success
+Frontend Build & Tests       Success
+E2E Tests                    Success
+```
+
+如果 `Validate Release Source` 尚未出现在 Ruleset 的 Required Status Checks 中，等本次 PR 生成检查记录后把它补入，再返回 PR。四项检查全部通过后，使用 `Create a merge commit` 合并；不要删除长期使用的 `develop`，也暂时保留功能分支。
+
+##### 验证 main 自动发布
+
+PR 合并会触发 `main` 的 CI。确认三个测试 Job 全部通过后，CD 应自动开始，并按以下关系执行：
+
+```text
+Build Frontend Artifact ─┐
+                         ├→ Deploy Production
+Build Backend Image  ────┘
+```
+
+前两个 Job 为同一个 `RELEASE_SHA` 生成前端 Artifact 和后端镜像；`Deploy Production` 更新后端、上传前端，并执行生产冒烟检查。三个 Job 全部显示 Success，才说明当前代码已经走完完整 CI/CD 流程。
+
+`develop → main` 的发布 PR #1 通过全部必需检查，并以 Merge Commit `f22fb84` 合并到 `main`。随后 `main` CI、两项构建 Job 和 `Deploy Production` 全部成功。
+
+#### 11.6 验证生产环境与 Google 登录
+
+CD 自动冒烟已经验证 API、前端首页和 `release.json`。再从浏览器确认完整用户路径：
+
+- 页面能完成加载，不停留在空白页或全局错误页。
+- 车辆查询请求发送到 `.env.production` 指定的生产 API，返回预期 JSON。
+- 浏览器没有阻止跨域请求；列表显示真实数据，或正确显示没有车辆的状态。
+- 直接访问并刷新 `/login` 等前端路由，仍能打开页面，确认 dist 中的 Static Web Apps 路由配置生效。
+- Google 登录按钮正常加载，新 Google 账号可建立 UUcars 会话。
+- 同一 Google 账号重复登录使用原有 User，不会生成重复用户。
+
+##### 配置并验证 Google 生产登录
+
+生产登录必须让浏览器与 API 使用同一个 Google OAuth Web Client ID：
+
+| 配置位置 | 配置项 | 值 |
+| --- | --- | --- |
+| Google Auth Platform | Authorised JavaScript origins | `https://black-coast-04ba93800.7.azurestaticapps.net` |
+| `uucars-web/.env.production` | `VITE_GOOGLE_CLIENT_ID` | Google OAuth Web Client ID |
+| Azure Container Apps | `GoogleAuth__ClientId` | 同一个 Google OAuth Web Client ID |
+
+`Authorised JavaScript origins` 只填写完整 Origin，不附加 `/login` 等路径。前端 Client ID 会进入浏览器 Bundle；后端使用同一个 Client ID 验证 Google ID Token 的 Audience。
+
+在 Azure Cloud Shell 中写入 Container App 运行时变量：
+
+```bash
+az containerapp update \
+  --name uucars-api \
+  --resource-group uucars-rg \
+  --set-env-vars "GoogleAuth__ClientId=<google-client-id>" \
+  --output none
+```
+
+只查询变量名称，避免在终端或笔记中再次输出值：
+
+```bash
+az containerapp show \
+  --name uucars-api \
+  --resource-group uucars-rg \
+  --query "properties.template.containers[0].env[?name=='GoogleAuth__ClientId'].name" \
+  --output tsv
+```
+
+输出应为：
+
+```text
+GoogleAuth__ClientId
+```
+
+配置生效后，使用未列入 Google Auth Platform Test users 的新 Google 账号完成实际登录。Azure SQL `Users` 中出现一条新记录，其 `PasswordHash = NULL`、`EmailConfirmed = 1`；同一账号再次登录后没有新增重复 User。该结果符合 Google 对 Sign in with Google 及基础身份 Scope 的 Testing 例外，但不适用于其他敏感或受限 Scope。[Google Auth Platform Audience 规则](https://support.google.com/cloud/answer/15549945)
+
+Azure Static Web Apps 的默认 HTTPS Origin 已加入当前 Web Client，因此本次登录不需要购买自定义域名。当前流程也不请求敏感或受限 Scope，不需要为这些 Scope 提交 OAuth 验证。[Google Web Client Origin 配置](https://developers.google.com/identity/gsi/web/guides/get-google-api-clientid)
+
+记录本次发布的最小证据：
+
+| 记录项 | 来源 |
+| --- | --- |
+| 发布 PR 与 main Commit SHA | PR 合并记录 |
+| main CI 与 CD Run | GitHub Actions |
+| 后端 Image Digest | `Build Backend Image` 输出 |
+| 前端 Commit | 线上 `release.json` |
+| 生产验证结果 | 冒烟日志和浏览器检查 |
+| Google 生产登录 | Authorised Origin、Container App 变量名、新用户记录与重复登录结果 |
+
+##### 恢复首次发布后的工作区
+
+发布成功后，把 `main` 的 Merge Commit 同步回 `develop`，再更新保留的功能分支：
+
+```bash
+git fetch origin
+
+git switch main &&
+git pull --ff-only origin main
+
+git switch develop &&
+git merge --ff-only main
+git push origin develop
+
+git switch feature/v3-runtime-cicd &&
+git merge --ff-only develop
+```
+
+同步后 `main`、`develop` 和保留的功能分支都到达 `f22fb84`。先快进本地 `main`，再从本地 `main` 快进 `develop`，可以明确核对每个分支的位置，并避免为同一次发布创建冗余 Merge Commit。
+
+如果第 11.5 节保存过 Stash，使用记录的准确 Commit SHA 恢复它：
+
+```bash
+git stash apply <STASH_COMMIT>
+git status --short
+```
+
+`git stash apply` 不会删除 Stash 备份。如果恢复时出现冲突，应先停止并处理冲突。确认笔记和其他本地修改完整恢复后，保留当前功能分支，不在本节执行清理操作。
+
+---
+
+### 12. 完成文档与发布收尾
+
+第 11 小节已经验证了从 `main` 到 Azure 的完整发布链路。本节不再引入新的架构或功能，只把工作区、文档、验证结果和长期分支整理到一致状态，为 Step 73 正式收尾。
+
+#### 12.1 核查剩余变更并同步文档
+
+先留在 `feature/v3-runtime-cicd`，确认首次生产发布后剩余的修改都属于 Step 73。这里重点检查 Workflow、环境变量示例、忽略规则和文档，不应再出现业务功能、数据库结构或真实 Secret 的改动。
+
+```bash
+git branch --show-current
+git status -sb
+```
+
+确认：
+
+- 当前位于 `feature/v3-runtime-cicd`。
+- 修改仅属于 Step 73，没有混入业务功能或数据库变更。
+- Workflow、环境变量示例和忽略规则与最终部署一致。
+- Playwright 生成文件已移除并加入忽略规则。
+- 仓库中没有真实 Secret。
+- `docs/steps_v3.md`、`docs/v3_完整纲要.md`、`README.md` 和 `AGENTS.md` 已同步。
+
+边界确认无误后，再对仓库最终状态执行一次完整验证。
+
+#### 12.2 执行最终本地验证
+
+本节虽然以文档和配置整理为主，但最终提交仍会影响 CI/CD，因此在提交前统一重跑后端、前端和 Compose 配置检查：
+
+```bash
+dotnet restore UUcars.sln
+dotnet build UUcars.sln --no-restore
+dotnet test UUcars.sln --no-build
+
+cd uucars-web
+npm ci
+npm run lint
+npm test -- --run
+npm run build
+cd ..
+
+docker compose config --quiet
+```
+
+任一命令失败都应先修正再继续，避免把已知问题带入最终发布。
+
+#### 12.3 提交收尾修改
+
+确认剩余修改都属于 Step 73 后，使用一个收尾提交即可，不需要再按文档、配置和清理工作拆分多个提交。
+
+```bash
+git add -A
+git diff --cached --check
+git commit -m "chore: complete Step 73 delivery setup"
+git push origin feature/v3-runtime-cicd
+```
+
+等待该分支的 Backend、Frontend 和 E2E Jobs 全部通过，再进入长期分支合并。
+
+#### 12.4 发布最终收尾提交
+
+将已验证的功能分支合并到 `develop`，随后沿用第 11 小节建立的发布门禁完成 `develop → main` PR：
+
+```bash
+git switch develop
+git pull --ff-only origin develop
+git merge --no-ff feature/v3-runtime-cicd -m "merge: complete Step 73"
+git push origin develop
+```
+
+`develop` CI 通过后，创建 `develop → main` PR。Required Checks 全部通过后使用 Merge Commit 合并，并确认 `main` 的 CI/CD 成功。
+
+生产环境最终检查：
+
+- 页面、路由刷新和 API 请求正常。
+- 密码登录和 Google 登录正常。
+- Google 重复登录不会创建重复用户。
+- SignalR 实时通知正常。
+- 图片、邮件、Redis 和数据库基础功能正常。
+- 线上版本对应本次发布提交。
+
+#### 12.5 同步长期分支并清理
+
+最终发布成功后，只需让 `develop` 快进到新的 `main`，再删除已经完成的功能分支。这样两个长期分支保持一致，也不会保留无用的临时工作。
+
+```bash
+git fetch origin
+git merge --ff-only origin/main
+git push origin develop
+git branch -d feature/v3-runtime-cicd
+git push origin --delete feature/v3-runtime-cicd
+git status -sb
+```
+
+如果仍保留本步骤创建的临时 Stash，只在确认其中内容已经进入提交后删除；没有 Stash 就直接跳过。
+
+### Step 73 完成检查
+
+```text
+□ 后端、Docker 和 GitHub Actions 的 .NET 运行时版本已统一
+□ 本地配置来源与 API 启动流程已整理并验证
+□ 后端构建、单元测试和集成测试全部通过
+□ 前端 TypeScript、ESLint、组件测试和生产构建全部通过
+□ Playwright 核心业务流程在本地和 CI 中全部通过
+□ Docker 镜像能够构建，Compose 后端环境能够正常启动和响应
+□ GitHub Actions 的 Backend、Frontend 和 E2E Jobs 全部正常运行
+□ main 发布门禁、前后端同提交产物和 Azure 自动部署均已验证
+□ 生产环境页面、API、Google 登录、SignalR 及外部服务运行正常
+□ Step 73 配置和文档已同步，长期分支与临时工作已完成清理
 ```
 
 ## fixed Issues 

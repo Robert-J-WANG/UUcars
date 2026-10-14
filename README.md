@@ -1,22 +1,10 @@
 # UUcars Marketplace
 
-UUcars is a personal full-stack portfolio project that models a C2C used-car marketplace. It began as a layered ASP.NET Core API, grew into a deployed React application, and now includes production-oriented capabilities such as Redis caching, rate limiting, background jobs, refresh-token rotation, Google OpenID Connect sign-in, optimistic concurrency, automated testing, real-time notifications and an Admin analytics dashboard.
-
-The repository is organised as a progressive learning project. The detailed development notes preserve that history; the current code, EF Core migrations, configuration and tests define the implemented system.
+UUcars is an independently designed and developed full-stack portfolio project that models a C2C used-car marketplace. It combines an ASP.NET Core API, a React frontend and an Azure production deployment with authentication, vehicle moderation, transactions, notifications, background processing, caching and automated testing.
 
 ## Current status
 
-The application currently implements V1, V2 and V3 through **Step 72**.
-
-| Version | Scope | Status |
-|---|---|---|
-| V1 | Core API, authentication, vehicles, favourites, orders, Admin, tests and Docker | Complete — `v1.0` |
-| V2 | Email workflows, R2 images, reviews, React frontend and Azure deployment | Complete — `v2.0` |
-| V2.1 | UI design system, responsive layout and vehicle cover images | Complete — `v2.1` |
-| V3.1 | Query optimisation, Redis, rate limiting, Hangfire, refresh tokens, concurrency and security | Complete — `v3.1` |
-| V3.2 | Image workflow, autosave, optimistic favourites, search improvements and frontend testing | Complete — `v3.2` |
-| V3 Step 70–72 | Persistent SignalR notifications, Admin analytics dashboard and Google OIDC sign-in | Complete |
-| V3 Step 73–75 | Delivery optimisation, Web Vitals and project close-out | Roadmap |
+The latest tagged release is **V3.2**. Current development adds persistent SignalR notifications, Admin analytics, Google sign-in, .NET 10, full CI validation and a gated Azure production deployment. Final V3 performance and release work remains in progress.
 
 ## What the application supports
 
@@ -111,7 +99,7 @@ HTTP request
 
 | Area | Technologies |
 |---|---|
-| Backend | ASP.NET Core 9, C#, Entity Framework Core 9, SQL Server |
+| Backend | ASP.NET Core 10, C#, Entity Framework Core 10, SQL Server |
 | Authentication | JWT Bearer authentication, refresh-token rotation, Google OpenID Connect, ASP.NET Core PasswordHasher |
 | Frontend | React 19, TypeScript 6, Vite 8, React Router 7 |
 | UI | Tailwind CSS 4, shadcn/ui, Radix UI, Lucide React, Embla Carousel, Recharts |
@@ -142,7 +130,7 @@ UUcars/
 ├── uucars-web/                 React application
 │   ├── src/
 │   └── e2e/
-├── docs/                       Development notes and version outlines
+├── docs/                       Technical and project documentation
 ├── .github/workflows/          CI/CD workflows
 ├── Dockerfile
 ├── docker-compose.yml
@@ -179,6 +167,8 @@ Important constraints include:
 
 EF Core migrations and `AppDbContextModelSnapshot` are the authoritative database definition.
 
+See [docs/database-schema.md](docs/database-schema.md) for the complete schema reference.
+
 ## Core API routes
 
 The API uses a common `ApiResponse<T>` envelope. The principal routes are:
@@ -206,8 +196,8 @@ http://localhost:5065/scalar/v1
 
 ### Prerequisites
 
-- .NET 9 SDK
-- Node.js `^20.19.0` or `>=22.12.0`
+- .NET 10 SDK
+- Node.js 24
 - Docker Desktop or another Docker-compatible runtime
 - A Google OAuth 2.0 Web client ID for real Google sign-in
 - Cloudflare R2 credentials for real image operations
@@ -286,7 +276,7 @@ dotnet restore
 dotnet run --project UUcars.API
 ```
 
-The API starts at `http://localhost:5065`. In the current learning-project setup, pending EF Core migrations are applied automatically during API startup.
+The API starts at `http://localhost:5065`. In Development, pending EF Core migrations are applied automatically during API startup.
 
 ### 5. Run the frontend
 
@@ -349,7 +339,7 @@ npm run e2e
 
 Five Playwright journeys cover registration, seller listing submission, Admin approval, buyer ordering and seller order viewing.
 
-The GitHub Actions E2E job currently preserves the intended staging-test structure but deliberately skips the real Playwright command until a dedicated staging environment is available.
+The GitHub Actions CI workflow runs the real Playwright suite with temporary SQL Server, Redis, API and frontend services on a GitHub Runner. It runs alongside the backend and frontend checks and does not require a dedicated Azure staging deployment.
 
 ## Production delivery
 
@@ -364,38 +354,14 @@ The implemented production architecture uses:
 - Cloudflare R2 for vehicle images
 - Resend for transactional email
 
-The backend workflow runs unit tests on branch pushes. On `main`, it builds and publishes the Docker image and deploys the API to Azure Container Apps. The frontend workflow builds and deploys the React application to Azure Static Web Apps.
+The current CI configuration runs backend build and tests, frontend lint, tests and build, and the real Playwright E2E suite. It is configured for branch pushes and pull requests targeting `develop` or `main`.
+
+After a successful `main` CI run, the CD workflow builds both release artefacts from the same commit, publishes the API image to GHCR by immutable digest, deploys it to Azure Container Apps, uploads the pre-built frontend to Azure Static Web Apps, and performs public read-only smoke checks. Production releases are merged through a `develop` to `main` pull request after the release-source, backend, frontend and E2E checks pass.
+
+Production Google sign-in uses the same public OAuth client ID in two places: Vite reads `VITE_GOOGLE_CLIENT_ID` from `uucars-web/.env.production`, while Azure Container Apps provides `GoogleAuth__ClientId` to the API for ID-token audience validation. The Static Web Apps origin must also be registered as an authorised JavaScript origin in the Google OAuth client. No Google client secret is used by this sign-in flow.
 
 Production secrets are supplied through GitHub or Azure configuration and are not intended to be committed to the repository.
 
-## Documentation
-
-### Final development outlines
-
-- [V1 complete development outline](docs/v1_完整纲要.md)
-- [V2 complete development outline](docs/v2_完整纲要.md)
-- [V3 complete development outline](docs/v3_完整纲要.md)
-
-### Database
-
-- [Current database schema](docs/database-schema.md)
-
-### Historical development notes
-
-- [V1 step-by-step notes](docs/steps_v1.md)
-- [V2 step-by-step notes](docs/steps_v2.md)
-- [V3 step-by-step notes](docs/steps_v3.md)
-
-The step-by-step files preserve the learning process and may include intermediate approaches that were later refined. Use the final outlines for the planned version structure and the current code, migrations, configuration and tests for the implemented system.
-
-The database schema is maintained against the current EF Core migrations and model snapshot.
-
 ## Roadmap
 
-The remaining V3 outline covers:
-
-- CI/CD hardening
-- Bundle analysis and Web Vitals
-- Final documentation, release and portfolio presentation
-
-These items are planned and are not presented as completed functionality.
+Remaining V3 work focuses on measured frontend performance improvements, final documentation review and release acceptance.
