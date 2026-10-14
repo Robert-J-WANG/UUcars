@@ -21,6 +21,7 @@ logs/
 # Environment
 .env
 .env.*
+!uucars-web/.env.example
 
 # ASP.NET User Secrets
 secrets.json

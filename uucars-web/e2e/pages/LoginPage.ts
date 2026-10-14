@@ -11,7 +11,10 @@ export class LoginPage {
   async login(email: string, password: string) {
     await this.page.getByLabel("Email").fill(email);
     await this.page.getByLabel("Password").fill(password);
-    await this.page.getByRole("button", { name: /sign in/i }).click();
+    await this.page
+      .locator("form")
+      .getByRole("button", { name: "Sign in", exact: true })
+      .click();
   }
 
   // expectedUrl 默认还是 "/"，普通用户登录不用改调用方式

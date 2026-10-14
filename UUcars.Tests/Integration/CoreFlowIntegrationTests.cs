@@ -1,20 +1,23 @@
 using System.Net;
 using Microsoft.EntityFrameworkCore;
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Entities;
+using UUcars.API.Entities.Enums;
 
 namespace UUcars.Tests.Integration;
 
-// [Collection] 让这个测试类使用共享的 SqlServerTestFactory
-// 同一个 Collection 里的所有测试类共享同一个数据库容器
-// 避免每个测试类都启动一个新容器（启动容器需要几秒钟，非常耗时）
+// 只保留通过 HTTP 验证 API 核心流程的测试步骤和断言。
 [Collection("Integration")]
 public class CoreFlowIntegrationTests : IntegrationTestBase
 {
-    public CoreFlowIntegrationTests(SqlServerTestFactory factory)
+    public CoreFlowIntegrationTests(ApiIntegrationTestFactory factory)
         : base(factory)
     {
     }
 
-    // ===== 用户注册和登录 =====
+    // =========================================================
+    // 本地认证：注册、邮箱验证和密码登录
+    // =========================================================
 
     [Fact]
     public async Task Register_WithValidData_ShouldReturn201()
@@ -68,7 +71,7 @@ public class CoreFlowIntegrationTests : IntegrationTestBase
         }));
 
         // V3 更新：直接从数据库取 Token
-        await using var db = Factory.GetDbContext();
+        await using var db = CreateDbContext();
         var user = await db.Users
             .FirstOrDefaultAsync(u => u.Email == "test@example.com");
         var verifyToken = user!.EmailConfirmationToken;
@@ -88,7 +91,85 @@ public class CoreFlowIntegrationTests : IntegrationTestBase
         Assert.NotEmpty(result!.Data!.Token);
     }
 
-    // ===== 认证保护 =====
+    // =========================================================
+    // Google 认证：Google 身份映射为 UUcars 会话
+    // =========================================================
+
+    [Fact]
+    public async Task GoogleLogin_WithValidToken_ShouldCreateSession()
+    {
+        // FakeGoogleIdTokenService 为普通测试 Token 返回固定、已验证的 Google Payload。
+        var response = await Client.PostAsync(
+            "/auth/google",
+            JsonContent(new
+            {
+                idToken = "valid-google-token"
+            }));
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        // 响应 Body 返回 UUcars Access Token。
+        var result =
+            await DeserializeAsync<ApiResponse<LoginData>>(response);
+
+        Assert.NotNull(result?.Data);
+        Assert.NotEmpty(result!.Data!.Token);
+
+        // Refresh Token 只通过 HttpOnly Cookie 返回，不出现在响应 Body。
+        Assert.Contains(
+            response.Headers.GetValues("Set-Cookie"),
+            value => value.StartsWith(
+                "refreshToken=",
+                StringComparison.OrdinalIgnoreCase));
+
+        await using var db = CreateDbContext();
+
+        // 首次 Google 登录应保存一个没有本地密码的 User 和关联记录。
+        var user = await db.Users
+            .Include(item => item.ExternalLogins)
+            .SingleAsync(item =>
+                item.Email == "google-user@gmail.com");
+
+        Assert.Null(user.PasswordHash);
+        Assert.True(user.EmailConfirmed);
+
+        var externalLogin = Assert.Single(user.ExternalLogins);
+        Assert.Equal("Google", externalLogin.Provider);
+        Assert.Equal("fake-google-subject", externalLogin.ProviderSubject);
+
+        // 返回的 Access Token 可以访问现有的受保护接口。
+        SetBearerToken(result.Data.Token);
+
+        var currentUserResponse =
+            await Client.GetAsync("/users/me");
+
+        Assert.Equal(HttpStatusCode.OK, currentUserResponse.StatusCode);
+    }
+
+    [Fact]
+    public async Task GoogleLogin_WithInvalidToken_ShouldReturn401()
+    {
+        // FakeGoogleIdTokenService 对该固定值模拟 Google 验证失败。
+        var response = await Client.PostAsync(
+            "/auth/google",
+            JsonContent(new
+            {
+                idToken = "invalid-google-token"
+            }));
+
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+
+        await using var db = CreateDbContext();
+
+        // 验证失败时，不应创建 User、ExternalLogin 或登录会话。
+        Assert.False(await db.Users.AnyAsync(item =>
+            item.Email == "google-user@gmail.com"));
+        Assert.False(await db.ExternalLogins.AnyAsync());
+    }
+
+    // =========================================================
+    // 认证保护：受保护接口必须要求有效 UUcars Access Token
+    // =========================================================
 
     [Fact]
     public async Task GetMe_WithoutToken_ShouldReturn401()
@@ -112,7 +193,9 @@ public class CoreFlowIntegrationTests : IntegrationTestBase
         Assert.Equal("test@example.com", result?.Data?.Email);
     }
 
-    // ===== 核心业务链路 =====
+    // =========================================================
+    // 核心业务链路：发布车辆、审核、下单和取消订单
+    // =========================================================
 
     [Fact]
     public async Task FullFlow_RegisterLoginCreateCarSubmit_ShouldWork()
@@ -181,7 +264,7 @@ public class CoreFlowIntegrationTests : IntegrationTestBase
         await Client.PostAsync($"/cars/{car!.Id}/submit", null);
 
         // Step 2：Admin 登录并审核通过
-        // Admin 账号在 InitializeDatabaseAsync 里已经插入了
+        // Admin 测试账号由 IntegrationTestBase 在测试开始前准备。
         var adminLoginResponse = await Client.PostAsync("/auth/login", JsonContent(new
         {
             email = "admin@uucars.com",
@@ -242,6 +325,283 @@ public class CoreFlowIntegrationTests : IntegrationTestBase
 
         var response = await Client.GetAsync("/admin/cars/pending");
 
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+    }
+
+    // =========================================================
+    // Admin Dashboard：平台统计和角色授权
+    // =========================================================
+
+    [Fact]
+    public async Task GetAdminStats_AsAdmin_ShouldReturnCorrectStatistics()
+    {
+        // Arrange
+        var nowUtc = DateTime.UtcNow;
+        var todayUtc = nowUtc.Date;
+
+        var startOfMonth = new DateTime(
+            nowUtc.Year,
+            nowUtc.Month,
+            1,
+            0, 0, 0,
+            DateTimeKind.Utc);
+
+        var startOfNextMonth = startOfMonth.AddMonths(1);
+
+        await using var db = CreateDbContext();
+
+        var seller = new User
+        {
+            Username = "stats-seller",
+            Email = "stats-seller@example.com",
+            PasswordHash = "test-hash",
+            Role = UserRole.User,
+            EmailConfirmed = true,
+            CreatedAt = nowUtc,
+            UpdatedAt = nowUtc
+        };
+
+        var buyer = new User
+        {
+            Username = "stats-buyer",
+            Email = "stats-buyer@example.com",
+            PasswordHash = "test-hash",
+            Role = UserRole.User,
+            EmailConfirmed = true,
+            CreatedAt = nowUtc,
+            UpdatedAt = nowUtc
+        };
+
+        db.Users.AddRange(seller, buyer);
+        await db.SaveChangesAsync();
+
+        // Published + Sold 共 11 个品牌。
+        // Toyota 有 3 辆，其余品牌各 1 辆。
+        // Top 10 排序后，ZzzTestBrand 应被排除。
+        var marketCarDefinitions = new (string Brand, CarStatus Status)[]
+        {
+            ("Toyota", CarStatus.Published),
+            ("Toyota", CarStatus.Published),
+            ("Toyota", CarStatus.Sold),
+            ("Mazda", CarStatus.Published),
+            ("Honda", CarStatus.Published),
+            ("Ford", CarStatus.Published),
+            ("BMW", CarStatus.Published),
+            ("Audi", CarStatus.Published),
+            ("Nissan", CarStatus.Published),
+            ("Hyundai", CarStatus.Published),
+            ("Kia", CarStatus.Published),
+            ("Suzuki", CarStatus.Published),
+            ("ZzzTestBrand", CarStatus.Published)
+        };
+
+        var marketCars = marketCarDefinitions
+            .Select((item, index) => new Car
+            {
+                Title = $"{item.Brand} test car {index + 1}",
+                Brand = item.Brand,
+                Model = "Test Model",
+                Year = 2020,
+                Price = 10000m,
+                Mileage = 50000,
+                SellerId = seller.Id,
+                Status = item.Status,
+                CreatedAt = nowUtc,
+                UpdatedAt = nowUtc
+            })
+            .ToList();
+
+        var pendingCar = new Car
+        {
+            Title = "Pending test car",
+            Brand = "PendingBrand",
+            Model = "Test Model",
+            Year = 2020,
+            Price = 10000m,
+            Mileage = 50000,
+            SellerId = seller.Id,
+            Status = CarStatus.PendingReview,
+            CreatedAt = nowUtc,
+            UpdatedAt = nowUtc
+        };
+
+        var draftCar = new Car
+        {
+            Title = "Draft test car",
+            Brand = "DraftBrand",
+            Model = "Test Model",
+            Year = 2020,
+            Price = 10000m,
+            Mileage = 50000,
+            SellerId = seller.Id,
+            Status = CarStatus.Draft,
+            CreatedAt = nowUtc,
+            UpdatedAt = nowUtc
+        };
+
+        var deletedCar = new Car
+        {
+            Title = "Deleted test car",
+            Brand = "DeletedBrand",
+            Model = "Test Model",
+            Year = 2020,
+            Price = 10000m,
+            Mileage = 50000,
+            SellerId = seller.Id,
+            Status = CarStatus.Deleted,
+            CreatedAt = nowUtc,
+            UpdatedAt = nowUtc
+        };
+
+        db.Cars.AddRange(marketCars);
+        db.Cars.AddRange(pendingCar, draftCar, deletedCar);
+        await db.SaveChangesAsync();
+
+        var soldCar = marketCars.Single(car => car.Status == CarStatus.Sold);
+
+        db.Orders.AddRange(
+            // 本月第一刻创建：计入 monthlyOrders。
+            // 本月完成：计入 monthlyRevenue。
+            new Order
+            {
+                CarId = soldCar.Id,
+                BuyerId = buyer.Id,
+                SellerId = seller.Id,
+                Price = 10000m,
+                Status = OrderStatus.Completed,
+                CreatedAt = startOfMonth,
+                UpdatedAt = nowUtc
+            },
+
+            // Pending 订单计入 monthlyOrders，
+            // 但不计入 monthlyRevenue。
+            new Order
+            {
+                CarId = soldCar.Id,
+                BuyerId = buyer.Id,
+                SellerId = seller.Id,
+                Price = 5000m,
+                Status = OrderStatus.Pending,
+                CreatedAt = startOfMonth,
+                UpdatedAt = nowUtc
+            },
+
+            // 上月创建，不计入 monthlyOrders；
+            // 本月完成，所以计入 monthlyRevenue。
+            new Order
+            {
+                CarId = soldCar.Id,
+                BuyerId = buyer.Id,
+                SellerId = seller.Id,
+                Price = 20000m,
+                Status = OrderStatus.Completed,
+                CreatedAt = startOfMonth.AddTicks(-1),
+                UpdatedAt = nowUtc
+            },
+
+            // 下月第一刻创建并完成，
+            // 不进入当前月份的订单量和成交额。
+            new Order
+            {
+                CarId = soldCar.Id,
+                BuyerId = buyer.Id,
+                SellerId = seller.Id,
+                Price = 40000m,
+                Status = OrderStatus.Completed,
+                CreatedAt = startOfNextMonth,
+                UpdatedAt = startOfNextMonth
+            });
+
+        await db.SaveChangesAsync();
+
+        // 使用测试数据库中已经存在的 Admin 登录
+        var loginResponse = await Client.PostAsync(
+            "/auth/login",
+            JsonContent(new
+            {
+                email = "admin@uucars.com",
+                password = "Admin@123456"
+            }));
+
+        var adminToken =
+            (await DeserializeAsync<ApiResponse<LoginData>>(loginResponse))
+            ?.Data?.Token;
+
+        SetBearerToken(adminToken!);
+
+        // Act
+        var response = await Client.GetAsync("/admin/stats");
+
+        // Assert
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var result =
+            await DeserializeAsync<ApiResponse<AdminStatsResponse>>(response);
+
+        Assert.NotNull(result);
+        Assert.True(result.Success);
+        Assert.NotNull(result.Data);
+
+        var stats = result.Data;
+
+        // 13 辆 Published/Sold + Pending + Draft；
+        // Deleted 不计入 totalCars。
+        Assert.Equal(15, stats.TotalCars);
+        Assert.Equal(1, stats.PendingCars);
+        Assert.Equal(12, stats.PublishedCars);
+
+        // 测试数据库保留 1 个 Admin，再加入 seller 和 buyer。
+        Assert.Equal(3, stats.TotalUsers);
+
+        // 当前月创建了 2 个订单；
+        // 当前月完成金额为 10000 + 20000。
+        Assert.Equal(2, stats.MonthlyOrders);
+        Assert.Equal(30000m, stats.MonthlyRevenue);
+
+        // Service 应返回连续的最近 30 个 UTC 日期。
+        Assert.Equal(30, stats.DailyNewCars.Count);
+        Assert.Equal(30, stats.DailyRevenue.Count);
+        Assert.Equal(
+            DateOnly.FromDateTime(todayUtc.AddDays(-29)),
+            stats.DailyNewCars[0].Date);
+        Assert.Equal(
+            DateOnly.FromDateTime(todayUtc),
+            stats.DailyNewCars[^1].Date);
+
+        // 所有 16 辆车都在今天创建。
+        // dailyNewCars 记录创建事件，因此 Deleted 也包含在内。
+        Assert.Equal(
+            16,
+            stats.DailyNewCars.Single(item => item.Date == DateOnly.FromDateTime(todayUtc)).Count);
+
+        // 两个 Completed 订单在今天完成。
+        Assert.Equal(
+            30000m,
+            stats.DailyRevenue.Single(item => item.Date == DateOnly.FromDateTime(todayUtc)).Revenue);
+
+        // 品牌只返回前 10。
+        Assert.Equal(10, stats.BrandDistribution.Count);
+        Assert.Equal("Toyota", stats.BrandDistribution[0].Brand);
+        Assert.Equal(3, stats.BrandDistribution[0].Count);
+        Assert.DoesNotContain(
+            stats.BrandDistribution,
+            item => item.Brand == "ZzzTestBrand");
+    }
+
+    [Fact]
+    public async Task GetAdminStats_WithNonAdminToken_ShouldReturn403()
+    {
+        // Arrange
+        var userToken = await RegisterAndLoginAsync(
+            "stats-user@example.com",
+            "stats-user");
+
+        SetBearerToken(userToken);
+
+        // Act
+        var response = await Client.GetAsync("/admin/stats");
+
+        // Assert
         Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
     }
 }

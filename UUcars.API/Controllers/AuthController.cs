@@ -1,10 +1,13 @@
+using Google.Apis.Auth;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
+using UUcars.API.Configurations;
 using UUcars.API.DTOs;
 using UUcars.API.DTOs.Requests;
 using UUcars.API.DTOs.Responses;
 using UUcars.API.Extensions;
 using UUcars.API.Services;
+using UUcars.API.Services.ExternalLogin;
 
 namespace UUcars.API.Controllers;
 
@@ -19,12 +22,19 @@ public class AuthController : ControllerBase
     // ✅ 新增： 用于判断当前运行环境是Development、Staging 还是 Production
     private readonly IWebHostEnvironment _environment;
 
-    public AuthController(UserService userService, RefreshTokenService refreshTokenService,
-        IWebHostEnvironment environment)
+    private readonly ExternalLoginService _externalLoginService;
+
+    public AuthController(
+        UserService userService,
+        RefreshTokenService refreshTokenService,
+        IWebHostEnvironment environment,
+        ExternalLoginService externalLoginService
+    )
     {
         _userService = userService;
         _refreshTokenService = refreshTokenService;
         _environment = environment;
+        _externalLoginService = externalLoginService;
     }
 
     [HttpPost("register")]
@@ -47,9 +57,11 @@ public class AuthController : ControllerBase
                 "Registration successful. Please check your email to verify your account."));
     }
 
+    /// <summary>
+    /// 使用邮箱和站内密码登录。
+    /// </summary>
     [HttpPost("login")]
-    // 使用限流
-    // ✅ 登录：每IP每分钟10次
+    // 与 Google 登录共用按 IP 限流的策略
     [EnableRateLimiting(RateLimitPolicies.Login)]
     public async Task<IActionResult> Login(
         [FromBody] LoginRequest request,
@@ -57,13 +69,7 @@ public class AuthController : ControllerBase
     {
         var result = await _userService.LoginAsync(request.Email, request.Password, cancellationToken);
 
-        // ✅ 新增：生成 RefreshToken 并写入 HttpOnly Cookie
-
-        var refreshToken = await _refreshTokenService.CreateRefreshTokenAsync(result.User.Id, cancellationToken);
-        SetRefreshTokenCookie(refreshToken.Token, refreshToken.ExpiresAt);
-
-        // 登录成功返回 200 OK（不是 201，登录不是"创建资源"）
-        return Ok(ApiResponse<LoginResponse>.Ok(result, "Login successful."));
+        return await CompleteLoginAsync(result, "Login successful.", cancellationToken);
     }
 
     // GET /auth/verify-email?token=xxx
@@ -108,8 +114,7 @@ public class AuthController : ControllerBase
     {
         await _userService.ForgotPasswordAsync(request.Email, cancellationToken);
 
-        // 无论用户是否存在、邮箱是否已验证，始终返回相同的成功响应
-        // 保持和 ResendVerification 一致的安全设计
+        // 即使账号不存在、邮箱未验证或没有站内密码，也返回相同提示
         return Ok(ApiResponse<object>.Ok(null!,
             "If this email is registered, a password reset link has been sent."));
     }
@@ -182,14 +187,14 @@ public class AuthController : ControllerBase
 
 
     // GET /auth/test-verification-token?email=xxx
-// ⚠️ 仅开发环境：供 E2E 测试绕过邮件验证
-// 非开发环境返回 404，和接口不存在完全一样
+    // 仅本地 Development 和 E2E 环境可用，供 E2E 测试绕过真实邮件投递。
     [HttpGet("test-verification-token")]
     public async Task<IActionResult> GetTestVerificationToken(
         [FromQuery] string email,
         CancellationToken cancellationToken)
     {
-        if (!_environment.IsDevelopment())
+        if (!_environment.IsDevelopment() &&
+            !_environment.IsEnvironment(AppEnvironments.E2E))
             return NotFound();
 
         var token = await _userService.GetEmailConfirmationTokenAsync(
@@ -201,10 +206,24 @@ public class AuthController : ControllerBase
         return Ok(new { token });
     }
 
+    /// <summary>
+    /// 使用 Google 身份登录 UUcars，并设置 Refresh Token Cookie。
+    /// </summary>
+    [HttpPost("google")]
+    [EnableRateLimiting(RateLimitPolicies.Login)]
+    public async Task<IActionResult> GoogleLogin(
+        [FromBody] GoogleLoginRequest request, CancellationToken cancellationToken)
+    {
+        // Service 负责验证 Google Token、处理站内账号并生成 Access Token
+        var result = await _externalLoginService.LoginAsync(request.IdToken, cancellationToken);
+
+        return await CompleteLoginAsync(result, "Google sign-in successful.", cancellationToken);
+    }
+
 
     /// <summary>
     /// 把 RefreshToken 写入 HttpOnly Cookie
-    /// 提取为私有方法：Login 和 Refresh 都需要调用
+    /// 登录成功和刷新 Token 时共用
     /// </summary>
     private void SetRefreshTokenCookie(string token, DateTime expiresAt)
     {
@@ -212,22 +231,45 @@ public class AuthController : ControllerBase
         {
             HttpOnly = true, // JS 无法读取
             Secure = true, // 只通过 HTTPS 传输
-            SameSite = SameSiteMode.None, // 防 CSRF 通过其他配置
-            Expires = expiresAt, // 和 RefreshToken 过期时间一致
+            SameSite = SameSiteMode.None, // 允许跨站携带 Cookie，需要配合 Secure
+            Expires = expiresAt, // 使用 Refresh Token 的到期时间，不是 Access Token 的
             Path = "/" // 全站发送，避免非/auth路径下无法携带Cookie
         };
 
-        // 开发环境：Secure=false（本地没有 HTTPS）
-        // 通过环境变量判断，避免本地开发时 Cookie 无法设置
-        if (HttpContext.RequestServices
-            .GetRequiredService<IWebHostEnvironment>()
-            .IsDevelopment())
+        // Development 和 E2E 都使用本地 HTTP，因此不能要求 Secure Cookie。
+        if (_environment.IsDevelopment() ||
+            _environment.IsEnvironment(AppEnvironments.E2E))
         {
             cookieOptions.SameSite = SameSiteMode.Strict;
             cookieOptions.Secure = false;
         }
 
-
         Response.Cookies.Append("refreshToken", token, cookieOptions);
+    }
+
+
+    /// <summary>
+    /// 本地和 Google 登录成功后，共用 Refresh Token 创建、Cookie 写入和响应返回逻辑。
+    /// </summary>
+    private async Task<IActionResult> CompleteLoginAsync(
+        LoginResponse result,
+        string message,
+        CancellationToken cancellationToken)
+    {
+        // 为已认证的站内用户创建并保存 Refresh Token
+        var refreshToken =
+            await _refreshTokenService.CreateRefreshTokenAsync(
+                result.User.Id,
+                cancellationToken);
+        // 通过 Cookie 返回 Refresh Token，前端 JavaScript 不能直接读取
+        SetRefreshTokenCookie(
+            refreshToken.Token,
+            refreshToken.ExpiresAt);
+
+        // Body 返回 Access Token 和用户资料，不包含 Refresh Token
+        return Ok(
+            ApiResponse<LoginResponse>.Ok(
+                result,
+                message));
     }
 }

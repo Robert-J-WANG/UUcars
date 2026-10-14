@@ -3,7 +3,7 @@
 # 使用包含 .NET SDK 的镜像来编译项目
 # AS build：给这个阶段命名为 "build"，后面可以引用
 # =============================================
-FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
 
 # 先只复制 .csproj 文件，利用 Docker 的层缓存机制
@@ -30,7 +30,7 @@ RUN dotnet publish UUcars.API/UUcars.API.csproj \
 # 第二阶段：运行
 # 使用更小的 runtime 镜像，只包含运行所需的东西
 # =============================================
-FROM mcr.microsoft.com/dotnet/aspnet:9.0 AS final
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS final
 WORKDIR /app
 
 # 创建日志目录（Serilog 写文件时需要）

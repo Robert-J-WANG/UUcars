@@ -104,7 +104,7 @@ export default function CarDetailPage() {
     onMutate: handleOnMutate(true),
     onSuccess: () => toast.success("Added to favorites!"),
     onError: (error, _vars, context) => handleFavoriteError(error, context),
-    onSettled: () => invalidateFavoriteQueries,
+    onSettled: () => invalidateFavoriteQueries(),
   });
 
   /* ── 取消收藏 mutation ── */
@@ -113,7 +113,7 @@ export default function CarDetailPage() {
     onMutate: handleOnMutate(false),
     onSuccess: () => toast.success("Removed from favorites."),
     onError: (error, _vars, context) => handleFavoriteError(error, context),
-    onSettled: () => invalidateFavoriteQueries,
+    onSettled: () => invalidateFavoriteQueries(),
   });
 
   /* ── 下单 mutation ── */

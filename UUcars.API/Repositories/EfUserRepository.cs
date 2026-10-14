@@ -69,4 +69,17 @@ public class EfUserRepository : IUserRepository
             .FirstOrDefaultAsync(
                 u => u.ResetPasswordToken == token, cancellationToken);
     }
+
+    public async Task<User> AddWithExternalLoginAsync(
+        User user,
+        ExternalLogin externalLogin,
+        CancellationToken cancellationToken = default)
+    {
+        user.ExternalLogins.Add(externalLogin);
+
+        _context.Users.Add(user);
+        await _context.SaveChangesAsync(cancellationToken);
+
+        return user;
+    }
 }

@@ -84,9 +84,16 @@ test.describe("核心用户流程", () => {
       headers: { Authorization: `Bearer ${sellerToken}` },
     });
 
-    // Admin 登录后跳转到 /admin，不是根路径，显式传第三个参数
+    // Admin 登录后进入 Dashboard，再通过真实导航进入待审核页。
     const loginPage = new LoginPage(page);
-    await loginPage.loginAndWait(ADMIN_EMAIL, ADMIN_PASSWORD, "/admin");
+    await loginPage.loginAndWait(
+      ADMIN_EMAIL,
+      ADMIN_PASSWORD,
+      "/admin/dashboard",
+    );
+
+    await page.getByRole("link", { name: /pending review/i }).click();
+    await page.waitForURL("/admin/pending");
 
     // 用 carId 拼出的 data-testid 精确定位到这张卡片，再在里面找 Approve 按钮
     const carCard = page.getByTestId(`pending-car-${carId}`);

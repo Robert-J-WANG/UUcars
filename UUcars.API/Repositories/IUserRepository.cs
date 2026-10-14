@@ -24,4 +24,10 @@ public interface IUserRepository
     // Step 39 新增
     Task<User?> GetByResetPasswordTokenAsync(string token,
         CancellationToken cancellationToken = default);
+
+    // 新 Google 用户需要同时保存
+    Task<User> AddWithExternalLoginAsync(
+        User user,
+        ExternalLogin externalLogin,
+        CancellationToken cancellationToken = default);
 }

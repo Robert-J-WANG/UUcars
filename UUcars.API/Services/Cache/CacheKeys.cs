@@ -27,4 +27,8 @@ public static class CacheKeys
     {
         return $"car:pending:p{page}:s{pageSize}";
     }
+
+    // Admin Dashboard 的完整统计数据。
+    // 此接口没有分页或筛选参数，因此所有 Admin 共用一个固定 Key。
+    public const string AdminStats = "admin:stats";
 }

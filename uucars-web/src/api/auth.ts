@@ -24,6 +24,16 @@ export const authApi = {
     return response.data.data!;
   },
 
+  // 新增Google 登录接口
+  googleLogin: async (idToken: string): Promise<LoginResponse> => {
+    const response = await apiClient.post<ApiResponse<LoginResponse>>(
+      "/auth/google",
+      { idToken },
+    );
+
+    return response.data.data!;
+  },
+
   // 新增logout接口
   logout: async (): Promise<void> => {
     await apiClient.post<ApiResponse<void>>("/auth/logout");

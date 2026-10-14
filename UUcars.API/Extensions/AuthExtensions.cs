@@ -7,22 +7,13 @@ namespace UUcars.API.Extensions;
 
 public static class AuthExtensions
 {
-    // 不能通过 IOptions<JwtSettings> 注入的方法使用jwtSettings配置
-    // 因为AddJwtAuthentication的功能还在注册阶段，不是在运行阶段，无法通过DI创建JwtSettings对象实例
-    /*
-     public static IServiceCollection AddJwtAuthentication(this IServiceCollection services,
-        IOptions<JwtSettings> jwtSettings)
-    {
-        return services;
-    }
-    */
-
-    // 先从配置系统读取 JwtSettings
-    // // 开发环境自动从 User Secrets 读取真实值（Step 03 已配置）
     public static IServiceCollection AddJwtAuthentication(this IServiceCollection services,
-        IConfiguration configuration)
+        IConfigurationSection jwtSection)
     {
-        var jwtSettings = configuration.GetSection("JwtSettings").Get<JwtSettings>()!;
+        // 先从配置系统读取
+        var jwtSettings = jwtSection.Get<JwtSettings>()
+                          ?? throw new InvalidOperationException(
+                              "JwtSettings is not configured.");
         services.AddAuthentication(options =>
             {
                 // DefaultAuthenticateScheme：指定默认用哪种方式来"认证"请求
@@ -73,6 +64,28 @@ public static class AuthExtensions
                     // 不限制算法时，某些 JWT 库实现可能接受这种 Token，完全绕过签名验证
                     // 明确指定后，任何不是 HmacSha256 签名的 Token 都会被直接拒绝
                     ValidAlgorithms = [SecurityAlgorithms.HmacSha256]
+                };
+
+                // ===== 核心新增：配置 JwtBearer 事件响应以兼容 SignalR Query Token =====
+                options.Events = new JwtBearerEvents
+                {
+                    OnMessageReceived = context =>
+                    {
+                        // 1. 从 URL Query 参数中尝试读取 access_token
+                        var accessToken = context.Request.Query["access_token"];
+
+                        // 2. 获取当前请求的路径
+                        var path = context.HttpContext.Request.Path;
+
+                        // 3. 判断：如果有 access_token 且请求路径指向 SignalR Hub
+                        //  匹配具体的 Hub 路径，如 "/chatHub" 或以特定前缀开头的路径）
+                        if (!string.IsNullOrEmpty(accessToken) &&
+                            path.StartsWithSegments("/hubs")) // 💡 根路由路径或根前缀
+                            // 将 Token 赋给上下文，JwtBearer 中间件后续就会拿这个 Token 去做签名和合法性校验
+                            context.Token = accessToken;
+
+                        return Task.CompletedTask;
+                    }
                 };
             });
 

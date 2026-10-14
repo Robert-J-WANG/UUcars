@@ -11434,7 +11434,7 @@ const addFavoriteMutation = useMutation({
     onMutate: handleOnMutate(true),
     onSuccess: () => toast.success("Added to favorites!"),
     onError: (error, _vars, context) => handleFavoriteError(error, context),
-    onSettled: () => invalidateFavoriteQueries,
+    onSettled: () => invalidateFavoriteQueries(),
 });
 
 /* ── 取消收藏 mutation ── */
@@ -11443,7 +11443,7 @@ const removeFavoriteMutation = useMutation({
     onMutate: handleOnMutate(false),
     onSuccess: () => toast.success("Removed from favorites."),
     onError: (error, _vars, context) => handleFavoriteError(error, context),
-    onSettled: () => invalidateFavoriteQueries,
+    onSettled: () => invalidateFavoriteQueries(),
 });
 ```
 
@@ -13678,6 +13678,10895 @@ git checkout develop
 
 
 
+## Step 70 · SignalR 实时通知
+
+### 这一步做什么
+
+目前的 UUcars 有一个体验缺口：
+
+```
+Admin 审核通过了卖家的车 → 卖家不知道，只能自己刷新页面查看
+买家下单了 → 卖家不知道，只能定时去看订单列表
+```
+
+我们的数据通信使用的是HTTP协议，它是**请求-响应模型**：客户端问，服务端答。服务端没有办法主动推送消息给客户端。
+
+有没有办法让服务器主动通知客户端？
+
+这类"有事发生时主动告知"的需求，是实时通信（Real-time Communication）需要解决的问题。简单来说，就是**需要在服务端和客户端之间建立一个持久连接， 服务端可以随时主动向客户端推送消息。**
+
+**实时通信有哪些方案**
+
+历史上有很多方案，主要包括如下3个：
+
+- Polling（轮询）
+
+    ```bash
+    Browser → GET /messages → 没有 → 5秒后再来 → GET /messages → ...
+    ```
+
+    这种方式最简单，但也最浪费资源
+
+- Long Polling（长轮询）
+
+    ```bash
+    Browser → GET /messages → 没有 → 一直等 → 直到返回消息
+    ```
+
+    比普通轮询好
+
+- Server-Sent Events（SSE）
+
+    ```bash
+    Server → Browser
+    ```
+
+    服务器可以一直往浏览器推送消息， 浏览器不能通过同一条连接发消息，只能单向。
+
+最终的解决方案是WebSocket。 
+
+
+
+### 1. WebSocket 
+
+WebSocket：是一种网络协议（Protocol）， 它的作用是：让浏览器和服务器建立一条持续存在的双向通信连接：
+
+第一次， WebSocket 会先通过 HTTP 建立连接：
+
+```bash
+Browser → HTTP 请求（Upgrade: websocket） → Server → 101 Switching Protocols → 升级成功
+```
+
+从这一刻开始， HTTP 就结束了。双方进入：
+
+```bash 
+Browser <========> Server
+```
+
+这条连接会一直保持。
+
+于是， 服务器可以主动发消息：
+
+```bash
+Server → "新订单" → Browser
+```
+
+浏览器也可以主动发：
+
+```bash
+Browser → "发送聊天消息" → Server
+```
+
+这样双方随时都能发送数据， 因此WebSocket 是**真正的双向通信（Full Duplex）**。
+
+WebSocket是底层的网络协议，原生的配置很麻烦，比如：
+
+- 用户管理
+
+- 广播
+
+- 群组
+
+- 连接管理
+
+- 断线重连
+
+    ...
+
+- 身份认证
+
+需要自己处理很多基础配置。 但是我们可以使用一些工具，比如SignalR。
+
+
+
+### 2. SignalR 
+
+**SignalR 是 ASP.NET Core 生态里，专门把上面这些重复的基础设施工作封装掉的一个库**。它不是取代 WebSocket，而是站在 WebSocket（以及 SSE、Long Polling）之上的一层抽象：自动协商用哪种传输方式、自动处理降级、把"发消息"包装成像直接调用函数一样的编程体验、内置自动重连、提供"给一群连接批量发消息"的能力。
+
+SignalR 会根据客户端和服务端的能力，自动选择最合适的传输方式：
+
+```
+WebSocket（首选）：
+  → 真正的双向持久连接
+  → 延迟最低，性能最好
+  → 现代浏览器和服务器都支持
+
+Server-Sent Events（降级）：
+  → 服务端单向推送
+  → 不支持 WebSocket 时的备选
+
+Long Polling（最后手段）：
+  → 客户端不断发请求"有新消息吗？"
+  → 兼容性最好，但性能最差
+```
+
+SignalR 自动处理这个降级逻辑，使用者不需要关心底层用的是哪种。
+
+#### 2.1  Hub 
+
+**Hub** 是 SignalR 的核心概念，一个 Hub 就是一个通信端点，类似于 Controller，但不是处理 HTTP 请求，而是处理 WebSocket 连接。 客户端连接到这个Hub 后，服务器就可以调用这个连接上注册的方法， 而客户端就可以接收服务端推送的消息。
+
+#### 2.2 Connection
+
+每一次客户端连上Hub，SignalR 都会给这次连接分配一个唯一的 `ConnectionId`。同一个用户如果开了两个浏览器标签页，会产生**两个不同的** ConnectionId。
+
+#### 2.3 Group
+
+但只有 Hub 还不够。假设服务器要通知用户 A（UserId=5）车辆审核通过了，直接摆在面前的几种做法都有问题：
+
+```
+方案一：给所有连接广播 → 所有用户都收到通知，错误
+方案二：用 ConnectionId 定向发送 → 一个用户同时开了两个标签页，只有一个收到，错误
+方案三：用 UserId 命名 Group → 同一个用户的所有连接都在这个 Group 里
+         → 给 Group "user-5" 发消息 → 这个用户的所有标签页都收到 ✅
+```
+
+**Group** 就是 SignalR 提供的"给一群连接打标签、按标签批量发消息" 的机制，实现的思路是：
+
+- 用户连接时， 把这个连接加进一个用 UserId 命名的 Group： `AddToGroupAsync("user-{userId}")`
+- 服务端给特定用户发消息时 `Clients.Group("user-{userId}").SendAsync(...)`， 不用关心这个用户当前具体开了几个标签页、每个标签页对应哪个 ConnectionId。
+
+#### 2.4 Client
+
+服务器想给谁发消息，靠 `Clients` 这个对象决定目标范围，常见的几种：
+
+```
+Clients.All              → 所有连接的人都收到 （服务器广播通知给所有人）
+Clients.Caller           → 客户端调用 Hub 方法，调用的那个连接收到通知
+Clients.Group("xxx")     → 只有加入了 "xxx" 这个 Group 的连接收到
+Clients.User("userId")   → SignalR 内置的按用户身份定向
+```
+
+**场景还原：**
+
+假设在一个在线文档协作系统（类似 Google Docs）：
+
+1. **客户端 A** 在页面上点击了“保存”按钮，主动调用了服务端的 `SaveDocument()` 方法。
+2. 此时 **客户端 A 就是 `Caller`**。
+3. 服务端收到请求，保存数据库成功后，可以：
+    - 回复**客户端 A**（`Clients.Caller`）：“保存成功！”（只有 A 需要看到这个提示）
+    - 推送给**其他人**（`Clients.Others`）：“客户端 A 刚刚更新了文档，请刷新界面。”
+
+在这个场景里，客户端主动触发了一个动作，服务端针对这个动作给它返回了专属响应， 此时就是双向通信的体现。
+
+#### 2.5 User
+
+值得知道的是，SignalR 其实**内置**了一套按用户身份定向的能力—— `Clients.User("userId")`。它的原理是：SignalR 有一个叫 `IUserIdProvider` 的接口，默认实现会从连接的身份信息（`Context.User`） 里读取 `ClaimTypes.NameIdentifier` 这个 Claim，把它当成这个连接的 "用户标识"，自动维护好"同一个用户的多个连接"这份映射——这跟 自己手动维护一个 `user-{id}` 命名的 Group，解决的其实是同一个问题。
+
+这两个方案不应该在同一条通知链路里叠加使用。本项目为了完整练习 Group 的连接管理，明确选择手动维护 `user-{id}` Group；`Clients.User(...)` 只作为 SignalR 内置替代方案了解。
+
+当前实现面向单个 API 实例。将来若在 Azure Container Apps 中运行多个 API 副本，需要在部署与扩展阶段接入 Azure SignalR Service 或其他 SignalR backplane，让不同实例之间共享连接路由；这不属于本步骤的基础 Group 实现。
+
+#### 2.6 IHubContext
+
+触发通知的地方（审核通过、下单成功）通常发生在 Controller 或 Service 里的普通业务代码里，它们不是 Hub 内部的方法，没法直接用 `Clients`。 `IHubContext<T>` 就是解决这个问题的——它是一个可以被注入到**任意服务**里的接口，让 Hub 外部的代码也能"以 Hub 的身份"推送消息。
+
+
+
+### 3. 切出功能分支
+
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b feature/v3-signalr-notifications
+git push -u origin feature/v3-signalr-notifications
+```
+
+
+
+### 4. 配置 SignalR 这套工具链
+
+先实现浏览器通过 SignalR 与 ASP.NET Core 建立连接，并完成一次最简单的双向通信。
+
+#### 4.1 注册SignalR服务
+
+SignalR 是 ASP.NET Core 内置的一部分，不需要额外装 NuGet 包。打开 `UUcars.API/Program.cs`，在服务注册部分加入：
+
+```c#
+// 实时通信 - SignalR 
+builder.Services.AddSignalR();
+```
+
+这里只是**注册能力**。此时：
+
+- 没有 Hub
+- 没有连接
+- 没有 WebSocket
+
+什么都还没有发生。
+
+#### 4.2 创建通知Hub
+
+新建 `UUcars.API/Hubs/NotificationHub.cs`：
+
+```c#
+using Microsoft.AspNetCore.SignalR;
+
+namespace UUcars.API.Hubs;
+
+public class NotificationHub : Hub
+{
+}
+```
+
+为什么需要 Hub？
+
+HTTP 请求都有一个 Controller：
+
+```
+GET /cars → CarsController
+```
+
+SignalR 也需要一个入口，这个入口就是：
+
+```
+Browser → NotificationHub
+```
+
+以后， 所有来自客户端的实时消息，都会先进入 Hub。所以：Hub 可以理解为 SignalR 的 Controller。
+
+目前我们先创建一个空 Hub。
+
+#### 4.3 映射 Hub 路由
+
+和映射Controller路由一样,  我们需要映射Hub 路由
+
+```c#
+app.MapControllers();
+ // 映射Hub路由
+app.MapHub<NotificationHub>("/hubs/notification");
+```
+
+这句话表示：`/hubs/notification`以后就是一个 SignalR 端点。但它不是普通 HTTP API。以后浏览器连接的是：`ws://localhost:5065/hubs/notification` 。
+
+现在整个项目已经拥有了 SignalR 服务。流程如下：
+
+```bash
+Program.cs → AddSignalR() → MapHub<NotificationHub>() → 等待客户端连接
+```
+
+目前服务器仍然不会主动做任何事情, 因为还没有客户端连接。
+
+#### 4.4 客户端连接
+
+前端要使用连接的话，需要使用工具库`SignalR Client`,  先安装库
+
+```
+npm install @microsoft/signalr
+```
+
+我们把通知相关的处理，封装进一个单独的组件 `NotificationBell` 通知铃铛
+
+```tsx
+export default function NotificationBell() {
+  return (
+    <div>
+       NotificationBell
+    </div>
+  );
+}
+```
+
+挂载组件到项目最上层组件`Layout`的标题栏中，这样任何页面打开都能挂载通知铃铛组件
+
+```tsx
+{/* 右侧 */}
+<div className="flex items-center gap-3">
+    
+  {/* 1. 通知铃铛组件 */}
+  <NotificationBell />
+    
+  {isAuthenticated() ? (
+    ...
+  )}
+
+  {/* 移动端汉堡菜单按钮 */}
+  <button onClick={() => setMobileOpen(!mobileOpen)} ...>
+    {/* ... */}
+  </button>
+```
+
+组件`NotificationBell`中使用 `signalr`库来建立signalR的连接 : 
+
+把建立连接的逻辑写进副作用钩子 `useEffect`中， 这样组件初次挂载就执行一次。
+
+- signalR内置的`HubConnectionBuilder()` 方法可以创建一下连接对象 connection
+- connection 对象 的 `start()`方法， 开始建立连接
+- connection 对象 的 `stop()`方法， 停止连接
+
+```tsx
+import * as signalR from "@microsoft/signalr";
+import { useEffect } from "react";
+
+export default function NotificationBell() {
+  useEffect(() => {
+    // 创建了连接对象。
+    const connection = new signalR.HubConnectionBuilder()
+      .withUrl("http://localhost:5065/hubs/notification")
+      .withAutomaticReconnect()
+      .build();
+
+    // 开始连接
+    connection
+      .start()
+      .then(() => {
+        console.log("✅ SignalR Connected");
+      })
+      .catch((err) => {
+        console.error(err);
+      });
+
+    return () => {
+      connection.stop();
+    };
+  }, []);
+
+  return <div>NotificationBell</div>;
+}
+
+```
+
+这样，打开页面，挂载组件`NotificationBell`, 执行连接逻辑。
+
+如果连接成功, 控制台会输出：
+
+```bash
+✅ SignalR Connected
+```
+
+上面的代码中，开始起作用的是
+
+```tsx
+await connection.start();
+```
+
+SignalR 内部把`start()`封装了很多事情:
+
+1. negotiate
+
+    ```bash
+    connection.start() → ① POST /hubs/notification/negotiate → 拿到：{connectionId, connectionToken, availableTransports}
+    ```
+
+2. 判断服务器支持什么
+
+    ```bash
+    if (支持 WebSocket)
+        使用 WebSocket
+    else if (支持 ServerSentEvents)
+        使用 SSE
+    else
+        使用 Long Polling
+    ```
+
+3. 发起 WebSocket Upgrade
+
+    ```bash
+    GET /hubs/notification?id=xxxxx → 等待服务器返回 101 → 建立 WebSocket → 开始监听服务器消息 → Promise resolve() → .then(() => {console.log("Connected")})
+    ```
+
+也就是说：**`start()` 其实包含了 negotiate + Upgrade + 建立连接 整个流程。**
+
+除了上面的 `start()`和 `stop()`方法外，connection对象还有以下常用方法：
+
+- `connection.on(事件名, 回调函数)`  - 用来监听 SignalR hub里定义的方法， 客户端无需主动发起请求，服务端只要触发hub里定义的方法， 客户端就能监听到
+- `connection.invoke(方法名, 参数)` - 用来主动发起请求触发服务端SignalR hub里定义的方法
+
+#### 4.5 创建Hub 方法 
+
+到目前为止， 浏览器已经连接到了 Hub。但是服务器什么都没有做，SignalR 框架是怎么知道连接建立的时候该执行我们写的逻辑的？
+
+`Hub` 这个基类封装了一些虚方法， 是空的方法，作为建立连接时的钩子， 比如：
+
+```c#
+public abstract class Hub : IDisposable
+{
+  ...
+
+  public virtual Task OnConnectedAsync();
+  public virtual Task OnDisconnectedAsync(Exception? exception);
+
+  ...
+}
+
+```
+
+我们自己的`NotificationHub`可以继承这个基类`Hub`, 并对基类的虚方法进行重写：
+
+```c#
+using Microsoft.AspNetCore.SignalR;
+
+namespace UUcars.API.Hubs;
+
+public class NotificationHub : Hub
+{
+    public override async Task OnConnectedAsync()
+    {
+        // 发送通知的逻辑
+    }
+}
+```
+
+`OnConnectedAsync()`这个方法，属于"生命周期钩子", 触发它的不是前端代码里某一行调用,而是 SignalR 框架本身。只要握手成功、这条 WebSocket 连接真正建立起来了,框架会**自动**在服务器端实例化一个 `Hub` 对象来处理这条连接,并且自动调用它的 `OnConnectedAsync()`。前端唯一需要做的事就是:
+
+1. 建立连接 
+
+2. 监听或者主动调用
+
+**那么如何编写方法让前端监听或者调用呢？**
+
+先指定Clients的范围，再使用扩展方法`SendAsync(“方法名”, 参数， 可选参数)`的链式调用法：
+
+```c#
+using Microsoft.AspNetCore.SignalR;
+
+namespace UUcars.API.Hubs;
+
+public class NotificationHub : Hub
+{
+    public override async Task OnConnectedAsync()
+    {
+        // Clients.All：发给所有连接的人
+        await Clients.All.SendAsync("ReceiveNotification", "Hello All from server!");
+            
+        // 不要把基类的行为完全覆盖丢掉
+        await base.OnConnectedAsync();
+    }
+}
+```
+
+客户端监听这个事件`ReceiveNotification`， 并渲染通知数据
+
+```tsx
+import * as signalR from "@microsoft/signalr";
+import { useEffect, useState } from "react";
+
+export default function NotificationBell() {
+  const [notification, setNotification] = useState("");
+
+  useEffect(() => {
+    // 创建了连接对象。
+    const connection = new signalR.HubConnectionBuilder()
+      .withUrl("http://localhost:5065/hubs/notification")
+      .withAutomaticReconnect()
+      .build();
+
+    // 开始连接
+    connection
+      .start()
+      .then(() => {
+        console.log("✅ SignalR Connected");
+      })
+      .catch((err) => {
+        console.error(err);
+      });
+
+    // 监听事件
+    connection.on("ReceiveNotification", (msg: string) => {
+      setNotification(msg);
+    });
+
+    return () => {
+      connection.stop();
+    };
+  }, []);
+
+  return (
+    <div>
+      <p>{notification}</p>
+    </div>
+  );
+}
+
+```
+
+这样页面一加载，就能收到通知 `Hello All from server!`
+
+同样，也可以定义客户端用来主动发起请求的方法，注意，这个方法不能定义在框架提供的`OnConnectedAsync()`, 否则会被自动监听
+
+```c#
+using Microsoft.AspNetCore.SignalR;
+
+namespace UUcars.API.Hubs;
+
+public class NotificationHub : Hub
+{
+    public override async Task OnConnectedAsync()
+    {
+        // Clients.All：发给所以连接的人
+        await Clients.All.SendAsync("ReceiveNotification", "Hello All from server!");
+        // 不要把基类的行为完全覆盖丢掉
+        await base.OnConnectedAsync();
+    }
+
+    // 这是一个自定义方法，不是生命周期钩子
+    public async Task SendMessage(string text)
+    {
+        // Clients.Caller：只发给触发这次连接的这一个连接
+        await Clients.Caller.SendAsync("Hello", "receive message: " + text);
+    }
+}
+```
+
+前端主动请求调用这个方法`SendMessage`, 并且可以监听事件`Hello`
+
+```tsx
+import * as signalR from "@microsoft/signalr";
+import { useEffect, useRef, useState } from "react";
+
+export default function NotificationBell() {
+  const [notification, setNotification] = useState("");
+  const connectionRef = useRef<signalR.HubConnection>(null);
+
+  useEffect(() => {
+    // 创建了连接对象。
+    const connection = new signalR.HubConnectionBuilder()
+      .withUrl("http://localhost:5065/hubs/notification")
+      .withAutomaticReconnect()
+      .build();
+
+    // 开始连接
+    connection
+      .start()
+      .then(() => {
+        console.log("✅ SignalR Connected");
+      })
+      .catch((err) => {
+        console.error(err);
+      });
+
+    connectionRef.current = connection;
+
+    connection.on("ReceiveNotification", (msg: string) => {
+      setNotification(msg);
+    });
+
+    return () => {
+      connection.stop();
+    };
+  }, []);
+
+  return (
+    <div>
+      <p>{notification}</p>
+      <button
+        onClick={() => {
+          connectionRef.current?.invoke("SendMessage", "invoke tested");
+          connectionRef.current?.on("Hello", (msg) => {
+            console.log(msg);
+          });
+        }}
+      >
+        点击测试 invoke
+      </button>
+    </div>
+  );
+}
+
+```
+
+> **那 `invoke()` 到底是用来干嘛的？**
+>
+> 这里要分清楚 SignalR 客户端提供的三个不同的 API,它们对应完全不同的场景：
+>
+> ```
+>connection.start()              → 建立连接（触发服务器 OnConnectedAsync）
+> connection.on(事件名, 回调函数)   → 被动监听：服务器主动推送消息时执行这个回调
+> connection.invoke(方法名, 参数)  → 主动调用：前端主动"喊"服务器 Hub 里的某个自定义方法
+> ```
+> 
+> `invoke()` 对应的是**前端主动发起、服务器执行后可能还要返回结果**的场景——有点像前端在正常调用一个后端 API,只是走的是 WebSocket 通道而不是普通 HTTP 请求。
+>
+> 
+
+#### 4.6 JWT身份认证
+
+目前，任何客户端都可以尝试连接 `NotificationHub` 并监听通知事件。即使用户没有登录，只要前端创建了 SignalR 连接并监听对应事件，就可能接收服务器推送的内容。
+
+对于用户通知、管理员通知等功能，这是不安全的。
+
+因此需要做到：
+
+1. 未登录用户不能连接 `NotificationHub`；
+2. 已登录用户建立 SignalR 连接时，必须携带 JWT Token；
+3. 后端必须验证 Token，并根据验证结果决定是否允许连接。
+
+##### 如何过滤未登录用户？
+
+类似于HTTP controller里关于是否登录身份的验证方式，我们也可以给`NotificationHub`加上 `[Authorize]` 特征标签:
+
+```c#
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.SignalR;
+
+namespace UUcars.API.Hubs;
+
+[Authorize]
+public class NotificationHub : Hub
+{
+    ...
+}
+```
+
+这样未登录的访问加载`NotificationBell`组件，建立SignalR的连接时：
+
+协商阶段（Negotiate）— 纯 HTTP 请求
+
+- 前端（SignalR SDK）发送一个普通的 HTTP POST 请求到 `http://localhost:5065/hubs/notification/negotiate`， 此时请求头（Request Header）里没有带 `Authorization: Bearer <Token>` ， 即使手动设置了，未登录token也是空。
+- 请求到达服务器，**首先拦截它的是 Auth 授权中间件**。 授权中间件发现 `NotificationHub` 上写了 `[Authorize]`。它去检查这个 POST 请求的 Header，发现里面没有 `Authorization` 属性或者为空。
+- 授权中间件直接拦截请求，返回 401 Unauthorized，Hub 不会建立连接
+
+升级阶段（WebSocket Handshake）— 根本未到达此阶段就结束，后面的连接和监听等等根本不执行。
+
+同时， 对于前端组件，也可以使用是否已登录进行过滤， 未登录的话直接不渲染通知组件：
+
+移动 `<NotificationBell />`组件的挂载位置，只有 `isAuthenticated()`为 true的时候才渲染
+
+```tsx
+{/* 右侧 */}
+  <div className="flex items-center gap-3">
+    {isAuthenticated() ? (
+      <>
+        {/* 通知铃铛组件*/}
+        <NotificationBell />
+        {/* 普通用户：Sell a Car 按钮 */}
+        {!isAdmin && (
+          ...
+        )}
+
+        {/* 用户下拉菜单 */}
+        ...
+      </>
+    ) : (
+      <>
+        ...
+      </>
+    )}
+
+    {/* 移动端汉堡 */}
+    ...
+  </div>
+```
+
+##### 登录后如何验证身份？
+
+用户登录成功并建立signalR连接时，会经过3个阶段：
+
+- 正常登录
+
+    用户登录时，前端发送正常的 HTTP 登录请求：
+
+    ```bash
+    POST /auth/login
+    ```
+
+    后端验证用户名和密码成功后，返回 JWT Token：
+
+    ```json
+    { "accessToken": "eyJhbGciOiJIUzI1NiIs..." }
+    ```
+
+    前端将 Token 保存到 Zustand：
+
+    ```ts
+    useAuthStore.getState().accessToken
+    ```
+
+    对于普通的 HTTP API 请求，我们已经通过 Axios 请求拦截器自动添加 Token 到请求头：
+
+    ```bash
+    Authorization: Bearer <access_token>
+    ```
+
+    这样之后所有的 http 请求，都会在请求头中自动携带token。
+
+- 登录成功后，Negotiate 协商请求
+
+    用户登录后，挂载通知铃铛组件`NotificationBell`，前端调用：
+
+    ```ts
+    connection.start();
+    ```
+
+    发起建立signalR的Negotiate 协商请求
+
+    ```bash
+    POST /hubs/notification/negotiate
+    ```
+
+    这是一个标准的 HTTP 请求，但它由 SignalR Client 发起，不经过 Axios。SignalR Client 会调用后面配置的 `accessTokenFactory`，并在协商请求中携带 Token。
+
+    ```bash
+    Authorization: Bearer eyJhbGciOiJIUzI1NiIs...
+    ```
+
+    这个请求到达服务端：
+
+    - 路由系统匹配请求路径 `/hubs/notification`
+    - 认证中间件 `UseAuthentication()` 拦截请求，从请求头中读取token，并进行身份验证；
+    - 验证通过则允许请求继续，Negotiate 成功。
+
+- Negotiate成功后，建立 WebSocket 长连接
+
+    ```
+    ws://localhost:5065/hubs/notification
+    ```
+
+    **这个请求不是http，而是WebSocket **。
+
+    SignalR 不会经过 Axios，因此 Axios 的请求拦截器不会帮 SignalR 自动添加 Token。所以，SignalR 必须单独配置如何自动携带 Token。
+
+    前端建立SignalR连接实例时，通过配置对象里的 `accessTokenFactory`函数来设置：
+
+    ```tsx
+    import { useAuthStore } from "@/stores/authStore";
+    ...
+    
+    export default function NotificationBell() {
+      ...
+      
+      useEffect(() => {
+        // 创建了连接对象。
+        const connection = new signalR.HubConnectionBuilder()
+          .withUrl("http://localhost:5065/hubs/notification", {
+              
+            // 告诉 SignalR 建立连接时带上 Token
+            accessTokenFactory: () => useAuthStore.getState().accessToken ?? "",
+          })
+          .withAutomaticReconnect()
+          .build();
+    
+        // 开始连接
+        ...
+      }, []);
+    
+      return (
+       ...
+      );
+    }
+    
+    ```
+
+    >`accessTokenFactory` 是一个函数，而不是固定的 Token 值。
+    >
+    >```
+    >accessTokenFactory: () => useAuthStore.getState().accessToken ?? ""
+    >```
+    >
+    >每次 SignalR 建立连接或自动重连时，都会调用这个函数，读取 Zustand 中最新的 Token。
+
+    但是浏览器原生 WebSocket API 有一个限制：
+
+    > JavaScript 无法为 WebSocket 请求自定义 `Authorization` Header。
+
+    因此，SignalR 无法继续像普通 HTTP 请求一样发送：
+
+    ```bash
+    Authorization: Bearer <access_token>
+    ```
+
+    作为替代，SignalR 会自动将 Token 放到 URL 的 Query String：
+
+    ```bash
+    ws://localhost:5065/hubs/notification?access_token=<access_token>
+    ```
+
+    这个 WebSocket 请求同样会到达服务端，并需要再次经过认证和授权。但此时会出现问题：
+
+    >**JWT Bearer 默认只从 `Authorization` Header 读取 Token，不会自动读取 URL Query String 中的。**
+
+    因此，需要配置Auth 授权中间件，让它读取URL Query String 参数
+
+    ```c#
+    public static class AuthExtensions
+    {
+        public static IServiceCollection AddJwtAuthentication(this IServiceCollection services,
+            IConfiguration configuration)
+        {
+            var jwtSettings = configuration.GetSection("JwtSettings").Get<JwtSettings>()!;
+            services.AddAuthentication(options =>
+                {
+                    options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
+                    options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
+                })
+                .AddJwtBearer(options =>
+                {
+                    // TokenValidationParameters：告诉框架"验证 Token 时要检查哪些东西"
+                    options.TokenValidationParameters = new TokenValidationParameters
+                    {
+                        ...
+                    };
+    
+                    // ===== 核心新增：配置 JwtBearer 事件响应以兼容 SignalR Query Token =====
+                    options.Events = new JwtBearerEvents
+                    {
+                        OnMessageReceived = context =>
+                        {
+                            // 1. 从 URL Query 参数中尝试读取 access_token
+                            var accessToken = context.Request.Query["access_token"];
+    
+                            // 2. 获取当前请求的路径
+                            var path = context.HttpContext.Request.Path;
+    
+                            // 3. 判断：如果有 access_token 且请求路径指向 SignalR Hub
+                            //  匹配具体的 Hub 路径，如 "/chatHub" 或以特定前缀开头的路径）
+                            if (!string.IsNullOrEmpty(accessToken) &&
+                                path.StartsWithSegments("/hubs")) // 💡 根路由路径或根前缀
+                             // 将 Token 赋给上下文，JwtBearer 中间件后续就会拿这个Token去做签名和合法性校验
+                                context.Token = accessToken;
+    
+                            return Task.CompletedTask;
+                        }
+                    };
+                });
+    
+            return services;
+        }
+    }
+    ```
+
+    于是，WebSocket 请求会到达服务端：
+
+    - 认证中间件 `UseAuthentication()` 拦截请求，从请求URL Query String 参数中读取token，并进行身份验证；
+    - 验证通过则允许请求继续，WebSocket 连接建立成功
+
+完成上面`登录，negotiate， WebSocket长连接`3个阶段的完整请求和身份认证之后， 客户端的登录用户就能开始监听和接收通知。
+
+#### 4.7 如何细分已登录用户？
+
+现在虽然过滤掉了未登录访客，但是不同的已登录用户，都能连接SignalR。这意味着只要监听了事件，所有用户都能收到通知。 比如这样的场景：
+
+```bash
+管理员通过车辆审核后，发通知给车主`Seller`, 而此时的`Buyer` 不应该收到通知。
+```
+
+因此需要解决2个问题：
+
+- 如何确认哪个登录的用户是当前的车主？？
+- 如何只给当前的车主发通知而不是广播通知`await Clients.All.SendAsync()`给所有人？
+
+##### 从用户身份到 SignalR 连接
+
+前面已经通过 JWT 完成了 SignalR 连接认证。连接建立后，SignalR 可以通过 `Context.UserIdentifier` 识别当前连接属于哪个用户。
+
+但是，“识别出当前用户”还不能直接解决通知路由问题。SignalR 实际管理的是一条条独立的连接，每条连接都有自己的 `ConnectionId`。同一个用户如果同时打开多个浏览器标签页，就会建立多条 SignalR 连接：
+
+```text
+用户 5
+├── 标签页 A → ConnectionId: abc123
+├── 标签页 B → ConnectionId: xyz789
+└── 手机浏览器 → ConnectionId: mobile456
+```
+
+如果只记录其中一个 `ConnectionId`，通知就可能只到达一个标签页；而且断线重连后，旧的 `ConnectionId` 还会失效。
+
+因此，本项目不直接维护某一个 `ConnectionId`，而是在每次连接建立时，把当前连接加入该用户专属的 Group：
+
+```text
+Group: user-5
+├── abc123
+├── xyz789
+└── mobile456
+```
+
+业务服务以后只需要向 `user-5` 发送一次消息，该用户当前所有在线连接就都能收到。整个映射关系是：
+
+```text
+经过 JWT 验证的用户身份
+        ↓
+Context.UserIdentifier
+        ↓
+用户专属 Group：user-{id}
+        ↓
+该用户当前所有 ConnectionId
+```
+
+Group 只是 SignalR 用于管理连接和路由消息的机制，不是数据库中的用户组，也不是角色或权限系统。
+
+##### 使用 UserId Group
+
+本项目使用 `user-{id}` 作为通知 Group 名称。真实用户 ID 只从通过验证的 JWT 身份中读取，不接受客户端传入的 Group 名称。
+
+统一 Group 命名：
+
+```csharp
+/// <summary>
+/// 集中管理通知系统使用的 SignalR Group 名称，
+/// 避免加入 Group 和发送消息时使用不同的命名格式。
+/// </summary>
+public static class NotificationGroups
+{
+    /// <summary>
+    /// 根据数据库用户 ID 生成该用户专属的通知 Group 名称。
+    /// 例如 userId 为 5 时，返回 "user-5"。
+    /// </summary>
+    public static string ForUser(int userId)
+    {
+        return $"user-{userId}";
+    }
+}
+```
+
+连接建立后，将当前 Connection 加入对应用户 Group：
+
+```csharp
+/// <summary>
+/// 每当客户端成功建立一条新的 SignalR 连接时，
+/// SignalR 都会自动调用这个生命周期方法。
+/// </summary>
+public override async Task OnConnectedAsync()
+{
+    // SignalR 提供的 UserIdentifier 是字符串，
+    // 而 UUcars 使用整数 User.Id，因此需要先完成转换和格式验证。
+    if (!int.TryParse(Context.UserIdentifier, out var userId))
+    {
+        // 无法确定连接所属的有效用户时，立即终止连接。
+        Context.Abort();
+        return;
+    }
+
+    // 同一个用户的所有连接都会加入同一个 user-{id} Group。
+    await Groups.AddToGroupAsync(
+        Context.ConnectionId,
+        NotificationGroups.ForUser(userId));
+
+    // 继续执行 SignalR Hub 原有的连接生命周期逻辑。
+    await base.OnConnectedAsync();
+}
+```
+
+同一个用户打开多个标签页时，每个标签页拥有独立的 ConnectionId，但都会加入同一个 `user-{id}` Group。断线后 SignalR 会自动移除旧连接；自动重连建立新连接时，`OnConnectedAsync()` 会再次执行并重新加入 Group。
+
+业务触发点仍然负责确定精确的目标用户。例如：
+
+```bash
+管理员点击“通过车辆审核”
+```
+
+在数据库里，车辆（Car）一定会关联一个车主 ID（`SellerId`）。当管理员审核通过时，API 从车辆读取 SellerId，这就确定了目标用户；通知服务随后向 `NotificationGroups.ForUser(sellerId)` 发送消息。
+
+##### 拆分业务逻辑
+
+`发什么通知？给谁发？什么时候发？` 这些事务其实是具体的业务逻辑，比如:
+
+```bash
+管理员审核通过通知车主
+车主创建草稿通知管理员
+...
+```
+
+因此，需要把业务相关逻辑从Hub中移出来，在具体的业务service方法中实现。
+
+而hub中仅保留基本的连接配置, 主要负责处理**客户端主动发起的连接、断开，或者客户端主动调用的方法**（比如聊天室里用户发消息）。
+
+生产环境中，`OnConnectedAsync()` 通常**不需要推送任何消息**。如果需要做点什么，只需留给基础设施逻辑（如记录日志、关联连接与用户）：
+
+```c#
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.SignalR;
+
+namespace UUcars.API.Hubs;
+
+[Authorize]
+public class NotificationHub : Hub
+
+{
+    private readonly ILogger<NotificationHub> _logger;
+
+    public NotificationHub(ILogger<NotificationHub> logger)
+    {
+        _logger = logger;
+    }
+
+    public override async Task OnConnectedAsync()
+    {
+        // 只做生命周期相关的辅助工作，比如打个日志
+        var userId = Context.UserIdentifier;
+        _logger.LogInformation("用户 {UserId} 已连接", userId);
+
+        // 不要把基类的行为完全覆盖丢掉
+        await base.OnConnectedAsync();
+    }
+}
+```
+
+##### 那如何发通知呢？
+
+asp.net core 提供了**`IHubContext`（服务端上下文）接口**：允许在 **Hub 外部**（如 API Controller、Service、后台定时任务）直接向客户端推送消息。把外部Hub传入接口之后，能获得当前hub的想下文对象 hubContext, 直接使用这个hubContext执行推送消息等操作。
+
+编写通知业务的接口和Service方法， 这样其他外部service都能直接引入使用， 不会和其他业务本身的逻辑耦合。
+
+新建 `UUcars.API/Services/Notifications/INotificationService.cs`：
+
+```c#
+namespace UUcars.API.Services.Notifications;
+
+public interface INotificationService
+{
+    /// <summary>
+    /// 实时推送给目标用户
+    /// </summary>
+    Task SendNotificationAsync(
+        int userId,
+        string message,
+        CancellationToken cancellationToken = default);
+}
+```
+
+Service方法实现接口：
+
+```c#
+using Microsoft.AspNetCore.SignalR;
+using UUcars.API.Hubs;
+
+namespace UUcars.API.Services.Notifications;
+
+public class NotificationService : INotificationService
+{
+    private readonly IHubContext<NotificationHub> _hubContext; // ✅ 新增
+    private readonly ILogger<NotificationService> _logger; // ✅ 新增
+
+    public NotificationService(IHubContext<NotificationHub> hubContext,
+        ILogger<NotificationService> logger)
+    {
+        _hubContext = hubContext;
+        _logger = logger;
+    }
+
+    public async Task SendNotificationAsync(
+        int userId,
+        string message)
+    {
+        // 推送（这一步失败只记录日志，不影响主流程）
+        // 通知指定用户
+        try
+        {
+            await _hubContext.Clients
+                .Group(NotificationGroups.ForUser(userId))
+                .SendAsync(
+                "ReceiveNotification", message);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "Failed to push SignalR notification to user {UserId}", userId);
+        }
+    }
+
+}
+```
+
+##### AdminCarService中触发通知推送
+
+在“管理员审核车辆”这个场景下：
+
+- 触发动作的是**管理员点击 API**（HTTP POST 请求到了 `AdminCarController`）。
+- ``AdminCarController`` 调用 `AdminCarService` 通过审核的方法 `ApproveAsync`
+- ``ApproveAsync``方法调用 `NotificationService`中的`SendNotificationAsync`方法
+
+```c#
+public class AdminCarService
+{
+    ...
+    private readonly INotificationService _notificationService;
+
+    public AdminCarService(...,
+        INotificationService notificationService)
+    {
+       ...
+        _notificationService = notificationService;
+    }
+
+
+    public async Task<CarResponse> ApproveAsync(
+        int carId,
+        CancellationToken cancellationToken = default)
+    {
+        var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+        ...
+
+        try
+        {
+            var updated = await _carRepository.UpdateAsync(car, cancellationToken);
+            await _cache.RemoveByPrefixAsync(CacheKeys.PublishedCarsPrefix, cancellationToken);
+            await _cache.RemoveByPrefixAsync(CacheKeys.PendingCarsPrefix, cancellationToken);
+            
+			// 审核通过，推送消息给车主
+            await _notificationService.SendNotificationAsync(car.SellerId, $"Your car {car.Title} has been approved.");
+
+            // ✅ 写审计日志
+            ...
+
+            return CarService.MapToResponse(updated);
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            ...
+        }
+    }
+
+    ...
+}
+```
+
+这样车主（Seller）只要打开着网页，就能收到通知。
+
+
+
+### 5. 数据持久化
+
+上面验证的推送，只在用户当时开着页面、连接还活着的情况下才有效。 如果只做实时推送，用户在事情发生的那一刻不在线，这条消息就永远错过了。因此，需要将通知持久化到数据库，之后的场景：
+
+- 用户已登录在线，能实时收到通知
+- 用户离线，未能收到实时通知，但通知会写入数据库保存，标记为未读
+- 用户再次登录上线，浏览器来取数据库里的未读通知并渲染
+- 用户点击通知，跳转链接到不同的内容页面，标记通知已读
+- 用户点击，标记所有通知已读
+
+#### 5.1 Notification 实体
+
+新建 `UUcars.API/Entities/Notification.cs`：
+
+```c#
+namespace UUcars.API.Entities;
+
+/// <summary>
+///     通知记录：实时推送 + 持久化，保证用户离线时也能看到历史通知
+/// </summary>
+public class Notification
+{
+    public int Id { get; set; }
+
+    /// <summary>
+    /// 接收者（目标用户）
+    /// </summary>
+    public int UserId { get; set; }
+
+    // 关联到 User 表
+    public User User { get; set; } = null!;
+
+    /// <summary>
+    /// 通知类型，用于前端决定跳转到哪个页面
+    /// </summary>
+    public string Type { get; set; } = string.Empty;
+
+    /// <summary>
+    /// 通知正文，直接展示给用户
+    /// </summary>
+    public string Message { get; set; } = string.Empty;
+
+    /// <summary>
+    /// 关联的业务实体 Id（CarId 或 OrderId），用于跳转
+    /// </summary>
+    public int? RelatedId { get; set; }
+
+    /// <summary>
+    /// 是否已读，默认未读
+    /// </summary>
+    public bool IsRead { get; set; } = false;
+
+    public DateTime CreatedAt { get; set; }
+}
+```
+
+#### 5.2 EF Core 配置
+
+新建 `UUcars.API/Configurations/NotificationConfiguration.cs`：
+
+```c#
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+using UUcars.API.Entities;
+
+namespace UUcars.API.Configurations;
+
+public class NotificationConfiguration : IEntityTypeConfiguration<Notification>
+{
+    public void Configure(EntityTypeBuilder<Notification> builder)
+    {
+        builder.HasKey(n => n.Id);
+
+        builder.Property(n => n.Type)
+            .IsRequired()
+            .HasMaxLength(50);
+
+        // Message 是固定文案 + car.Title（上限100个字符）拼接出来的字符串
+        // 300 留出比最坏情况更宽松的余量，避免长标题导致 SaveChanges 抛异常
+        builder.Property(n => n.Message)
+            .IsRequired()
+            .HasMaxLength(300);
+
+        builder.Property(n => n.IsRead)
+            .IsRequired()
+            .HasDefaultValue(false);
+
+        builder.Property(n => n.CreatedAt)
+            .IsRequired();
+
+        builder.HasOne(n => n.User)
+            .WithMany()
+            .HasForeignKey(n => n.UserId)
+            .OnDelete(DeleteBehavior.Cascade);
+        // Cascade：用户删除时其通知一起删除，合理
+
+        // 最常见查询：某个用户的未读通知，按时间倒序
+        builder.HasIndex(n => new { n.UserId, n.IsRead, n.CreatedAt })
+            .HasDatabaseName("IX_Notifications_UserId_IsRead_CreatedAt");
+    }
+}
+```
+
+加入表格， 打开 `UUcars.API/Data/AppDbContext.cs`，加入：
+
+```c#
+public DbSet<Notification> Notifications => Set<Notification>();
+```
+
+数据库迁移
+
+```bash
+cd UUcars.API
+dotnet ef migrations add AddNotificationsTable 
+dotnet ef database update
+```
+
+#### 5.3 编写Repository
+
+新建 `UUcars.API/Repositories/INotificationRepository.cs`：
+
+```c#
+using UUcars.API.Entities;
+
+namespace UUcars.API.Repositories;
+
+public interface INotificationRepository
+{
+    Task AddAsync(Notification notification, CancellationToken cancellationToken = default);
+
+    Task<List<Notification>> GetAllUnreadAsync(int userId, CancellationToken cancellationToken = default);
+
+    Task<Notification?> GetByIdUnreadAsync(
+        int notificationId, int userId, CancellationToken cancellationToken = default);
+
+    Task MarkAllAsReadAsync(int userId, CancellationToken cancellationToken = default);
+
+    Task SaveChangesAsync(CancellationToken cancellationToken = default);
+}
+```
+
+新建 `UUcars.API/Repositories/NotificationRepository.cs`：
+
+```c#
+using Microsoft.EntityFrameworkCore;
+using UUcars.API.Data;
+using UUcars.API.Entities;
+
+namespace UUcars.API.Repositories;
+
+public class EfNotificationRepository : INotificationRepository
+{
+    private readonly AppDbContext _context;
+
+    public EfNotificationRepository(AppDbContext context)
+    {
+        _context = context;
+    }
+
+    // 添加一个消息到数据库
+    public async Task AddAsync(
+        Notification notification, CancellationToken cancellationToken = default)
+    {
+        _context.Notifications.Add(notification);
+        await _context.SaveChangesAsync(cancellationToken);
+    }
+
+    // 取出所有未读消息
+    public async Task<List<Notification>> GetAllUnreadAsync(
+        int userId, CancellationToken cancellationToken = default)
+    {
+        return await _context.Notifications
+            .Where(n => n.UserId == userId && !n.IsRead)
+            .OrderByDescending(n => n.CreatedAt)
+            .ToListAsync(cancellationToken);
+    }
+
+    // 取出一个未读消息
+    public async Task<Notification?> GetByIdUnreadAsync(
+        int notificationId, int userId, CancellationToken cancellationToken = default)
+    {
+        // 同时按 notificationId 和 userId 过滤，防止 IDOR
+        // （不能只按 id 查到就随便让人标记别人的通知已读）
+        return await _context.Notifications
+            .FirstOrDefaultAsync(
+                n => n.Id == notificationId && n.UserId == userId && !n.IsRead,
+                cancellationToken);
+    }
+
+
+    public async Task MarkAllAsReadAsync(
+        int userId, CancellationToken cancellationToken = default)
+    {
+        // ExecuteUpdateAsync：EF Core 7+ 提供的批量更新 API
+        // 直接在数据库层面执行一条 UPDATE 语句，不需要先把符合条件的
+        // 实体全部加载进内存、逐个改字段再 SaveChanges——未读通知可能有
+        // 几十上百条，这种场景下批量更新比"加载 + 逐条改 + 保存"效率高得多
+        await _context.Notifications
+            .Where(n => n.UserId == userId && !n.IsRead)
+            .ExecuteUpdateAsync(
+                s => s.SetProperty(n => n.IsRead, true),
+                cancellationToken);
+    }
+
+    public async Task SaveChangesAsync(CancellationToken cancellationToken = default)
+    {
+        await _context.SaveChangesAsync(cancellationToken);
+    }
+}
+```
+
+#### 5.4 编写数据持久化的逻辑Service
+
+这一步的 `NotificationService` 负责持久化，也有推送给目标用户的能力。
+
+定义`NotificationService` 的数据响应模型， 新建 `UUcars.API/DTOs/Responses/NotificationResponse.cs`：
+
+```c#
+namespace UUcars.API.DTOs.Responses;
+
+public class NotificationResponse
+{
+    public int Id { get; set; }
+    public string Type { get; set; } = string.Empty;
+    public string Message { get; set; } = string.Empty;
+    public int? RelatedId { get; set; }
+    public bool IsRead { get; set; }
+    public DateTime CreatedAt { get; set; }
+}
+```
+
+补充 `UUcars.API/Services/Notifications/INotificationService.cs`里的和数据库交互的能力：
+
+- 写入数据库（写入库后可以推送通知）
+- 查询当前用户的未读通知
+- 标记单条通知已读
+- 全部全部标记已读
+
+```c#
+using UUcars.API.DTOs.Responses;
+
+namespace UUcars.API.Services.Notifications;
+
+public interface INotificationService
+{
+    /// <summary>
+    /// 写入数据库 + 实时推送给目标用户
+    /// </summary>
+    Task SendNotificationAsync(
+        int userId,
+        string type,
+        string message,
+        int? relatedId = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 查询当前用户的未读通知
+    /// </summary>
+    Task<List<NotificationResponse>> GetUnreadNotificationsAsync(
+        int userId,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 标记单条已读
+    /// </summary>
+    Task MarkNotificationAsReadAsync(
+        int notificationId,
+        int userId,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 全部标记已读
+    /// </summary>
+    Task MarkAllNotificationsAsReadAsync(
+        int userId,
+        CancellationToken cancellationToken = default);
+}
+```
+
+实现 `INotificationService`接口
+
+```c#
+using Microsoft.AspNetCore.SignalR;
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Entities;
+using UUcars.API.Hubs;
+using UUcars.API.Repositories;
+
+namespace UUcars.API.Services.Notifications;
+
+public class NotificationService : INotificationService
+{
+    private readonly INotificationRepository _repository;
+    private readonly IHubContext<NotificationHub> _hubContext;
+    private readonly ILogger<NotificationService> _logger;
+
+    public NotificationService(INotificationRepository repository, IHubContext<NotificationHub> hubContext,
+        ILogger<NotificationService> logger)
+    {
+        _repository = repository;
+        _hubContext = hubContext;
+        _logger = logger;
+    }
+
+    public async Task SendNotificationAsync(
+        int userId, string type, string message,
+        int? relatedId = null, CancellationToken cancellationToken = default)
+    {
+        var notification = new Notification
+        {
+            UserId = userId,
+            Type = type,
+            Message = message,
+            RelatedId = relatedId,
+            IsRead = false,
+            CreatedAt = DateTime.UtcNow
+        };
+
+        await _repository.AddAsync(notification, cancellationToken);
+
+        var response = new NotificationResponse
+        {
+            Id = notification.Id,
+            Type = notification.Type,
+            Message = notification.Message,
+            RelatedId = notification.RelatedId,
+            IsRead = notification.IsRead,
+            CreatedAt = notification.CreatedAt
+        };
+
+        // 写库成功之后，尝试向目标用户 Group 实时推送完整通知对象
+        try
+        {
+            await _hubContext.Clients
+                .Group(NotificationGroups.ForUser(userId))
+                .SendAsync("ReceiveNotification", response, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "Failed to push SignalR notification to user {UserId}", userId);
+        }
+    }
+
+    public async Task<List<NotificationResponse>> GetUnreadNotificationsAsync(
+        int userId, CancellationToken cancellationToken = default)
+    {
+        var list = await _repository.GetAllUnreadAsync(userId, cancellationToken);
+
+        return list.Select(n => new NotificationResponse
+        {
+            Id = n.Id,
+            Type = n.Type,
+            Message = n.Message,
+            RelatedId = n.RelatedId,
+            IsRead = n.IsRead,
+            CreatedAt = n.CreatedAt
+        }).ToList();
+    }
+
+    public async Task MarkNotificationAsReadAsync(
+        int notificationId, int userId, CancellationToken cancellationToken = default)
+    {
+        var notification = await _repository.GetByIdUnreadAsync(
+            notificationId, userId, cancellationToken);
+
+        if (notification == null) return; // 静默处理，不暴露是否存在
+
+        notification.IsRead = true;
+        await _repository.SaveChangesAsync(cancellationToken);
+    }
+
+    public async Task MarkAllNotificationsAsReadAsync(
+        int userId, CancellationToken cancellationToken = default)
+    {
+        await _repository.MarkAllAsReadAsync(userId, cancellationToken);
+    }
+}
+```
+
+#### 5.5 NotificationsController端口
+
+新建 `UUcars.API/Controllers/NotificationsController.cs`：
+
+```c#
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
+using UUcars.API.DTOs;
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Services;
+using UUcars.API.Services.Notifications;
+
+namespace UUcars.API.Controllers;
+
+[ApiController]
+[Route("notifications")]
+[Authorize]
+public class NotificationsController : ControllerBase
+{
+    private readonly INotificationService _notificationService;
+    private readonly CurrentUserService _currentUserService;
+
+    public NotificationsController(
+        INotificationService notificationService,
+        CurrentUserService currentUserService)
+    {
+        _notificationService = notificationService;
+        _currentUserService = currentUserService;
+    }
+
+    [HttpGet]
+    [EnableRateLimiting(RateLimitPolicies.Browse)]
+    public async Task<IActionResult> GetUnread(CancellationToken cancellationToken)
+    {
+        var userId = _currentUserService.GetCurrentUserId();
+        if (userId == null)
+            return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+        var notifications = await _notificationService
+            .GetUnreadNotificationsAsync(userId.Value, cancellationToken);
+
+        return Ok(ApiResponse<List<NotificationResponse>>.Ok(notifications));
+    }
+
+    [HttpPut("{id:int}/read")]
+    [EnableRateLimiting(RateLimitPolicies.Write)]
+    public async Task<IActionResult> MarkAsRead(int id, CancellationToken cancellationToken)
+    {
+        var userId = _currentUserService.GetCurrentUserId();
+        if (userId == null)
+            return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+        await _notificationService.MarkNotificationAsReadAsync(id, userId.Value, cancellationToken);
+        return Ok(ApiResponse<object>.Ok(null, "Notification marked as read."));
+    }
+
+    [HttpPut("read-all")]
+    [EnableRateLimiting(RateLimitPolicies.Write)]
+    public async Task<IActionResult> MarkAllAsRead(CancellationToken cancellationToken)
+    {
+        var userId = _currentUserService.GetCurrentUserId();
+        if (userId == null)
+            return Unauthorized(ApiResponse<object>.Fail("Invalid token."));
+
+        await _notificationService.MarkAllAsReadAsync(userId.Value, cancellationToken);
+        return Ok(ApiResponse<object>.Ok(null, "All notifications marked as read."));
+    }
+}
+```
+
+注意： `NotificationService`里的`SendNotificationAsync`方法不需要使用一个api端口去调用触发，因为通知写入库并发送通知的逻辑并不需要单独的按钮或者action主动触发，而是在其他业务逻辑中附带执行的， 比如我们上面的实例中，管理员审核通过，附带执行通知入库并触发通知的推送。而其他逻辑需要客户端手动触发才能执行， 比如：
+
+- 用户登录成功，渲染通知铃铛组件，浏览器触发api，拉取未读通知
+- 用户手动点击某条未读通知，标记为已读
+
+等等其他动作。
+
+#### 5.6 注册这两个新服务
+
+在 `Program.cs` 注册这两个新服务：
+
+```c#
+builder.Services.AddScoped<INotificationRepository, EfNotificationRepository>();
+builder.Services.AddScoped<INotificationService, NotificationService>();
+```
+
+用 Scalar 手动调一下（或者临时在别处调用一次 `SendAsync`），确认 `GET /notifications` 能查到、`PUT .../read` 能改状态。 这一步先只验证持久化这条链路是通的，跟 SignalR 完全无关。
+
+#### 5.7 验证通知的入库和推送
+
+还是以真实业务中的场景为例：
+
+```bash
+管理员通过车辆审核，通知车主
+```
+
+更新`AdminCarService`中触发通知推送的逻辑：使用新的 `NotificationService`
+
+```c#
+public class AdminCarService
+{
+    ...
+    private readonly INotificationService _notificationService;
+
+    public AdminCarService(...,
+        INotificationService notificationService)
+    {
+       ...
+        _notificationService = notificationService;
+    }
+
+
+    public async Task<CarResponse> ApproveAsync(
+        int carId,
+        CancellationToken cancellationToken = default)
+    {
+        var car = await _carRepository.GetByIdAsync(carId, cancellationToken);
+
+        ...
+
+        try
+        {
+            var updated = await _carRepository.UpdateAsync(car, cancellationToken);
+            await _cache.RemoveByPrefixAsync(CacheKeys.PublishedCarsPrefix, cancellationToken);
+            await _cache.RemoveByPrefixAsync(CacheKeys.PendingCarsPrefix, cancellationToken);
+            
+			// 审核通过，推送消息给车主
+            await _notificationService.SendNotificationAsync(car.SellerId, "test",
+                $"Your car {car.Title} has been approved.", carId, cancellationToken);
+
+            // ✅ 写审计日志
+            ...
+
+            return CarService.MapToResponse(updated);
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            ...
+        }
+    }
+
+    ...
+}
+```
+
+admin登录，并通过一台待审核车辆，通知数据写入数据库， 车主能收到通知。
+
+其他接口，用 Scalar 手动调一下，确认 `GET /notifications` 能查到、`PUT .../read` 能改状态。 
+
+### 6. 数据的优化渲染
+
+#### 6.1 渲染通知数据
+
+我们上面的通知组件只做了基础的连接和维护，但需要对这个组件的功能进行完善，包括未读通知的处理，阅读通知等等。
+
+整个过程需要调用我们上面创建的几个api接口，因此我们先统一封装一下这部分的前端axios请求接口
+
+新建 `src/types/notification.ts`:
+
+```ts
+// 对应后端 NotificationResponse
+export interface Notification {
+  id: number;
+  type: string;
+  message: string;
+  relatedId: number | null;
+  isRead: boolean;
+  createdAt: string;
+}
+```
+
+新建 `src/api/notification.ts`:
+
+```tsx
+import type { Notification, ApiResponse } from "@/types";
+import apiClient from "./client";
+
+export const notificationApi = {
+  // 历史未读通知
+  getAll: async (): Promise<Notification[]> => {
+    const response =
+      await apiClient.get<ApiResponse<Notification[]>>("/notifications");
+    return response.data.data!;
+  },
+
+  // 单条已读
+  read: async (id: number): Promise<void> => {
+    await apiClient.put(`/notifications/${id}/read`);
+  },
+
+  // 全部已读
+  readAll: async (): Promise<void> => {
+    await apiClient.put("/notifications/read-all");
+  },
+};
+
+```
+
+目前**只能收到"页面开着期间"新推送的通知**。如果用户在通知发生时没开着页面，等他打开页面，那条通知早就写进数据库了，但组件从来没有主动去查过历史数据，压根不知道有这条通知存在。因此需要组件第一次挂载时，主动调一次 `GET /notifications`，把历史未读通知塞进现有的 `notifications` 这个 State 里，跟 SignalR 推送过来的新通知共用同一份状态、同一套渲染逻辑，不用另外单独维护一份"历史通知"。
+
+```tsx
+import * as signalR from "@microsoft/signalr";
+import { useEffect, useState } from "react";
+import type { Notification } from "@/types";
+import { notificationApi } from "@/api";
+import { useAuthStore } from "@/stores/authStore";
+
+export default function NotificationBell() {
+  const [notifications, setNotifications] = useState<Notification[]>([]);
+
+  // 拉取历史未读通知
+  const fetchUnread = async () => {
+    try {
+      const data = await notificationApi.getAll();
+      setNotifications(data);
+    } catch {
+      // 静默处理，通知拉取失败不影响主流程
+    }
+  };
+
+  useEffect(() => {
+    // 初次渲染时来取历史数据
+    fetchUnread();
+
+    // 建立 SignalR 连接
+    const connection = new signalR.HubConnectionBuilder()
+      .withUrl(`${import.meta.env.VITE_API_BASE_URL}/hubs/notification`, {
+        // 告诉 SignalR 建立连接时带上 Token
+        accessTokenFactory: () => useAuthStore.getState().accessToken ?? "",
+      })
+      // 连接断开后自动重连（SignalR 内置，不需要手动实现）
+      .withAutomaticReconnect()
+      .build();
+
+    // 监听服务端推送的通知事件
+    // "ReceiveNotification" 对应服务端 SendAsync("ReceiveNotification", ...)
+    connection.on("ReceiveNotification", (data: Notification) => {
+      // 新通知加到列表顶部
+      setNotifications((prev) => [data, ...prev]);
+    });
+
+    // 启动连接
+    connection.start().catch((err) => console.error(err));
+
+    // 组件卸载时断开连接
+    return () => {
+      connection.stop();
+    };
+  }, []);
+
+  return (
+    <div className="relative">
+      {notifications &&
+        notifications.map((n) => (
+          <p key={n.id}>
+            {n.id} - {n.message}
+          </p>
+        ))}
+    </div>
+  );
+}
+
+
+```
+
+完善标记通知已读逻辑，需要2个功能：
+
+- 标记单条已读
+- 标记全部已读
+
+并使用变量`const unreadCount = notifications.length` 来记录未读通知的数量。
+
+定义标记已读的方法， 并简单渲染按钮操作：
+
+```tsx
+import * as signalR from "@microsoft/signalr";
+import { useEffect, useState } from "react";
+import type { Notification } from "@/types";
+import { notificationApi } from "@/api";
+import { useAuthStore } from "@/stores/authStore";
+import { Button } from "./ui/button";
+
+export default function NotificationBell() {
+  const [notifications, setNotifications] = useState<Notification[]>([]);
+
+  const unreadCount = notifications.length;
+
+  // 拉取历史未读通知
+  ...
+
+  // 标记单条已读
+  const markAsRead = async (id: number) => {
+    try {
+      await notificationApi.read(id);
+      setNotifications((prev) => prev.filter((n) => n.id !== id));
+    } catch {
+      // 静默处理，通知拉取失败不影响主流程
+    }
+  };
+
+  // 全部标记已读
+  const markAllAsRead = async () => {
+    try {
+      await notificationApi.readAll();
+      setNotifications([]);
+    } catch {
+      // 静默处理
+    }
+  };
+
+  useEffect(() => {
+    ...
+  }, []);
+
+  return (
+    <div>
+      {notifications.map((n) => (
+        <div key={n.id} className="flex flex-row items-center gap-10">
+          <span>
+            {n.id} - {n.message}
+          </span>
+          <Button
+            variant={"outline"}
+            onClick={() => {
+              markAsRead(n.id);
+            }}
+          >
+            mark as read
+          </Button>
+        </div>
+      ))}
+      <p>未读通知：{unreadCount}</p>
+
+      <Button onClick={markAllAsRead}>read all</Button>
+    </div>
+  );
+}
+
+```
+
+现在的状态是：
+
+1. **页面首次加载完成时**：`fetchUnread()` 拿到数据 -> 调用 `setNotifications(data)` -> **触发 1 次渲染**展示列表。
+2. **接收到实时通知时**：SignalR 推送消息 -> 调用 `setNotifications(prev => ...)` -> **触发 1 次渲染**追加新消息。
+3. **点击 `markAsRead` 时**：过滤数组 -> 调用 `setNotifications(prev => ...)` -> **触发 1 次渲染**剔除已读项。
+4. **点击 `markAllAsRead` 时**：清空数组 -> 调用 `setNotifications([])` -> **触发 1 次渲染**清空列表。
+
+#### 6.2 优化：使用React Query
+
+使用TanStack Query (React Query) 来替代手写的 `fetchUnread` 和 `useState`。手写状态管理时，需要手动处理加载状态、错误捕捉以及数据更新逻辑。改用 `useQuery` + `useQueryClient` 后，不仅代码更优雅，还能轻松实现“收到 SignalR 实时通知后直接更新 React Query 缓存”的高级模式。
+
+```tsx
+import * as signalR from "@microsoft/signalr";
+import { useEffect } from "react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import type { Notification } from "@/types";
+import { notificationApi } from "@/api";
+import { Button } from "./ui/button";
+
+// 辅助函数，用于生成一个根据`userId`动态变化的query key
+const notificationKeys = {
+  unread: (userId: number | undefined) =>
+    ["notifications", "unread", userId] as const,
+};
+
+export default function NotificationBell() {
+  const queryClient = useQueryClient();
+  // 当前用户的id
+  const userId = useAuthStore((state) => state.user?.id);
+ 
+  // 1. 获取未读消息列表（自动托管 loading / error / data 状态）
+  const { data: notifications = [] } = useQuery({
+    queryKey: queryKey: notificationKeys.unread(userId),
+    queryFn: () => notificationApi.getAll(),
+    retry: false, // 通知拉取失败不影响主流程，无需反复重试
+  });
+
+  // 派生状态：不需要额外的 unreadCount State，直接算就行，效率更高！
+  const unreadCount = notifications.length;
+
+  // 2. 标记单条已读 Mutation
+  const readMutation = useMutation({
+    mutationFn: (id: number) => notificationApi.read(id),
+    onSuccess: () => {
+      // 操作成功后统一作废 key，让 TanStack Query 重新同步后台数据
+      queryClient.invalidateQueries({ queryKey: notificationKeys.unread(userId)});
+    },
+    onError: (error) => toast.error(error.message),
+  });
+
+  // 3. 全部标记已读 Mutation
+  const readAllMutation = useMutation({
+    mutationFn: () => notificationApi.readAll(),
+    onSuccess: () => {
+      toast.success("All notifications marked as read.");
+      queryClient.invalidateQueries({ queryKey: queryKey: notificationKeys.unread(userId)});
+    },
+    onError: (error) => toast.error(error.message),
+  });
+
+  // 4. SignalR 监听逻辑（仅在组件挂载时建立一次连接）
+  useEffect(() => {
+      
+    if (userId === undefined) return;
+
+      /*
+       * queryKey 定义在 Effect 内部，不需要放进依赖数组。
+       * userId 改变时，Effect 会重新执行并生成新用户的 Query Key。
+       */
+    const queryKey = notificationKeys.unread(userId);
+      
+    const connection = new signalR.HubConnectionBuilder()
+      .withUrl(`${import.meta.env.VITE_API_BASE_URL}/hubs/notification`, {
+        // 告诉 SignalR 建立连接时带上 Token
+        accessTokenFactory: () => useAuthStore.getState().accessToken ?? "",
+      })
+      .withAutomaticReconnect()
+      .build();
+
+    // 收到实时消息时，让 query 缓存失效，自动拉取最新的通知列表
+    connection.on("ReceiveNotification", () => {
+      queryClient.invalidateQueries({ queryKey });
+      // 弹出 Toast 提示
+      toast.info("You have received a new notification!", {
+        duration: 5000,
+      });
+    });
+
+    connection.start().catch((err) => console.error(err));
+
+    return () => {
+      connection.stop();
+    };
+  }, [queryClient, userId]); // ✅ 依赖项只有 queryClient，整个生命周期只连接一次 SignalR
+
+  return (
+    <div>
+      {notifications.map((n) => (
+        <div key={n.id} className="flex flex-row items-center gap-10">
+          <span>
+            {n.id} - {n.message}
+          </span>
+          <Button
+            variant="outline"
+            disabled={readMutation.isPending}
+            onClick={() => readMutation.mutate(n.id)}
+          >
+            mark as read
+          </Button>
+        </div>
+      ))}
+
+      <p>未读通知：{unreadCount}</p>
+
+      <Button
+        disabled={readAllMutation.isPending || unreadCount === 0}
+        onClick={() => readAllMutation.mutate()}
+      >
+        read all
+      </Button>
+    </div>
+  );
+}
+```
+
+
+
+#### 6.3 完善组件UI：
+
+新增状态 `isOpen` 控制铃铛的开关
+
+```tsx
+import * as signalR from "@microsoft/signalr";
+import { useEffect, useState } from "react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { notificationApi } from "@/api";
+import { Bell } from "lucide-react";
+import { toast } from "sonner";
+
+
+export default function NotificationBell() {
+  ...
+  const [isOpen, setIsOpen] = useState(false);
+
+  // 1. 获取未读消息列表（自动托管 loading / error / data 状态）
+  ...
+
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        onClick={() => setIsOpen((prev) => !prev)}
+        className="relative flex h-9 w-9 items-center justify-center rounded-full transition-colors"
+        style={{ color: "var(--color-text-secondary)" }}
+        aria-label={`Notifications (${unreadCount} unread)`}
+      >
+        <Bell className="h-5 w-5" />
+        {unreadCount > 0 && (
+          <span
+            className="absolute -right-0.5 -top-0.5 flex h-4 w-4 items-center
+                       justify-center rounded-full text-[10px] font-bold text-white"
+            style={{ backgroundColor: "var(--color-danger)" }}
+          >
+            {unreadCount}
+          </span>
+        )}
+      </button>
+
+      {isOpen && (
+        <>
+          <div
+            className="fixed inset-0 z-10"
+            onClick={() => setIsOpen(false)}
+          />
+
+          <div
+            className="absolute right-0 top-10 z-20 w-80 rounded-[var(--radius-lg)] border shadow-lg"
+            style={{
+              backgroundColor: "var(--color-warning-light)",
+              borderColor: "var(--color-border)",
+            }}
+          >
+            <div
+              className="flex items-center justify-between border-b px-4 py-3"
+              style={{ borderColor: "var(--color-border)" }}
+            >
+              <span
+                className="text-sm font-semibold"
+                style={{ color: "var(--color-text-primary)" }}
+              >
+                Notifications
+              </span>
+              {unreadCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => readAllMutation.mutate()}
+                  className="text-xs"
+                  style={{ color: "var(--color-primary)" }}
+                >
+                  Mark all as read
+                </button>
+              )}
+            </div>
+
+            <div className="max-h-80 overflow-y-auto">
+              {notifications.length === 0 ? (
+                <p
+                  className="px-4 py-6 text-center text-sm"
+                  style={{ color: "var(--color-text-muted)" }}
+                >
+                  No unread notifications
+                </p>
+              ) : (
+                notifications.map((n) => (
+                  <button
+                    key={n.id}
+                    type="button"
+                    onClick={() => {
+                      readMutation.mutate(n.id);
+                      setIsOpen(false);
+                    }}
+                    className="w-full border-b px-4 py-3 text-left transition-colors last:border-b-0"
+                    style={{
+                      borderColor: "var(--color-border)",
+                      backgroundColor: "transparent",
+                    }}
+                  >
+                    <p
+                      className="text-sm"
+                      style={{ color: "var(--color-text-primary)" }}
+                    >
+                      {n.message}
+                    </p>
+                    <p
+                      className="mt-0.5 text-xs"
+                      style={{ color: "var(--color-text-muted)" }}
+                    >
+                      {new Date(n.createdAt).toLocaleDateString()}
+                    </p>
+                  </button>
+                ))
+              )}
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+```
+
+
+
+### 7. 在业务操作里触发通知
+
+上面我们只测试了
+
+```bash
+管理员通过车辆审核，通知车主
+```
+
+的场景， 那么针对其他不同的场景，我们需要设计不同的通知类型。
+
+#### 7.1 编写通知常量类型
+
+把通知类型统一管理，新建 `UUcars.API/Entities/NotificationTypes.cs`：
+
+```csharp
+namespace UUcars.API.Entities;
+
+/// <summary>
+///     通知类型常量
+///     前端根据 Type 决定点击后跳转到哪个页面
+/// </summary>
+public static class NotificationTypes
+{
+    public const string CarApproved = "CarApproved";    // → 车辆详情页
+    public const string CarRejected = "CarRejected";    // → 车辆编辑页
+    public const string NewOrder = "NewOrder";          // → 销售订单列表
+    public const string OrderCancelled = "OrderCancelled"; // → 销售订单列表
+}
+```
+
+根据不同的业务场景，补充推送通知的服务：
+
+- 通知卖家审核通过
+- 通知卖家审核被拒绝
+- 通知卖家有新订单
+- 通知卖家订单被取消
+
+#### 7.2 更新 AdminCarServic
+
+**在 `ApproveAsync` 的 `try` 块里，缓存清理之后加入：**
+
+```csharp
+// ✅ 新增：通知卖家审核通过
+await _notificationService.SendNotificationAsync(
+    car.SellerId,
+    NotificationTypes.CarApproved,
+    $"Your car listing \"{car.Title}\" has been approved and is now live!",
+    relatedId: car.Id,
+    cancellationToken: cancellationToken);
+```
+
+**在 `RejectAsync` 的 `try` 块里，缓存清理之后加入：**
+
+```csharp
+// ✅ 新增：通知卖家审核被拒绝
+await _notificationService.SendNotificationAsync(
+    car.SellerId,
+    NotificationTypes.CarRejected,
+    $"Your car listing \"{car.Title}\" was not approved. Please review and resubmit.",
+    relatedId: car.Id,
+    cancellationToken: cancellationToken);
+```
+
+#### 7.3 更新 OrderService
+
+在`CreateAsync` 里，缓存清理之后加入通知
+
+找到这一行：
+
+```csharp
+await _cache.RemoveByPrefixAsync(CacheKeys.PublishedCarsPrefix, cancellationToken);
+```
+
+在这行之后加入：
+
+```csharp
+// ✅ 新增：通知卖家有新订单
+// car 对象在前面已经通过 GetByIdAsync 取出，直接用 car.SellerId 和 car.Title
+await _notificationService.SendNotificationAsync(
+    car.SellerId,
+    NotificationTypes.NewOrder,
+    $"You have a new order for \"{car.Title}\"!",
+    relatedId: order.Id,
+    cancellationToken: cancellationToken);
+```
+
+**`CancelAsync` 里，状态更新成功后加入通知**
+
+找到 `_logger.LogInformation("Order {OrderId} cancelled", orderId)` 这行之前，加入：
+
+```csharp
+// ✅ 新增：通知卖家订单被取消
+// order.Car 已经通过 Include 加载，直接使用
+await _notificationService.SendNotificationAsync(
+    order.Car.SellerId,
+    NotificationTypes.OrderCancelled,
+    $"The order for \"{order.Car.Title}\" has been cancelled by the buyer.",
+    relatedId: order.Id,
+    cancellationToken: cancellationToken);
+```
+
+### 8. 通知详情跳转
+
+客户端查重通知详情后， 需要根据不同的通知类型，调转到不同的操作页面。
+
+`NotificationBell`组件中定义辅助方法：
+
+```tsx
+...
+import type { Notification } from "@/types";
+import { useNavigate } from "react-router-dom";
+
+
+export default function NotificationBell() {
+  ...
+  const navigate = useNavigate();
+
+  // 根据通知类型决定点击后跳转到哪里
+  function getNotificationUrl(notification: Notification): string {
+    switch (notification.type) {
+      case "CarApproved":
+        return `/cars/${notification.relatedId}`;
+      case "CarRejected":
+        return `/cars/${notification.relatedId}/edit`;
+      case "NewOrder":
+      case "OrderCancelled":
+        return "/profile/sales";
+      default:
+        return "/";
+    }
+  }
+
+  ...
+
+    return () => {
+      connection.stop();
+    };
+  }, [queryClient]); // ✅ 依赖项只有 queryClient，整个生命周期只连接一次 SignalR
+
+  return (
+    <div className="relative">
+      ...
+    </div>
+  );
+}
+
+```
+
+点击阅读通知时跳转页面
+
+```tsx
+...
+import type { Notification } from "@/types";
+import { useNavigate } from "react-router-dom";
+
+
+export default function NotificationBell() {
+  ...
+  const navigate = useNavigate();
+
+  // 根据通知类型决定点击后跳转到哪里
+  function getNotificationUrl(notification: Notification): string {
+    switch (notification.type) {
+      case "CarApproved":
+        return `/cars/${notification.relatedId}`;
+      case "CarRejected":
+        return `/cars/${notification.relatedId}/edit`;
+      case "NewOrder":
+      case "OrderCancelled":
+        return "/profile/sales";
+      default:
+        return "/";
+    }
+  }
+
+  ...
+
+  return (
+    <div className="relative">
+      <button
+        ...
+      </button>
+
+      {isOpen && (
+        <>
+          <div
+            className="fixed inset-0 z-10"
+            onClick={() => setIsOpen(false)}
+          />
+
+          <div
+            ...
+            <div className="max-h-80 overflow-y-auto">
+              {notifications.length === 0 ? (
+                <p
+                  className="px-4 py-6 text-center text-sm"
+                  style={{ color: "var(--color-text-muted)" }}
+                >
+                  No unread notifications
+                </p>
+              ) : (
+                notifications.map((n) => (
+                  <button
+                    key={n.id}
+                    type="button"
+                    onClick={() => {
+                      readMutation.mutate(n.id);
+                      setIsOpen(false);
+                      // 点击跳转
+                      navigate(getNotificationUrl(n));
+                    }}
+                    className="w-full border-b px-4 py-3 text-left transition-colors last:border-b-0"
+                    style={{
+                      borderColor: "var(--color-border)",
+                      backgroundColor: "transparent",
+                    }}
+                  >
+                    ...
+                  </button>
+                ))
+              )}
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+```
+
+
+
+### 9 后端单元测试
+
+#### 9.1 新建 FakeNotificationService
+
+新建 `UUcars.Tests/Fakes/FakeNotificationService.cs`：
+
+```csharp
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Services.Notifications;
+
+namespace UUcars.Tests.Fakes;
+
+public class FakeNotificationService : INotificationService
+{
+    public record SentNotification(
+        int UserId,
+        string Type,
+        string Message,
+        int? RelatedId);
+
+    public List<SentNotification> SentNotifications { get; } = new();
+
+    public Task SendNotificationAsync
+    (
+        int userId,
+        string type,
+        string message,
+        int? relatedId = null,
+        CancellationToken cancellationToken = default)
+    {
+        SentNotifications.Add(new SentNotification(userId, type, message, relatedId));
+        return Task.CompletedTask;
+    }
+
+    public Task<List<NotificationResponse>> GetUnreadNotificationsAsync(
+        int userId,
+        CancellationToken cancellationToken = default)
+    {
+        return Task.FromResult(new List<NotificationResponse>());
+    }
+
+    public Task MarkNotificationAsReadAsync(
+        int notificationId,
+        int userId,
+        CancellationToken cancellationToken = default)
+    {
+        return Task.CompletedTask;
+    }
+
+    public Task MarkAllNotificationsAsReadAsync(
+        int userId,
+        CancellationToken cancellationToken = default)
+    {
+        return Task.CompletedTask;
+    }
+}
+```
+
+#### 9.2 更新 AdminCarServiceTests
+
+`AdminCarService` 构造函数多了 `INotificationService`，更新 CreateService 辅助方法：
+
+```csharp
+...
+namespace UUcars.Tests.Services;
+
+public class AdminCarServiceTests
+{
+    
+    private static AdminCarService CreateService(
+        ICarRepository carRepository,
+        IAuditLogService? auditLogService = null,
+        // ✅ 新增
+        INotificationService? notificationService = null) 
+    {
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseInMemoryDatabase(Guid.NewGuid().ToString())
+            .Options;
+        var context = new AppDbContext(options);
+
+        var httpContextAccessor = new HttpContextAccessor();
+        var currentUserService = new CurrentUserService(httpContextAccessor);
+
+        return new AdminCarService(
+            new FakeCacheService(),
+            carRepository,
+            NullLogger<AdminCarService>.Instance,
+            auditLogService ?? new FakeAuditLogService(),
+            currentUserService,
+            // ✅ 新增
+            context, notificationService ?? new FakeNotificationService() 
+        );
+    }
+
+	...
+}
+
+
+```
+
+#### 9.3 新增通知测试
+
+在 `AdminCarServiceTests.cs` 里加入：
+
+```csharp
+// 新增推送通知测试
+
+[Fact]
+public async Task ApproveAsync_WhenSuccessful_SendsNotificationToSeller()
+{
+    var fakeRepo = new FakeCarRepository();
+    var fakeNotifications = new FakeNotificationService();
+    var service = CreateService(fakeRepo, notificationService: fakeNotifications);
+
+    fakeRepo.Seed(new Car
+    {
+        Id = 1,
+        SellerId = 42,
+        Title = "My Test Car",
+        Brand = "Toyota",
+        Model = "Corolla",
+        Year = 2020,
+        Price = 10000,
+        Mileage = 50000,
+        Status = CarStatus.PendingReview,
+        CreatedAt = DateTime.UtcNow,
+        UpdatedAt = DateTime.UtcNow
+    });
+
+    await service.ApproveAsync(1);
+
+    // 验证通知被发送给卖家（SellerId = 42）
+    Assert.Single(fakeNotifications.SentNotifications);
+    Assert.Equal(42, fakeNotifications.SentNotifications[0].UserId);
+    Assert.Equal(NotificationTypes.CarApproved,
+        fakeNotifications.SentNotifications[0].Type);
+}
+
+[Fact]
+public async Task RejectAsync_WhenSuccessful_SendsNotificationToSeller()
+{
+    var fakeRepo = new FakeCarRepository();
+    var fakeNotifications = new FakeNotificationService();
+    var service = CreateService(fakeRepo, notificationService: fakeNotifications);
+
+    fakeRepo.Seed(new Car
+    {
+        Id = 1,
+        SellerId = 42,
+        Title = "My Test Car",
+        Brand = "Toyota",
+        Model = "Corolla",
+        Year = 2020,
+        Price = 10000,
+        Mileage = 50000,
+        Status = CarStatus.PendingReview,
+        CreatedAt = DateTime.UtcNow,
+        UpdatedAt = DateTime.UtcNow
+    });
+
+    await service.RejectAsync(1);
+
+    Assert.Single(fakeNotifications.SentNotifications);
+    Assert.Equal(42, fakeNotifications.SentNotifications[0].UserId);
+    Assert.Equal(NotificationTypes.CarRejected,
+        fakeNotifications.SentNotifications[0].Type);
+}
+```
+
+#### 9.4 更新 OrderServiceTests
+
+`OrderService` 构造函数多了 `INotificationService`，更新 CreateService 辅助方法：
+
+```c#
+...
+
+namespace UUcars.Tests.Services;
+
+public class OrderServiceTests
+{
+    private static AppDbContext CreateDbContext()
+    {
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseInMemoryDatabase(Guid.NewGuid().ToString())
+            .Options;
+        return new AppDbContext(options);
+    }
+
+    private static OrderService CreateService(
+        AppDbContext context,
+        FakeCarRepository? carRepo = null,
+        // ✅ 新增
+        INotificationService? notificationService = null)
+    {
+        var orderRepo = new EfOrderRepository(context);
+        return new OrderService(
+            new FakeCacheService(),
+            carRepo ?? new FakeCarRepository(),
+            context,
+            NullLogger<OrderService>.Instance,
+            orderRepo,
+            // 新增通知
+            notificationService ?? new FakeNotificationService()
+        );
+    }
+
+    ...
+    
+}
+```
+
+#### 9.5 新增orderService里通知的测试 
+
+ 新增2个创建订单通知测试：
+
+- CreateAsync_WhenSuccessful_SendsNewOrderNotificationToSeller
+- CancelAsync_WhenSuccessful_SendsOrderCancelledNotificationToSeller
+
+```c#
+[Fact]
+public async Task CreateAsync_WhenSuccessful_SendsNewOrderNotificationToSeller()
+{
+    // Arrange
+    var context = CreateDbContext();
+    var carRepo = new FakeCarRepository();
+    var fakeNotifications = new FakeNotificationService();
+
+    var buyer = new User
+    {
+        Id = 2,
+        Username = "buyer",
+        Email = "buyer@test.com",
+        PasswordHash = "hash",
+        Role = UserRole.User,
+        CreatedAt = DateTime.UtcNow,
+        UpdatedAt = DateTime.UtcNow
+    };
+
+    var seller = new User
+    {
+        Id = 10,
+        Username = "seller",
+        Email = "seller@test.com",
+        PasswordHash = "hash",
+        Role = UserRole.User,
+        CreatedAt = DateTime.UtcNow,
+        UpdatedAt = DateTime.UtcNow
+    };
+
+    var car = new Car
+    {
+        Id = 1,
+        SellerId = 10,
+        Price = 260000,
+        Status = CarStatus.Published,
+        Title = "BMW 3 Series",
+        Brand = "BMW",
+        Model = "3 Series",
+        Year = 2020,
+        Mileage = 15000,
+        CreatedAt = DateTime.UtcNow,
+        UpdatedAt = DateTime.UtcNow
+    };
+
+    context.Users.AddRange(buyer, seller);
+    context.Cars.Add(car);
+    await context.SaveChangesAsync();
+
+    carRepo.Seed(car);
+
+    var service = CreateService(
+        context,
+        carRepo,
+        fakeNotifications);
+
+    // Act
+    var result = await service.CreateAsync(
+        buyer.Id,
+        new OrderCreateRequest { CarId = car.Id });
+
+    // Assert
+    var notification =
+        Assert.Single(fakeNotifications.SentNotifications);
+
+    Assert.Equal(seller.Id, notification.UserId);
+    Assert.Equal(
+        NotificationTypes.NewOrder,
+        notification.Type);
+    Assert.Equal(result.Id, notification.RelatedId);
+}
+
+[Fact]
+public async Task CancelAsync_WhenSuccessful_SendsOrderCancelledNotificationToSeller()
+{
+    // Arrange
+    var context = CreateDbContext();
+    var carRepo = new FakeCarRepository();
+    var fakeNotifications = new FakeNotificationService();
+
+    var buyer = new User
+    {
+        Id = 2,
+        Username = "buyer",
+        Email = "buyer@test.com",
+        PasswordHash = "hash",
+        Role = UserRole.User,
+        CreatedAt = DateTime.UtcNow,
+        UpdatedAt = DateTime.UtcNow
+    };
+
+    var seller = new User
+    {
+        Id = 10,
+        Username = "seller",
+        Email = "seller@test.com",
+        PasswordHash = "hash",
+        Role = UserRole.User,
+        CreatedAt = DateTime.UtcNow,
+        UpdatedAt = DateTime.UtcNow
+    };
+
+    var car = new Car
+    {
+        Id = 1,
+        SellerId = seller.Id,
+        Price = 260000,
+        Status = CarStatus.Sold,
+        Title = "BMW 3 Series",
+        Brand = "BMW",
+        Model = "3 Series",
+        Year = 2020,
+        Mileage = 15000,
+        CreatedAt = DateTime.UtcNow,
+        UpdatedAt = DateTime.UtcNow
+    };
+
+    var order = new Order
+    {
+        Id = 1,
+        CarId = car.Id,
+        BuyerId = buyer.Id,
+        SellerId = seller.Id,
+        Price = car.Price,
+        Status = OrderStatus.Pending,
+        CreatedAt = DateTime.UtcNow,
+        UpdatedAt = DateTime.UtcNow
+    };
+
+    context.Users.AddRange(buyer, seller);
+    context.Cars.Add(car);
+    context.Orders.Add(order);
+    await context.SaveChangesAsync();
+
+    carRepo.Seed(car);
+
+    var service = CreateService(
+        context,
+        carRepo,
+        fakeNotifications);
+
+    // Act
+    var result = await service.CancelAsync(
+        order.Id,
+        buyer.Id);
+
+    // Assert
+    var notification =
+        Assert.Single(fakeNotifications.SentNotifications);
+
+    Assert.Equal(seller.Id, notification.UserId);
+    Assert.Equal(
+        NotificationTypes.OrderCancelled,
+        notification.Type);
+    Assert.Equal(result.Id, notification.RelatedId);
+}
+```
+
+
+
+### 10. 本地验证
+
+#### 10.1 验证 SignalR 连接
+
+1. 卖家账号登录前端
+2. 打开 DevTools → Network → WS（WebSocket 过滤）
+3. 应该看到一条到 `/hubs/notification` 的 WebSocket 连接，状态是 101 Switching Protocols
+
+如果这里连接一直建立不起来、Network 面板里 negotiate 请求直接报跨域 相关错误，第一时间去确认 `app.UseCors(...)` 中间件是不是真的注册在 `app.MapHub<NotificationHub>(...)` 之前生效。
+
+#### 10.2 验证实时通知
+
+1. 用两个浏览器窗口（或无痕 + 普通）分别以卖家和 Admin 身份登录
+2. 有一辆车处于 PendingReview 状态
+3. Admin 窗口点击 Approve
+4. 卖家窗口**立即**弹出 Toast 通知，不需要刷新
+5. 铃铛角标数字增加 1
+
+#### 10.3 验证持久化
+
+1. 卖家关闭浏览器窗口（或退出登录再重新登录）
+2. 重新打开后铃铛角标仍然显示未读数
+3. 点开铃铛，能看到历史未读通知列表
+
+
+
+### 11. 编译和测试
+
+```bash
+dotnet build
+dotnet test
+cd uucars-web && npm run build
+```
+
+
+
+### 12. Git 提交
+
+```bash
+git add .
+git commit -m "feat: SignalR real-time notifications with persistence"
+git push origin feature/v3-signalr-notifications
+
+git checkout develop
+git merge --no-ff feature/v3-signalr-notifications \
+  -m "merge: feature/v3-signalr-notifications into develop"
+git push origin develop
+
+git branch -d feature/v3-signalr-notifications
+git push origin --delete feature/v3-signalr-notifications
+```
+
+
+
+### Step 70 完成状态
+
+```
+知识点：
+✅ 理解 SignalR 的传输方式选择（WebSocket → SSE → Long Polling 自动降级）
+✅ 理解 Hub 和 Group 的概念（同一用户的多个连接加入同一个 `user-{id}` Group）
+✅ 理解 SignalR JWT 从 QueryString 取 Token 的原因（WebSocket 不支持自定义请求头）
+✅ 理解通知为什么要持久化（用户离线时推送失败，重新上线可从数据库恢复）
+✅ 理解推送失败静默处理的原因（用户不在线是正常情况，不能影响主流程）
+✅ 理解为什么 Hub 内部不能沿用 CurrentUserService（IHttpContextAccessor
+   面向 HTTP 请求-响应周期设计，Hub 是长连接场景，应直接用 Context.User）
+✅ 理解 IHubContext<T> 的作用（让 Hub 外部的普通服务也能向指定 Group 推送消息）
+✅ 理解 ExecuteUpdateAsync 的适用场景（批量更新不需要先加载实体到内存）
+
+实现（后端）：
+✅ Notification 实体 + NotificationTypes 常量 + EF 配置
+✅ Migration: AddNotificationsTable
+✅ AuthExtensions 更新（SignalR JWT QueryString 配置）
+✅ NotificationGroups 统一 Group 命名
+✅ NotificationHub（从 Context.UserIdentifier 解析 userId，并将连接加入用户 Group）
+✅ INotificationService 接口 + NotificationService 实现（写DB + 向用户 Group 推送完整通知对象）
+✅ NotificationsController（GET/PUT 三个接口，用 CurrentUserService 完全没问题）
+✅ AdminCarService：Approve/Reject 时发送通知
+✅ OrderService：CreateAsync/CancelAsync 时发送通知
+✅ Program.cs：AddSignalR + MapHub
+
+实现（前端）：
+✅ @microsoft/signalr 安装
+✅ NotificationBell 组件
+✅ Layout 集成 NotificationBell
+✅ NotificationResponse 类型定义
+
+测试：
+✅ FakeNotificationService
+✅ AdminCarServiceTests 更新（加入 FakeNotificationService）
+✅ 新增2个通知测试（Approve/Reject 发送通知给正确的卖家）
+✅ OrderServiceTests 更新（Create/Cancel 验证通知类型、目标卖家和关联订单）
+```
+
+## Step 71 · Admin 数据面板
+
+### 这一步做什么
+
+Step 70 完成了实时通知，系统已经能够处理车辆发布、审核、下单、成交和用户通知。
+
+但现在 Admin 只能处理一条条具体业务记录：
+
+```
+查看待审核车辆
+→ Approve / Reject / Delete
+→ 查看审计日志
+```
+
+Admin 仍然无法回答更高层的问题：
+
+```
+平台现在有多少车辆？
+有多少车辆还在等待审核？
+本月产生了多少订单？
+本月实际完成了多少交易额？
+最近 30 天的车辆和收入趋势如何？
+平台上哪些品牌最多？
+```
+
+这些问题与普通列表查询不同。
+
+列表查询回答的是：
+
+```
+“有哪些记录？”
+```
+
+Dashboard 统计回答的是：
+
+```
+“这些记录整体呈现什么状态和趋势？”
+```
+
+这一步会以 Admin Dashboard 为载体，学习：
+
+- SQL Aggregate；
+- `Count`、`Sum` 和 `GroupBy`；
+- UTC 日期边界；
+- 时间序列补零；
+- Dashboard DTO；
+- 短期缓存；
+- Recharts；
+- 图表数据与页面状态处理。
+
+最终数据流是：
+
+```bash
+Cars / Orders / Users
+        ↓
+EfAdminStatsRepository
+        ↓
+AdminStatsService
+        ↓
+Redis 5 分钟缓存
+        ↓
+GET /admin/stats
+        ↓
+TanStack Query
+        ↓
+统计卡片 + LineChart + PieChart
+```
+
+同时，Step 63 已经完成了审计日志的写入和查询接口，但目前还没有前端页面使用它。
+
+审计日志继续使用现有接口：
+
+```
+GET /admin/audit-logs
+```
+
+本步骤将在 Dashboard 中加入审计日志表格和分页。
+
+
+
+### 1. 切出功能分支
+
+先检查当前状态：
+
+```
+git status --short --branch
+```
+
+确认在干净的 `develop` 后：
+
+```
+git pull --ff-only origin develop
+git checkout -b feature/v3-admin-dashboard
+git push -u origin feature/v3-admin-dashboard
+```
+
+
+
+### 2. SQL Aggregate 聚合查询
+
+普通查询通常返回一组记录：
+
+```
+SELECT *
+FROM Cars
+WHERE Status = 'Published'
+```
+
+Aggregate 查询不会返回每一辆车，而是把多行数据压缩为一个结果：
+
+```
+SELECT COUNT(*)
+FROM Cars
+WHERE Status = 'Published'
+```
+
+常见 Aggregate：
+
+```
+COUNT   统计记录数量
+SUM     合计数值
+AVG     平均值
+MIN     最小值
+MAX     最大值
+```
+
+在 EF Core 中对应：
+
+```
+await query.CountAsync();
+await query.SumAsync();
+await query.AverageAsync();
+await query.MinAsync();
+await query.MaxAsync();
+```
+
+#### 2.1 为什么不能先 `ToListAsync` 再统计？
+
+下面的写法虽然能工作，但会把所有车辆加载到应用内存：
+
+```
+var cars = await _context.Cars.ToListAsync();
+
+var totalCars = cars.Count(c => c.Status != CarStatus.Deleted);
+```
+
+生成的过程是：
+
+```
+SQL Server 读取所有 Cars 行
+→ 把全部字段传给 API
+→ EF Core 创建全部 Car 对象
+→ C# 在内存里 Count
+```
+
+正确写法：
+
+```
+var totalCars = await _context.Cars
+    .CountAsync(c => c.Status != CarStatus.Deleted);
+```
+
+生成的是类似：
+
+```
+SELECT COUNT(*)
+FROM Cars
+WHERE Status <> 'Deleted'
+```
+
+统计发生在数据库中，只返回一个数字。
+
+#### 2.2 Aggregate 查询还需要 `AsNoTracking` 吗？
+
+变更追踪针对的是加载进内存的 Entity。
+
+`CountAsync`、`SumAsync` 和投影后的 `GroupBy` 不会返回完整 Entity，因此本身没有大量实体追踪成本。
+
+因此，这类聚合查询不需要额外调用 `AsNoTracking()`。真正关键的是：
+
+```
+不要先加载 Entity
+而要让数据库完成聚合
+```
+
+
+
+### 3. 实现一个最小的 Aggregate 查询
+
+我们同样采用项目约定的分层结构：
+
+```
+Controller
+  负责 HTTP
+
+Service
+  负责业务规则和流程编排
+
+Repository
+  负责 EF Core 查询与持久化
+```
+
+因此，主要的操作如下：
+
+```
+新建 EfAdminStatsRepository
+  → 数据库过滤
+  → Count / Sum / GroupBy
+  → 只返回数据库实际存在的聚合结果
+
+新建 AdminStatsService
+  → 决定业务时间范围
+  → 补齐没有数据的日期
+  → 组合最终 DTO
+  → 处理 5 分钟缓存
+
+AdminController 中新增接口 `GET /admin/stats`
+  → 处理 HTTP 请求
+  → 鉴权
+  → 限流
+```
+
+我们先实现一个最小的查询：先让 Admin 能读到总车辆数， 来打通数据流。
+
+#### 3.1 定义 Dashboard DTO
+
+新建 `UUcars.API/DTOs/Responses/AdminStatsResponse.cs`
+
+```c#
+namespace UUcars.API.DTOs.Responses;
+
+public sealed class AdminStatsResponse
+{
+    public int TotalCars { get; init; }
+}
+```
+
+#### 3.2 定义统计数据 Repository
+
+定义仓库接口，新建 `UUcars.API/Repositories/IAdminStatsRepository.cs`：
+
+```c#
+namespace UUcars.API.Repositories;
+
+public interface IAdminStatsRepository
+{
+    Task<int> GetTotalCarsAsync(CancellationToken cancellationToken = default);
+}
+```
+
+实现接口方法，新建 `UUcars.API/Repositories/EfAdminStatsRepository.cs`：
+
+```c#
+using Microsoft.EntityFrameworkCore;
+using UUcars.API.Data;
+using UUcars.API.Entities.Enums;
+
+namespace UUcars.API.Repositories;
+
+public class EfAdminStatsRepository : IAdminStatsRepository
+{
+    private readonly AppDbContext _context;
+
+    public EfAdminStatsRepository(AppDbContext context)
+    {
+        _context = context;
+    }
+
+    public async Task<int> GetTotalCarsAsync(CancellationToken cancellationToken = default)
+    {
+        return await _context.Cars
+            .CountAsync(c => c.Status != CarStatus.Deleted, cancellationToken);
+    }
+}
+```
+
+`CountAsync()` 会直接生成数据库聚合查询，不会把 `Car` 实体加载进内存，因此这里不需要额外调用 `AsNoTracking()`。
+
+#### 3.3 实现 AdminStats 业务
+
+新建 `UUcars.API/Services/AdminStatsService.cs`：
+
+```c#
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Repositories;
+
+namespace UUcars.API.Services;
+
+public class AdminStatsService
+{
+    private readonly IAdminStatsRepository _adminStatsRepository;
+
+    public AdminStatsService(IAdminStatsRepository adminStatsRepository)
+    {
+        _adminStatsRepository = adminStatsRepository;
+    }
+
+    public async Task<AdminStatsResponse> GetStatsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        var totalCars = await _adminStatsRepository.GetTotalCarsAsync(cancellationToken);
+
+        return new AdminStatsResponse
+        {
+            TotalCars = totalCars
+        };
+    }
+}
+```
+
+#### 3.4 在 AdminController 新增接口
+
+在 `UUcars.API/Controllers/AdminController.cs`中新增接口，并调用AdminStatsService
+
+```c#
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using UUcars.API.DTOs;
+using UUcars.API.DTOs.Requests;
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Services;
+
+namespace UUcars.API.Controllers;
+
+[ApiController]
+[Route("admin")]
+[Authorize(Roles = "Admin")] // Controller 级别：所有 Admin 接口都需要 Admin 角色
+public class AdminController : ControllerBase
+{
+    private readonly AdminCarService _adminCarService;
+    private readonly AdminStatsService _adminStatsService;
+
+    public AdminController(AdminCarService adminCarService, AdminStatsService adminStatsService)
+    {
+        _adminCarService = adminCarService;
+        _adminStatsService = adminStatsService;
+    }
+
+    ...
+
+    // 新增统计数据接口
+    // GET /admin/stats
+    [HttpGet("stats")]
+    public async Task<IActionResult> GetStats(CancellationToken cancellationToken)
+    {
+        var stats = await _adminStatsService.GetStatsAsync(cancellationToken);
+        return Ok(ApiResponse<AdminStatsResponse>.Ok(stats));
+    }
+}
+```
+
+#### 3.5 注册服务
+
+在 `UUcars.API/Program.cs` 的 Repository 和 Service 注册区域加入：
+
+```c#
+builder.Services.AddScoped<IAdminStatsRepository, EfAdminStatsRepository>();
+builder.Services.AddScoped<AdminStatsService>();
+```
+
+#### 3.6 业务验证
+
+在 Scalar 中发送请求：
+
+```
+GET /admin/stats
+```
+
+预期结果：
+
+```json
+{
+  "success": true,
+  "data": {
+    "totalCars": 41
+  },
+  "message": null,
+  "errors": null
+}
+```
+
+这样，实现了一个最小的Aggregate 查询， 并打通了完整的后端数据流。
+
+
+
+### 4. Dashboard DTO 设计
+
+Dashboard 的统计数据除了上面实现的 `totalCars` 指标外，还需要包含其他核心指标和图表数据。因此接下来定义完整的统计口径和响应 DTO。
+
+#### 4.1 约定“统计口径”
+
+统计代码最容易出现的问题，不是语法错误，而是不同人对同一个指标有不同理解。
+
+例如：
+
+```
+monthlyOrders
+```
+
+可能表示：
+
+```
+本月创建的全部订单
+本月完成的订单
+本月仍处于 Pending 的订单
+本月除 Cancelled 外的订单
+```
+
+这几种写法都能通过编译，但返回的是完全不同的业务答案。
+
+因此，Dashboard 开发不能从 `CountAsync()` 开始，而应该先把每个指标的含义锁定。
+
+##### 统计卡片
+
+Dashboard 需要显示 6 个统计卡片：
+
+```
+totalCars
+  = Draft + PendingReview + Published + Sold
+  = 排除 Deleted
+
+pendingCars
+  = PendingReview
+
+publishedCars
+  = Published
+  = 不包含 Sold
+
+totalUsers
+  = Users 表全部记录
+  = 包含 Admin Seed
+
+monthlyOrders
+  = 当前 UTC 月内创建的全部订单
+  = 根据 CreatedAt 判断
+  = 不因为后来 Cancelled 就从历史订单量里消失
+
+monthlyRevenue
+  = 当前 UTC 月内完成的订单金额
+  = 只统计 Completed
+  = 根据完成时间判断
+```
+
+`monthlyOrders` 和 `monthlyRevenue` 的口径不同，这是有意的。
+
+订单量回答的是：
+
+```
+“这个月产生了多少购买行为？”
+```
+
+成交额回答的是：
+
+```
+“这个月真正完成了多少交易？”
+```
+
+Pending 和 Cancelled 订单都是已经产生过的订单，所以计入订单量；但它们没有形成真实成交，所以不能计入收入。
+
+除了上面的 6 个统计卡片，还需要按日期和品牌维度返回趋势与分布数据：
+
+##### 每日新增车辆
+
+```
+dailyNewCars
+  = 近 30 个 UTC 日期内创建的车辆数量
+  = 根据 Car.CreatedAt
+  = 包括后来变成 Deleted 的车辆
+```
+
+这里与 `totalCars` 的口径不同。
+
+`totalCars` 是当前状态快照：
+
+```
+“平台现在有多少非 Deleted 车辆？”
+```
+
+`dailyNewCars` 是历史事件趋势：
+
+```
+“这些日期当时创建了多少车辆？”
+```
+
+如果一辆车创建后又被删除，创建事件仍然真实发生过。因此它仍然进入历史新增趋势。
+
+##### 每日收入
+
+```
+dailyRevenue
+  = 近 30 个 UTC 日期内完成的订单金额
+  = Status == Completed
+  = 根据订单完成时间分组
+```
+
+##### 品牌分布
+
+```
+brandDistribution
+  = Published + Sold
+  = 按 Brand 分组
+  = Count 降序
+  = 数量相同时 Brand 升序
+  = 只取前 10
+```
+
+> 为什么不包含 Draft 和 PendingReview？
+>
+> 因为这些车辆还没有真正进入公开市场。Dashboard 的品牌分布要表达的是已经进入市场的车辆构成，而不是卖家尚未完成或 Admin 尚未通过的草稿。
+>
+> 为什么包含 Sold？
+>
+> 因为 Sold 车辆曾经真实进入市场，也反映平台历史上的品牌构成。
+
+上面的一些指标都涉及到了时间维度：
+
+```
+当前 UTC 月
+近 30 个 UTC 日期
+订单完成时间
+```
+
+需要对这些时间维度进行统一约定。
+
+##### 近 30 天的边界
+
+```
+包含今天
+共 30 个 UTC 日期
+```
+
+如果今天是：
+
+```
+2026-08-08
+```
+
+范围就是：
+
+```
+2026-07-10 00:00:00 UTC
+到
+2026-08-09 00:00:00 UTC
+```
+
+查询使用半开区间：
+
+```
+timestamp >= start
+timestamp < endExclusive
+```
+
+不是：
+
+```
+timestamp <= 2026-08-08 23:59:59.999
+```
+
+原因是数据库时间精度可能比毫秒更细。使用下一天的 00:00 作为 exclusive end，不需要猜测一天最后一刻的精度。
+
+##### 订单完成时间
+
+当前 `Order` 只有：
+
+```
+CreatedAt
+UpdatedAt
+```
+
+没有 `CompletedAt`，收入应该按什么时间计算？
+
+订单完成时，`OrderService.CompleteAsync` 会执行：
+
+```
+order.Status = OrderStatus.Completed;
+order.UpdatedAt = DateTime.UtcNow;
+```
+
+当前状态机只允许：
+
+```
+Pending → Completed
+Pending → Cancelled
+```
+
+Completed 订单没有后续编辑流程，所以在目前代码中：
+
+```
+Completed 订单的 UpdatedAt = 订单完成时间
+```
+
+因此可以使用：
+
+```
+Status == Completed + UpdatedAt
+```
+
+来统计成交额。
+
+这依赖一个当前成立的业务约束：
+
+> Completed 订单完成后不会再次更新。
+
+如果以后允许修改 Completed 订单，`UpdatedAt` 就不再等同于完成时间，那时才应该增加专用 `CompletedAt`。
+
+#### 4.2 定义 Dashboard DTO
+
+前端发送一次 Dashboard 统计 API 请求：
+
+```bash
+GET /admin/stats
+```
+
+接口需要返回统一的完整 Dashboard DTO，而不需要为不同指标分别设计 API 请求。
+
+因此需要定义完整的 Dashboard DTO 来对应 Dashboard 统计指标。
+
+修改 `UUcars.API/DTOs/Responses/AdminStatsResponse.cs`，加入完整的 9 个顶层属性：
+
+```c#
+namespace UUcars.API.DTOs.Responses;
+
+public class AdminStatsResponse
+{
+    // 核心指标（统计卡片用）
+    public int TotalCars { get; set; }
+    public int PendingCars { get; set; }
+    public int PublishedCars { get; set; }
+    public int TotalUsers { get; set; }
+    public int MonthlyOrders { get; set; }
+    public decimal MonthlyRevenue { get; set; }
+
+    // 趋势数据 （折线图用）
+    public List<DailyCountDto> DailyNewCars { get; set; } = [];
+    public List<DailyRevenueDto> DailyRevenue { get; set; } = [];
+
+    // 品牌分布 （饼图用）
+    public List<BrandCountDto> BrandDistribution { get; set; } = [];
+}
+
+public class DailyCountDto
+{
+    public DateOnly Date { get; set; }
+    public int Count { get; set; }
+}
+
+public class DailyRevenueDto
+{
+    public DateOnly Date { get; set; }
+    public decimal Revenue { get; set; }
+}
+
+public class BrandCountDto
+{
+    public string Brand { get; set; } = string.Empty;
+    public int Count { get; set; }
+}
+```
+
+>**为什么日期使用 `DateOnly`？**
+>
+>这些数据代表：
+>
+>```
+>2026-08-08 这个 UTC 日期桶
+>```
+>
+>不是某一个具体时刻。
+>
+>如果返回完整 `DateTime`：
+>
+>```
+>"2026-08-08T00:00:00Z"
+>```
+>
+>前端可能把它转成浏览器本地时区，导致日期移动。
+>
+>使用 `DateOnly` 后 JSON 表达为：
+>
+>```
+>"2026-08-08"
+>```
+>
+>更符合时间序列日期桶的语义。
+
+
+
+### 5. 实现完整的 Repository
+
+#### 5.1 补齐接口方法
+
+补充 `IAdminStatsRepository` 接口里的方法：
+
+```c#
+public interface IAdminStatsRepository
+{
+    // ── 核心指标 ─────────────────────────────────────────────
+    Task<int> GetTotalCarsAsync(CancellationToken cancellationToken = default);
+    Task<int> GetPendingCarsAsync(CancellationToken cancellationToken = default);
+    Task<int> GetPublishedCarsAsync(CancellationToken cancellationToken = default);
+    Task<int> GetTotalUsersAsync(CancellationToken cancellationToken = default);
+    Task<int> GetMonthlyOrdersAsync(DateTime startOfMonth, CancellationToken cancellationToken = default);
+    Task<decimal> GetMonthlyRevenueAsync(DateTime startOfMonth, CancellationToken cancellationToken = default);
+
+    // ── 趋势数据 ─────────────────────────────────────────────
+    Task<List<DailyCountDto>> GetDailyNewCarsAsync(DateTime dailyFrom, DateTime dailyTo,
+        CancellationToken cancellationToken = default);
+
+    Task<List<DailyRevenueDto>> GetDailyRevenueAsync(DateTime dailyFrom, DateTime dailyTo,
+        CancellationToken cancellationToken = default);
+
+    // ── 品牌分布 ─────────────────────────────────────────────
+    Task<List<BrandCountDto>> GetBrandDistributionAsync(int top, CancellationToken cancellationToken = default);
+}
+```
+
+然后在 `EfAdminStatsRepository` 中实现这些方法。
+
+#### 5.2 实现核心指标
+
+```c#
+public class EfAdminStatsRepository : IAdminStatsRepository
+{
+    private readonly AppDbContext _context;
+
+    public EfAdminStatsRepository(AppDbContext context)
+    {
+        _context = context;
+    }
+
+    // ── 核心指标 ─────────────────────────────────────────────
+    public Task<int> GetTotalCarsAsync(CancellationToken cancellationToken = default)
+    {
+        return _context.Cars
+            .CountAsync(c => c.Status != CarStatus.Deleted, cancellationToken);
+    }
+
+    public Task<int> GetPendingCarsAsync(CancellationToken cancellationToken = default)
+    {
+        return _context.Cars
+            .CountAsync(c => c.Status == CarStatus.PendingReview, cancellationToken);
+    }
+
+    public Task<int> GetPublishedCarsAsync(CancellationToken cancellationToken = default)
+    {
+        return _context.Cars
+            .CountAsync(c => c.Status == CarStatus.Published, cancellationToken);
+    }
+
+    public Task<int> GetTotalUsersAsync(CancellationToken cancellationToken = default)
+    {
+        return _context.Users.CountAsync(cancellationToken);
+    }
+
+    public Task<int> GetMonthlyOrdersAsync(
+        DateTime startOfMonth,
+        CancellationToken cancellationToken = default)
+    {
+        return _context.Orders
+            .CountAsync(o => o.CreatedAt >= startOfMonth &&
+                             o.CreatedAt < startOfMonth.AddMonths(1), cancellationToken);
+    }
+
+    public async Task<decimal> GetMonthlyRevenueAsync(
+        DateTime startOfMonth,
+        CancellationToken cancellationToken = default)
+    {
+        // SumAsync 在没有数据时返回 null（因为类型是 decimal?），
+        // 所以这里用 ?? 0m 保证返回值不为 null
+        var result = await _context.Orders
+            .Where(o => o.Status == OrderStatus.Completed &&
+                        o.UpdatedAt >= startOfMonth &&
+                        o.UpdatedAt < startOfMonth.AddMonths(1))
+            .Select(o => (decimal?)o.Price)
+            .SumAsync(cancellationToken);
+
+        return result ?? 0m;
+    }
+
+}
+```
+
+#### 5.3 实现趋势数据
+
+##### 理解 `GroupBy`：从一个总数到每天一个数字
+
+月度收入只需要一个数字，例如：
+
+```
+monthlyRevenue = 85000
+```
+
+折线图需要的是一组日期，例如：
+
+```
+2026-08-01 → 0
+2026-08-02 → 18000
+2026-08-03 → 0
+2026-08-04 → 25000
+```
+
+如果只写：
+
+```
+SumAsync()
+```
+
+所有日期会被合并成一个总数。
+
+要按日期分别计算，必须先分组：
+
+```
+先按日期把记录分成多组
+→ 每组分别 Count 或 Sum
+```
+
+SQL 类似：
+
+```
+SELECT
+    CAST(CreatedAt AS date) AS Date,
+    COUNT(*) AS Count
+FROM Cars
+GROUP BY CAST(CreatedAt AS date)
+```
+
+EF Core 对应：
+
+```
+.GroupBy(c => c.CreatedAt.Date)
+.Select(group => new
+{
+    Date = group.Key,
+    Count = group.Count()
+})
+```
+
+`group.Key` 是日期，`group.Count()` 是该日期内的车辆数量。
+
+##### 近 30 天每日新增车辆
+
+```c#
+public async Task<List<DailyCountDto>> GetDailyNewCarsAsync(
+    DateTime dailyFrom,
+    DateTime dailyTo,
+    CancellationToken cancellationToken = default)
+{
+    return await _context.Cars
+        .Where(c => c.CreatedAt >= dailyFrom && c.CreatedAt < dailyTo)
+        .GroupBy(c => c.CreatedAt.Date).Select(g => new DailyCountDto
+            {
+                Date = DateOnly.FromDateTime(g.Key),
+                Count = g.Count()
+            }
+        ).OrderBy(item => item.Date)
+        .ToListAsync(cancellationToken);
+}
+```
+
+这里没有过滤 `CarStatus`（排除 Deleted），因为这个指标统计历史创建事件。
+
+##### 近 30 天每日收入
+
+```c#
+public async Task<List<DailyRevenueDto>> GetDailyRevenueAsync(
+    DateTime dailyFrom,
+    DateTime dailyTo,
+    CancellationToken cancellationToken = default)
+{
+    return await _context.Orders
+        .Where(o => o.Status == OrderStatus.Completed && o.UpdatedAt >= dailyFrom && o.UpdatedAt < dailyTo)
+        .GroupBy(o => o.UpdatedAt.Date).Select(g => new DailyRevenueDto
+        {
+            Date = DateOnly.FromDateTime(g.Key),
+            Revenue = g.Sum(o => o.Price)
+        }).OrderBy(item => item.Date).ToListAsync(cancellationToken);
+}
+```
+
+##### 数据库没有记录的日期去哪了？
+
+假设数据库只有：
+
+```
+08-01：2 辆
+08-03：1 辆
+```
+
+`GroupBy` 返回：
+
+```
+[
+  { "date": "08-01", "count": 2 },
+  { "date": "08-03", "count": 1 }
+]
+```
+
+数据库不会自动创造：
+
+```
+08-02：0
+```
+
+如果直接把结果交给折线图，横轴会从 08-01 跳到 08-03。视觉上可能像两天连续，实际上中间缺了一天。
+
+因此需要补零。
+
+补零不属于数据库聚合，而属于 Dashboard 的业务展示规则：
+
+```
+无数据日期也必须显示
+```
+
+所以补零放在 Service，不放 Repository。
+
+#### 5.4 实现品牌分布
+
+品牌分布同样交给数据库完成过滤、分组、排序和截取。Repository 最终只把前 10 条结果返回给 Service。
+
+##### 如何稳定排序？
+
+如果 Toyota 和 BMW 都有 5 辆：
+
+```
+Toyota 5
+BMW    5
+```
+
+只写：
+
+```
+OrderByDescending(item => item.Count)
+```
+
+数据库不保证两条相同 Count 的记录顺序。不同调用可能返回不同顺序，饼图颜色也会跟着交换。
+
+增加：
+
+```
+.ThenBy(item => item.Brand)
+```
+
+后：
+
+```
+BMW
+Toyota
+```
+
+顺序固定，图表颜色和图例更稳定。
+
+##### `Take(10)` 的使用
+
+查询的正确思路：
+
+```
+数据库 GroupBy
+→ 数据库排序
+→ 数据库 Top 10
+→ API 只接收 10 条
+```
+
+完整实现如下：
+
+```c#
+public Task<List<BrandCountDto>> GetBrandDistributionAsync(
+    int top,
+    CancellationToken cancellationToken = default)
+{
+    return _context.Cars
+        .Where(c => c.Status == CarStatus.Published || c.Status == CarStatus.Sold)
+        .GroupBy(c => c.Brand)
+        .Select(g => new BrandCountDto
+        {
+            Brand = g.Key,
+            Count = g.Count()
+        })
+        .OrderByDescending(item => item.Count)
+        .ThenBy(item => item.Brand)
+        .Take(top)
+        .ToListAsync(cancellationToken);
+}
+```
+
+
+
+### 6. 实现完整的 AdminStatsService 业务
+
+在前面的最小 Aggregate 查询基础上，接下来补齐剩余指标。开始实现之前，先解决 UTC 时间边界和时间序列补零两个问题。
+
+#### 6.1 UTC 边界问题
+
+月度指标和趋势查询都依赖“当前时间”：
+
+```c#
+var nowUtc = DateTime.UtcNow;
+```
+
+在service中直接这样写，运行时没有问题，但测试很难固定“现在”。比如要测试：
+
+```
+当前时间是 2026-08-01 00:00:00 UTC
+```
+
+如果代码内部直接读取系统时钟，测试无法控制这个值，只能依赖实际日期。
+
+.NET 提供了：
+
+```
+TimeProvider
+```
+
+它把“取得当前时间”抽象成一个依赖：
+
+```
+生产环境 → TimeProvider.System
+测试环境 → 固定时间的 FakeTimeProvider
+```
+
+这不是为了抽象而抽象，而是为了解决 UTC 边界无法稳定测试的问题。
+
+这样我们得到此刻时间如下：
+
+```c#
+var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+```
+
+#### 6.2 时间序列如何补齐？
+
+现在的查询逻辑是 `GroupBy`——**它只会返回"有数据的那些天"**。
+
+```
+假设近 30 天里，只有第 1 天、第 5 天、第 10 天创建了新车：
+GroupBy 的结果：[{Date: "第1天", Count: 3}, {Date: "第5天", Count: 1}, {Date: "第10天", Count: 2}]
+
+第2、3、4、6、7、8、9天完全不在结果里（不是 Count=0，而是压根没有这一行）
+```
+
+对折线图来说，这是个真实问题：
+
+```
+Recharts 拿到这个不连续的数组，X 轴会怎么显示？
+→ 数据点之间的间距不是按真实天数算的，而是按数组里"第几个元素"算的
+→ 图表看起来会是"数据点均匀分布"，但实际上第1天到第5天中间空了3天没有画出来
+→ 视觉上完全无法看出"这段时间是真的没有新车，还是查询漏掉了"
+```
+
+折线图需要一条连续的时间轴，每一天都要有对应的值（哪怕是0），这样才能正确反映"哪几天是真的没有活动"。
+
+#### 6.3 实现 `AdminStatsService` 业务逻辑
+
+先在 `Program.cs` 注册系统时钟：
+
+```c#
+builder.Services.AddSingleton<TimeProvider>(TimeProvider.System);
+```
+
+实现基础逻辑
+
+```c#
+public class AdminStatsService
+{
+    private readonly IAdminStatsRepository _adminStatsRepository;
+    private readonly TimeProvider _timeProvider;
+
+    public AdminStatsService(IAdminStatsRepository adminStatsRepository, TimeProvider timeProvider)
+    {
+        _adminStatsRepository = adminStatsRepository;
+        _timeProvider = timeProvider;
+    }
+
+    public async Task<AdminStatsResponse> GetStatsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        // 获取当前时间戳
+        var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+
+        // ── 核心指标 ─────────────────────────────────────────────
+        var totalCars = await _adminStatsRepository.GetTotalCarsAsync(cancellationToken);
+        var pendingCars = await _adminStatsRepository.GetPendingCarsAsync(cancellationToken);
+        var publishedCars = await _adminStatsRepository.GetPublishedCarsAsync(cancellationToken);
+        var totalUsers = await _adminStatsRepository.GetTotalUsersAsync(cancellationToken);
+
+        // 当前月份的第一天
+        var startOfMonth = new DateTime(nowUtc.Year, nowUtc.Month, 1, 0, 0, 0, DateTimeKind.Utc);
+
+        var monthlyOrders = await _adminStatsRepository.GetMonthlyOrdersAsync(startOfMonth, cancellationToken);
+        var monthlyRevenue =
+            await _adminStatsRepository.GetMonthlyRevenueAsync(startOfMonth, cancellationToken);
+
+        // ── 趋势数据 ─────────────────────────────────────────────
+        var todayUtc = DateOnly.FromDateTime(nowUtc);
+        var dailyFrom = todayUtc
+            .AddDays(-29)
+            .ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
+        var dailyTo = todayUtc
+            .AddDays(1)
+            .ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
+
+        var dailyNewCars = await _adminStatsRepository.GetDailyNewCarsAsync(dailyFrom, dailyTo, cancellationToken);
+        var dailyRevenue = await _adminStatsRepository.GetDailyRevenueAsync(dailyFrom, dailyTo, cancellationToken);
+
+        // ── 品牌分布 ─────────────────────────────────────────────
+        var brandDistribution = await _adminStatsRepository.GetBrandDistributionAsync(10, cancellationToken);
+
+        return new AdminStatsResponse
+        {
+            TotalCars = totalCars,
+            PendingCars = pendingCars,
+            PublishedCars = publishedCars,
+            TotalUsers = totalUsers,
+            MonthlyOrders = monthlyOrders,
+            MonthlyRevenue = monthlyRevenue,
+            DailyNewCars = dailyNewCars,
+            DailyRevenue = dailyRevenue,
+            BrandDistribution = brandDistribution
+        };
+    }
+}
+```
+
+**查询数据补零**
+
+补零应该紧跟在 Repository 查询之后、组装最终 `AdminStatsResponse` 之前完成。在 `AdminStatsService.cs` 里加两个辅助方法，对 `dailyNewCars` 和 `dailyRevenue` 分别做补零。
+
+先明确日期窗口的定义：**近30天，包含今天，一共30个自然日**。
+
+定义辅助方法：
+
+```c#
+private static List<DailyCountDto> FillMissingDailyNewCars(
+    DateTime dailyFrom,
+    DateTime dailyTo,
+    List<DailyCountDto> dailyNewCarsFromDatabase)
+{
+    // 将数据库实际返回的“日期 → 新增车辆数”转换为便于按日期查找的结构。
+    // Repository 已经按日期 GroupBy，因此每个日期只会有一条记录。
+    var countByDate = dailyNewCarsFromDatabase.ToDictionary(
+        item => item.Date,
+        item => item.Count);
+
+    // 最终返回给前端的完整 30 天序列。
+    var completedDailyNewCars = new List<DailyCountDto>();
+
+    // dailyFrom 是包含边界，dailyTo 是不包含边界；
+    // 每次循环处理一个 UTC 日期，直到 dailyTo 前一天。
+    for (
+        var currentDateTime = dailyFrom;
+        currentDateTime < dailyTo;
+        currentDateTime = currentDateTime.AddDays(1))
+    {
+        var currentDate = DateOnly.FromDateTime(currentDateTime);
+
+        completedDailyNewCars.Add(new DailyCountDto
+        {
+            Date = currentDate,
+
+            // 数据库有当天记录时使用真实数量；
+            // 没有记录时补 0，确保图表时间轴连续。
+            Count = countByDate.GetValueOrDefault(currentDate, 0)
+        });
+    }
+
+    return completedDailyNewCars;
+}
+
+private static List<DailyRevenueDto> FillMissingDailyRevenue(
+    DateTime dailyFrom,
+    DateTime dailyTo,
+    List<DailyRevenueDto> dailyRevenueFromDatabase)
+{
+    // 将数据库实际返回的“日期 → 当日成交额”转换为按日期查找的结构。
+    var revenueByDate = dailyRevenueFromDatabase.ToDictionary(
+        item => item.Date,
+        item => item.Revenue);
+
+    // 最终返回给前端的完整 30 天序列。
+    var completedDailyRevenue = new List<DailyRevenueDto>();
+
+    // 与 Repository 使用相同的 [dailyFrom, dailyTo) UTC 时间范围。
+    for (
+        var currentDateTime = dailyFrom;
+        currentDateTime < dailyTo;
+        currentDateTime = currentDateTime.AddDays(1))
+    {
+        var currentDate = DateOnly.FromDateTime(currentDateTime);
+
+        completedDailyRevenue.Add(new DailyRevenueDto
+        {
+            Date = currentDate,
+
+            // 数据库没有当天成交订单时，成交额应为 0。
+            Revenue = revenueByDate.GetValueOrDefault(currentDate, 0m)
+        });
+    }
+
+    return completedDailyRevenue;
+}
+```
+
+使用补零复杂方法实现完整的逻辑
+
+```c#
+public class AdminStatsService
+{
+    private readonly IAdminStatsRepository _adminStatsRepository;
+    private readonly TimeProvider _timeProvider;
+
+    public AdminStatsService(IAdminStatsRepository adminStatsRepository, TimeProvider timeProvider)
+    {
+        _adminStatsRepository = adminStatsRepository;
+        _timeProvider = timeProvider;
+    }
+
+    public async Task<AdminStatsResponse> GetStatsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        // 获取当前时间戳
+        var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+
+        // ── 核心指标 ─────────────────────────────────────────────
+        var totalCars = await _adminStatsRepository.GetTotalCarsAsync(cancellationToken);
+        var pendingCars = await _adminStatsRepository.GetPendingCarsAsync(cancellationToken);
+        var publishedCars = await _adminStatsRepository.GetPublishedCarsAsync(cancellationToken);
+        var totalUsers = await _adminStatsRepository.GetTotalUsersAsync(cancellationToken);
+
+        // 当前月份的第一天
+        var startOfMonth = new DateTime(nowUtc.Year, nowUtc.Month, 1, 0, 0, 0, DateTimeKind.Utc);
+
+        var monthlyOrders = await _adminStatsRepository.GetMonthlyOrdersAsync(startOfMonth, cancellationToken);
+        var monthlyRevenue =
+            await _adminStatsRepository.GetMonthlyRevenueAsync(startOfMonth, cancellationToken);
+
+        // ── 趋势数据 ─────────────────────────────────────────────
+        var todayUtc = DateOnly.FromDateTime(nowUtc);
+        var dailyFrom = todayUtc
+            .AddDays(-29)
+            .ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
+        var dailyTo = todayUtc
+            .AddDays(1)
+            .ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
+
+        var dailyNewCars = await _adminStatsRepository.GetDailyNewCarsAsync(dailyFrom, dailyTo, cancellationToken);
+        var dailyRevenue = await _adminStatsRepository.GetDailyRevenueAsync(dailyFrom, dailyTo, cancellationToken);
+
+
+        // ── 品牌分布 ─────────────────────────────────────────────
+        var brandDistribution = await _adminStatsRepository.GetBrandDistributionAsync(10, cancellationToken);
+
+        return new AdminStatsResponse
+        {
+            TotalCars = totalCars,
+            PendingCars = pendingCars,
+            PublishedCars = publishedCars,
+            TotalUsers = totalUsers,
+            MonthlyOrders = monthlyOrders,
+            MonthlyRevenue = monthlyRevenue,
+            DailyNewCars = FillMissingDailyNewCars(dailyFrom, dailyTo, dailyNewCars),
+            DailyRevenue = FillMissingDailyRevenue(dailyFrom, dailyTo, dailyRevenue),
+            BrandDistribution = brandDistribution
+        };
+    }
+
+    // ── 补零辅助方法 ─────────────────────────────────────────────
+    ...
+}
+```
+
+controller不用做修改，继续使用现有的接口。使用 Scalar 或 Postman 进行简单测试：
+
+```json
+{
+    "success": true,
+    "data": {
+        "totalCars": 41,
+        "pendingCars": 0,
+        "publishedCars": 27,
+        "totalUsers": 40,
+        "monthlyOrders": 2,
+        "monthlyRevenue": 12000.00,
+        "dailyNewCars": [
+            {
+                "date": "2026-07-27",
+                "count": 0
+            },
+            ...省略， 总共30个
+            {
+                "date": "2026-08-25",
+                "count": 0
+            }
+        ],
+        "dailyRevenue": [
+            {
+                "date": "2026-07-27",
+                "revenue": 0
+            },
+            ...省略， 总共30个
+            {
+                "date": "2026-08-25",
+                "revenue": 0
+            }
+        ],
+        "brandDistribution": [
+            {
+                "brand": "Toyota",
+                "count": 8
+            },
+            {
+                "brand": "Honda",
+                "count": 7
+            },
+            {
+                "brand": "MAZDA",
+                "count": 7
+            },
+            {
+                "brand": "Nissan",
+                "count": 5
+            },
+            {
+                "brand": "BMW",
+                "count": 2
+            },
+            {
+                "brand": "Ford",
+                "count": 2
+            },
+            {
+                "brand": "Hyundai",
+                "count": 2
+            },
+            {
+                "brand": "Subaru",
+                "count": 2
+            },
+            {
+                "brand": "HHH",
+                "count": 1
+            },
+            {
+                "brand": "Kia",
+                "count": 1
+            }
+        ]
+    },
+    "message": null,
+    "errors": null
+}
+```
+
+
+
+### 7. 优化：加入缓存策略
+
+Dashboard 查询不是一条 SQL。一次请求需要：
+
+- 基础 Count；
+- 月订单 Count；
+- 月收入 Sum；
+- 每日车辆 GroupBy；
+- 每日收入 GroupBy；
+- 品牌 GroupBy。
+
+这些查询远比读取一条车辆详情昂贵。
+
+但 Dashboard 数据也不要求每一秒绝对实时。Admin 能接受：
+
+```
+最多延迟 5 分钟
+```
+
+因此适合缓存整个 `AdminStatsResponse`：
+
+```
+第一次请求
+→ 查询数据库
+→ 组合 DTO
+→ 写入 Redis
+
+5 分钟内再次请求
+→ 直接返回 Redis DTO
+→ 不执行统计 SQL
+```
+
+当前 `/admin/stats` 一次请求会执行：
+
+```
+4 个核心 Count
++ 2 个月度聚合
++ 2 个每日 GroupBy
++ 1 个品牌 GroupBy
+= 9 条数据库查询
+```
+
+这些结果总是一起展示，最合理的缓存粒度是“完整的 `AdminStatsResponse`”，而不是为每个数字建立一个 key。
+
+#### 7.1 缓存策略
+
+```
+缓存 key：admin:stats
+缓存内容：完整 AdminStatsResponse
+TTL：5 分钟
+模式：Cache-Aside
+```
+
+请求流程：
+
+```
+GET /admin/stats
+    ↓
+Redis 是否有 admin:stats？
+    ├─ 有 → 反序列化并直接返回，不执行 9 条查询
+    └─ 没有 → 执行现有统计逻辑 → Redis 保存 5 分钟 → 返回结果
+```
+
+这里使用一个固定 key 是正确的，因为该 API 没有分页、筛选条件或用户私有数据；所有 Admin 看到的是同一份平台总览。
+
+#### 7.2 不做主动失效
+
+本步骤应采用“5 分钟 TTL 自然过期”，不在车辆、订单、注册等每一个写操作后主动删除 `admin:stats`。
+
+原因是这份 Dashboard 本来就定义为短期缓存数据，允许最多五分钟延迟。若现在加入主动失效，需要修改多个业务 Service：
+
+```
+CarService
+AdminCarService
+OrderService
+UserService
+```
+
+还要逐一判断每种状态变更是否影响哪些统计，复杂度会突然升高。
+
+因此本步骤的资料一致性定义为：
+
+```
+Dashboard 最多显示五分钟前的数据。
+五分钟后，下一个请求自动重新聚合。
+```
+
+如果未来产品要求“管理员审核通过后卡片必须立刻变化”，再单独做主动失效步骤。
+
+#### 7.3 新增统一缓存 Key
+
+在 `UUcars.API/Services/Cache/CacheKeys.cs` 的 `CacheKeys` 类中加入：
+
+```c#
+// Admin Dashboard 的完整统计数据。
+// 此接口没有分页或筛选参数，因此所有 Admin 共用一个固定 Key。
+public const string AdminStats = "admin:stats";
+```
+
+这里不需要 `Prefix`，因为只有一个 Dashboard 结果，没有 `page1`、`page2` 这类需要批量删除的 key。
+
+#### 7.4 在 Service 中加入缓存
+
+```c#
+public class AdminStatsService
+{
+    private readonly IAdminStatsRepository _adminStatsRepository;
+    private readonly TimeProvider _timeProvider;
+    private readonly ICacheService _cache;
+
+    public AdminStatsService(IAdminStatsRepository adminStatsRepository, TimeProvider timeProvider, ICacheService cache)
+    {
+        _adminStatsRepository = adminStatsRepository;
+        _timeProvider = timeProvider;
+        _cache = cache;
+    }
+
+    public async Task<AdminStatsResponse> GetStatsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        // Dashboard 没有分页、筛选或用户私有数据，
+        // 因此所有 Admin 共用同一个统计缓存 Key。
+        var cacheKey = CacheKeys.AdminStats;
+
+        // 缓存命中：直接返回 Redis 中的 AdminStatsResponse。
+        // 缓存未命中：才执行下面 lambda 内的完整统计逻辑。
+        return await _cache.GetOrSetAsync(cacheKey, async () =>
+        {
+            // 获取当前 UTC 时间。它放在 lambda 内，
+            // 只有真的需要重新查询统计数据时才会计算时间边界。
+            var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+
+            // ── 核心指标 ─────────────────────────────────────────────
+            ...
+
+            // ── 趋势数据 ─────────────────────────────────────────────
+            ...
+
+            // ── 品牌分布 ─────────────────────────────────────────────
+            ...
+        }, TimeSpan.FromMinutes(5), cancellationToken);
+    }
+
+    // ── 补零辅助方法 ─────────────────────────────────────────────
+    ...
+}
+```
+
+终端项目根目录中，手动验证是否配置成功
+
+```bash
+docker exec uucars-redis redis-cli --scan --pattern 'uucars:admin:stats'
+```
+
+预计输出
+
+```bash
+uucars:admin:stats
+```
+
+### 8. 后端测试
+
+`GET /admin/stats` 的风险主要来自三部分：
+
+```
+时间边界是否正确；
+真实 SQL 聚合是否正确；
+非 Admin 是否被拒绝。
+```
+
+缓存可以通过真实 Redis 手动验证：
+
+```
+第一次请求：Cache MISS + SQL 查询
+第二次请求：Cache HIT + 无 SQL 查询
+```
+
+因此自动化测试不再重复 Redis 行为。现有 `SqlServerTestFactory` 也会用 `FakeCacheService` 替换真实 Redis，确保集成测试不依赖本地缓存服务。
+
+本步骤只新增三项测试：
+
+```
+1. Service 单元测试：
+   固定 UTC 时间，验证近 30 天范围和补零。
+
+2. API 集成测试：
+   使用真实 SQL Server，验证 Deleted 排除、月度统计、每日成交额和 Top 10 品牌。
+
+3. API 集成测试：
+   验证普通用户访问 GET /admin/stats 得到 403。
+```
+
+不测试：
+
+```
+DTO 属性
+Controller 的简单转发
+Redis 序列化
+CacheKey 字符串
+每一个 CountAsync 的独立实现
+```
+
+#### 8.1 Service 单元测试
+
+新建 `FakeAdminStatsRepository`, 使用fake Repository 来隔离数据库
+
+```c#
+public class FakeAdminStatsRepository : IAdminStatsRepository
+{
+    public AdminStatsResponse Stats { get; set; } = new();
+
+    // ── IAdminStatsRepository 实现 ─────────────────────────────
+    public Task<int> GetTotalCarsAsync(CancellationToken cancellationToken = default)
+    {
+        return Task.FromResult(Stats.TotalCars);
+    }
+
+    public Task<int> GetPendingCarsAsync(CancellationToken cancellationToken = default)
+    {
+        return Task.FromResult(Stats.PendingCars);
+    }
+
+    public Task<int> GetPublishedCarsAsync(CancellationToken cancellationToken = default)
+    {
+        return Task.FromResult(Stats.PublishedCars);
+    }
+
+    public Task<int> GetTotalUsersAsync(CancellationToken cancellationToken = default)
+    {
+        return Task.FromResult(Stats.TotalUsers);
+    }
+
+    public Task<int> GetMonthlyOrdersAsync(DateTime startOfMonth, CancellationToken cancellationToken = default)
+    {
+        return Task.FromResult(Stats.MonthlyOrders);
+    }
+
+    public Task<decimal> GetMonthlyRevenueAsync(DateTime startOfMonth,
+        CancellationToken cancellationToken = default)
+    {
+        return Task.FromResult(Stats.MonthlyRevenue);
+    }
+
+    public Task<List<DailyCountDto>> GetDailyNewCarsAsync(DateTime dailyFrom, DateTime dailyTo,
+        CancellationToken cancellationToken = default)
+    {
+        return Task.FromResult(Stats.DailyNewCars);
+    }
+
+    public Task<List<DailyRevenueDto>> GetDailyRevenueAsync(DateTime dailyFrom, DateTime dailyTo,
+        CancellationToken cancellationToken = default)
+    {
+        return Task.FromResult(Stats.DailyRevenue);
+    }
+
+    public Task<List<BrandCountDto>> GetBrandDistributionAsync(int top,
+        CancellationToken cancellationToken = default)
+    {
+        return Task.FromResult(Stats.BrandDistribution);
+    }
+}
+```
+
+实现单元测试逻辑，新建`AdminStatsServiceTests`
+
+```c#
+using UUcars.API.DTOs.Responses;
+using UUcars.API.Services;
+using UUcars.Tests.Fakes;
+
+namespace UUcars.Tests.Services;
+
+public class AdminStatsServiceTests
+{
+    // 和现有 CarServiceTests、OrderServiceTests 保持相同结构：
+    // 统一在辅助方法中创建被测试的 Service。
+    private static AdminStatsService CreateService(
+        FakeAdminStatsRepository repository,
+        TimeProvider? timeProvider = null)
+    {
+        return new AdminStatsService(
+            repository,
+            timeProvider ?? TimeProvider.System,
+            new FakeCacheService());
+    }
+
+    [Fact]
+    public async Task GetStatsAsync_ShouldFillMissingDaysForLastThirtyDays()
+    {
+        // Arrange
+        var repository = new FakeAdminStatsRepository
+        {
+            Stats = new AdminStatsResponse
+            {
+                DailyNewCars =
+                [
+                    new DailyCountDto
+                    {
+                        Date = new DateOnly(2026, 7, 30),
+                        Count = 2
+                    },
+                    new DailyCountDto
+                    {
+                        Date = new DateOnly(2026, 8, 28),
+                        Count = 1
+                    }
+                ],
+                DailyRevenue =
+                [
+                    new DailyRevenueDto
+                    {
+                        Date = new DateOnly(2026, 8, 27),
+                        Revenue = 12000m
+                    }
+                ]
+            }
+        };
+
+        // 固定“当前时间”，避免测试结果随着真实日期变化。
+        var timeProvider = new FixedTimeProvider(
+            new DateTimeOffset(
+                2026, 8, 28,
+                12, 0, 0,
+                TimeSpan.Zero));
+
+        var service = CreateService(repository, timeProvider);
+
+
+        // Act
+        var result = await service.GetStatsAsync();
+
+        // Assert：近 30 天必须正好返回 30 项
+        Assert.Equal(30, result.DailyNewCars.Count);
+        Assert.Equal(30, result.DailyRevenue.Count);
+
+        // Assert：包含今天，从 29 天前开始
+        Assert.Equal(
+            new DateOnly(2026, 7, 30),
+            result.DailyNewCars[0].Date);
+
+        Assert.Equal(
+            new DateOnly(2026, 8, 28),
+            result.DailyNewCars[^1].Date);
+
+        // Assert：数据库已有的数据保留原值
+        Assert.Equal(
+            2,
+            result.DailyNewCars.Single(item => item.Date == new DateOnly(2026, 7, 30)).Count);
+
+        Assert.Equal(
+            1,
+            result.DailyNewCars.Single(item => item.Date == new DateOnly(2026, 8, 28)).Count);
+
+        Assert.Equal(
+            12000m,
+            result.DailyRevenue.Single(item => item.Date == new DateOnly(2026, 8, 27)).Revenue);
+
+        // Assert：数据库没有返回的日期补 0
+        Assert.Equal(
+            0,
+            result.DailyNewCars.Single(item => item.Date == new DateOnly(2026, 7, 31)).Count);
+
+        Assert.Equal(
+            0m,
+            result.DailyRevenue.Single(item => item.Date == new DateOnly(2026, 7, 31)).Revenue);
+    }
+}
+
+// TimeProvider.System 会读取运行测试时的真实时间。
+// 这个测试替代实现只返回构造时传入的固定 UTC 时间。
+internal class FixedTimeProvider : TimeProvider
+{
+    private readonly DateTimeOffset _utcNow;
+
+    public FixedTimeProvider(DateTimeOffset utcNow)
+    {
+        _utcNow = utcNow;
+    }
+
+    public override DateTimeOffset GetUtcNow()
+    {
+        return _utcNow;
+    }
+}
+```
+
+#### 8.2 集成测试
+
+这个测试集中验证同一个目标：
+
+```
+真实数据库中的统计数据
+经过完整 HTTP 请求后
+是否形成正确的 AdminStatsResponse
+普通用户权限测试
+```
+
+在 `CoreFlowIntegrationTests` 类中加入Admin 统计集成测试的逻辑
+
+```c#
+// ===== Admin Dashboard =====
+
+[Fact]
+public async Task GetAdminStats_AsAdmin_ShouldReturnCorrectStatistics()
+{
+    // Arrange
+    var nowUtc = DateTime.UtcNow;
+    var todayUtc = nowUtc.Date;
+
+    var startOfMonth = new DateTime(
+        nowUtc.Year,
+        nowUtc.Month,
+        1,
+        0, 0, 0,
+        DateTimeKind.Utc);
+
+    var startOfNextMonth = startOfMonth.AddMonths(1);
+
+    await using var db = Factory.GetDbContext();
+
+    var seller = new User
+    {
+        Username = "stats-seller",
+        Email = "stats-seller@example.com",
+        PasswordHash = "test-hash",
+        Role = UserRole.User,
+        EmailConfirmed = true,
+        CreatedAt = nowUtc,
+        UpdatedAt = nowUtc
+    };
+
+    var buyer = new User
+    {
+        Username = "stats-buyer",
+        Email = "stats-buyer@example.com",
+        PasswordHash = "test-hash",
+        Role = UserRole.User,
+        EmailConfirmed = true,
+        CreatedAt = nowUtc,
+        UpdatedAt = nowUtc
+    };
+
+    db.Users.AddRange(seller, buyer);
+    await db.SaveChangesAsync();
+
+    // Published + Sold 共 11 个品牌。
+    // Toyota 有 3 辆，其余品牌各 1 辆。
+    // Top 10 排序后，ZzzTestBrand 应被排除。
+    var marketCarDefinitions = new (string Brand, CarStatus Status)[]
+    {
+        ("Toyota", CarStatus.Published),
+        ("Toyota", CarStatus.Published),
+        ("Toyota", CarStatus.Sold),
+        ("Mazda", CarStatus.Published),
+        ("Honda", CarStatus.Published),
+        ("Ford", CarStatus.Published),
+        ("BMW", CarStatus.Published),
+        ("Audi", CarStatus.Published),
+        ("Nissan", CarStatus.Published),
+        ("Hyundai", CarStatus.Published),
+        ("Kia", CarStatus.Published),
+        ("Suzuki", CarStatus.Published),
+        ("ZzzTestBrand", CarStatus.Published)
+    };
+
+    var marketCars = marketCarDefinitions
+        .Select((item, index) => new Car
+        {
+            Title = $"{item.Brand} test car {index + 1}",
+            Brand = item.Brand,
+            Model = "Test Model",
+            Year = 2020,
+            Price = 10000m,
+            Mileage = 50000,
+            SellerId = seller.Id,
+            Status = item.Status,
+            CreatedAt = nowUtc,
+            UpdatedAt = nowUtc
+        })
+        .ToList();
+
+    var pendingCar = new Car
+    {
+        Title = "Pending test car",
+        Brand = "PendingBrand",
+        Model = "Test Model",
+        Year = 2020,
+        Price = 10000m,
+        Mileage = 50000,
+        SellerId = seller.Id,
+        Status = CarStatus.PendingReview,
+        CreatedAt = nowUtc,
+        UpdatedAt = nowUtc
+    };
+
+    var draftCar = new Car
+    {
+        Title = "Draft test car",
+        Brand = "DraftBrand",
+        Model = "Test Model",
+        Year = 2020,
+        Price = 10000m,
+        Mileage = 50000,
+        SellerId = seller.Id,
+        Status = CarStatus.Draft,
+        CreatedAt = nowUtc,
+        UpdatedAt = nowUtc
+    };
+
+    var deletedCar = new Car
+    {
+        Title = "Deleted test car",
+        Brand = "DeletedBrand",
+        Model = "Test Model",
+        Year = 2020,
+        Price = 10000m,
+        Mileage = 50000,
+        SellerId = seller.Id,
+        Status = CarStatus.Deleted,
+        CreatedAt = nowUtc,
+        UpdatedAt = nowUtc
+    };
+
+    db.Cars.AddRange(marketCars);
+    db.Cars.AddRange(pendingCar, draftCar, deletedCar);
+    await db.SaveChangesAsync();
+
+    var soldCar = marketCars.Single(
+        car => car.Status == CarStatus.Sold);
+
+    db.Orders.AddRange(
+        // 本月第一刻创建：计入 monthlyOrders。
+        // 本月完成：计入 monthlyRevenue。
+        new Order
+        {
+            CarId = soldCar.Id,
+            BuyerId = buyer.Id,
+            SellerId = seller.Id,
+            Price = 10000m,
+            Status = OrderStatus.Completed,
+            CreatedAt = startOfMonth,
+            UpdatedAt = nowUtc
+        },
+
+        // Pending 订单计入 monthlyOrders，
+        // 但不计入 monthlyRevenue。
+        new Order
+        {
+            CarId = soldCar.Id,
+            BuyerId = buyer.Id,
+            SellerId = seller.Id,
+            Price = 5000m,
+            Status = OrderStatus.Pending,
+            CreatedAt = startOfMonth,
+            UpdatedAt = nowUtc
+        },
+
+        // 上月创建，不计入 monthlyOrders；
+        // 本月完成，所以计入 monthlyRevenue。
+        new Order
+        {
+            CarId = soldCar.Id,
+            BuyerId = buyer.Id,
+            SellerId = seller.Id,
+            Price = 20000m,
+            Status = OrderStatus.Completed,
+            CreatedAt = startOfMonth.AddTicks(-1),
+            UpdatedAt = nowUtc
+        },
+
+        // 下月第一刻创建并完成，
+        // 不进入当前月份的订单量和成交额。
+        new Order
+        {
+            CarId = soldCar.Id,
+            BuyerId = buyer.Id,
+            SellerId = seller.Id,
+            Price = 40000m,
+            Status = OrderStatus.Completed,
+            CreatedAt = startOfNextMonth,
+            UpdatedAt = startOfNextMonth
+        });
+
+    await db.SaveChangesAsync();
+
+    // 使用测试数据库中已经存在的 Admin 登录
+    var loginResponse = await Client.PostAsync(
+        "/auth/login",
+        JsonContent(new
+        {
+            email = "admin@uucars.com",
+            password = "Admin@123456"
+        }));
+
+    var adminToken =
+        (await DeserializeAsync<ApiResponse<LoginData>>(loginResponse))
+        ?.Data?.Token;
+
+    SetBearerToken(adminToken!);
+
+    // Act
+    var response = await Client.GetAsync("/admin/stats");
+
+    // Assert
+    Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+    var result =
+        await DeserializeAsync<ApiResponse<AdminStatsResponse>>(response);
+
+    Assert.NotNull(result);
+    Assert.True(result.Success);
+    Assert.NotNull(result.Data);
+
+    var stats = result.Data;
+
+    // 13 辆 Published/Sold + Pending + Draft；
+    // Deleted 不计入 totalCars。
+    Assert.Equal(15, stats.TotalCars);
+    Assert.Equal(1, stats.PendingCars);
+    Assert.Equal(12, stats.PublishedCars);
+
+    // 测试数据库保留 1 个 Admin，再加入 seller 和 buyer。
+    Assert.Equal(3, stats.TotalUsers);
+
+    // 当前月创建了 2 个订单；
+    // 当前月完成金额为 10000 + 20000。
+    Assert.Equal(2, stats.MonthlyOrders);
+    Assert.Equal(30000m, stats.MonthlyRevenue);
+
+    // Service 应返回连续的最近 30 个 UTC 日期。
+    Assert.Equal(30, stats.DailyNewCars.Count);
+    Assert.Equal(30, stats.DailyRevenue.Count);
+    Assert.Equal(
+        DateOnly.FromDateTime(todayUtc.AddDays(-29)),
+        stats.DailyNewCars[0].Date);
+    Assert.Equal(
+        DateOnly.FromDateTime(todayUtc),
+        stats.DailyNewCars[^1].Date);
+
+    // 所有 16 辆车都在今天创建。
+    // dailyNewCars 记录创建事件，因此 Deleted 也包含在内。
+    Assert.Equal(
+        16,
+        stats.DailyNewCars.Single(
+            item => item.Date == DateOnly.FromDateTime(todayUtc)).Count);
+
+    // 两个 Completed 订单在今天完成。
+    Assert.Equal(
+        30000m,
+        stats.DailyRevenue.Single(
+            item => item.Date == DateOnly.FromDateTime(todayUtc)).Revenue);
+
+    // 品牌只返回前 10。
+    Assert.Equal(10, stats.BrandDistribution.Count);
+    Assert.Equal("Toyota", stats.BrandDistribution[0].Brand);
+    Assert.Equal(3, stats.BrandDistribution[0].Count);
+    Assert.DoesNotContain(
+        stats.BrandDistribution,
+        item => item.Brand == "ZzzTestBrand");
+}
+```
+
+普通用户权限测试， 继续在 `CoreFlowIntegrationTests` 中加入：
+
+```c#
+[Fact]
+public async Task GetAdminStats_WithNonAdminToken_ShouldReturn403()
+{
+    // Arrange
+    var userToken = await RegisterAndLoginAsync(
+        "stats-user@example.com",
+        "stats-user");
+
+    SetBearerToken(userToken);
+
+    // Act
+    var response = await Client.GetAsync("/admin/stats");
+
+    // Assert
+    Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+}
+```
+
+运行测试
+
+```bash
+dotnet build
+dotnet test --filter AdminStats
+dotnet test
+```
+
+
+
+### 9. 前端请求数据
+
+现在完成前端请求数据的逻辑，包括路由跳转、HTTP 请求和响应数据接收。
+
+#### 9.1 新建 AdminDashboardPage 组件
+
+先新建一个简单的 `AdminDashboardPage` 页面，用来确认路由能够正常渲染：
+
+```tsx
+function AdminDashboardPage() {
+  return <div>AdminDashboardPage</div>;
+}
+
+export default AdminDashboardPage;
+
+```
+
+#### 9.2 配置跳转路由
+
+当前 `router.tsx` 里 Admin 路由的 index 渲染的是 `AdminPendingPage`， 需要新增一个 `/admin/dashboard` 子路由，并把 index 改为指向 Dashboard。
+
+```ts
+// 新增 import
+import AdminDashboardPage from "@/pages/AdminDashboardPage";
+
+// Admin 路由更新
+{
+  element: <AdminRoute />,
+  children: [
+    {
+      path: "/admin",
+      element: withEB(<AdminPage />),
+      children: [
+          {
+            index: true,
+            element: <Navigate to="dashboard" replace />,
+          },
+          { path: "dashboard", element: withEB(<AdminDashboardPage />) },
+          { path: "pending", element: withEB(<AdminPendingPage />) },
+        ],
+    },
+  ],
+},
+```
+
+#### 9.3 更新 AdminPage 导航
+
+打开 `src/pages/AdminPage.tsx`，在 Pending Review 的导航链接之前加入 Dashboard 链接, 用来点击跳转页面
+
+```tsx
+// src/pages/AdminPage.tsx
+import { NavLink, Outlet } from "react-router-dom";
+import { ClipboardList, LayoutDashboard } from "lucide-react";
+
+const tabs = [
+  { to: "/admin/dashboard", label: "Dashboard", icon: LayoutDashboard },
+  { to: "/admin/pending", label: "Pending Review", icon: ClipboardList },
+];
+
+export default function AdminPage() {
+  return (
+    <div className="space-y-6">
+      ...
+    </div>
+  );
+}
+
+```
+
+#### 9.4 编写前端 API 接口
+
+先建立与后端一致的 TypeScript contract。 新建 `uucars-web/src/types/admin.ts`：
+
+```ts
+export interface DailyCarStat {
+  date: string;
+  count: number;
+}
+
+export interface DailyRevenueStat {
+  date: string;
+  revenue: number;
+}
+
+export interface BrandDistribution {
+  brand: string;
+  count: number;
+}
+
+export interface AdminStats {
+  totalCars: number;
+  pendingCars: number;
+  publishedCars: number;
+  totalUsers: number;
+  monthlyOrders: number;
+  monthlyRevenue: number;
+  dailyNewCars: DailyCarStat[];
+  dailyRevenue: DailyRevenueStat[];
+  brandDistribution: BrandDistribution[];
+}
+
+export interface AuditLog {
+  id: number;
+  adminId: number;
+  adminUsername: string;
+  action: string;
+  entityType: string;
+  entityId: number;
+  detail: string | null;
+  createdAt: string;
+}
+```
+
+在 `uucars-web/src/types/index.ts` 中统一导出
+
+```ts
+export * from "./admin";
+```
+
+> 为什么日期在 C# 是 `DateOnly`，TypeScript 还是 `string`？
+>
+> TypeScript 运行时没有 `DateOnly`。HTTP JSON 传输的是：
+>
+> ```
+> "2026-08-08"
+> ```
+>
+> 因此前端类型应该诚实表示传输格式，而不是假装 Axios 自动把它变成 `Date`。
+
+扩展 `adminApi`, 修改 `uucars-web/src/api/admin.ts` ，在现有 pending/approve/reject/delete 基础上新增：
+
+```ts
+getStats: async (): Promise<AdminStats> => {
+  const response =
+    await apiClient.get<ApiResponse<AdminStats>>("/admin/stats");
+
+  return response.data.data!;
+},
+
+getAuditLogs: async (
+  page = 1,
+  pageSize = 10,
+): Promise<PagedResponse<AuditLog>> => {
+  const response =
+    await apiClient.get<ApiResponse<PagedResponse<AuditLog>>>(
+      "/admin/audit-logs",
+      { params: { page, pageSize } },
+    );
+
+  return response.data.data!;
+},
+```
+
+继续遵守当前 Axios 分工：
+
+```
+apiClient
+  → token 和统一 transport error
+
+adminApi
+  → 具体 endpoint
+  → 解包 response.data.data
+
+页面
+  → 只处理业务数据
+```
+
+页面不应该知道 Axios response 的层级。
+
+#### 9.5 发送 HTTP 请求，拉取数据
+
+在 `AdminDashboardPage` 组件中编写请求数据的逻辑。这里继续使用 TanStack Query。
+
+Dashboard 有两类数据：
+
+```
+Stats
+  → 固定一份
+  → 后端缓存 5 分钟
+
+Audit Logs
+  → 有 page/pageSize
+  → 翻页变化
+```
+
+如果把它们放进同一个 Query：
+
+```
+日志翻页
+→ 整个 Query key 变化
+→ Stats 也重新请求
+```
+
+所以使用两个独立 Query。
+
+Stats：
+
+```
+useQuery({
+  queryKey: ["admin", "stats"],
+  queryFn: adminApi.getStats,
+});
+```
+
+Audit Logs：
+
+```
+useQuery({
+  queryKey: ["admin", "audit-logs", { page, pageSize }],
+  queryFn: () => adminApi.getAuditLogs(page, pageSize),
+});
+```
+
+Query key 表达依赖：
+
+```
+Stats 不依赖 page
+Audit Logs 依赖 page/pageSize
+```
+
+因此日志翻页不会让 Stats Query key 改变。
+
+先使用 `useQuery` 拉取数据，并进行简单渲染：
+
+```tsx
+import { adminApi } from "@/api";
+import { useQuery } from "@tanstack/react-query";
+import { useSearchParams } from "react-router-dom";
+
+const PAGE_SIZE = 10;
+function AdminDashboardPage() {
+  const [searchParams] = useSearchParams();
+  const page = Number(searchParams.get("page") ?? "1");
+
+  // ── 拉取统计数据 ─────────────────────────────────────────
+  const { data: stats } = useQuery({
+    queryKey: ["admin", "stats"],
+    queryFn: () => adminApi.getStats(),
+  });
+
+  // ── 拉取审计日志 ─────────────────────────────────────────
+  const { data: auditLogs } = useQuery({
+    queryKey: ["admin", "audit-logs", { page, pageSize: PAGE_SIZE }],
+    queryFn: () => adminApi.getAuditLogs(page, PAGE_SIZE),
+  });
+
+  return (
+    <div>
+      <h1>AdminDashboardPage</h1>
+      <p>TotalCars: {stats?.totalCars}</p>
+      <ul>
+        {auditLogs?.items.map((i) => (
+          <li key={i.id}>
+            {i.action} - {i.entityId} - {i.createdAt}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+export default AdminDashboardPage;
+
+```
+
+
+
+### 10. Recharts 数据渲染
+
+现在前端已经拿到数据，但仍然只是临时输出，例如：
+
+```
+<p>TotalCars: {stats?.totalCars}</p>
+```
+
+这一节要把数据转换成真正的 Dashboard：
+
+```
+AdminStats
+├── 6 个核心指标 → 统计卡片
+├── dailyNewCars → 每日新增车辆折线图
+├── dailyRevenue → 每日成交额折线图
+└── brandDistribution → 品牌分布饼图
+
+Audit Logs
+└── 表格 + 分页
+```
+
+#### 10.1 Recharts 概述和安装
+
+Recharts 是基于 React 组件的数据可视化库。
+
+不用 Recharts 时，我们需要自己处理：
+
+```
+SVG 坐标
+数据比例
+折线路径
+坐标轴
+Tooltip
+图例
+响应式尺寸
+```
+
+Recharts 把这些能力封装成 React 组件：
+
+```
+<LineChart>
+  <XAxis />
+  <YAxis />
+  <Tooltip />
+  <Line />
+</LineChart>
+```
+
+在本项目中主要使用以下组件：
+
+```
+ResponsiveContainer   根据父容器尺寸调整图表
+LineChart             折线图坐标系统
+Line                  读取数据并绘制折线
+XAxis / YAxis         横轴和纵轴
+CartesianGrid         背景网格
+Tooltip               鼠标悬停时显示数据
+PieChart              饼图容器
+Pie                   绘制品牌扇区
+Legend                图例
+```
+
+`ResponsiveContainer` 会观察父容器尺寸，因此父元素必须具有真实高度。
+
+下面先通过每日新增车辆折线图理解基本的数据映射。
+
+以每日新增车辆折线图 `dailyNewCars` 为例，后端返回：
+
+后端返回：
+
+```
+dailyNewCars: [
+  { date: "2026-08-01", count: 2 },
+  { date: "2026-08-02", count: 0 },
+];
+```
+
+我们需要把数据传给图表：
+
+```
+<LineChart data={stats.dailyNewCars}>
+```
+
+再告诉各组件读取哪个属性：
+
+```
+<XAxis dataKey="date" />
+<Line dataKey="count" />
+```
+
+关系是：
+
+```
+data             → 整个对象数组
+XAxis dataKey    → 横轴读取 date
+Line dataKey     → 折线读取 count
+```
+
+Recharts 的 `LineChart` 官方 API 把数据定义为对象数组，并通过 `dataKey` 选择对象属性。
+
+在饼图中设置各扇区颜色时，当前 Recharts 已经将 `Cell` 标记为 deprecated，并计划在 Recharts 4 删除。因此不再使用 `Cell`，而是把 `fill` 直接加入饼图数据，例如：
+
+```tsx
+const brandChartData = stats.brandDistribution.map((item, index) => ({
+  ...item,
+  fill: PIE_COLORS[index % PIE_COLORS.length],
+}));
+```
+
+安装 Recharts：
+
+```bash
+cd uucars-web
+npm install recharts
+```
+
+不需要安装：
+
+```
+npm install @types/recharts
+```
+
+Recharts 自身已经包含 TypeScript 类型。
+
+#### 10.2 处理 useQuery 响应状态
+
+HTTP 请求不会直接从“没有数据”跳到“成功数据”，而是会经历：
+
+```
+Loading
+Success
+Error
+```
+
+对于数组数据，还可能出现：
+
+```
+Empty
+```
+
+因此，需要处理 `useQuery` 的不同响应状态。
+
+Stats 和 Audit Logs 是两个独立 Query，所以状态也要独立处理。
+
+修改两个 `useQuery` 的解构：
+
+```tsx
+const {
+  data: stats,
+  isLoading: statsIsLoading,
+  error: statsError,
+} = useQuery({
+  queryKey: ["admin", "stats"],
+  queryFn: () => adminApi.getStats(),
+});
+
+const {
+  data: auditLogs,
+  isLoading: auditLogsIsLoading,
+  error: auditLogsError,
+} = useQuery({
+  queryKey: ["admin", "audit-logs", { page, pageSize: PAGE_SIZE }],
+  queryFn: () => adminApi.getAuditLogs(page, PAGE_SIZE),
+});
+```
+
+不能直接在页面顶部写：
+
+```
+if (statsError) {
+  return <div>Failed</div>;
+}
+```
+
+这样 Stats 请求失败时，已经成功取得的 Audit Logs 也会被整个隐藏。
+
+正确结构是让两个区域分别处理自己的状态：
+
+```tsx
+return (
+  <div className="space-y-6">
+    {/* Stats 自己处理 Loading / Error / Success */}
+
+    {/* Audit Logs 自己处理 Loading / Error / Empty / Success */}
+  </div>
+);
+```
+
+##### Stats Loading
+
+项目已经有 `Skeleton`，直接引入使用
+
+```
+import { Skeleton } from "@/components/ui/skeleton";
+```
+
+Stats 加载时先显示六个卡片占位：
+
+```tsx
+{statsIsLoading && (
+  <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+    {Array.from({ length: 6 }).map((_, index) => (
+      <Skeleton key={index} className="h-28" />
+    ))}
+  </div>
+)}
+```
+
+##### Stats Error
+
+```tsx
+{statsError && (
+  <div
+    className="rounded-[var(--radius-lg)] border px-6 py-10 text-center text-sm"
+    style={{
+      color: "var(--color-danger)",
+      borderColor: "var(--color-border)",
+      backgroundColor: "var(--color-surface)",
+    }}
+  >
+    Failed to load dashboard statistics. Please try again.
+  </div>
+)}
+```
+
+##### Stats Success
+
+只有真正获得 `stats` 后才渲染卡片和图表：
+
+```
+{stats && (
+  <>
+    {/* 统计卡片 */}
+    {/* 折线图 */}
+    {/* 饼图 */}
+  </>
+)}
+```
+
+这样不需要使用不安全的：
+
+```
+stats!.totalCars
+```
+
+完整的架构：
+
+```tsx
+import { adminApi } from "@/api";
+import { Card } from "@/components/ui/card";
+import { Skeleton } from "@/components/ui/skeleton";
+import { useQuery } from "@tanstack/react-query";
+import { useSearchParams } from "react-router-dom";
+
+const PAGE_SIZE = 10;
+function AdminDashboardPage() {
+  const [searchParams] = useSearchParams();
+  const page = Number(searchParams.get("page") ?? "1");
+
+  // ── 拉取统计数据 ─────────────────────────────────────────
+  const {
+    data: stats,
+    isLoading: statsIsLoading,
+    error: statsError,
+  } = useQuery({
+    queryKey: ["admin", "stats"],
+    queryFn: () => adminApi.getStats(),
+  });
+
+  // ── 拉取审计日志 ─────────────────────────────────────────
+  const {
+    data: auditLogs,
+    isLoading: auditLogsIsLoading,
+    error: auditLogsError,
+  } = useQuery({
+    queryKey: ["admin", "audit-logs", { page, pageSize: PAGE_SIZE }],
+    queryFn: () => adminApi.getAuditLogs(page, PAGE_SIZE),
+  });
+
+  return (
+    <div className="space-y-6">
+      {/* Stats Loading */}
+      {statsIsLoading && (
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+          {Array.from({ length: 6 }).map((_, index) => (
+            <Skeleton key={index} className="h-28" />
+          ))}
+        </div>
+      )}
+
+      {/* Stats Error */}
+      {statsError && (
+        <div
+          className="rounded-[var(--radius-lg)] border px-6 py-10 text-center text-sm"
+          style={{
+            color: "var(--color-danger)",
+            borderColor: "var(--color-border)",
+            backgroundColor: "var(--color-surface)",
+          }}
+        >
+          Failed to load dashboard statistics. Please try again.
+        </div>
+      )}
+
+      {/* Stats Success */}
+      {stats && (
+        <>
+          <p>stats</p>
+          {/* 6 张统计卡片 */}
+
+          {/* 两个折线图 */}
+
+          {/* 品牌分布饼图 */}
+        </>
+      )}
+
+      {/* Audit Logs 独立区域 */}
+      <Card>
+        {/* /* Audit Loading / Error / Empty / Success */}
+        {auditLogsIsLoading && (
+          <div className="space-y-3">
+            {Array.from({ length: 5 }).map((_, index) => (
+              <Skeleton key={index} className="h-10" />
+            ))}
+          </div>
+        )}
+        {auditLogsError && (
+          <div
+            className="py-10 text-center text-sm"
+            style={{ color: "var(--color-danger)" }}
+          >
+            Failed to load audit logs. Please try again.
+          </div>
+        )}
+        {auditLogs && (
+          <>
+            <p>audit logs</p>
+            {/* auditLogs表格 */}
+          </>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+export default AdminDashboardPage;
+```
+
+#### 10.3 新西兰格式与 UTC 日期桶
+
+统计接口返回的是原始数字和日期字符串。前端在显示时需要统一使用新西兰格式。
+
+在 `AdminDashboardPage.tsx` 中定义这些格式转换的辅助方法
+
+```tsx
+...
+
+const PAGE_SIZE = 10;
+
+// ── 格式化辅助方法 ─────────────────────────────────────────
+// 普通数字：使用新西兰千分位格式
+const formatNumber = (value: number) => value.toLocaleString("en-NZ");
+
+// 金额：使用新西兰元格式
+const formatCurrency = (value: number) =>
+  value.toLocaleString("en-NZ", {
+    style: "currency",
+    currency: "NZD",
+  });
+
+// 趋势图日期：将 yyyy-MM-dd 显示为 dd/MM
+const formatChartDate = (value: string) => {
+  const [, month, day] = value.split("-");
+  return `${day}/${month}`;
+};
+
+// 审计日志时间：将 UTC 时间转换为用户本地时间，并使用新西兰格式
+const formatAuditDate = (value: string) => {
+  const utcValue = value.endsWith("Z") ? value : `${value}Z`;
+
+  return new Date(utcValue).toLocaleString("en-NZ", {
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
+};
+
+function AdminDashboardPage() {
+  ...
+}
+
+```
+
+##### 数字格式
+
+`formatNumber()` 用于车辆数量、用户数量和订单数量：
+
+```
+formatNumber(stats.totalCars);
+formatNumber(stats.totalUsers);
+formatNumber(stats.monthlyOrders);
+```
+
+例如：
+
+```
+1234567 → 1,234,567
+```
+
+##### 金额格式
+
+`formatCurrency()` 用于月度成交额和每日成交额：
+
+```
+formatCurrency(stats.monthlyRevenue);
+```
+
+例如：
+
+```
+1234.5 → $1,234.50
+```
+
+指定：
+
+```
+currency: "NZD"
+```
+
+可以确保金额按照新西兰元显示。
+
+##### 趋势图日期桶
+
+后端趋势 DTO 使用 `DateOnly`：
+
+```
+public DateOnly Date { get; set; }
+```
+
+前端收到的日期是：
+
+```
+2026-08-28
+```
+
+这个值表示 UTC 统计中的某一天，不是具体时间点。因此不需要创建 JavaScript `Date`，只需要调整显示顺序：
+
+```
+<XAxis dataKey="date" tickFormatter={formatChartDate} />
+```
+
+显示结果：
+
+```
+2026-08-28 → 28/08
+```
+
+近 30 天范围和缺失日期补零已经由后端完成，前端只负责显示接口返回的日期桶。
+
+##### 审计日志时间
+
+审计日志的 `createdAt` 表示操作发生的具体时间，因此需要转换为日期时间：
+
+```
+<TableCell>{formatAuditDate(item.createdAt)}</TableCell>
+```
+
+如果后端返回的 UTC 时间没有 `Z`：
+
+```
+2026-08-28T08:30:00
+```
+
+代码会补充为：
+
+```
+2026-08-28T08:30:00Z
+```
+
+然后由浏览器转换为用户本地时间，并使用 `en-NZ` 格式显示。
+
+#### 10.4 数据渲染
+
+统计数据和审计日志已经分别完成请求状态处理。接下来按照页面组成逐步渲染：
+
+```
+统计卡片
+→ 每日新增车辆折线图
+→ 每日成交额折线图
+→ 品牌分布饼图
+→ 审计日志表格和分页
+```
+
+##### 渲染 6 张统计卡片
+
+统计卡片都包含标题、数值和图标，结构相同。因此先把 6 张卡片的数据整理成数组，再通过 `map()` 渲染。
+
+先引入统计卡片需要的组件
+
+```
+import { Card, CardContent } from "@/components/ui/card";
+```
+
+引入统计卡片图标：
+
+```tsx
+import {
+  Car,
+  CheckCircle,
+  Clock,
+  DollarSign,
+  ShoppingCart,
+  Users,
+} from "lucide-react";
+```
+
+整理统计卡片数据数组：
+
+在两个 `useQuery()` 后：面加入：
+
+```tsx
+const statCards = stats
+  ? [
+      {
+        title: "Total cars",
+        value: formatNumber(stats.totalCars),
+        icon: Car,
+      },
+      {
+        title: "Pending cars",
+        value: formatNumber(stats.pendingCars),
+        icon: Clock,
+      },
+      {
+        title: "Published cars",
+        value: formatNumber(stats.publishedCars),
+        icon: CheckCircle,
+      },
+      {
+        title: "Total users",
+        value: formatNumber(stats.totalUsers),
+        icon: Users,
+      },
+      {
+        title: "Orders this month",
+        value: formatNumber(stats.monthlyOrders),
+        icon: ShoppingCart,
+      },
+      {
+        title: "Revenue this month",
+        value: formatCurrency(stats.monthlyRevenue),
+        icon: DollarSign,
+      },
+    ]
+  : [];
+```
+
+只有成功取得 `stats` 后，数组才会包含卡片数据。
+
+`icon` 保存的是 React 图标组件。渲染数组时，可以把它赋值给首字母大写的 `Icon`，再作为组件使用。
+
+渲染卡片:
+
+将 Stats Success 中临时的：
+
+```
+<p>stats</p>
+{/* 6 张统计卡片 */}
+```
+
+替换为：
+
+```tsx
+...
+
+function AdminDashboardPage() {
+...
+  // 统计卡片数据数组
+  const statCards = stats
+    ? [
+        {
+          title: "Total cars",
+          value: formatNumber(stats.totalCars),
+          icon: Car,
+        },
+        {
+          title: "Pending cars",
+          value: formatNumber(stats.pendingCars),
+          icon: Clock,
+        },
+        {
+          title: "Published cars",
+          value: formatNumber(stats.publishedCars),
+          icon: CheckCircle,
+        },
+        {
+          title: "Total users",
+          value: formatNumber(stats.totalUsers),
+          icon: Users,
+        },
+        {
+          title: "Orders this month",
+          value: formatNumber(stats.monthlyOrders),
+          icon: ShoppingCart,
+        },
+        {
+          title: "Revenue this month",
+          value: formatCurrency(stats.monthlyRevenue),
+          icon: DollarSign,
+        },
+      ]
+    : [];
+
+  return (
+    <div className="space-y-6">
+      {/* Stats Loading */}
+      ...
+
+      {/* Stats Error */}
+      ...
+
+      {/* Stats Success */}
+      {stats && (
+        <>
+          {/* 统计卡片 */}
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+            {statCards.map((item) => {
+              const Icon = item.icon;
+
+              return (
+                <Card key={item.title}>
+                  <CardContent className="flex items-center justify-between pt-5">
+                    <div>
+                      <p
+                        className="text-sm"
+                        style={{ color: "var(--color-text-secondary)" }}
+                      >
+                        {item.title}
+                      </p>
+
+                      <p
+                        className="mt-2 text-2xl font-semibold"
+                        style={{ color: "var(--color-text-primary)" }}
+                      >
+                        {item.value}
+                      </p>
+                    </div>
+
+                    <div
+                      className="flex h-11 w-11 items-center justify-center rounded-full"
+                      style={{
+                        color: "var(--color-accent)",
+                        backgroundColor: "var(--color-accent-light)",
+                      }}
+                    >
+                      <Icon className="h-5 w-5" aria-hidden="true" />
+                    </div>
+                  </CardContent>
+                </Card>
+              );
+            })}
+          </div>
+          {/* 趋势折线图：每日新增车辆 */}
+          {/* 趋势折线图：每日成交额 */}
+        </>
+      )}
+
+      {/* Audit Logs 独立区域 */}
+      <Card>
+        ...
+      </Card>
+    </div>
+  );
+}
+
+```
+
+现在 `stats` 成功返回时，页面会显示 6 张统计卡片。
+
+##### 渲染每日新增车辆折线图
+
+先完成第一张折线图，理解 Recharts 如何把数据字段映射到坐标轴和折线。
+
+补充 Card 组件：
+
+```
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+```
+
+引入折线图需要的 Recharts 组件：
+
+```
+import {
+  CartesianGrid,
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
+```
+
+这些组件分别负责：
+
+```
+ResponsiveContainer → 图表跟随父容器宽度变化
+LineChart           → 折线图容器
+CartesianGrid       → 图表背景网格
+XAxis               → 日期横轴
+YAxis               → 数量纵轴
+Tooltip             → 鼠标悬停提示
+Line                → 实际折线
+```
+
+渲染趋势折线图：每日新增车辆
+
+```tsx
+<Card>
+  <CardHeader>
+    <CardTitle>Daily new cars</CardTitle>
+    <CardDescription>
+      New cars added during the last 30 days
+    </CardDescription>
+  </CardHeader>
+
+  <CardContent>
+    <div
+      className="h-72 w-full"
+      role="img"
+      aria-label="Daily new cars during the last 30 days"
+    >
+      <ResponsiveContainer width="100%" height="100%">
+        <LineChart
+          data={stats.dailyNewCars}
+          margin={{ top: 5, right: 10, left: 0, bottom: 0 }}
+          accessibilityLayer
+        >
+          <CartesianGrid
+            stroke="var(--color-border)"
+            strokeDasharray="3 3"
+          />
+
+          <XAxis
+            dataKey="date"
+            tickFormatter={formatChartDate}
+            tick={{
+              fill: "var(--color-text-secondary)",
+              fontSize: 12,
+            }}
+          />
+
+          <YAxis
+            allowDecimals={false}
+            width={50}
+            tick={{
+              fill: "var(--color-text-secondary)",
+              fontSize: 12,
+            }}
+          />
+
+          <Tooltip
+            labelFormatter={(label) => formatChartDate(String(label))}
+            formatter={(value) => [
+              formatNumber(Number(value)),
+              "New cars",
+            ]}
+            contentStyle={{
+              backgroundColor: "var(--color-surface)",
+              borderColor: "var(--color-border)",
+              borderRadius: "var(--radius-md)",
+            }}
+          />
+
+          <Line
+            type="linear"
+            dataKey="count"
+            stroke="var(--color-accent)"
+            strokeWidth={2}
+            dot={false}
+            activeDot={{ r: 4 }}
+          />
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
+  </CardContent>
+</Card>
+```
+
+数据来源是：
+
+```
+data={stats.dailyNewCars}
+```
+
+其中每个元素的结构为：
+
+```
+{
+  date: string;
+  count: number;
+}
+```
+
+因此：
+
+```
+<XAxis dataKey="date" />
+<Line dataKey="count" />
+```
+
+分别读取 `date` 和 `count`。
+
+`ResponsiveContainer` 自身没有固定高度，所以外层必须提供：
+
+```
+className="h-72 w-full"
+```
+
+否则图表可能没有可用的绘制高度。
+
+##### 渲染每日成交额折线图
+
+第二张折线图的布局与第一张一致，但使用的数据和数值格式不同：
+
+```
+dailyNewCars → count → 普通数字
+dailyRevenue → revenue → NZD 金额
+```
+
+渲染趋势折线图：每日成交额， 并将2个折线图合并成双列图表区域：
+
+```tsx
+<div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+  {/* 趋势折线图：每日新增车辆 */}
+  <Card>
+    <CardHeader>
+      <CardTitle>Daily new cars</CardTitle>
+      <CardDescription>
+        New cars added during the last 30 days
+      </CardDescription>
+    </CardHeader>
+
+    <CardContent>
+      <div
+        className="h-72 w-full"
+        role="img"
+        aria-label="Daily new cars during the last 30 days"
+      >
+        <ResponsiveContainer width="100%" height="100%">
+          <LineChart
+            data={stats.dailyNewCars}
+            margin={{ top: 5, right: 10, left: 0, bottom: 0 }}
+            accessibilityLayer
+          >
+            <CartesianGrid
+              stroke="var(--color-border)"
+              strokeDasharray="3 3"
+            />
+
+            <XAxis
+              dataKey="date"
+              tickFormatter={formatChartDate}
+              tick={{
+                fill: "var(--color-text-secondary)",
+                fontSize: 12,
+              }}
+            />
+
+            <YAxis
+              allowDecimals={false}
+              width={50}
+              tick={{
+                fill: "var(--color-text-secondary)",
+                fontSize: 12,
+              }}
+            />
+
+            <Tooltip
+              labelFormatter={(label) => formatChartDate(String(label))}
+              formatter={(value) => [
+                formatNumber(Number(value)),
+                "New cars",
+              ]}
+              contentStyle={{
+                backgroundColor: "var(--color-surface)",
+                borderColor: "var(--color-border)",
+                borderRadius: "var(--radius-md)",
+              }}
+            />
+
+            <Line
+              type="linear"
+              dataKey="count"
+              stroke="var(--color-accent)"
+              strokeWidth={2}
+              dot={false}
+              activeDot={{ r: 4 }}
+            />
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+    </CardContent>
+  </Card>
+
+  {/* 趋势折线图：每日成交额 */}
+  <Card>
+    <CardHeader>
+      <CardTitle>Daily revenue</CardTitle>
+      <CardDescription>
+        Completed order revenue during the last 30 days
+      </CardDescription>
+    </CardHeader>
+
+    <CardContent>
+      <div
+        className="h-72 w-full"
+        role="img"
+        aria-label="Daily revenue during the last 30 days"
+      >
+        <ResponsiveContainer width="100%" height="100%">
+          <LineChart
+            data={stats.dailyRevenue}
+            margin={{ top: 5, right: 10, left: 0, bottom: 0 }}
+            accessibilityLayer
+          >
+            <CartesianGrid
+              stroke="var(--color-border)"
+              strokeDasharray="3 3"
+            />
+
+            <XAxis
+              dataKey="date"
+              tickFormatter={formatChartDate}
+              tick={{
+                fill: "var(--color-text-secondary)",
+                fontSize: 12,
+              }}
+            />
+
+            <YAxis
+              width={70}
+              tickFormatter={(value) => formatNumber(Number(value))}
+              tick={{
+                fill: "var(--color-text-secondary)",
+                fontSize: 12,
+              }}
+            />
+
+            <Tooltip
+              labelFormatter={(label) => formatChartDate(String(label))}
+              formatter={(value) => [
+                formatCurrency(Number(value)),
+                "Revenue",
+              ]}
+              contentStyle={{
+                backgroundColor: "var(--color-surface)",
+                borderColor: "var(--color-border)",
+                borderRadius: "var(--radius-md)",
+              }}
+            />
+
+            <Line
+              type="linear"
+              dataKey="revenue"
+              stroke="var(--color-primary)"
+              strokeWidth={2}
+              dot={false}
+              activeDot={{ r: 4 }}
+            />
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+    </CardContent>
+  </Card>
+</div>
+```
+
+`xl:grid-cols-2` 表示：
+
+- 小屏幕中上下排列；
+- 大屏幕中左右排列。
+
+##### 渲染品牌分布饼图
+
+品牌分布接口已经按照车辆数量降序返回前 10 个品牌。
+
+饼图需要让不同品牌使用不同颜色，因此在渲染之前，为每条数据补充 `fill` 属性。
+
+先引入饼图组件，在现有 Recharts import 中增加：
+
+```
+Legend,
+Pie,
+PieChart,
+```
+
+完整的 Recharts import 变为：
+
+```
+import {
+  CartesianGrid,
+  Legend,
+  Line,
+  LineChart,
+  Pie,
+  PieChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
+```
+
+定义饼图颜色，在组件内的 `brandChartData` 之前加入：
+
+```tsx
+const PIE_COLORS = [
+  "#c0392b",
+  "#1c1c1e",
+  "#d97706",
+  "#2563eb",
+  "#16a34a",
+  "#7c3aed",
+  "#0891b2",
+  "#db2777",
+  "#65a30d",
+  "#64748b",
+];
+```
+
+接口最多返回 10 个品牌，因此准备 10 种颜色。
+
+整理饼图数据, 在 `statCards` 后面加入：
+
+```
+const brandChartData =
+  stats?.brandDistribution.map((item, index) => ({
+    ...item,
+    fill: PIE_COLORS[index % PIE_COLORS.length],
+  })) ?? [];
+```
+
+原始数据：
+
+```
+{
+  brand: string;
+  count: number;
+}
+```
+
+整理后增加了 `fill`：
+
+```
+{
+  brand: string;
+  count: number;
+  fill: string;
+}
+```
+
+渲染饼图，在两个折线图区域下面加入：
+
+```tsx
+<Card>
+  <CardHeader>
+    <CardTitle>Brand distribution</CardTitle>
+    <CardDescription>
+      Top 10 brands by number of active listings
+    </CardDescription>
+  </CardHeader>
+
+  <CardContent>
+    {brandChartData.length === 0 ? (
+      <p
+        className="py-16 text-center text-sm"
+        style={{ color: "var(--color-text-secondary)" }}
+      >
+        No brand data available.
+      </p>
+    ) : (
+      <div
+        className="h-80 w-full"
+        role="img"
+        aria-label="Top 10 car brands by number of active listings"
+      >
+        <ResponsiveContainer width="100%" height="100%">
+          <PieChart accessibilityLayer>
+            <Pie
+              data={brandChartData}
+              dataKey="count"
+              nameKey="brand"
+              cx="50%"
+              cy="50%"
+              innerRadius={55}
+              outerRadius={105}
+              paddingAngle={2}
+            />
+
+            <Tooltip
+              formatter={(value) => formatNumber(Number(value))}
+              contentStyle={{
+                backgroundColor: "var(--color-surface)",
+                borderColor: "var(--color-border)",
+                borderRadius: "var(--radius-md)",
+              }}
+            />
+
+            <Legend />
+          </PieChart>
+        </ResponsiveContainer>
+      </div>
+    )}
+  </CardContent>
+</Card>
+```
+
+`Pie` 的字段映射为：
+
+```
+dataKey="count"
+nameKey="brand"
+```
+
+因此：
+
+- `count` 决定每个扇区的大小；
+- `brand` 作为 Tooltip 和 Legend 中的品牌名称。
+
+##### 渲染审计日志表格
+
+统计区域和审计日志使用不同的查询，因此审计日志继续独立处理自己的 Loading、Error、Empty 和 Success 状态。
+
+先引入需要的现有公共组件，增加：
+
+```
+import EmptyState from "@/components/EmptyState";
+import Pagination from "@/components/Pagination";
+```
+
+增加表格组件：
+
+```
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+```
+
+在现有的 `lucide-react` import 中增加：
+
+```
+FileClock,
+```
+
+图标 import 变为：
+
+```
+import {
+  Car,
+  CheckCircle,
+  Clock,
+  DollarSign,
+  FileClock,
+  ShoppingCart,
+  Users,
+} from "lucide-react";
+```
+
+渲染审计日志占位区域， 将页面底部现有的 Audit Logs `<Card>` 完整替换为：
+
+```tsx
+<Card>
+  <CardHeader>
+    <CardTitle>Audit logs</CardTitle>
+    <CardDescription>
+      Recent administrative activity on the platform
+    </CardDescription>
+  </CardHeader>
+
+  <CardContent>
+    {/* Audit Loading */}
+    {auditLogsIsLoading && (
+      <div className="space-y-3">
+        {Array.from({ length: 5 }).map((_, index) => (
+          <Skeleton key={index} className="h-10" />
+        ))}
+      </div>
+    )}
+
+    {/* Audit Error */}
+    {auditLogsError && (
+      <div
+        className="py-10 text-center text-sm"
+        style={{ color: "var(--color-danger)" }}
+      >
+        Failed to load audit logs. Please try again.
+      </div>
+    )}
+
+    {/* Audit Empty */}
+    {!auditLogsIsLoading &&
+      !auditLogsError &&
+      auditLogs &&
+      auditLogs.items.length === 0 && (
+        <EmptyState
+          icon={<FileClock className="h-8 w-8" />}
+          title="No audit logs"
+          description="Administrative activity will appear here."
+          className="py-10"
+        />
+      )}
+
+    {/* Audit Success */}
+    {!auditLogsIsLoading &&
+      !auditLogsError &&
+      auditLogs &&
+      auditLogs.items.length > 0 && (
+        <>
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Date</TableHead>
+                <TableHead>Admin</TableHead>
+                <TableHead>Action</TableHead>
+                <TableHead>Entity</TableHead>
+                <TableHead>Detail</TableHead>
+              </TableRow>
+            </TableHeader>
+
+            <TableBody>
+              {auditLogs.items.map((item) => (
+                <TableRow key={item.id}>
+                  <TableCell>{formatAuditDate(item.createdAt)}</TableCell>
+
+                  <TableCell>{item.adminUsername}</TableCell>
+
+                  <TableCell>{item.action}</TableCell>
+
+                  <TableCell>
+                    {item.entityType} #{item.entityId}
+                  </TableCell>
+
+                  <TableCell className="max-w-sm whitespace-normal">
+                    {item.detail ?? "—"}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+
+          <div className="mt-6">
+            <Pagination totalPages={auditLogs.totalPages} />
+          </div>
+        </>
+      )}
+  </CardContent>
+</Card>
+```
+
+表格中的：
+
+```
+<TableRow key={item.id}>
+```
+
+使用审计日志自身的 `id` 作为 React 列表键。
+
+分页继续使用项目已有的 `Pagination`。点击分页按钮后，它会更新 URL 中的：
+
+```
+?page=2
+```
+
+`page` 改变后，审计日志的 Query Key 也会改变：
+
+```
+["admin", "audit-logs", { page, pageSize: PAGE_SIZE }]
+```
+
+TanStack Query 随后请求对应页的数据。统计 Query Key 没有变化，因此统计接口不会因为审计日志翻页而重新请求。
+
+##### 验证数据渲染
+
+启动前端和后端后，依次检查：
+
+1. 页面显示 6 张统计卡片。
+2. 数量使用千分位格式。
+3. 月度成交额显示为新西兰元。
+4. 每日新增车辆折线图显示 30 个日期桶。
+5. 每日成交额折线图的 Tooltip 显示 NZD 金额。
+6. 饼图显示最多 10 个品牌和对应图例。
+7. 审计日志正确显示时间、Admin、操作、实体和详情。
+8. 审计日志没有数据时显示 Empty State。
+9. 审计日志分页只更新日志，不影响统计区域。
+
+最后运行：
+
+```
+cd uucars-web
+npm run build
+npm run lint
+```
+
+如果 build 和 lint 均通过，说明当前页面的 TypeScript 类型、Recharts 属性和组件引用正确，并且没有引入新的 lint 问题。
+
+
+
+### 11. 完整验证
+
+#### 后端
+
+```
+dotnet build
+dotnet test --filter AdminStats
+dotnet test
+```
+
+#### 前端
+
+```
+cd uucars-web
+npm run build
+npm run lint
+```
+
+#### 手动验收
+
+```
+□ Admin 登录后 /admin 跳到 /admin/dashboard
+□ 普通用户不能访问 Admin Dashboard
+□ 6 张卡片显示
+□ totalCars 排除 Deleted
+□ publishedCars 不包含 Sold
+□ monthlyRevenue 只统计 Completed
+□ 两个折线图各有 30 个日期
+□ 零数据日期没有消失
+□ 品牌只显示前 10
+□ 品牌无数据时显示 Empty State
+□ Audit Logs 正确分页
+□ 日志翻页没有重新请求 Stats
+□ 金额使用 NZD
+□ 日期和数字使用 en-NZ
+□ 手机宽度没有横向溢出
+□ Redis 命中后不重复执行统计查询
+```
+
+
+
+### 12. Git 提交
+
+```
+git commit -m "feat: admin statistics dashboard with charts and audit logs"
+git push origin feature/v3-admin-dashboard
+```
+
+验证完成后按标准流程合并：
+
+```
+git checkout develop
+git pull --ff-only origin develop
+git merge --no-ff feature/v3-admin-dashboard \
+  -m "merge: feature/v3-admin-dashboard into develop"
+git push origin develop
+
+git branch -d feature/v3-admin-dashboard
+git push origin --delete feature/v3-admin-dashboard
+```
+
+
+
+### Step 71 完成状态
+
+```
+概念理解：
+□ 理解 SQL Aggregate 与普通列表查询的区别
+□ 理解 Count/Sum 为什么应在数据库执行
+□ 理解 GroupBy 如何生成日期和品牌聚合
+□ 理解 UTC 半开区间避免时间精度边界问题
+□ 理解 TimeProvider 如何让当前时间可测试
+□ 理解为什么数据库 GroupBy 不会返回零数据日期
+□ 理解为什么补零属于 Service 业务组合
+□ 理解稳定排序对图表颜色和顺序的重要性
+□ 理解 Dashboard DTO 与 Repository 查询结果的区别
+□ 理解为什么缓存完整 DTO 而不是分别缓存每个字段
+□ 理解 ResponsiveContainer 依赖父容器高度
+□ 理解 Recharts dataKey 如何映射对象属性
+□ 理解 Stats 与 Audit Logs 应使用独立 Query key
+
+后端实现：
+□ AdminStatsResponse
+□ IAdminStatsRepository
+□ EfAdminStatsRepository
+□ AdminStatsService
+□ TimeProvider
+□ UTC 月度统计
+□ 近 30 天每日统计
+□ 日期补零
+□ 品牌 Top 10
+□ 5 分钟 Redis 缓存
+□ GET /admin/stats
+□ Admin 授权
+
+前端实现：
+□ Recharts
+□ AdminStats TypeScript contract
+□ adminApi.getStats
+□ adminApi.getAuditLogs
+□ Admin Dashboard 路由与 tab
+□ 6 张统计卡片
+□ 2 个 LineChart
+□ 1 个 PieChart
+□ Audit Logs 表格与分页
+□ en-NZ / NZD
+□ loading/error/empty 状态
+
+测试：
+□ Service 单元测试
+□ API 集成测试
+```
+
+
+
+以下为重新按 Step 71 风格整理的 Step 72 笔记草案。
+
+
+
+## Step 72 · Google OpenID Connect（OIDC）第三方登录
+
+### 这一步做什么
+
+目前 UUcars 已完成本地认证流程：
+
+```
+注册
+→ 邮箱验证
+→ Email + Password 登录
+→ JWT Access Token
+→ Refresh Token Cookie
+```
+
+但用户只能使用 UUcars 自己保存的密码登录。
+
+本步骤增加 Google 登录。用户在 Login 或 Register 页面点击同一个 Google 按钮后，由 Google 确认身份；UUcars 后端验证 Google 返回的 ID Token，再建立 UUcars 自己的登录会话。
+
+最终数据流：
+
+```
+Google Login Button
+        ↓
+Google 返回 ID Token
+        ↓
+POST /auth/google
+        ↓
+GoogleIdTokenService
+        ↓
+ExternalLoginService
+        ↓
+User + ExternalLogin
+        ↓
+现有 JWT + Refresh Token Cookie
+        ↓
+Zustand auth state
+```
+
+本步骤会学习：
+
+- OpenID Connect 登录中的 ID Token；
+- `sub`、Issuer、Audience 和 Email Verified；
+- 第三方身份与本地 User 的关联；
+- EF Core 一对多关系与唯一索引；
+- 后端验证外部 Token；
+- 复用现有 JWT 和 Refresh Token 登录流程；
+- Mock 外部验证器进行单元测试和集成测试；
+- React 中接入 Google 登录按钮。
+
+
+
+### 1. 切出功能分支
+
+先检查当前状态：
+
+```
+git status --short --branch
+```
+
+确认当前在干净的 `develop` 后：
+
+```
+git pull --ff-only origin develop
+git checkout -b feature/v3-google-oidc-login
+git push -u origin feature/v3-google-oidc-login
+```
+
+
+
+### 2. Google 登录流程
+
+Google 登录不是把用户的 Google 密码交给 UUcars，而是让 Google 先确认用户身份，再把确认结果交给 UUcars。
+
+整个过程中有三个参与者：
+
+```
+用户
+Google
+UUcars
+```
+
+它们各自负责的事情不同：
+
+```
+用户
+→ 选择要使用的 Google 账号
+
+Google
+→ 完成账号验证
+→ 向 UUcars 提供一份身份凭证
+
+UUcars
+→ 验证这份凭证是否可信
+→ 根据 Google 身份找到对应的站内用户
+→ 建立 UUcars 自己的登录状态
+```
+
+因此，Google 只负责证明“当前用户是谁”。用户进入 UUcars 后使用的登录状态，仍然由 UUcars 自己创建和管理。
+
+#### 2.1 Google 登录失败
+
+如果用户取消、关闭窗口或 Google 登录失败：
+
+```
+Google 不会返回有效身份凭证
+→ UUcars 无法继续登录
+→ 页面提示本次登录没有完成
+```
+
+#### 2.2 Google 返回 ID Token
+
+如果 Google 成功确认用户，前端会收到：
+
+```
+ID Token
+```
+
+这个 ID Token 是 Google 签发的 JWT，里面包含类似：
+
+```
+{
+  "iss": "https://accounts.google.com",
+  "aud": "uucars-client-id.apps.googleusercontent.com",
+  "sub": "10769150350006150715113082367",
+  "email": "alice@example.com",
+  "email_verified": true,
+  "name": "Alice"
+}
+```
+
+几个字段的含义：
+
+```
+iss：谁签发这个 Token
+aud：这个 Token 是签发给哪个应用的
+sub：Google Account 的稳定唯一标识
+email：Google 当前返回的邮箱
+email_verified：Google 是否已确认用户控制这个邮箱
+```
+
+**其中最重要的是：**
+
+```
+Google 用户身份 = sub
+```
+
+而不是：
+
+```
+Google 用户身份 = email
+```
+
+因为邮箱可能改变，而 `sub` 用来稳定标识同一个 Google Account。
+
+前端不能只取出其中的邮箱或用户名交给 UUcars，因为浏览器传来的普通字段可以被修改。它需要把完整的 ID Token 发送给后端：
+
+```
+POST /auth/google
+{
+  "idToken": "..."
+}
+```
+
+#### 2.3 UUcars 后端验证 Token
+
+收到 ID Token 后，UUcars 后端首先验证这份凭证是否可信，主要确认：
+
+```
+它是否由 Google 签发
+内容是否被修改过
+是否签发给 UUcars 使用
+是否仍在有效期内
+```
+
+失败时：
+
+```
+UUcars 不接受这份身份凭证
+→ 本次登录失败
+```
+
+验证通过后，UUcars 才能信任 Token 中由 Google 提供的身份数据，例如：
+
+```
+sub = G123
+email = alice@example.com
+```
+
+#### 2.4 后端找到对应 UUcars 用户
+
+Google 身份和 UUcars 站内用户是两个不同概念：
+
+```
+Google 身份
+→ 由 Google 的 sub 标识
+
+UUcars 用户
+→ 由 UUcars 自己的站内编号标识
+```
+
+因此，验证 Google 身份后，UUcars 还需要确定这个 Google 身份对应哪个站内用户。
+
+如果这个 Google 身份以前使用过 UUcars：
+
+```
+找到原来对应的 UUcars 用户
+→ 登录原账号
+```
+
+如果这是这个 Google 身份第一次使用 UUcars：
+
+```
+根据经过验证的身份信息判断应使用已有站内账号
+或创建一个新的 UUcars 用户
+```
+
+无论最终对应已有用户还是新用户，UUcars 都需要记住这个对应关系。以后同一个 Google 身份再次登录时，就可以直接找到原来的站内账号。
+
+#### 2.5 创建 UUcars 登录会话
+
+找到对应的 UUcars 用户后，后端建立站内登录会话：
+
+```
+生成 UUcars JWT Access Token
+→ 创建 Refresh Token
+→ 写入 HttpOnly Cookie
+→ 把登录结果返回前端
+```
+
+前端收到 UUcars 的登录结果后，再保存前端登录状态并进入相应页面。
+
+所以完整原理是：
+
+```
+用户选择 Google 账号
+→ Google 确认用户身份
+→ Google 返回 ID Token
+→ UUcars 后端验证 ID Token
+→ 确定对应的 UUcars 用户
+→ UUcars 建立自己的登录会话
+```
+
+
+
+### 3. 创建 Google OAuth Client 并准备配置
+
+Google 登录按钮需要一个 Google OAuth Client ID。
+
+这个 Client ID 用来标识：
+
+```
+“正在请求 Google 登录的是 UUcars 网站”
+```
+
+它不限制只能由创建项目的 Google 账号登录 UUcars。
+
+#### 3.1 创建 Google Cloud Project
+
+先登录 Google Cloud Console：
+
+```
+https://console.cloud.google.com/
+```
+
+创建独立项目：
+
+```
+Project name：UUcars
+```
+
+创建后确认顶部项目选择器显示：
+
+```
+UUcars
+```
+
+#### 3.2 配置 Google Auth Platform 品牌信息
+
+进入：
+
+```
+Google Auth Platform
+→ 品牌塑造
+```
+
+填写：
+
+```
+应用名称：UUcars
+用户支持邮箱：自己的 Google 邮箱
+开发者联系信息：自己的 Google 邮箱
+```
+
+`应用名称` 是用户在 Google 登录授权界面中看到的名称。
+
+当前不需要上传 Logo，也不需要配置 Google API 权限。
+
+#### 3.3 设置目标对象和测试用户
+
+进入：
+
+```
+Google Auth Platform
+→ 目标对象
+```
+
+选择：
+
+```
+外部（External）
+```
+
+含义是：
+
+```
+UUcars 未来可以允许任何 Google 账号登录。
+```
+
+新建项目通常处于：
+
+```
+Testing
+```
+
+在 Testing 状态下，只有被加入 Test users 的 Google 账号才能测试登录。
+
+因此在：
+
+```
+测试用户
+→ 添加用户
+```
+
+加入自己的测试 Google 邮箱。
+
+开发期间可再加入其他测试账号。
+
+#### 3.4 创建 Web OAuth Client
+
+进入：
+
+```
+Google Auth Platform
+→ 客户端
+→ 创建客户端
+```
+
+填写：
+
+```
+应用类型：Web 应用
+名称：UUcars Local Development
+```
+
+名称只用于 Google Cloud Console 内部识别，不会显示给最终用户。
+
+#### 3.5 配置 Authorized JavaScript origins
+
+在：
+
+```
+已获授权的 JavaScript 来源
+```
+
+点击：
+
+```
+添加 URI
+```
+
+加入：
+
+```
+http://localhost
+http://localhost:5173
+```
+
+这里填写的是 React + Vite 前端页面地址，不是后端 API 地址。
+
+```
+正确：http://localhost:5173
+错误：http://localhost:5065
+```
+
+Google 登录按钮在浏览器中的 React 页面运行，因此 Google 需要确认：
+
+```
+这个前端来源可以使用 UUcars 的 Client ID。
+```
+
+如果以后 Vite 实际启动在其他端口，例如：
+
+```
+http://localhost:5174
+```
+
+再将该地址加入 JavaScript origins。
+
+#### 3.6 不配置 Redirect URI
+
+在：
+
+```
+已获授权的重定向 URI
+```
+
+保持空白。
+
+本项目使用流程是：
+
+```
+Google popup
+→ React 收到 ID Token
+→ React 调用 POST /auth/google
+```
+
+不是：
+
+```
+Google 重定向到后端 URL
+```
+
+因此当前不需要 Redirect URI。
+
+#### 3.7 保存 Client ID
+
+点击：
+
+```
+创建
+```
+
+创建后会显示：
+
+```
+客户端 ID
+客户端密钥
+```
+
+只复制：
+
+```
+客户端 ID
+```
+
+不要使用、下载或保存：
+
+```
+客户端密钥
+```
+
+本步骤的 Google popup 登录不需要 Client Secret。
+
+#### 3.8 配置本地前后端
+
+在 `uucars-web/.env.local` 中加入：
+
+```
+VITE_GOOGLE_CLIENT_ID=your-client-id.apps.googleusercontent.com
+```
+
+在后端 User Secrets 中加入相同值：
+
+```
+dotnet user-secrets set "GoogleAuth:ClientId" \
+  "1017312818794-93b9fkeegcnfbohbc9j68s7b073ensja.apps.googleusercontent.com" \
+  --project UUcars.API
+```
+
+前端使用 Client ID 初始化 Google 登录组件。
+
+后端使用同一个 Client ID 验证 Google ID Token 的：
+
+```
+aud
+```
+
+确保该 Token 确实是签发给 UUcars 的。
+
+
+
+### 4. 前端接收 Google 返回的 Credential
+
+上面通过设置我们已经获取了 Google OAuth Client ID，并把它保存到：
+
+```
+VITE_GOOGLE_CLIENT_ID
+```
+
+但环境变量本身不会让 React 自动拥有 Google 登录功能。前端还需要：
+
+```
+加载 Google Identity Services
+→ 使用 Client ID 初始化 Google 登录
+→ 显示 Google 登录按钮
+→ 接收 Google 登录结果
+```
+
+#### 4.1 安装 React Google OAuth 包
+
+安装：
+
+```
+cd uucars-web
+npm install @react-oauth/google
+```
+
+这个包主要提供两个组件：
+
+```
+GoogleOAuthProvider
+→ 初始化 Google 登录环境
+→ 保存 Client ID
+→ 加载 Google Identity Services
+→ 把配置提供给内部组件
+
+GoogleLogin
+→ 显示 Google 官方登录按钮
+→ 用户完成 Google 登录后触发回调
+```
+
+#### 4.2 使用 GoogleOAuthProvider 初始化登录环境
+
+`GoogleLogin` 需要知道：
+
+```
+当前网站使用哪个 Google Client ID
+Google Identity Services 是否已经加载完成
+```
+
+如果每个登录按钮都单独读取和初始化这些配置，会产生重复代码。
+
+`GoogleOAuthProvider` 使用 React Context 把同一份 Google 配置提供给内部组件：
+
+```
+GoogleOAuthProvider
+└── UUcars React 应用
+    ├── LoginPage
+    │   └── GoogleLogin
+    └── RegisterPage
+        └── GoogleLogin
+```
+
+因此在 `uucars-web/src/main.tsx` 中引入：
+
+```tsx
+import { GoogleOAuthProvider } from "@react-oauth/google";
+```
+
+读取 Client ID：
+
+```tsx
+const googleClientId = import.meta.env.VITE_GOOGLE_CLIENT_ID;
+
+if (!googleClientId) {
+  throw new Error("VITE_GOOGLE_CLIENT_ID is not configured.");
+}
+```
+
+然后包裹现有应用：
+
+```tsx
+createRoot(document.getElementById("root")!).render(
+  <StrictMode>
+    <GoogleOAuthProvider clientId={googleClientId}>
+      <QueryClientProvider client={queryClient}>
+        <AuthInitializer>
+          <RouterProvider router={router} />
+        </AuthInitializer>
+
+        <Toaster position="bottom-right" />
+      </QueryClientProvider>
+    </GoogleOAuthProvider>
+  </StrictMode>,
+);
+```
+
+这里的 `clientId` 告诉 Google：
+
+```
+这个页面正在代表 UUcars 请求用户登录
+```
+
+被 Provider 包裹后，内部任何位置中的 `GoogleLogin` 才能读取这份配置。
+
+#### 4.3 在 LoginPage 中暂时接收 Google 返回值
+
+现在先在 `LoginPage` 中直接加入 `GoogleLogin`，确认前端实际收到的数据类型。
+
+引入：
+
+```
+import {
+  GoogleLogin,
+  type CredentialResponse,
+} from "@react-oauth/google";
+import { toast } from "sonner";
+```
+
+定义成功回调：
+
+```tsx
+const handleGoogleSuccess = (response: CredentialResponse) => {
+    if (!response.credential) {
+      toast.error("Google did not return an ID token.");
+      return;
+    }
+    console.log("Google response:", response);
+  };
+```
+
+在本地登录表单下方暂时加入：
+
+```tsx
+<div className="my-6 flex items-center gap-3">
+  <div className="h-px flex-1 bg-[var(--color-border-strong)]" />
+
+  <span className="text-sm text-muted-foreground">
+    Or continue with
+  </span>
+
+  <div className="h-px flex-1 bg-[var(--color-border-strong)]" />
+</div>
+
+<GoogleLogin
+  onSuccess={handleGoogleSuccess}
+  onError={() => {
+    toast.error("Google sign-in was cancelled or failed.");
+  }}
+/>
+```
+
+启动前端：
+
+```
+npm run dev
+```
+
+访问：
+
+```
+http://localhost:5173/login
+```
+
+点击 Google 按钮并选择测试账号。
+
+Google 成功确认用户后，收到 `CredentialResponse`对象：
+
+```objc
+{
+    "credential": "eyJhbGciOiJSUzI...r3aA",
+    "clientId": "1017312818794...nsja.apps.googleusercontent.com",
+    "select_by": "btn"
+}
+```
+
+这里没有直接得到：
+
+```
+sub
+email
+name
+```
+
+真正的用户身份数据被放在：
+
+```
+response.credential
+```
+
+这个就是 Google ID Token
+
+
+
+### 5. 在后端验证 Google ID Token
+
+前端得到的 `credential` 只是一个字符串。虽然它内部包含 Google 用户信息，但 UUcars 后端不能直接相信前端传来的内容。攻击者也可以自己构造请求，并提交伪造字符串。
+
+因此后端需要对这个字符串进行解析并验证，比如需要确认：
+
+```
+Token 是否由 Google 签名
+Token 是否签发给 UUcars
+Token 是否已经过期
+Token 中是否包含有效的用户身份
+```
+
+验证通过后，才能把 Google Token 转换为 UUcars 可以使用的身份数据。
+
+#### 5.1 安装 Google 验证库
+
+安装：
+
+```
+dotnet add UUcars.API package Google.Apis.Auth
+```
+
+这个包提供了验证方法：
+
+```
+GoogleJsonWebSignature.ValidateAsync(...)
+```
+
+它同时完成**解析和验证**：
+
+1. 拆开 Token，解码其中的 JSON，并转换成 SDK 定义的 `Payload` 对象。
+2. 使用 Google 公钥验证签名，确认内容没有被篡改。
+3. 检查签发者和时间等条件。
+4. 检查通过后，返回 `Payload`；失败则抛出异常。
+
+因此，它不是只把字符串转换成对象。**能取得返回结果，说明 SDK 已执行的验证已经通过。**
+
+Google 公钥的获取和缓存由 SDK 处理，不需要自己实现。
+
+#### 5.2 解析ID Token
+
+后端需要从请求体接收 Token，因此先定义请求 DTO。
+
+创建 `UUcars.API/DTOs/Requests/GoogleLoginRequest.cs`
+
+```c#
+using System.ComponentModel.DataAnnotations;
+
+namespace UUcars.API.DTOs.Requests;
+
+public class GoogleLoginRequest
+{
+    [Required(ErrorMessage = "Google ID token is required.")]
+    public string IdToken { get; set; } = string.Empty;
+}
+```
+
+这样，前端发送的请求 Body 为：
+
+```json
+{
+  "idToken": "response.credential"
+}
+```
+
+这里的 `[Required]` 只检查请求是否提供了 Token，**不负责判断 Token 是否真实有效**。
+
+如果收到的字符串不是合法 JWT，接口需要返回认证失败, 因此我们也定义 `InvalidGoogleIdTokenException`异常类。 新建 `UUcars.API/Exceptions/InvalidGoogleIdTokenException.cs`：
+
+```c#
+namespace UUcars.API.Exceptions;
+
+public class InvalidGoogleIdTokenException : AppException
+{
+    public InvalidGoogleIdTokenException()
+        : base(
+            StatusCodes.Status401Unauthorized,
+            "Google authentication failed.")
+    {
+    }
+}
+```
+
+把解析逻辑放在 Service 中， 创建`UUcars.API/Services/ExternalLogin/GoogleIdTokenService.cs `，并临时编写解析逻辑。
+
+可以使用`GoogleJsonWebSignature.ValidateAsync`这个方法， 调用后的返回结果:
+
+```c#
+<GoogleJsonWebSignature.Payload> payload
+```
+
+这个 `payload` 就是对 ID Token 解析后的数据。
+
+先创建接口方法， 方便测试时使用这个解析认证的能力。
+
+新建 ``UUcars.API/Services/ExternalLogin/IGoogleIdTokenService.cs ``
+
+```c#
+using Google.Apis.Auth;
+
+namespace UUcars.API.Services.ExternalLogin;
+
+public interface IGoogleIdTokenService
+{
+    public Task<GoogleJsonWebSignature.Payload> ValidateAsync(string idToken,
+        CancellationToken cancellationToken = default);
+}
+```
+
+实现接口
+
+```c#
+using Google.Apis.Auth;
+
+namespace UUcars.API.Services.ExternalLogin;
+
+public class GoogleIdTokenService:IGoogleIdTokenService
+{
+    public async Task<GoogleJsonWebSignature.Payload> ValidateAsync(string idToken,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            return await GoogleJsonWebSignature.ValidateAsync(idToken);
+        }
+       catch (InvalidJwtException)
+        {
+            throw new InvalidGoogleIdTokenException();
+        }
+    }
+}
+```
+
+这里返回的 `GoogleJsonWebSignature.Payload` 是 **SDK 已经定义好的类型**
+
+`Program.cs`中注册 `GoogleIdTokenService`：
+
+```c#
+builder.Services.AddScoped<IGoogleIdTokenService, GoogleIdTokenService>();
+```
+
+`AuthController`中添加 `post /auth/google  `接口， 注入上面的GoogleIdTokenService方法，实现临时解析
+
+```c#
+[ApiController]
+[Route("auth")]
+public class AuthController : ControllerBase
+{
+    ...
+
+    private readonly IGoogleIdTokenService _googleIdTokenService;
+
+    public AuthController(UserService userService, RefreshTokenService refreshTokenService,
+        IWebHostEnvironment environment, IGoogleIdTokenService googleIdTokenService)
+    {
+       ...
+        _googleIdTokenService = googleIdTokenService;
+    }
+
+...
+
+    [HttpPost("google")]
+    public async Task<IActionResult> GoogleLogin(
+        [FromBody] GoogleLoginRequest request)
+    {
+        var payload =
+            await _googleIdTokenService.ValidateAsync(request.IdToken);
+        return Ok(ApiResponse<GoogleJsonWebSignature.Payload>.Ok(payload, "Parse successful."));
+    }
+
+...
+   
+}
+```
+
+Scalar或者Postman中发送 Http请求，传入前端获取的idToken字符串，解析结果为：
+
+```json
+{
+  "success": true,
+  "data": {
+    "scope": null,
+    "prn": null,
+    "hostedDomain": null,
+    "email": "rwial666@gmail.com",
+    "emailVerified": true,
+    "name": "rwial1",
+    "givenName": "rwial1",
+    "familyName": null,
+    "picture": "https://lh3.googleusercontent.com/a/ACg8ocIQMxcLKdoGGF05NhXT5KPP875_0GdZus4tsESrdZ2Bex4ihg=s96-c",
+    "locale": null,
+    "issuer": "https://accounts.google.com",
+    "subject": "101832463461530622420",
+    "audience": "1017312818794-93b9fkeegcnfbohbc9j68s7b073ensja.apps.googleusercontent.com",
+    "targetAudience": null,
+    "expirationTimeSeconds": 1788482294,
+    "notBeforeTimeSeconds": 1788478394,
+    "issuedAtTimeSeconds": 1788478694,
+    "jwtId": "36e3d8ec5017dd5571acaffab9a351974863a5bd",
+    "nonce": null,
+    "type": null,
+    "audienceAsList": [
+      "1017312818794-93b9fkeegcnfbohbc9j68s7b073ensja.apps.googleusercontent.com"
+    ]
+  },
+  "message": "Parse successful.",
+  "errors": null
+}
+```
+
+主要字段对应关系为：
+
+| 返回属性                | Token 中的字段   | 含义                      |
+| ----- | ---- | - |
+| `issuer`                | `iss`            | 签发者                    |
+| `audience`              | `aud`            | Token 的接收应用          |
+| `subject`               | `sub`            | Google 用户编号           |
+| `email`                 | `email`          | 邮箱                      |
+| `emailVerified`         | `email_verified` | Google 提供的邮箱验证状态 |
+| `name`                  | `name`           | 显示名称                  |
+| `expirationTimeSeconds` | `exp`            | 到期时间                  |
+| `issuedAtTimeSeconds`   | `iat`            | 签发时间                  |
+
+返回对象中有些属性可能为 `null`，因为 SDK 的模型包含多种字段，而当前 Token 不一定提供所有字段。
+
+**签名验证保护的是 Token 携带的数据，不是要求每个属性都非空，也不是要求 `EmailVerified` 必须为 `true`。**
+
+#### 5.3 配置 Audience，确认 Token 签发给 UUcars
+
+上面返回的数据中的 `audience`， 它对应的是前端发送google登录时，传入进组件中的
+
+```tsx
+const googleClientId = import.meta.env.VITE_GOOGLE_CLIENT_ID;
+
+ <GoogleOAuthProvider clientId={googleClientId}>
+    ...
+ </GoogleOAuthProvider>   
+```
+
+它表示Google 将这个 Token 签发给哪个应用。
+
+但上面的验证还没有确认这个 Token 是否确实签发给 UUcars 使用。
+
+因此还需要指定 UUcars 的 Client ID，验证 Token 中的 Audience。
+
+`GoogleJsonWebSignature.ValidateAsync()` 还有另一个重载
+
+```c#
+public static Task<Payload> ValidateAsync(
+    string jwt,
+    GoogleJsonWebSignature.ValidationSettings validationSettings)
+```
+
+可以传入配置对象 `GoogleJsonWebSignature.ValidationSettings validationSettings` 指定额外的验证条件，其中 `Audience` 用来配置允许接收这个 Token 的 Client ID：
+
+```c#
+Audience = UUcars 的 Google Client ID
+```
+
+UUcars 使用的 Google Client ID 已经保存进 `user-secrets` 中：
+
+```c#
+GoogleAuth:ClientId = 1017312818794-93b9fkeegcnfbohbc9j68s7b073ensja.apps.googleusercontent.com
+```
+
+编写配置类 `GoogleAuthSettings`， 用于获取 `GoogleAuth:ClientId`:
+
+```c#
+namespace UUcars.API.Configurations;
+
+public class GoogleAuthSettings
+{
+    public string ClientId { get; set; } = string.Empty;
+}
+```
+
+在 [Program.cs](/Users/aqiang/Desktop/myGitHub/upload/dotNet Projects/UUcars/UUcars.API/Program.cs) 中绑定：
+
+```c#
+builder.Services.Configure<GoogleAuthSettings>(
+    builder.Configuration.GetSection("GoogleAuth"));
+```
+
+把配置中的 `GoogleAuth` 部分绑定到 `GoogleAuthSettings`，
+
+使 Service 可以通过 `IOptions<GoogleAuthSettings>` 取得 Client ID。
+
+完成验证配置对象的条件设置：
+
+```c#
+public class GoogleIdTokenService
+{
+    private readonly GoogleAuthSettings _settings;
+    
+    public GoogleIdTokenService(IOptions<GoogleAuthSettings> options)
+    {
+        _settings = options.Value;
+    }
+    
+    public async Task<GoogleJsonWebSignature.Payload> ValidateAsync(string idToken,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var validationSettings = new GoogleJsonWebSignature.ValidationSettings()
+            {
+                Audience = [ _settings.ClientId]
+            };
+            return await GoogleJsonWebSignature.ValidateAsync(idToken, validationSettings);
+        }
+        catch(InvalidJwtException)
+        {
+            throw new InvalidGoogleIdTokenException();
+        }
+    }
+}
+```
+
+一旦设置了配置对象，当后端的ClientId与 id token里的 Audience不一致时， 验证就不能通过。
+
+对于当前单个 Audience 的情况：
+
+```
+Token 的 aud 与后端配置的 Client ID 相同
+→ Audience 检查通过
+
+Token 的 aud 属于其他应用
+→ 验证失败，抛出 InvalidJwtException
+```
+
+前端使用 Client ID，是向 Google **申请发给 UUcars 的 Token**；后端使用同一个值，是**检查收到的 Token 是否确实发给 UUcars**。
+
+
+
+### 6. 设计 ExternalLogin 数据模型
+
+上面取得的 `payload.Subject` 是 Google 用户编号，但 UUcars 的车辆、收藏等数据关联的是站内 `User.Id`。这两个编号不是同一个东西。
+
+因此，需要保存一条对应关系：这个 Google 账号对应哪个 UUcars 用户。以后再次取得同一个 Google 用户编号，就可以通过这条记录找到站内账号。
+
+我们把这条关联记录定义为 `ExternalLogin`。
+
+经过后端验证后，现在已经确定真正需要长期保存的第三方身份是：
+
+| 字段              | 来源和作用                               |
+| ----- | ---- |
+| `Provider`        | UUcars 设置为 `"Google"`，表示认证提供方 |
+| `ProviderSubject` | 来自 SDK 返回的 `payload.Subject`        |
+| `UserId`          | 对应的 UUcars 用户编号                   |
+
+例如：
+
+```
+Provider = Google
+Subject = 10769150350006150715113082367
+UserId = 123
+```
+
+`Provider` 不是 Google Payload 返回的属性，而是我们为了记录认证来源定义的字段。
+
+数据库需要表达：
+
+```
+Google 的这个 Subject
+属于哪个 UUcars User
+```
+
+#### 6.1 User 与 ExternalLogin 的关系
+
+关系为：
+
+```
+User 1 ──── * ExternalLogin
+```
+
+含义是：
+
+```
+一个 UUcars User
+可以没有 ExternalLogin
+也可以拥有一条或多条 ExternalLogin
+```
+
+本地密码用户：
+
+```
+User
+└── ExternalLogins = []
+```
+
+本地密码用户可以没有关联记录，因此 `ExternalLogins` 是空集合；数据库中没有该用户对应的 `ExternalLogins` 行。
+
+Google 用户：
+
+```
+User
+└── ExternalLogins
+    └── Google + Subject
+```
+
+#### 6.2 新建 ExternalLogin 实体
+
+新建 `UUcars.API/Entities/ExternalLogin.cs`：
+
+```c#
+
+namespace UUcars.API.Entities;
+
+public class ExternalLogin
+{
+    public int Id { get; set; }
+
+    // 第三方身份提供方，例如 Google
+    public string Provider { get; set; } = string.Empty;
+
+    // 第三方平台返回的稳定用户编号，例如 Google sub
+    public string ProviderSubject { get; set; } = string.Empty;
+
+    public int UserId { get; set; }
+
+    public User User { get; set; } = null!;
+
+    public DateTime CreatedAt { get; set; }
+}
+```
+
+这里保存的是：
+
+```
+Provider + ProviderSubject → UserId
+```
+
+不把 Google Email 当成关联主键。
+
+`ExternalLogin` 不继承 `BaseEntity`，因为这条关联创建后不会频繁修改，不需要单独保存 `UpdatedAt`。
+
+#### 6.3 更新 User 实体
+
+Google 首次登录创建的 User 没有 UUcars 密码，因此修改：
+
+```
+UUcars.API/Entities/User.cs
+```
+
+将：
+
+```
+public string PasswordHash { get; set; } = string.Empty;
+```
+
+改为：
+
+```
+// Google 首次登录创建的用户没有 UUcars 本地密码
+public string? PasswordHash { get; set; }
+```
+
+然后加入导航属性：
+
+```
+// 本地用户可以没有关联记录；第三方登录用户保存对应的关联记录
+public ICollection<ExternalLogin> ExternalLogins { get; set; } = [];
+```
+
+这里的可空关系分别是：
+
+```
+本地用户
+PasswordHash = 有值
+ExternalLogins = 空集合
+
+Google-only 用户
+PasswordHash = null
+ExternalLogins = 包含 Google 记录
+
+本地账号后来使用 Google 登录
+PasswordHash = 有值
+ExternalLogins = 包含 Google 记录
+```
+
+#### 6.4 配置 ExternalLogin
+
+新建 `UUcars.API/Configurations/ExternalLoginConfiguration.cs`：
+
+```c#
+
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+using UUcars.API.Entities;
+
+namespace UUcars.API.Configurations;
+
+public class ExternalLoginConfiguration
+    : IEntityTypeConfiguration<ExternalLogin>
+{
+    public void Configure(
+        EntityTypeBuilder<ExternalLogin> builder)
+    {
+        builder.HasKey(login => login.Id);
+
+        builder.Property(login => login.Provider)
+            .IsRequired()
+            .HasMaxLength(30);
+
+        builder.Property(login => login.ProviderSubject)
+            .IsRequired()
+            .HasMaxLength(255);
+
+        builder.Property(login => login.CreatedAt)
+            .IsRequired();
+
+        builder.HasIndex(login => new
+            {
+                login.Provider,
+                login.ProviderSubject
+            })
+            .IsUnique()
+            .HasDatabaseName(
+                "IX_ExternalLogins_Provider_ProviderSubject");
+
+        builder.HasIndex(login => login.UserId)
+            .HasDatabaseName("IX_ExternalLogins_UserId");
+
+        builder.HasOne(login => login.User)
+            .WithMany(user => user.ExternalLogins)
+            .HasForeignKey(login => login.UserId)
+            .OnDelete(DeleteBehavior.Cascade);
+    }
+}
+```
+
+联合唯一索引保证：
+
+```
+Google + 同一个 Subject
+```
+
+最多只能关联到一个 UUcars User。
+
+删除 User 时使用 `Cascade`，因为失去所属 User 后，这条外部登录记录也没有独立保留价值。
+
+#### 6.5 允许 PasswordHash 为 NULL
+
+在 `UserConfiguration` 中将：
+
+```c#
+builder.Property(user => user.PasswordHash)
+    .IsRequired()
+    .HasMaxLength(256);
+```
+
+改为：
+
+```c#
+builder.Property(user => user.PasswordHash)
+    .HasMaxLength(256);
+```
+
+属性声明为 `string?`后，移除 EF 配置中的 `.IsRequired()`，使 `PasswordHash` 成为可空字段。
+
+#### 6.6 注册 DbSet
+
+在 `AppDbContext` 中加入：
+
+```c#
+public DbSet<ExternalLogin> ExternalLogins
+    => Set<ExternalLogin>();
+```
+
+#### 6.7 生成 Migration
+
+执行：
+
+```
+dotnet ef migrations add AddExternalLoginsForGoogleOidc \
+  --project UUcars.API \
+  --startup-project UUcars.API
+```
+
+更新本地数据库：
+
+```
+dotnet ef database update \
+  --project UUcars.API \
+  --startup-project UUcars.API
+```
+
+
+
+### 7. 实现 ExternalLogin Repository
+
+数据库已经能够保存第三方身份关联，但业务代码还缺少两个操作：
+
+```
+根据 Provider + Subject 查找关联
+保存新的 ExternalLogin
+```
+
+这些是数据库访问操作，因此放进 Repository。
+
+#### 7.1 定义 IExternalLoginRepository
+
+新建 `UUcars.API/Repositories/IExternalLoginRepository.cs`：
+
+```c#
+
+using UUcars.API.Entities;
+
+namespace UUcars.API.Repositories;
+
+public interface IExternalLoginRepository
+{
+    // 查找第三方账号的关联记录，同时加载对应的 UUcars 用户
+    Task<ExternalLogin?> GetByProviderAndSubjectAsync(
+        string provider,
+        string providerSubject,
+        CancellationToken cancellationToken = default);
+
+    // 保存新的第三方账号关联
+    Task<ExternalLogin> AddAsync(
+        ExternalLogin externalLogin,
+        CancellationToken cancellationToken = default);
+}
+```
+
+#### 7.2 实现 EfExternalLoginRepository
+
+新建 `UUcars.API/Repositories/EfExternalLoginRepository.cs`：
+
+```c#
+using Microsoft.EntityFrameworkCore;
+using UUcars.API.Data;
+using UUcars.API.Entities;
+
+namespace UUcars.API.Repositories;
+
+public class EfExternalLoginRepository
+    : IExternalLoginRepository
+{
+    private readonly AppDbContext _context;
+
+    public EfExternalLoginRepository(AppDbContext context)
+    {
+        _context = context;
+    }
+
+    public async Task<ExternalLogin?>
+        GetByProviderAndSubjectAsync(
+            string provider,
+            string providerSubject,
+            CancellationToken cancellationToken = default)
+    {
+        return await _context.ExternalLogins
+            .Include(login => login.User)
+            .FirstOrDefaultAsync(
+                login =>
+                    login.Provider == provider &&
+                    login.ProviderSubject == providerSubject,
+                cancellationToken);
+    }
+
+    public async Task<ExternalLogin> AddAsync(
+        ExternalLogin externalLogin,
+        CancellationToken cancellationToken = default)
+    {
+        _context.ExternalLogins.Add(externalLogin);
+        await _context.SaveChangesAsync(cancellationToken);
+
+        return externalLogin;
+    }
+}
+```
+
+查询中使用：
+
+```
+.Include(login => login.User)
+```
+
+因为查到 ExternalLogin 后，真正需要登录的是它关联的：
+
+```
+User
+```
+
+`ExternalLogin` 中保存了 `UserId` 外键，但外键有值不代表 `User` 对象已经加载。这里使用 `Include`，让查询结果同时包含关联的用户。
+
+#### 7.3 同时保存新 User 和 ExternalLogin
+
+全新的 Google 用户需要在同一次数据库保存中创建：
+
+```
+User
+ExternalLogin
+```
+
+如果先保存 User，再单独保存 ExternalLogin，中间失败时可能只留下一个没有登录方式的 Google User。
+
+为了明确表达“同时保存新用户和第三方关联”这个操作，在 `IUserRepository` 中增加一个专用方法:
+
+```c#
+Task<User> AddWithExternalLoginAsync(
+    User user,
+    ExternalLogin externalLogin,
+    CancellationToken cancellationToken = default);
+```
+
+这个方法只用于：
+
+```
+首次使用第三方登录创建的新 User
+```
+
+本地注册仍然使用原来的：
+
+```
+AddAsync(User user)
+```
+
+在 `EfUserRepository` 中实现：
+
+```c#
+public async Task<User> AddWithExternalLoginAsync(
+    User user,
+    ExternalLogin externalLogin,
+    CancellationToken cancellationToken = default)
+{
+    // 在内存中建立关系
+    user.ExternalLogins.Add(externalLogin);
+	// 让 EF Core 跟踪整个新增对象关系
+    _context.Users.Add(user);
+    //在同一次事务中保存
+    await _context.SaveChangesAsync(cancellationToken);
+
+    return user;
+}
+```
+
+`user.ExternalLogins.Add(...)` 建立了实体关系。
+
+EF Core 会在一次 `SaveChangesAsync()` 中执行：
+
+```
+INSERT Users
+→ 取得新 UserId
+→ INSERT ExternalLogins
+```
+
+#### 7.4 注册 Repository
+
+在 `Program.cs` 中加入：
+
+```c#
+builder.Services.AddScoped<
+    IExternalLoginRepository,
+    EfExternalLoginRepository>();
+```
+
+
+
+### 8. 实现 ExternalLoginService
+
+本节在 `ExternalLoginService` 中组织登录业务：先调用 `GoogleIdTokenService` 验证 Token，再根据返回的 Google 身份查找或创建对应的 UUcars 账号，最后生成站内 Access Token 并返回登录结果。
+
+账号匹配规则放在业务 Service 中，数据库查询和保存仍由 Repository 完成。
+
+新建 `UUcars.API/Services/ExternalLogin/ExternalLoginService.cs`：
+
+```c#
+namespace UUcars.API.Services.ExternalLogin;
+
+public class ExternalLoginService
+{
+}
+```
+
+新建2个方法：
+
+- `FindOrCreateUserAsync()` - 根据验证后的 Google 身份，查找或创建对应的 UUcars 用户
+- `LoginAsync()` - 调用 Token 验证和账户处理方法，生成站内 Token 并返回登录结果
+
+```c#
+public class ExternalLoginService
+{
+    public async Task<LoginResponse> LoginAsync(string idToken, CancellationToken cancellationToken)
+    {
+        // 处理登录逻辑
+    }
+
+    private async Task<User?> FindOrCreateUserAsync(GoogleJsonWebSignature.Payload payload,
+        CancellationToken cancellationToken = default)
+    {
+        // 查找或创建对应的 UUcars 用户
+    }
+}
+```
+
+#### 8.1 获取验证后的 Payload 数据
+
+处理站内账号之前，需要取得验证后的 Google 身份数据，因此先在业务入口中调用 `GoogleIdTokenService`。
+
+```c#
+public class ExternalLoginService
+{
+    private readonly IGoogleIdTokenService _googleIdTokenService;
+
+    public ExternalLoginService(IGoogleIdTokenService googleIdTokenService)
+    {
+        _googleIdTokenService = googleIdTokenService;
+    }
+
+    public async Task<LoginResponse> LoginAsync(string idToken,
+        CancellationToken cancellationToken = default)
+    {
+        // 获取认证后的payload
+        var payload = await _googleIdTokenService.ValidateAsync(idToken, cancellationToken);
+        
+        // 查询关联用户的逻辑
+    }
+    
+    
+}
+```
+
+取得 Payload 后，首先要回答：
+
+> 这个 Google 账号是否已经关联了一个 UUcars 账号？
+
+把账户查询和创建逻辑封装进 `FindOrCreateUserAsync()`，将验证后取得的 `payload` 传给它：
+
+```c#
+public class ExternalLoginService
+{
+    private readonly IGoogleIdTokenService _googleIdTokenService;
+
+    public ExternalLoginService(IGoogleIdTokenService googleIdTokenService)
+    {
+        _googleIdTokenService = googleIdTokenService;
+    }
+
+    public async Task<LoginResponse> LoginAsync(string idToken, CancellationToken cancellationToken)
+    {
+        // 获取认证后的payload
+        var payload = await _googleIdTokenService.ValidateAsync(idToken, cancellationToken);
+        
+        // 查询关联用户
+        var user=await FindOrCreateUserAsync(payload, cancellationToken);
+    }
+    
+    
+    private async Task<User?> FindOrCreateUserAsync(GoogleJsonWebSignature.Payload payload,
+        CancellationToken cancellationToken = default)
+    {
+        // ... 
+    }
+    
+}
+```
+
+
+
+#### 8.2 查找或创建站内用户
+
+先查询 Google 账号的关联记录；找到时返回关联的站内用户，未找到时再根据邮箱处理账号。
+
+##### 1. 已经存在第三方关联记录
+
+使用：
+
+```
+Provider = Google
+ProviderSubject = payload.Subject
+```
+
+进行查询 `ExternalLogin`。
+
+Repository 已经通过 `Include` 加载关联的 `User`，因此找到关联后，可以直接取得对应用户。
+
+```c#
+public class ExternalLoginService
+{
+    private readonly IGoogleIdTokenService _googleIdTokenService;
+    private readonly IExternalLoginRepository _externalLoginRepository;
+
+    public ExternalLoginService(IGoogleIdTokenService googleIdTokenService,
+        IExternalLoginRepository externalLoginRepository)
+    {
+        _googleIdTokenService = googleIdTokenService;
+        _externalLoginRepository = externalLoginRepository;
+    }
+
+    public async Task<LoginResponse> LoginAsync(string idToken, CancellationToken cancellationToken)
+    {
+       ...
+    }
+
+    private async Task<User?> FindOrCreateUserAsync(GoogleJsonWebSignature.Payload payload,
+        CancellationToken cancellationToken = default)
+    {
+        // 查询关联用户的逻辑
+        // 1. 已经存在第三方关联——————————————————————————————
+
+        var existingLogin = await _externalLoginRepository.GetByProviderAndSubjectAsync(GoogleProvider,
+            payload.Subject,
+            cancellationToken);
+
+        if (existingLogin != null) return existingLogin.User;
+    }
+}
+```
+
+##### 2. 没有第三方关联记录时，根据邮箱处理账号
+
+没有关联记录，说明 UUcars 尚未记录这个 Google 账号对应哪个站内用户。
+
+这时需要根据邮箱判断：
+
+```
+站内已有同邮箱账号 → 判断是否允许关联
+
+站内没有同邮箱账号 → 创建账号和关联
+```
+
+**先明确邮箱要求**
+
+当前用户模型要求邮箱，因此在使用邮箱之前，需要检查：
+
+- 邮箱有值；
+- Google 返回的 `EmailVerified` 为 `true`；
+- 邮箱长度不超过数据库规定的 100 个字符。
+
+邮箱统一转换为小写，与现有本地注册保持一致。
+
+此外，不能仅凭任意 Google 账号的邮箱字段自动关联站内账号。Google 对 Gmail，以及已验证且带有 `HostedDomain` 的 Workspace 邮箱，能够提供当前邮箱归属依据；其他邮箱即使返回 `EmailVerified = true`，也可能只是过去验证过。
+
+这里采用以下业务规则：
+
+- 首次接入只在上述邮箱归属条件满足时继续。
+- 同邮箱站内账号已经验证，才允许自动关联。
+- 同邮箱站内账号尚未验证，返回冲突，不自动激活。
+
+未验证的本地账号可能由其他人填写该邮箱并设置密码。直接激活并保留原密码，会让那份密码也获得登录能力。
+
+**定义邮箱业务异常**：
+
+1. 邮箱条件不满足时，返回 `403`。
+
+    ```c#
+    namespace UUcars.API.Exceptions;
+    
+    public class ExternalLoginNotAllowedException : AppException
+    {
+        public ExternalLoginNotAllowedException(string message)
+            : base(StatusCodes.Status403Forbidden, message)
+        {
+        }
+    }
+    ```
+
+2. 同邮箱账号存在，但不能自动关联时，返回 `409`。
+
+    ```c#
+    namespace UUcars.API.Exceptions;
+    
+    public class ExternalLoginConflictException : AppException
+    {
+        public ExternalLoginConflictException()
+            : base(
+                StatusCodes.Status409Conflict,
+                "This email is already registered and cannot be linked automatically.")
+        {
+        }
+    }
+    ```
+
+这两个异常表示业务条件不满足，与第 5 节的 Token 验证失败分开。
+
+**补全邮箱的业务逻辑**：
+
+```c#
+public class ExternalLoginService
+{
+    private readonly IGoogleIdTokenService _googleIdTokenService;
+    private readonly IExternalLoginRepository _externalLoginRepository;
+    
+    public ExternalLoginService(IGoogleIdTokenService googleIdTokenService,
+        IExternalLoginRepository externalLoginRepository)
+    {
+        _googleIdTokenService = googleIdTokenService;
+        _externalLoginRepository = externalLoginRepository;
+    }
+
+    public async Task<LoginResponse> LoginAsync(string idToken, CancellationToken cancellationToken)
+    {
+        ...
+    }
+
+    private async Task<User?> FindOrCreateUserAsync(GoogleJsonWebSignature.Payload payload,
+        CancellationToken cancellationToken = default)
+    {
+        // 查询关联用户的逻辑
+        // 1. 已经存在第三方关联——————————————————————————————
+
+        var existingLogin = await _externalLoginRepository.GetByProviderAndSubjectAsync(GoogleProvider,
+            payload.Subject,
+            cancellationToken);
+
+        if (existingLogin != null) return existingLogin.User;
+
+        // 2. 没有关联用户——————————————————————————————
+        
+        // 处理邮件的逻辑
+        if (string.IsNullOrWhiteSpace(payload.Email) ||
+            !payload.EmailVerified)
+            throw new ExternalLoginNotAllowedException(
+                "A verified email address is required.");
+
+        var email = payload.Email.Trim().ToLowerInvariant();
+        if (email.Length > 100)
+            throw new ExternalLoginNotAllowedException(
+                "The email address exceeds the supported length.");
+        var googleConfirmsEmailOwnership =
+            email.EndsWith("@gmail.com", StringComparison.Ordinal) ||
+            !string.IsNullOrWhiteSpace(payload.HostedDomain);
+
+        if (!googleConfirmsEmailOwnership)
+            throw new ExternalLoginNotAllowedException(
+                "Please use email registration or your existing sign-in method.");
+    }
+}
+```
+
+**根据站内是否存在同邮箱账号进行判断**
+
+情况1：找到同邮箱的站内账号。这里只判断账号是否存在，不判断它最初通过哪种方式注册。
+
+```c#
+public class ExternalLoginService
+{
+    private const string GoogleProvider = "Google";
+    private readonly IGoogleIdTokenService _googleIdTokenService;
+    private readonly IExternalLoginRepository _externalLoginRepository;
+    private readonly IUserRepository _userRepository;
+
+
+    public ExternalLoginService(IGoogleIdTokenService googleIdTokenService,
+        IExternalLoginRepository externalLoginRepository, IUserRepository userRepository)
+    {
+        _googleIdTokenService = googleIdTokenService;
+        _externalLoginRepository = externalLoginRepository;
+        _userRepository = userRepository;
+    }
+
+    public async Task<LoginResponse> LoginAsync(string idToken, CancellationToken cancellationToken)
+    {
+        ...
+    }
+
+    private async Task<User?> FindOrCreateUserAsync(GoogleJsonWebSignature.Payload payload,
+        CancellationToken cancellationToken = default)
+    {
+        // 查询关联用户的逻辑
+        // 1. 已经存在第三方关联——————————————————————————————
+
+        var existingLogin = await _externalLoginRepository.GetByProviderAndSubjectAsync(GoogleProvider,
+            payload.Subject,
+            cancellationToken);
+
+        if (existingLogin != null) return existingLogin.User;
+
+        // 2. 没有关联用户——————————————————————————————
+        // 处理邮件的逻辑
+        if (string.IsNullOrWhiteSpace(payload.Email) ||
+            !payload.EmailVerified)
+            throw new ExternalLoginNotAllowedException(
+                "A verified email address is required.");
+
+        var email = payload.Email.Trim().ToLowerInvariant();
+        if (email.Length > 100)
+            throw new ExternalLoginNotAllowedException(
+                "The email address exceeds the supported length.");
+        var googleConfirmsEmailOwnership =
+            email.EndsWith("@gmail.com", StringComparison.Ordinal) ||
+            !string.IsNullOrWhiteSpace(payload.HostedDomain);
+
+        if (!googleConfirmsEmailOwnership)
+            throw new ExternalLoginNotAllowedException(
+                "Please use email registration or your existing sign-in method.");
+
+        // 查询是否存在同邮箱的站内账号
+        var existingUser = await _userRepository.GetByEmailAsync(
+            email,
+            cancellationToken);
+        // 找到同邮箱的站内账号
+        if (existingUser != null)
+        {
+            // 站内账号的邮箱未验证，抛出冲突异常
+            if (!existingUser.EmailConfirmed) throw new ExternalLoginConflictException();
+            // 站内账号的邮箱已验证，保存第三方关联记录
+            var externalLogin = new ExternalLogin
+            {
+                Provider = GoogleProvider,
+                ProviderSubject = payload.Subject,
+                UserId = existingUser.Id,
+                CreatedAt = DateTime.UtcNow
+            };
+            await _externalLoginRepository.AddAsync(externalLogin, cancellationToken);
+
+            return existingUser;
+        }
+    }
+}
+```
+
+情况2：未找到同邮箱的站内账号，创建 `User` 和 `ExternalLogin`。新用户的字段赋值如下：
+
+| 用户字段         | 赋值依据                                 |
+| ---- | ---- |
+| `Username`       | 优先使用 Google 名称，没有则使用邮箱前缀 |
+| `Email`          | 规范化后的邮箱                           |
+| `PasswordHash`   | 没有设置站内密码，因此为 `null`          |
+| `Role`           | 新用户为普通用户                         |
+| `EmailConfirmed` | 已通过本分支的邮箱状态及归属检查         |
+| 时间字段         | 当前 UTC 时间                            |
+
+用户名最多保留 50 个字符，与现有模型一致；邮箱不能截断，否则会变成另一个地址。
+
+```c#
+public class ExternalLoginService
+{
+    private const string GoogleProvider = "Google";
+    private readonly IGoogleIdTokenService _googleIdTokenService;
+    private readonly IExternalLoginRepository _externalLoginRepository;
+    private readonly IUserRepository _userRepository;
+
+
+    public ExternalLoginService(IGoogleIdTokenService googleIdTokenService,
+        IExternalLoginRepository externalLoginRepository, IUserRepository userRepository)
+    {
+        _googleIdTokenService = googleIdTokenService;
+        _externalLoginRepository = externalLoginRepository;
+        _userRepository = userRepository;
+    }
+
+    public async Task<LoginResponse> LoginAsync(string idToken, CancellationToken cancellationToken)
+    {
+       ...
+    }
+
+    private async Task<User?> FindOrCreateUserAsync(GoogleJsonWebSignature.Payload payload,
+        CancellationToken cancellationToken = default)
+    {
+        // 查询关联用户的逻辑
+        // 1. 已经存在第三方关联——————————————————————————————
+
+        var existingLogin = await _externalLoginRepository.GetByProviderAndSubjectAsync(GoogleProvider,
+            payload.Subject,
+            cancellationToken);
+
+        if (existingLogin != null) return existingLogin.User;
+
+        // 2. 没有关联用户——————————————————————————————
+        // 处理邮件的逻辑
+        if (string.IsNullOrWhiteSpace(payload.Email) ||
+            !payload.EmailVerified)
+            throw new ExternalLoginNotAllowedException(
+                "A verified email address is required.");
+
+        var email = payload.Email.Trim().ToLowerInvariant();
+        if (email.Length > 100)
+            throw new ExternalLoginNotAllowedException(
+                "The email address exceeds the supported length.");
+        var googleConfirmsEmailOwnership =
+            email.EndsWith("@gmail.com", StringComparison.Ordinal) ||
+            !string.IsNullOrWhiteSpace(payload.HostedDomain);
+
+        if (!googleConfirmsEmailOwnership)
+            throw new ExternalLoginNotAllowedException(
+                "Please use email registration or your existing sign-in method.");
+
+        // 查询是否存在同邮箱的站内账号
+        var existingUser = await _userRepository.GetByEmailAsync(
+            email,
+            cancellationToken);
+        // 找到同邮箱的站内账号
+        if (existingUser != null)
+        {
+            // 站内账号的邮箱未验证，抛出冲突异常
+            if (!existingUser.EmailConfirmed) throw new ExternalLoginConflictException();
+            // 站内账号的邮箱已验证，保存第三方关联记录
+            var externalLogin = new ExternalLogin
+            {
+                Provider = GoogleProvider,
+                ProviderSubject = payload.Subject,
+                UserId = existingUser.Id,
+                CreatedAt = DateTime.UtcNow
+            };
+            await _externalLoginRepository.AddAsync(externalLogin, cancellationToken);
+
+            return existingUser;
+        }
+
+        // 未找到同邮箱的站内账号，同时创建用户和第三方关联记录
+        var username = string.IsNullOrWhiteSpace(payload.Name)
+            ? email.Split('@')[0]
+            : payload.Name.Trim();
+        
+        var user = new User
+        {
+            Username = username[..Math.Min(username.Length, 50)],
+            Email = email,
+            PasswordHash = null,
+            Role = UserRole.User,
+            EmailConfirmed = true,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+        var newExternalLogin = new ExternalLogin
+        {
+            Provider = GoogleProvider,
+            ProviderSubject = payload.Subject,
+            CreatedAt = DateTime.UtcNow
+        };
+
+        return await _userRepository.AddWithExternalLoginAsync(user, newExternalLogin, cancellationToken);
+    }
+}
+```
+
+#### 8.3 实现用户登录
+
+账户处理方法已经能够返回对应的站内用户，接下来根据这个用户生成登录结果，包括：
+
+- 根据站内用户生成 Access Token
+
+    使用已有的`JwtTokenGenerator`类
+
+- 返回 LoginResponse
+
+    其中的 `ExpiresAt` 从刚生成的 UUcars Token 中读取，不再单独计算
+
+`FindOrCreateUserAsync()` 成功时返回用户，失败时抛出异常，没有返回 `null` 的分支，因此最终返回类型使用 `Task<User>`。
+
+完善登录逻辑：
+
+```c#
+public class ExternalLoginService
+{
+    private const string GoogleProvider = "Google";
+    private readonly IGoogleIdTokenService _googleIdTokenService;
+    private readonly IExternalLoginRepository _externalLoginRepository;
+    private readonly IUserRepository _userRepository;
+    private readonly JwtTokenGenerator _jwtTokenGenerator;
+
+
+    public ExternalLoginService(IGoogleIdTokenService googleIdTokenService,
+        IExternalLoginRepository externalLoginRepository, IUserRepository userRepository,
+        JwtTokenGenerator jwtTokenGenerator)
+    {
+        _googleIdTokenService = googleIdTokenService;
+        _externalLoginRepository = externalLoginRepository;
+        _userRepository = userRepository;
+        _jwtTokenGenerator = jwtTokenGenerator;
+    }
+
+    public async Task<LoginResponse> LoginAsync(string idToken, CancellationToken cancellationToken)
+    {
+        // 获取认证后的payload
+        var payload = await _googleIdTokenService.ValidateAsync(idToken, cancellationToken);
+
+        // 查询关联用户的逻辑
+        var user = await FindOrCreateUserAsync(payload, cancellationToken);
+
+        // 生成用户的Access Token
+        var token = _jwtTokenGenerator.GenerateToken(user);
+        // 读取 过期时间
+        var expiresAt = new JwtSecurityTokenHandler()
+            .ReadJwtToken(token)
+            .ValidTo;
+
+        // 返回登录结果LoginResponse
+        return new LoginResponse
+        {
+            Token = token,
+            ExpiresAt = expiresAt,
+            User = new UserResponse
+            {
+                Id = user.Id,
+                Username = user.Username,
+                Email = user.Email,
+                Role = user.Role.ToString(),
+                CreatedAt = user.CreatedAt
+            }
+        };
+    }
+
+    private async Task<User> FindOrCreateUserAsync(GoogleJsonWebSignature.Payload payload,
+        CancellationToken cancellationToken = default)
+    {
+        ...
+    }
+}
+```
+
+最后在 `Program.cs` 注册：
+
+```
+builder.Services.AddScoped<ExternalLoginService>();
+```
+
+
+
+### 9. 接通 Google 登录接口并建立 UUcars 会话
+
+第 5 节的 `POST /auth/google` 目前只返回 Google Payload。第 8 节已经能够根据 Token 完成账号处理，并返回 `LoginResponse`。
+
+现在将接口接入业务 Service，再沿用本地登录的 Refresh Token 和 Cookie 处理。
+
+#### 9.1 将接口依赖改为 ExternalLoginService
+
+Controller 不再直接调用 `GoogleIdTokenService`。Token 验证已经由 `ExternalLoginService.LoginAsync()` 组织执行。
+
+在 [AuthController.cs](/Users/aqiang/Desktop/myGitHub/upload/dotNet Projects/UUcars/UUcars.API/Controllers/AuthController.cs) 中，使用`ExternalLoginService`:
+
+```c#
+[ApiController]
+[Route("auth")]
+public class AuthController : ControllerBase
+{
+    private readonly UserService _userService;
+    private readonly RefreshTokenService _refreshTokenService;
+    private readonly IWebHostEnvironment _environment;
+    private readonly ExternalLoginService _externalLoginService;
+
+    public AuthController(
+        UserService userService,
+        RefreshTokenService refreshTokenService,
+        IWebHostEnvironment environment,
+        ExternalLoginService externalLoginService
+    )
+    {
+        _userService = userService;
+        _refreshTokenService = refreshTokenService;
+        _environment = environment;
+        _externalLoginService = externalLoginService;
+    }
+
+    ...
+
+    [HttpPost("google")]
+    public async Task<IActionResult> GoogleLogin(
+        [FromBody] GoogleLoginRequest request, CancellationToken cancellationToken)
+    {
+        var result = await _externalLoginService.LoginAsync(request.IdToken, cancellationToken);
+        return Ok(ApiResponse<LoginResponse>.Ok(result, "sign-in successful."));
+    }
+
+
+    ...
+}
+```
+
+#### 9.2 复用登录成功后的会话处理
+
+业务 Service 返回的 `LoginResponse` 包含：
+
+```
+Access Token
+Access Token 的到期时间
+站内用户资料
+```
+
+为了让浏览器在 Access Token 过期后继续刷新登录状态，还需要创建 Refresh Token。
+
+现有本地登录已经完成这三步：
+
+```
+创建并保存 Refresh Token
+→ 写入 HttpOnly Cookie
+→ 返回 LoginResponse
+```
+
+Google 登录也需要相同处理，因此把这段代码提取为 Controller 的私有方法。
+
+在 `AuthController` 中加入：
+
+```c#
+private async Task<IActionResult> CompleteLoginAsync(
+    LoginResponse result,
+    string message,
+    CancellationToken cancellationToken)
+{
+    var refreshToken =
+        await _refreshTokenService.CreateRefreshTokenAsync(
+            result.User.Id,
+            cancellationToken);
+
+    SetRefreshTokenCookie(
+        refreshToken.Token,
+        refreshToken.ExpiresAt);
+
+    return Ok(
+        ApiResponse<LoginResponse>.Ok(
+            result,
+            message));
+}
+```
+
+这里使用 `result.User.Id`，因为 Refresh Token 关联的是已经完成认证的站内用户。
+
+`SetRefreshTokenCookie()` 沿用 Controller 中已有的实现。两个到期时间分别属于不同对象：
+
+| 值                       | 用途                                      |
+| ---- | ---- |
+| `result.ExpiresAt`       | Access Token 的到期时间                   |
+| `refreshToken.ExpiresAt` | Refresh Token 的到期时间，用于设置 Cookie |
+
+Refresh Token 不加入响应 Body，而是通过 `Set-Cookie` 响应头交给浏览器保存。
+
+#### 9.3 更新 Google 和本地登录接口
+
+**更新 Google 登录接口**
+
+将原有 `GoogleLogin()` 替换为：
+
+```c#
+[HttpPost("google")]
+[EnableRateLimiting(RateLimitPolicies.Login)]
+public async Task<IActionResult> GoogleLogin(
+    [FromBody] GoogleLoginRequest request,
+    CancellationToken cancellationToken)
+{
+    var result = await _externalLoginService.LoginAsync(
+        request.IdToken,
+        cancellationToken);
+
+    return await CompleteLoginAsync(
+        result,
+        "Google sign-in successful.",
+        cancellationToken);
+}
+```
+
+这里沿用本地登录的限流策略。
+
+执行顺序为：
+
+```
+接收 Google ID Token
+→ ExternalLoginService 完成认证和账号处理
+→ 取得 LoginResponse
+→ 创建 Refresh Token 并写入 Cookie
+→ 返回 HTTP 200
+```
+
+如果业务方法抛出异常，代码不会继续执行 `CompleteLoginAsync()`，也不会为这次失败的请求创建 Refresh Token。
+
+**更新本地密码登录接口**
+
+本地登录仍由 `UserService` 验证邮箱和密码，只把成功后的重复代码替换为共同方法：
+
+```c#
+[HttpPost("login")]
+[EnableRateLimiting(RateLimitPolicies.Login)]
+public async Task<IActionResult> Login(
+    [FromBody] LoginRequest request,
+    CancellationToken cancellationToken)
+{
+    var result = await _userService.LoginAsync(
+        request.Email,
+        request.Password,
+        cancellationToken);
+
+    return await CompleteLoginAsync(
+        result,
+        "Login successful.",
+        cancellationToken);
+}
+```
+
+两种登录方式现在只在认证业务上不同，成功后的 Refresh Token、Cookie 和响应处理保持一致。
+
+#### 9.4 让本地密码登录正确处理无密码账号
+
+Google 注册创建的用户可能没有站内密码：
+
+```
+PasswordHash = null
+```
+
+现有 `UserService.LoginAsync()` 查询到用户后，会直接调用：
+
+```c#
+_passwordHasher.VerifyHashedPassword(
+    user,
+    user.PasswordHash,
+    password);
+```
+
+没有密码哈希的账号不能执行这一步，应直接按凭据错误处理。
+
+在 [UserService.cs](/Users/aqiang/Desktop/myGitHub/upload/dotNet Projects/UUcars/UUcars.API/Services/UserService.cs) 的 `LoginAsync()` 中，将用户不存在判断改为：
+
+```c#
+var user = await _userRepository.GetByEmailAsync(
+    email,
+    cancellationToken);
+
+if (user == null ||
+    string.IsNullOrWhiteSpace(user.PasswordHash))
+{
+    throw new InvalidCredentialsException();
+}
+```
+
+后面的密码验证和登录结果生成保持不变。
+
+这样：
+
+```
+只有 Google 登录方式，没有站内密码
+→ 密码登录返回 401
+
+原本有站内密码，后来关联 Google
+→ 仍然可以使用原密码登录
+```
+
+判断依据是账号是否有 `PasswordHash`，而不是有没有 `ExternalLogin`。
+
+#### 9.5 调整忘记密码流程
+
+当前“忘记密码”用于重置账号已有的站内密码。对于没有站内密码的账号，不通过这个入口自动增加密码登录方式。
+
+在 `UserService.ForgotPasswordAsync()` 中，保留现有的：
+
+```
+用户不存在 → 返回
+邮箱未验证 → 返回
+```
+
+在这两个判断之后、生成 `resetToken` 之前，加入：
+
+```
+if (string.IsNullOrWhiteSpace(user.PasswordHash))
+{
+    _logger.LogWarning(
+                "Password reset is not allowed!" );
+            return;
+}
+```
+
+后面的重置 Token 生成、保存和邮件发送逻辑保持不变。
+
+Controller 仍然返回现有统一提示：
+
+```
+If this email is registered, a password reset link has been sent.
+```
+
+因此，调用方不会通过响应内容得知这个邮箱是否存在，或者账号有没有密码。
+
+#### 9.6 验证接口与会话
+
+先编译 API：
+
+```
+dotnet build UUcars.API
+```
+
+启动后端：
+
+```
+dotnet run --project UUcars.API
+```
+
+**验证 Google 登录**
+
+从前端取得新的 `response.credential`，在 Postman 中请求：
+
+```
+POST /auth/google
+Content-Type: application/json
+```
+
+请求体：
+
+```
+{
+  "idToken": "替换为实际取得的 Google ID Token"
+}
+```
+
+成功后检查：
+
+- 状态码为 `200`。
+- `data.token` 是 UUcars 签发的 Access Token。
+- `data.expiresAt` 与该 Token 中的到期时间一致。
+- `data.user` 是对应的站内用户。
+- 响应头包含 `Set-Cookie`，Cookie 名称为 `refreshToken`，带有 `HttpOnly`。
+
+**验证 Refresh Token**
+
+保持同一个 Postman 客户端和 API 地址，让它携带刚保存的 Cookie，发送：
+
+```
+POST /auth/refresh
+```
+
+不需要请求 Body。
+
+成功后应返回新的 `accessToken`，并通过 `Set-Cookie` 更新 Refresh Token。说明这次 Google 登录已经接入项目现有的刷新流程。
+
+**验证两种登录方式的兼容性**
+
+| 操作                                 | 预期结果                                  |
+| ---- | ---- |
+| 原有已验证账号使用正确密码登录       | `200`，仍然设置 Refresh Token Cookie      |
+| 无站内密码的 Google 用户尝试密码登录 | `401`，而不是服务器异常                   |
+| 无站内密码的用户请求忘记密码         | 返回统一提示，不生成重置 Token            |
+| 提交无法通过验证的 Google Token      | `401`，不为本次请求签发新的 Refresh Token |
+
+至此，Google 登录接口返回的不再是供观察的 Payload，而是与本地登录采用相同响应和 Cookie 机制的 UUcars 登录结果。
+
+
+
+### 10. 后端测试
+
+第 8 节的 `ExternalLoginService` 负责两件事：
+
+```
+调用 GoogleIdTokenService 验证 ID Token
+→ 根据验证后的 Payload 查找或创建 UUcars User
+```
+
+测试账户匹配逻辑时，不应真的请求 Google。我们只需要让测试提供一个“已经通过 Google 验证的 Payload”，再检查 UUcars 如何处理这个身份。
+
+#### 10.1 创建测试用的 FakeGoogleIdTokenService
+
+生产环境注入真实的 `GoogleIdTokenService`；测试环境注入假的实现，直接提供指定 Payload。
+
+新建 `UUcars.Tests/Fakes/FakeGoogleIdTokenService.cs`：
+
+```c#
+using Google.Apis.Auth;
+using UUcars.API.Exceptions;
+using UUcars.API.Services.ExternalLogin;
+
+namespace UUcars.Tests.Fakes;
+
+public class FakeGoogleIdTokenService : IGoogleIdTokenService
+{
+    // 单元测试可传入不同 Payload；集成测试使用默认 Google 用户。
+    private readonly GoogleJsonWebSignature.Payload _payload;
+
+    public FakeGoogleIdTokenService(
+        GoogleJsonWebSignature.Payload? payload = null)
+    {
+        _payload = payload ?? new GoogleJsonWebSignature.Payload
+        {
+            Subject = "fake-google-subject",
+            Email = "google-user@gmail.com",
+            EmailVerified = true,
+            Name = "Google Test User"
+        };
+    }
+
+    public Task<GoogleJsonWebSignature.Payload> ValidateAsync(
+        string idToken,
+        CancellationToken cancellationToken = default)
+    {
+        // 用固定字符串模拟 Google 验证失败。
+        if (idToken == "invalid-google-token")
+        {
+            throw new InvalidGoogleIdTokenException();
+        }
+
+        // 测试只关心 UUcars 如何处理已验证身份，不重复测试 Google SDK。
+        return Task.FromResult(_payload);
+    }
+}
+```
+
+这个 Fake 不解析 Token 字符串。它只模拟两种结果：
+
+```
+普通测试 Token
+→ 返回预先准备好的 Google Payload
+
+invalid-google-token
+→ 模拟 Google 验证失败
+```
+
+#### 10.2 创建 FakeExternalLoginRepository
+
+新建 `UUcars.Tests/Fakes/FakeExternalLoginRepository.cs`：
+
+```c#
+using UUcars.API.Entities;
+using UUcars.API.Repositories;
+
+namespace UUcars.Tests.Fakes;
+
+public class FakeExternalLoginRepository
+    : IExternalLoginRepository
+{
+    // 用内存集合保存 Google 身份与 UUcars User 的关联记录。
+    private readonly List<ExternalLogin> _store = [];
+
+    public Task<ExternalLogin?> GetByProviderAndSubjectAsync(
+        string provider,
+        string providerSubject,
+        CancellationToken cancellationToken = default)
+    {
+        var externalLogin = _store.FirstOrDefault(item =>
+            item.Provider == provider &&
+            item.ProviderSubject == providerSubject);
+
+        return Task.FromResult(externalLogin);
+    }
+
+    public Task<ExternalLogin> AddAsync(
+        ExternalLogin externalLogin,
+        CancellationToken cancellationToken = default)
+    {
+        externalLogin.Id = _store.Count + 1;
+        _store.Add(externalLogin);
+
+        return Task.FromResult(externalLogin);
+    }
+
+    public void Seed(ExternalLogin externalLogin)
+    {
+        // 预先放入已有的关联记录，用于模拟老用户再次 Google 登录。
+        _store.Add(externalLogin);
+    }
+
+    public IReadOnlyList<ExternalLogin> Items => _store;
+}
+```
+
+#### 10.3 更新 FakeUserRepository
+
+`IUserRepository` 已增加 `AddWithExternalLoginAsync()`，测试用的 Repository 也必须实现这个方法。
+
+在 `FakeUserRepository` 中加入：
+
+```c#
+public Task<User> AddWithExternalLoginAsync(
+    User user,
+    ExternalLogin externalLogin,
+    CancellationToken cancellationToken = default)
+{
+    // 模拟数据库为新 User 分配主键。
+    user.Id = _store.Count + 1;
+
+    // 模拟 EF Core 保存关系后为 ExternalLogin 补齐关联字段。
+    externalLogin.Id = 1;
+    externalLogin.UserId = user.Id;
+    externalLogin.User = user;
+
+    user.ExternalLogins.Add(externalLogin);
+    _store[user.Email.ToLowerInvariant()] = user;
+
+    return Task.FromResult(user);
+}
+```
+
+这个方法模拟一次保存两个对象：
+
+```
+新 User
++
+对应的 ExternalLogin
+```
+
+#### 10.4 测试账户匹配逻辑
+
+新建 `UUcars.Tests/Services/ExternalLoginServiceTests.cs`：
+
+```c#
+using Google.Apis.Auth;
+using Microsoft.Extensions.Options;
+using UUcars.API.Auth;
+using UUcars.API.Entities;
+using UUcars.API.Entities.Enums;
+using UUcars.API.Exceptions;
+using UUcars.API.Services.ExternalLogin;
+using UUcars.Tests.Fakes;
+
+namespace UUcars.Tests.Services;
+
+public class ExternalLoginServiceTests
+{
+    // 每个测试传入自己的已验证 Payload，隔离真实 Google 网络请求。
+    private static ExternalLoginService CreateService(
+        GoogleJsonWebSignature.Payload payload,
+        FakeUserRepository users,
+        FakeExternalLoginRepository externalLogins)
+    {
+        var jwtSettings = Options.Create(new JwtSettings
+        {
+            Secret = "test-secret-key-at-least-32-characters!",
+            ExpiresInMinutes = 60,
+            Issuer = "UUcars.Tests",
+            Audience = "UUcars.Tests"
+        });
+
+        return new ExternalLoginService(
+            new FakeGoogleIdTokenService(payload),
+            externalLogins,
+            users,
+            new JwtTokenGenerator(jwtSettings));
+    }
+
+    // 验证：同一 Google Subject 再次登录时，必须回到原先关联的 UUcars User。
+    [Fact]
+    public async Task LoginAsync_WithKnownGoogleSubject_ShouldUseLinkedUser()
+    {
+        // Arrange：准备已有的 Provider + Subject 关联记录。
+        var users = new FakeUserRepository();
+        var externalLogins = new FakeExternalLoginRepository();
+
+        var user = new User
+        {
+            Id = 1,
+            Username = "alice",
+            Email = "alice@gmail.com",
+            PasswordHash = "existing-hash",
+            Role = UserRole.User,
+            EmailConfirmed = true,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        externalLogins.Seed(new ExternalLogin
+        {
+            Id = 1,
+            Provider = "Google",
+            ProviderSubject = "known-google-subject",
+            UserId = user.Id,
+            User = user,
+            CreatedAt = DateTime.UtcNow
+        });
+
+        var payload = new GoogleJsonWebSignature.Payload
+        {
+            Subject = "known-google-subject"
+        };
+
+        var service = CreateService(
+            payload,
+            users,
+            externalLogins);
+
+        // Act：模拟该 Google 身份再次登录。
+        var result = await service.LoginAsync(
+            "valid-google-token",
+            CancellationToken.None);
+
+        // Assert：不创建第二条关联，直接返回原 User。
+        Assert.Equal(user.Id, result.User.Id);
+        Assert.NotEmpty(result.Token);
+        Assert.Single(externalLogins.Items);
+    }
+
+    // 验证：已验证的本地账号可按同一 Gmail 地址新增 Google 登录关联。
+    [Fact]
+    public async Task LoginAsync_WithConfirmedLocalUser_ShouldCreateGoogleLink()
+    {
+        // Arrange：已有可安全复用的本地 User。
+        var users = new FakeUserRepository();
+        var externalLogins = new FakeExternalLoginRepository();
+
+        var user = new User
+        {
+            Id = 1,
+            Username = "alice",
+            Email = "alice@gmail.com",
+            PasswordHash = "existing-hash",
+            Role = UserRole.User,
+            EmailConfirmed = true,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        users.Seed(user);
+
+        var payload = new GoogleJsonWebSignature.Payload
+        {
+            Subject = "new-google-subject",
+            Email = "alice@gmail.com",
+            EmailVerified = true,
+            Name = "Alice"
+        };
+
+        var service = CreateService(
+            payload,
+            users,
+            externalLogins);
+
+        // Act：使用同邮箱的 Google Payload 登录。
+        var result = await service.LoginAsync(
+            "valid-google-token",
+            CancellationToken.None);
+
+        // Assert：仍使用原 User，并新增一条 Google 关联。
+        var externalLogin = Assert.Single(externalLogins.Items);
+
+        Assert.Equal(user.Id, result.User.Id);
+        Assert.Equal(user.Id, externalLogin.UserId);
+        Assert.Equal("Google", externalLogin.Provider);
+        Assert.Equal("new-google-subject", externalLogin.ProviderSubject);
+    }
+
+    // 验证：首次 Google 登录会创建无 PasswordHash 的 User 及其关联记录。
+    [Fact]
+    public async Task LoginAsync_WithNewGoogleUser_ShouldCreateUserAndLink()
+    {
+        // Arrange：Repository 中不存在同邮箱 User，也不存在关联记录。
+        var users = new FakeUserRepository();
+        var externalLogins = new FakeExternalLoginRepository();
+
+        var payload = new GoogleJsonWebSignature.Payload
+        {
+            Subject = "new-google-subject",
+            Email = "new-user@gmail.com",
+            EmailVerified = true,
+            Name = "New Google User"
+        };
+
+        var service = CreateService(
+            payload,
+            users,
+            externalLogins);
+
+        // Act：首次使用该 Google 身份登录。
+        var result = await service.LoginAsync(
+            "valid-google-token",
+            CancellationToken.None);
+
+        var user = await users.GetByEmailAsync(
+            "new-user@gmail.com");
+
+        // Assert：新 User 没有本地密码，并保存对应的 Google Subject。
+        Assert.NotNull(user);
+        Assert.Equal(user.Id, result.User.Id);
+        Assert.Null(user.PasswordHash);
+        Assert.True(user.EmailConfirmed);
+
+        var externalLogin = Assert.Single(user.ExternalLogins);
+
+        Assert.Equal("Google", externalLogin.Provider);
+        Assert.Equal("new-google-subject", externalLogin.ProviderSubject);
+    }
+
+    // 验证：未验证的本地同邮箱账号不能被 Google 登录自动关联。
+    [Fact]
+    public async Task LoginAsync_WithUnconfirmedLocalUser_ShouldThrowConflict()
+    {
+        // Arrange：邮箱相同，但本地账号尚未完成邮箱验证。
+        var users = new FakeUserRepository();
+        var externalLogins = new FakeExternalLoginRepository();
+
+        users.Seed(new User
+        {
+            Id = 1,
+            Username = "alice",
+            Email = "alice@gmail.com",
+            PasswordHash = "existing-hash",
+            Role = UserRole.User,
+            EmailConfirmed = false,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        });
+
+        var payload = new GoogleJsonWebSignature.Payload
+        {
+            Subject = "new-google-subject",
+            Email = "alice@gmail.com",
+            EmailVerified = true,
+            Name = "Alice"
+        };
+
+        var service = CreateService(
+            payload,
+            users,
+            externalLogins);
+
+        // Act / Assert：登录被拒绝，且不会写入关联记录。
+        await Assert.ThrowsAsync<ExternalLoginConflictException>(
+            () => service.LoginAsync(
+                "valid-google-token",
+                CancellationToken.None));
+
+        Assert.Empty(externalLogins.Items);
+    }
+}
+```
+
+这四个测试覆盖账户处理时真正会改变结果的四条路径：
+
+```
+已有 Google 关联
+→ 使用关联的 UUcars User
+
+已验证的本地同邮箱账号
+→ 创建关联，再登录原 User
+
+全新 Google 身份
+→ 创建 User 和 ExternalLogin
+
+未验证的本地同邮箱账号
+→ 返回冲突，不自动关联
+```
+
+#### 10.5 补充 Google-only 用户的密码流程测试
+
+在 `UserServiceTests` 的登录测试区域加入：
+
+```c#
+// 验证：Google-only 用户不能使用任意密码通过本地登录。
+[Fact]
+public async Task LoginAsync_WithGoogleOnlyUser_ShouldRejectPasswordLogin()
+{
+    // Arrange：Google-only User 没有 PasswordHash。
+    var repository = new FakeUserRepository();
+
+    repository.Seed(new User
+    {
+        Id = 1,
+        Username = "google-user",
+        Email = "google-user@gmail.com",
+        PasswordHash = null,
+        Role = UserRole.User,
+        EmailConfirmed = true,
+        CreatedAt = DateTime.UtcNow,
+        UpdatedAt = DateTime.UtcNow
+    });
+
+    var (service, _) = CreateService(repository);
+
+    // Act / Assert：本地密码登录统一按凭据错误拒绝。
+    await Assert.ThrowsAsync<InvalidCredentialsException>(
+        () => service.LoginAsync(
+            "google-user@gmail.com",
+            "AnyPassword@123"));
+}
+```
+
+在密码重置测试区域加入：
+
+```c#
+// 验证：Google-only 用户不能经由忘记密码流程获得本地密码。
+[Fact]
+public async Task ForgotPasswordAsync_WithGoogleOnlyUser_ShouldNotEnqueueJob()
+{
+    // Arrange：Google-only User 已验证邮箱，但没有 PasswordHash。
+    var repository = new FakeUserRepository();
+
+    repository.Seed(new User
+    {
+        Id = 1,
+        Username = "google-user",
+        Email = "google-user@gmail.com",
+        PasswordHash = null,
+        Role = UserRole.User,
+        EmailConfirmed = true,
+        CreatedAt = DateTime.UtcNow,
+        UpdatedAt = DateTime.UtcNow
+    });
+
+    var (service, jobClient) = CreateService(repository);
+
+    // Act：请求重置密码。
+    await service.ForgotPasswordAsync("google-user@gmail.com");
+
+    var user = await repository.GetByEmailAsync(
+        "google-user@gmail.com");
+
+    // Assert：不生成 Token，也不发送重置邮件任务。
+    Assert.Empty(jobClient.EnqueuedJobs);
+    Assert.Null(user!.ResetPasswordToken);
+}
+```
+
+#### 10.6 测试 Google 登录接口
+
+集成测试需要真实经过：
+
+```
+HTTP Request
+→ AuthController
+→ ExternalLoginService
+→ EF Core / SQL Server
+→ JWT
+→ Refresh Token Cookie
+```
+
+但不需要在测试时登录真实 Google 账号，所以在测试服务器中替换 `IGoogleIdTokenService`。
+
+在 `SqlServerTestFactory.cs` 中加入：
+
+```c#
+...
+using UUcars.API.Services.ExternalLogin;
+...
+
+// 自定义的 WebApplicationFactory
+// 在测试启动时自动拉起 SQL Server 容器，测试结束后自动销毁
+public class SqlServerTestFactory : WebApplicationFactory<Program>, IAsyncLifetime
+{
+    ...
+    // ConfigureWebHost：在 WebApplicationFactory 构建应用时调用
+    // 在这里替换 DI 服务，把生产用的 SQL Server 换成测试容器
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    {
+        builder.ConfigureServices(services =>
+        {
+            ...
+            
+            // =================================================
+            // Google 登录：
+            // 测试服务器不请求真实 Google，改为注入固定结果的 Fake
+            // =================================================
+            var googleServiceDescriptor = services.SingleOrDefault(
+                descriptor => descriptor.ServiceType ==
+                              typeof(IGoogleIdTokenService));
+
+            if (googleServiceDescriptor != null)
+            {
+                services.Remove(googleServiceDescriptor);
+            }
+
+            services.AddSingleton<
+                IGoogleIdTokenService,
+                FakeGoogleIdTokenService>();
+        });
+
+        // 使用测试环境，避免加载生产配置
+        builder.UseEnvironment("Testing");
+    }
+
+    ...
+}
+
+```
+
+然后在 `CleanDatabaseAsync()` 中，删除 `Users` 前加入：
+
+```c#
+public class SqlServerTestFactory : WebApplicationFactory<Program>, IAsyncLifetime
+{
+    ...
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    {
+       ...
+    }
+
+    // 清理数据库：每个测试方法结束后调用
+    // 删除所有业务数据，但保留表结构和 Admin 账号
+    // 这样下一个测试面对的是干净的数据库
+    public async Task CleanDatabaseAsync()
+    {
+        ...
+
+        // ExternalLogin 依赖 User，必须在删除普通用户前先清理
+        // 避免外键约束冲突
+        context.ExternalLogins.RemoveRange(context.ExternalLogins);
+
+        // 只删除普通用户，保留 Admin
+        context.Users.RemoveRange(context.Users.Where(u => u.Role != UserRole.Admin));
+        await context.SaveChangesAsync();
+    }
+}
+
+```
+
+在 `CoreFlowIntegrationTests.cs` 中加入：
+
+```c#
+// [Collection] 让这个测试类使用共享的 SqlServerTestFactory
+// 同一个 Collection 里的所有测试类共享同一个数据库容器
+// 避免每个测试类都启动一个新容器（启动容器需要几秒钟，非常耗时）
+[Collection("Integration")]
+public class CoreFlowIntegrationTests : IntegrationTestBase
+{
+    public CoreFlowIntegrationTests(SqlServerTestFactory factory)
+        : base(factory)
+    {
+    }
+
+    // =========================================================
+    // 本地认证：注册、邮箱验证和密码登录
+    // =========================================================
+
+    ...
+
+    // =========================================================
+    // Google 认证：Google 身份映射为 UUcars 会话
+    // =========================================================
+
+    [Fact]
+    public async Task GoogleLogin_WithValidToken_ShouldCreateSession()
+    {
+        // FakeGoogleIdTokenService 为普通测试 Token 返回固定、已验证的 Google Payload。
+        var response = await Client.PostAsync(
+            "/auth/google",
+            JsonContent(new
+            {
+                idToken = "valid-google-token"
+            }));
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        // 响应 Body 返回 UUcars Access Token。
+        var result =
+            await DeserializeAsync<ApiResponse<LoginData>>(response);
+
+        Assert.NotNull(result?.Data);
+        Assert.NotEmpty(result!.Data!.Token);
+
+        // Refresh Token 只通过 HttpOnly Cookie 返回，不出现在响应 Body。
+        Assert.Contains(
+            response.Headers.GetValues("Set-Cookie"),
+            value => value.StartsWith(
+                "refreshToken=",
+                StringComparison.OrdinalIgnoreCase));
+
+        await using var db = Factory.GetDbContext();
+
+        // 首次 Google 登录应保存一个没有本地密码的 User 和关联记录。
+        var user = await db.Users
+            .Include(item => item.ExternalLogins)
+            .SingleAsync(item =>
+                item.Email == "google-user@gmail.com");
+
+        Assert.Null(user.PasswordHash);
+        Assert.True(user.EmailConfirmed);
+
+        var externalLogin = Assert.Single(user.ExternalLogins);
+        Assert.Equal("Google", externalLogin.Provider);
+        Assert.Equal("fake-google-subject", externalLogin.ProviderSubject);
+
+        // 返回的 Access Token 可以访问现有的受保护接口。
+        SetBearerToken(result.Data.Token);
+
+        var currentUserResponse =
+            await Client.GetAsync("/users/me");
+
+        Assert.Equal(HttpStatusCode.OK, currentUserResponse.StatusCode);
+    }
+
+    
+    // =========================================================
+    // 认证保护：受保护接口必须要求有效 UUcars Access Token
+    // =========================================================
+
+    ...
+
+    // =========================================================
+    // 核心业务链路：发布车辆、审核、下单和取消订单
+    // =========================================================
+
+    ...
+
+    // =========================================================
+    // Admin Dashboard：平台统计和角色授权
+    // =========================================================
+
+    ...
+}
+
+```
+
+再加入无效 Token 的测试：
+
+```c#
+[Collection("Integration")]
+public class CoreFlowIntegrationTests : IntegrationTestBase
+{
+    ...
+
+    // =========================================================
+    // Google 认证：Google 身份映射为 UUcars 会话
+    // =========================================================
+
+    [Fact]
+    public async Task GoogleLogin_WithValidToken_ShouldCreateSession()
+    {
+        ...
+    }
+
+    [Fact]
+    public async Task GoogleLogin_WithInvalidToken_ShouldReturn401()
+    {
+        // FakeGoogleIdTokenService 对该固定值模拟 Google 验证失败。
+        var response = await Client.PostAsync(
+            "/auth/google",
+            JsonContent(new
+            {
+                idToken = "invalid-google-token"
+            }));
+
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+
+        await using var db = Factory.GetDbContext();
+
+        // 验证失败时，不应创建 User、ExternalLogin 或登录会话。
+        Assert.False(await db.Users.AnyAsync(item =>
+            item.Email == "google-user@gmail.com"));
+        Assert.False(await db.ExternalLogins.AnyAsync());
+    }
+    ...
+}
+
+```
+
+#### 10.7 编译和测试
+
+先运行本步骤相关测试：
+
+```
+dotnet test --filter "FullyQualifiedName~ExternalLoginServiceTests|FullyQualifiedName~GoogleLogin"
+```
+
+再运行完整后端测试：
+
+```
+dotnet build
+dotnet test
+```
+
+这一步验证的是 UUcars 对 Google 已验证身份的处理、登录会话建立，以及本地密码流程不会错误处理 Google-only 用户。
+
+
+
+### 11. 完成前端 Google 登录流程
+
+第 4 节已经确认，Google 登录成功后，前端可以取得 Google ID Token：
+
+```
+response.credential
+```
+
+第 9 节已经完成后端接口：
+
+```
+POST /auth/google
+```
+
+后端接收 ID Token 后，会完成：
+
+```
+验证 Google 身份
+→ 找到或创建 UUcars User
+→ 创建 UUcars Access Token 和 Refresh Token
+→ 返回 LoginResponse
+```
+
+因此现在需要完成前端完整的登录流程：
+
+```
+credential
+→ authApi.googleLogin
+→ POST /auth/google
+→ 后端返回 LoginResponse
+→ 页面保存 UUcars 登录状态
+→ 页面按自身规则跳转
+```
+
+#### 11.1 Google 登录的前端API请求接口
+
+在 `uucars-web/src/api/auth.ts` 的 `authApi` 中加入：
+
+```tsx
+import apiClient from "./client";
+import type {
+  LoginRequest,
+  LoginResponse,
+  RegisterRequest,
+  User,
+  ApiResponse,
+} from "@/types";
+
+export const authApi = {
+  ...
+
+  // 新增Google 登录接口
+  googleLogin: async (idToken: string): Promise<LoginResponse> => {
+    const response = await apiClient.post<ApiResponse<LoginResponse>>(
+      "/auth/google",
+      { idToken },
+    );
+    return response.data.data!;
+  }
+};
+
+```
+
+请求 Body 是：
+
+```
+{
+  "idToken": "credential"
+}
+```
+
+现在两种登录请求的输入不同：
+
+```
+本地登录
+→ email + password
+
+Google 登录
+→ idToken
+```
+
+但成功后的输出相同：
+
+```
+LoginResponse
+```
+
+#### 11.2 处理登录请求的 401
+
+Google 登录接口可能返回：
+
+```
+401 Unauthorized
+```
+
+例如 Google ID Token 无效、过期，或后端验证失败。
+
+但当前 Axios 响应拦截器看到任何 `401`，都会尝试 `POST /auth/refresh`：
+
+```ts
+// src/api/client.ts
+const apiClient = axios.create({
+  ...
+});
+
+// =============================================
+// 响应拦截器：统一处理响应和错误
+// =============================================
+apiClient.interceptors.response.use(
+  (response) => {
+    ...
+    // =============================================
+    // 处理 401 Token 过期：自动刷新后重试
+    // =============================================
+    if (
+      error.response?.status === 401 &&
+      !originalRequest._retry
+    ) {
+      originalRequest._retry = true;
+
+      try {
+        const response = await axios.post(
+          `${import.meta.env.VITE_API_BASE_URL}/auth/refresh`,
+          null,
+          { withCredentials: true },
+        );
+       ...
+      } catch {
+        ...
+      }
+    }
+
+   ...
+);
+
+export default apiClient;
+```
+
+这是为了处理已经登录的用户访问受保护接口时，UUcars Access Token 过期的情况。
+
+例如：
+
+```
+用户已登录
+→ GET /users/me
+→ Access Token 过期
+→ 401
+→ /auth/refresh
+→ 使用新 Token 重试 GET /users/me
+```
+
+但登录请求的 `401` 含义不同：
+
+```
+POST /auth/login
+→ 密码错误
+
+POST /auth/google
+→ Google Token 无效
+```
+
+这两种情况都**不是已有 UUcars 会话过期，因此不应该触发刷新。**
+
+因此触发刷新时，把这2种情况排除。定义变量 `isSignInRequest`, 用来标识当前失败请求是否是登录请求, 触发刷新的条件中排除：
+
+```ts
+// =============================================
+// 响应拦截器：统一处理响应和错误
+// =============================================
+apiClient.interceptors.response.use(
+(response) => {
+...
+
+// 定义登录的请求
+const isSignInRequest =
+  originalRequest.url === "/auth/login" ||
+  originalRequest.url === "/auth/google";
+
+// =============================================
+// 处理 401 Token 过期：自动刷新后重试
+// =============================================
+if (
+  error.response?.status === 401 &&
+  !originalRequest._retry &&
+  !isSignInRequest
+) {
+  originalRequest._retry = true;
+
+  try {
+    const response = await axios.post(
+      `${import.meta.env.VITE_API_BASE_URL}/auth/refresh`,
+      null,
+      { withCredentials: true },
+    );
+   ...
+  } catch {
+    ...
+  }
+}
+```
+
+修改后：
+
+```
+受保护接口返回 401
+→ 尝试刷新现有会话
+
+本地登录或 Google 登录返回 401
+→ 直接把登录失败错误交给调用页面
+```
+
+这样后面 Google 登录组件捕获到的才是正确错误，而不是一次无意义的刷新失败。
+
+#### 11.3 封装 Google 登录按钮
+
+第 4 节为了观察 Google 返回的数据，暂时把：
+
+```
+GoogleLogin
+handleGoogleSuccess
+console.log(response)
+```
+
+直接放在 `LoginPage` 中。
+
+现在 `credential` 已经确认，且 `authApi.googleLogin()` 已经存在。下一步可以在这个回调中直接调用后端。
+
+但 Google 登录入口不仅出现在 `LoginPage`，也会出现在 `RegisterPage`。
+
+两个页面都会重复这一段过程：
+
+```
+Google 返回 credential
+→ 调用 authApi.googleLogin
+→ 处理 Google 取消或后端错误
+→ 得到 LoginResponse
+```
+
+如果把这些代码继续留在 `LoginPage`，再实现 `RegisterPage` 时就需要复制一次。
+
+因此现在提取一个 `GoogleSignInButton`。它只负责：
+
+```
+Google 登录按钮
+→ credential
+→ 调用 UUcars 后端
+→ 返回 LoginResponse
+```
+
+页面跳转不放在这个组件中，因为两个页面成功后的去向不同。
+
+新建 `uucars-web/src/components/GoogleSignInButton.tsx`：
+
+```tsx
+import { GoogleLogin, type CredentialResponse } from "@react-oauth/google";
+import { toast } from "sonner";
+import { authApi } from "@/api";
+import type { LoginResponse } from "@/types";
+
+interface GoogleSignInButtonProps {
+  // 回调函数：Google 登录成功后，把 UUcars 的登录结果交给页面。
+  onAuthenticated: (result: LoginResponse) => void;
+}
+
+function GoogleSignInButton({ onAuthenticated }: GoogleSignInButtonProps) {
+  const handleSuccess = async (response: CredentialResponse) => {
+    // credential 才是需要发送给 UUcars 后端的 Google ID Token。
+    if (!response.credential) {
+      toast.error("Google did not return an ID token.");
+      return;
+    }
+
+    try {
+      // 后端验证 Google Token，并返回 UUcars 的登录结果。
+      const result = await authApi.googleLogin(response.credential);
+
+      // 页面决定成功后如何保存状态和跳转。
+      onAuthenticated(result);
+    } catch (error) {
+      // Axios 拦截器已将后端错误转换为 Error。
+      toast.error(
+        error instanceof Error ? error.message : "Google sign-in failed.",
+      );
+    }
+  };
+
+  return (
+    <GoogleLogin
+      type="icon"
+      shape="circle"
+      size="large"
+      theme="outline"
+      onSuccess={(response) => {
+        void handleSuccess(response);
+      }}
+      onError={() => {
+        // 用户取消弹窗或 Google 页面本身失败时，不会调用后端。
+        toast.error("Google sign-in was cancelled or failed.");
+      }}
+    />
+  );
+}
+
+export default GoogleSignInButton;
+
+
+```
+
+`onAuthenticated` 是组件暴露给页面的回调。
+
+当组件成功拿到后端返回的：
+
+```
+LoginResponse
+```
+
+它会执行：
+
+```
+onAuthenticated(result)
+```
+
+由页面决定回调函数里的逻辑：
+
+```
+保存状态
+跳转位置
+```
+
+#### 11.4 LoginPage 接入 Google 登录
+
+`LoginPage` 需要使用`GoogleSignInButton`组件时， 需要先提供一个回调函数，用来接收这个登录结果，并按当前页面原有的规则执行后续的登录逻辑：
+
+- 保存登录状态
+- 完成跳转
+
+定义google登录的回调函数 `completeAuthentication`：
+
+```ts
+const completeAuthentication = (
+  result: LoginResponse,
+) => {
+  // 保存后端返回的 UUcars User 和 Access Token
+  setAuth(result.user, result.token);
+
+  // // 回到受保护页面；没有来源页时按角色进入默认页面
+  if (from) {
+    navigate(from, { replace: true });
+  } else if (result.user.role === "Admin") {
+    navigate("/admin", { replace: true });
+  } else {
+    navigate("/", { replace: true });
+  }
+};
+```
+
+使用 `GoogleSignInButton` 组件：
+
+```tsx
+...
+import GoogleSignInButton from "@/components/GoogleSignInButton";
+...
+
+export default function LoginPage() {
+  ...
+
+  const completeAuthentication = (result: LoginResponse) => {
+    ...
+  };
+      
+  const onSubmit = async (data: LoginForm) => {
+   ...
+  };
+
+  return (
+    <div
+      className="flex min-h-screen items-center justify-center px-4 py-12"
+      style={{ backgroundColor: "var(--color-bg)" }}
+    >
+      {/* 背景装饰 */}
+      ...
+
+      <div className="relative w-full max-w-sm animate-fade-in-up">
+        {/* Logo */}
+        ...
+
+        {/* 表单卡片 */}
+        <div>
+          {/* 本地登录表格 */}
+          <form>
+            ...
+          </form>
+
+          {/* 分割线 */}
+          <div className="my-6 flex items-center gap-3">
+            <div className="h-px flex-1 bg-[var(--color-border-strong)]" />
+
+            <span className="shrink-0 text-sm text-muted-foreground">
+              Or continue with
+            </span>
+
+            <div className="h-px flex-1 bg-[var(--color-border-strong)]" />
+          </div>
+
+          {/* Google登录 */}
+          <div className="flex justify-center">
+            <GoogleSignInButton onAuthenticated={completeAuthentication} />
+          </div>
+        </div>
+          ...
+    </div>
+  );
+}
+```
+
+此时 Google 登录已经接入 `LoginPage`。
+
+但是本地密码登录的 `onSubmit()`里, 登录成功后的逻辑和`completeAuthentication`回调函数的逻辑相同：
+
+```ts
+
+const onSubmit = async (data: LoginForm) => {
+    // 清除上次的服务端错误
+    setServerError(null);
+
+    try {
+      // 调用登录 API
+      const result = await authApi.login(data);
+
+      // 登录成功：把用户信息和 Token 存入 Zustand
+      setAuth(result.user, result.token);
+
+      // 跳转
+      // 有来源页就跳回去，没有的话 Admin 跳管理页、普通用户跳首页
+      if (from) {
+        navigate(from, { replace: true });
+      } else if (result.user.role === "Admin") {
+        navigate("/admin", { replace: true });
+      } else {
+        navigate("/", { replace: true });
+      }
+    } catch (error) {
+      // Axios 拦截器已经把错误提取成 Error 对象
+      // 直接读 message 显示给用户
+      if (error instanceof Error) {
+        setServerError(error.message);
+      }
+    }
+};
+```
+
+因此可以直接使用这个回调逻辑：
+
+```ts
+
+const onSubmit = async (data: LoginForm) => {
+setServerError(null);
+    try {
+      const result = await authApi.login(data);
+      completeAuthentication(result);
+
+    } catch (error) {
+      if (error instanceof Error) {
+        setServerError(error.message);
+      }
+    }
+};
+```
+
+优化后，两条登录路径会在成功后汇合：
+
+```
+密码登录
+→ authApi.login
+→ completeAuthentication
+
+Google 登录
+→ authApi.googleLogin
+→ completeAuthentication
+```
+
+两者都会使用完全相同的 UUcars 登录状态和跳转规则。
+
+#### 11.5 RegisterPage 接入 Google 登录
+
+本地注册与 Google 登录的成功结果不同。
+
+本地注册成功后：
+
+```
+创建未验证 User
+→ 显示 Check your email
+→ 用户点击邮件中的验证链接
+```
+
+Google 登录成功后：
+
+```
+后端已完成 Google 身份验证
+→ 返回 LoginResponse
+→ 可以立即建立 UUcars 前端登录状态
+```
+
+因此 `RegisterPage` 不能把 Google 登录结果当作本地注册成功来处理。
+
+Google 登录成功后不应该执行：
+
+```
+setIsSuccess(true)
+```
+
+因为它不需要等待邮箱验证提示页。
+
+而应该执行：
+
+```
+setAuth
+→ 进入首页
+```
+
+定义Google 登录验证成功后处理的回调函数`completeGoogleAuthentication`：
+
+```ts
+const { setAuth } = useAuthStore();
+
+const completeGoogleAuthentication = (
+  result: LoginResponse,
+) => {
+  // Google 登录已经得到 UUcars User 和 Access Token。
+  setAuth(result.user, result.token);
+
+  // RegisterPage 没有来源页，成功后直接进入首页。
+  navigate("/", { replace: true });
+};
+```
+
+现有本地 `onSubmit()` 与 `isSuccess` 流程不变。
+
+使用 `GoogleSignInButton`组件：
+
+```tsx
+{/* Google登录 */}
+<div className="flex justify-center">
+    <GoogleSignInButton
+      onAuthenticated={completeGoogleAuthentication}
+    />
+</div>
+```
+
+至此，前端的完整流程变为：
+
+```
+LoginPage / RegisterPage
+→ GoogleSignInButton
+→ Google 返回 credential
+→ authApi.googleLogin
+→ POST /auth/google
+→ 后端返回 LoginResponse
+→ 页面保存 UUcars 登录状态
+→ 页面按自身规则跳转
+```
+
+#### 11.6 增加密码显示切换
+
+当前密码输入框使用：
+
+```tsx
+<Input type="password" />
+```
+
+浏览器会把输入内容显示为圆点。这样可以避免旁边的人直接看到密码，但用户也无法确认自己是否输错。
+
+因此在密码输入框右侧加入一个眼睛按钮：
+
+```
+密码隐藏时点击 Eye
+→ 显示密码
+
+密码显示时点击 EyeOff
+→ 再次隐藏密码
+```
+
+这个功能只需要改变输入框的 `type`：
+
+```tsx
+type={isPasswordVisible ? "text" : "password"}
+```
+
+它不会修改密码值，也不会改变 React Hook Form 的验证和提交过程。
+
+项目中已经有四个密码输入位置：
+
+```
+LoginPage：password
+RegisterPage：password
+ResetPasswordPage：newPassword
+ResetPasswordPage：confirmPassword
+```
+
+如果每个页面分别保存显示状态并绘制眼睛按钮，就会重复相同的交互代码。因此创建一个 `PasswordInput`，让组件自己管理显示状态；页面通过 props 和 `register()` 管理密码值。
+
+新建 `uucars-web/src/components/PasswordInput.tsx`：
+
+```tsx
+import { useState, type ComponentProps } from "react";
+import { Eye, EyeOff } from "lucide-react";
+import { Input } from "@/components/ui/input";
+import { cn } from "@/lib/utils";
+
+type PasswordInputProps = ComponentProps<"input">;
+
+function PasswordInput({ className, ...props }: PasswordInputProps) {
+  const [isPasswordVisible, setIsPasswordVisible] = useState(false);
+
+  return (
+    <div className="relative">
+      <Input
+        {...props}
+        type={isPasswordVisible ? "text" : "password"}
+        className={cn("pr-11", className)}
+      />
+
+      <button
+        type="button"
+        className="absolute inset-y-0 right-0 flex w-10 items-center justify-center text-[var(--color-text-muted)] transition-colors hover:text-[var(--color-text-primary)]"
+        onClick={() =>
+          setIsPasswordVisible((isVisible) => !isVisible)
+        }
+      >
+        {isPasswordVisible ? (
+          <EyeOff className="h-4 w-4" />
+        ) : (
+          <Eye className="h-4 w-4" />
+        )}
+      </button>
+    </div>
+  );
+}
+
+export default PasswordInput;
+```
+
+这里用 `ComponentProps<"input">` 接收普通输入框的属性，因此页面原有的：
+
+```
+id
+placeholder
+autoComplete
+React Hook Form register() 返回的属性
+```
+
+都可以继续传给内部的 `Input`。
+
+眼睛按钮必须使用：
+
+```tsx
+type="button"
+```
+
+否则它位于表单内部时，浏览器会把按钮当作提交按钮。
+
+输入框增加 `pr-11`，为右侧眼睛按钮留出空间，避免密码文字与图标重叠。
+
+在 `LoginPage`、`RegisterPage` 和 `ResetPasswordPage` 中引入：
+
+```tsx
+import PasswordInput from "@/components/PasswordInput";
+```
+
+然后用 `PasswordInput` 替换原来的密码 `Input`。例如登录页：
+
+```tsx
+<PasswordInput
+  id="password"
+  placeholder="••••••••"
+  autoComplete="current-password"
+  {...register("password")}
+/>
+```
+
+注册和重置密码使用：
+
+```tsx
+autoComplete="new-password"
+```
+
+组件内部只切换显示状态，页面原有的密码验证规则和提交数据保持不变。
+
+
+
+### 12. 前端测试
+
+第 10 节已经测试了后端账号处理和登录会话，第 11 节完成了前端接入。
+
+现在需要验证前端自己负责的两段逻辑：
+
+```
+GoogleSignInButton
+→ 把 credential 发送给后端
+→ 把 LoginResponse 交给页面
+
+LoginPage
+→ 接收 LoginResponse
+→ 保存登录状态
+→ 完成跳转
+```
+
+测试不需要真的打开 Google 弹窗，也不测试 Google 如何签发 ID Token。这些功能由 Google Identity Services 提供。
+
+#### 12.1 建立 GoogleSignInButton 的测试环境
+
+新建：
+
+```
+uucars-web/src/test/components/GoogleSignInButton.test.tsx
+```
+
+先引入测试当前组件需要的内容：
+
+```
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import GoogleSignInButton from "@/components/GoogleSignInButton";
+import { authApi } from "@/api";
+```
+
+组件内部会调用：
+
+```
+authApi.googleLogin()
+```
+
+测试不能发送真实 HTTP 请求，因此先替换这个方法：
+
+```ts
+// 测试时不发送真实 HTTP 请求。
+// 把 authApi.googleLogin 替换成可以控制和检查的 Mock 函数。
+vi.mock("@/api", () => ({
+  authApi: {
+    googleLogin: vi.fn(),
+  },
+}));
+```
+
+但是当前组件还会渲染 Google 提供的：
+
+```
+<GoogleLogin />
+```
+
+测试环境没有真实 Google 登录页面，也没有 `GoogleOAuthProvider`。因此将它替换为普通按钮：
+
+```ts
+// 测试环境不能打开真实的 Google 登录窗口，
+// 因此用一个普通按钮代替 GoogleLogin。
+vi.mock("@react-oauth/google", () => ({
+  GoogleLogin: ({
+    onSuccess,
+  }: {
+    onSuccess: (response: { credential?: string }) => void;
+  }) => (
+    <button
+      type="button"
+      onClick={() =>
+        // 点击按钮时，模拟 Google 登录成功，
+        // 并返回一个 credential。
+        onSuccess({
+          credential: "google-id-token",
+        })
+      }
+    >
+      Mock Google sign in
+    </button>
+  ),
+}));
+```
+
+点击这个按钮时，相当于模拟 Google 执行：
+
+```
+onSuccess({
+  credential: "google-id-token",
+});
+```
+
+现在测试可以控制 credential，而不依赖真实 Google 服务。
+
+#### 12.2 测试 credential 是否发送给后端
+
+测试的第一段数据流是：
+
+```
+Google 返回 credential
+→ GoogleSignInButton 调用 authApi.googleLogin()
+```
+
+先定义后端成功返回的结果：
+
+```ts
+// 模拟 UUcars 后端验证 Google ID Token 后返回的登录结果。
+// 因为组件会等待 googleLogin 完成，所以需要准备这个返回值。
+const loginResult: LoginResponse = {
+  token: "uucars-access-token",
+  expiresAt: "2026-09-03T12:00:00Z",
+  user: {
+    id: 2,
+    username: "Alice",
+    email: "alice@gmail.com",
+    role: "User",
+    createdAt: "2026-09-03T10:00:00Z",
+  },
+};
+```
+
+建立测试结构：
+
+```ts
+describe("GoogleSignInButton", () => {
+  beforeEach(() => {
+    // 清除上一个测试留下的 Mock 调用记录。
+    vi.clearAllMocks();
+  });
+  // 测试逻辑
+  ...
+});
+```
+
+然后加入第一个测试：
+
+```ts
+describe("GoogleSignInButton", () => {
+  beforeEach(() => {
+      
+    // 清除上一个测试留下的 Mock 调用记录。
+    vi.clearAllMocks();
+  });
+
+  /* -------------- 测试 1： ------------- */  
+  // 验证 Google 返回 credential 后，组件会把它传给 UUcars 的 Google 登录接口。
+  it("应该把 Google credential 发送给后端", async () => {
+      
+    // 1. 规定 Mock 接口本次调用成功，并返回上面准备好的 UUcars 登录结果。
+    vi.mocked(authApi.googleLogin).mockResolvedValueOnce(loginResult);
+
+    // 2. 渲染要测试的组件。
+    // 这个测试暂时不检查 onAuthenticated，所以传入一个空的 Mock 函数。
+    render(<GoogleSignInButton onAuthenticated={vi.fn()} />);
+
+    // 3. 用户点击模拟的 Google 登录按钮。
+    // 创建用户
+    const user = userEvent.setup();
+    // 点击后，Mock GoogleLogin 会返回 "google-id-token"。
+    await user.click(
+      screen.getByRole("button", {
+        name: /mock google sign in/i,
+      }),
+    );
+
+    // 4. 检查组件是否把 Google 返回的 credential原样传给了 authApi.googleLogin
+    await waitFor(() => {
+      expect(authApi.googleLogin).toHaveBeenCalledWith("google-id-token");
+    });
+  });
+});
+
+```
+
+这个测试只回答一个问题：
+
+```
+Google 返回的 credential
+是否被正确传给 authApi.googleLogin？
+```
+
+运行这个测试：
+
+```bash
+cd uucars-web
+
+npm test -- --run src/test/components/GoogleSignInButton.test.tsx
+```
+
+#### 12.3 测试 LoginResponse 是否交给页面
+
+`authApi.googleLogin()` 成功后，组件还会执行：
+
+```
+onAuthenticated(result);
+```
+
+这个回调负责把登录结果交还给使用组件的页面。
+
+创建一个 空的Mock 回调函数，记录 onAuthenticated 是否被调用以及收到的数据
+
+```ts
+const mockOnAuthenticated = vi.fn();
+```
+
+它只会：
+
+- 记录是否被调用；
+- 记录调用次数；
+- 记录每次收到的参数；
+- 默认返回 `undefined`。
+
+它不会执行真实的登录状态保存、页面跳转等业务逻辑。
+
+完整的测试逻辑：
+
+```ts
+  /* -------------- 测试 2： ------------- */
+  // 验证后端登录成功后，组件会把返回的登录结果交给页面
+  it("应该把 UUcars 登录结果交给页面", async () => {
+    // 1. 规定 Mock 接口本次调用成功，并返回准备好的 UUcars 登录结果
+    vi.mocked(authApi.googleLogin).mockResolvedValueOnce(loginResult);
+
+    // 2. 创建一个 Mock 回调函数，记录 onAuthenticated 是否被调用以及收到的数据
+    const mockOnAuthenticated = vi.fn();
+
+    // 3. 渲染组件，并把 Mock 回调函数传给 onAuthenticated
+    render(
+      <GoogleSignInButton onAuthenticated={mockOnAuthenticated} />,
+    );
+
+    // 4. 用户点击模拟的 Google 登录按钮。
+    const user = userEvent.setup();
+
+    await user.click(
+      screen.getByRole("button", {
+        name: /mock google sign in/i,
+      }),
+    );
+
+    // 5. 检查组件是否把后端返回的 loginResult 交给了页面。
+    await waitFor(() => {
+      expect(mockOnAuthenticated).toHaveBeenCalledWith(loginResult);
+    });
+  });
+```
+
+这个测试关注的不是 `credential`，而是后续数据流：
+
+```
+authApi.googleLogin 返回 loginResult
+→ GoogleSignInButton 调用 onAuthenticated(loginResult)
+```
+
+运行测试：
+
+```bash
+npm test -- --run src/test/components/GoogleSignInButton.test.tsx
+```
+
+现在成功路径已经被分成两个清楚的问题：
+
+```
+credential 是否发送给后端？
+LoginResponse 是否交给页面？
+```
+
+#### 12.4 测试后端拒绝登录的情况
+
+成功路径完成后，再考虑后端拒绝 ID Token 的情况：
+
+```
+authApi.googleLogin() 抛出错误
+→ 显示错误
+→ 不执行 onAuthenticated()
+```
+
+组件通过 `toast.error()` 显示错误，因此添加 Mock 错误函数：
+
+```ts
+
+// 测试环境不需要真正显示 Sonner 提示框。
+// 把 toast.error 替换成 Mock 函数，用来检查组件显示了什么错误。
+vi.mock("sonner", () => ({
+  toast: {
+    error: vi.fn(),
+  },
+}));
+```
+
+然后加入失败测试：
+
+```ts
+/* -------------- 测试 3： ------------- */
+  // 验证后端拒绝 Google 登录时，组件会显示错误，
+  // 并且不会把登录结果交给页面。
+  it("后端拒绝 Google 登录时应该显示错误", async () => {
+    // 1. 模拟后端验证失败。
+    // mockRejectedValueOnce 表示这次调用不会返回 LoginResponse，
+    // 而是返回一个被拒绝的 Promise，并抛出指定错误。
+    vi.mocked(authApi.googleLogin).mockRejectedValueOnce(
+      new Error("Invalid Google ID token"),
+    );
+
+    // 2. 创建 Mock 回调函数。
+    // 如果登录失败，这个函数不应该被调用。
+    const mockOnAuthenticated = vi.fn();
+
+    // 3. 渲染组件，并把 Mock 回调传给 onAuthenticated。
+    render(<GoogleSignInButton onAuthenticated={mockOnAuthenticated} />);
+
+    // 4. 用户点击模拟的 Google 登录按钮。
+    // Mock GoogleLogin 会把 "google-id-token" 交给组件。
+    const user = userEvent.setup();
+
+    await user.click(
+      screen.getByRole("button", {
+        name: /mock google sign in/i,
+      }),
+    );
+
+    // 5. googleLogin 是异步调用。
+    // 等待组件捕获错误后，检查 toast.error 收到的错误信息。
+    await waitFor(() => {
+      expect(toast.error).toHaveBeenCalledWith("Invalid Google ID token");
+    });
+
+    // 6. 后端没有返回登录结果，
+    // 因此组件不能调用登录成功回调。
+    expect(mockOnAuthenticated).not.toHaveBeenCalled();
+  });
+```
+
+运行测试
+
+```bash
+# 运行当前测试
+npm test -- --run \
+  src/test/components/GoogleSignInButton.test.tsx \
+  -t "后端拒绝 Google 登录时应该显示错误"
+
+# 运行全部测试
+npm test -- --run \
+  src/test/components/GoogleSignInButton.test.tsx
+```
+
+这里不继续测试 Google SDK 内部的弹窗、账号选择或 Token 生成，只验证 UUcars 对后端失败的处理。
+
+#### 12.5 测试 LoginPage 如何处理 Google 登录结果
+
+前三个测试已经确认 `GoogleSignInButton` 能够调用后端，并把 `LoginResponse` 交给页面。
+
+现在继续验证页面收到结果后的处理：
+
+```
+LoginPage 收到 LoginResponse
+→ setAuth(user, token)
+→ 跳转到登录后的页面
+```
+
+这里测试的是 `LoginPage`，不需要再次测试真实的 `GoogleSignInButton`。因此把它替换成一个普通按钮。点击按钮时，直接向 `LoginPage` 提供模拟的 `LoginResponse`。
+
+创建 `GoogleSignInButton`的 Mock 组件：
+
+```ts
+// 当前测试只关心 LoginPage 收到登录结果后如何处理。
+// 因此用普通按钮代替真实的 GoogleSignInButton。
+vi.mock("@/components/GoogleSignInButton", () => ({
+  default: ({
+    onAuthenticated,
+  }: {
+    onAuthenticated: (result: LoginResponse) => void;
+  }) => (
+    <button
+      type="button"
+      onClick={() =>
+        // 点击按钮时，模拟 GoogleSignInButton
+        // 已经取得后端返回的 UUcars 登录结果。
+        onAuthenticated({
+          token: "google-uucars-token",
+          expiresAt: "2026-09-03T12:00:00Z",
+          user: {
+            id: 2,
+            username: "Google User",
+            email: "google-user@gmail.com",
+            role: "User",
+            createdAt: "2026-09-03T10:00:00Z",
+          },
+        })
+      }
+    >
+      Mock Google sign in
+    </button>
+  ),
+}));
+```
+
+这个 Mock 不会调用 `authApi.googleLogin()`。
+
+它只模拟前三个测试已经确认的数据流结果：
+
+```
+GoogleSignInButton 已经取得 LoginResponse
+→ 调用 LoginPage 提供的 onAuthenticated
+```
+
+因此，现有的 `authApi` Mock 仍然只需要保留：
+
+```ts
+vi.mock("@/api", () => ({
+  authApi: {
+    login: vi.fn(),
+  },
+}));
+```
+
+添加测试：
+
+```ts
+  /* -------------- 测试 4： ------------- */
+  // 验证 LoginPage 收到 Google 登录结果后，
+  // 会保存用户和 Access Token，并跳转到首页。
+  it("Google 登录成功后应该保存状态并跳转", async () => {
+    // 1. 渲染 LoginPage。
+    // 页面中的 GoogleSignInButton 已经被替换成普通测试按钮。
+    renderLoginPage();
+
+    // 2. 用户点击模拟的 Google 登录按钮。
+    const user = userEvent.setup();
+
+    await user.click(
+      screen.getByRole("button", {
+        name: /mock google sign in/i,
+      }),
+    );
+
+    // 3. 检查 LoginPage 是否把后端返回的
+    // User 和 Access Token 保存到认证状态中。
+    expect(mockSetAuth).toHaveBeenCalledWith(
+      {
+        id: 2,
+        username: "Google User",
+        email: "google-user@gmail.com",
+        role: "User",
+        createdAt: "2026-09-03T10:00:00Z",
+      },
+      "google-uucars-token",
+    );
+
+    // 4. 当前没有来源页面，并且登录用户不是 Admin，
+    // 所以登录成功后应该进入首页。
+    expect(mockNavigate).toHaveBeenCalledWith("/", {
+      replace: true,
+    });
+  });
+```
+
+这里不需要 `waitFor()`，因为 Mock 按钮调用 `onAuthenticated()` 后，`setAuth()` 和 `navigate()` 都是同步执行的。`await user.click()` 完成后即可检查结果。
+
+运行测试：
+
+```bash
+# 单独运行这个测试
+npm test -- --run src/test/pages/LoginPage.test.tsx \
+  -t "Google 登录成功后应该保存状态并跳转"
+
+# 然后运行 LoginPage 的全部测试
+npm test -- --run src/test/pages/LoginPage.test.tsx
+```
+
+第四个测试验证的是：
+
+```
+Mock GoogleSignInButton 提供 LoginResponse
+→ LoginPage 执行 completeAuthentication
+→ setAuth(user, token)
+→ navigate("/")
+```
+
+#### 12.6 运行前端测试
+
+先运行本步骤直接相关的测试：
+
+```bash
+cd uucars-web
+
+npm test -- --run \
+  src/test/components/GoogleSignInButton.test.tsx \
+  src/test/pages/LoginPage.test.tsx
+```
+
+相关测试通过后，再运行完整前端测试：
+
+```bash
+npm test -- --run
+```
+
+#### 12.7 完整项目验证
+
+后端：
+
+```bash
+dotnet build
+dotnet test
+```
+
+前端：
+
+```bash
+cd uucars-web
+
+npm run lint
+npm run build
+npm test -- --run
+```
+
+#### 12.8 手动验证真实 Google 流程
+
+自动测试中的 Google 组件是 Mock，因此还需要使用真实测试账号确认：
+
+```
+□ Login 和 Register 页面可以打开 Google 账号选择窗口
+
+□ 全新 Google 用户可以登录
+  → 创建 User
+  → PasswordHash 为 NULL
+  → 创建 ExternalLogin
+
+□ 同一个 Google 账号再次登录
+  → 使用原来的 User
+  → 不创建重复记录
+
+□ 已验证的同邮箱本地账号使用 Google 登录
+  → 使用原来的 User
+  → 保存 Google 登录关联
+
+□ Google 登录后刷新页面
+  → Refresh Token 可以恢复登录状态
+
+□ 原有注册、邮箱验证和密码登录仍然正常
+```
+
+
+
+### Git 提交
+
+提交并推送：
+
+```bash
+git add .
+git commit -m "feat: add Google OIDC login"
+git push origin feature/v3-google-oidc-login
+```
+
+验证后合并回 `develop` 并删除功能分支：
+
+```bash
+git checkout develop
+git pull --ff-only origin develop
+
+git merge --no-ff feature/v3-google-oidc-login \
+  -m "merge: feature/v3-google-oidc-login into develop"
+
+git push origin develop
+
+git branch -d feature/v3-google-oidc-login
+git push origin --delete feature/v3-google-oidc-login
+```
+
+
+
+### Step 72 完成状态
+
+```
+概念理解：
+□ 理解 GoogleOAuthProvider 的作用
+□ 理解 CredentialResponse 中的 credential
+□ 理解 ID Token 与 Access Token 的区别
+□ 理解后端对 Google ID Token 的验证过程
+□ 理解 Google sub 是稳定的第三方身份标识
+□ 理解 User 与 ExternalLogin 的一对多关系
+□ 理解本地用户可以没有 ExternalLogin 记录
+□ 理解 Google-only 用户的 PasswordHash 可以为空
+□ 理解三个账户匹配分支
+□ 理解 Google 登录成功后仍使用 UUcars 自己的 JWT 会话
+
+后端实现：
+□ GoogleAuthSettings
+□ IGoogleIdTokenService / GoogleIdTokenService
+□ InvalidGoogleIdTokenException
+□ ExternalLogin Entity
+□ ExternalLoginConfiguration
+□ ExternalLogin Migration
+□ IExternalLoginRepository
+□ EfExternalLoginRepository
+□ ExternalLoginService
+□ POST /auth/google
+□ Google-only 密码登录保护
+□ Refresh Token Cookie 复用
+
+前端实现：
+□ @react-oauth/google
+□ GoogleOAuthProvider
+□ GoogleLogin
+□ authApi.googleLogin
+□ GoogleSignInButton
+□ LoginPage Google 登录
+□ RegisterPage Google 登录
+□ Axios 401 登录请求区分
+□ Zustand 登录状态更新
+
+测试：
+□ ExternalLoginService 核心分支单元测试
+□ Google-only 密码登录测试
+□ FakeGoogleIdTokenService
+□ Google 登录 API、数据库和 Cookie 集成测试
+□ GoogleSignInButton 与 LoginPage 组件测试
+□ 后端与前端完整验证
+```
+
 ## fixed Issues 
 
 ### Fix 1. 并发 Refresh Token 请求竞态条件（Refresh Token Rotation Race Condition）
@@ -14747,6 +25636,3 @@ git push origin develop
 git branch -d fix/add-images-when-create-car
 git push origin --delete fix/add-images-when-create-car
 ```
-
-
-

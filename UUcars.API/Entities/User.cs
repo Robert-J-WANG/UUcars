@@ -6,7 +6,9 @@ public class User : BaseEntity
 {
     public string Username { get; set; } = string.Empty;
     public string Email { get; set; } = string.Empty;
-    public string PasswordHash { get; set; } = string.Empty;
+
+    // Google 首次登录创建的用户没有 UUCars 本地密码
+    public string? PasswordHash { get; set; }
     public UserRole Role { get; set; } = UserRole.User;
     public bool EmailConfirmed { get; set; } = false;
 
@@ -33,4 +35,7 @@ public class User : BaseEntity
 
     // 一个用户可以有多个refresh token
     public ICollection<RefreshToken> RefreshTokens { get; set; } = [];
+
+    // 本地用户可以没有关联记录；第三方登录用户保存对应的关联记录
+    public ICollection<ExternalLogin> ExternalLogins { get; set; } = [];
 }

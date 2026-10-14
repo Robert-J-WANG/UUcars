@@ -26,6 +26,7 @@ import {
 import { navLinkClass } from "@/lib/navLinkClass";
 import { cn } from "@/lib/utils";
 import { authApi } from "@/api";
+import NotificationBell from "./NotificationBell";
 
 export default function Layout() {
   const { user, isAuthenticated, clearAuth } = useAuthStore();
@@ -107,6 +108,8 @@ export default function Layout() {
           <div className="flex items-center gap-3">
             {isAuthenticated() ? (
               <>
+                {/* 通知铃铛组件*/}
+                <NotificationBell />
                 {/* 普通用户：Sell a Car 按钮 */}
                 {!isAdmin && (
                   <Button

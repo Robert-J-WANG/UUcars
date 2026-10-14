@@ -2,6 +2,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import LoginPage from "@/pages/LoginPage";
+import type { LoginResponse } from "@/types";
 
 // Mock 路由 hook（LoginPage 里用了 useNavigate 和 useLocation）
 // vi.importActual 保留 react-router-dom 里其他真实导出（比如 MemoryRouter 本身）
@@ -31,6 +32,37 @@ vi.mock("@/stores/authStore", () => ({
   })),
 }));
 
+// 当前测试只关心 LoginPage 收到登录结果后如何处理。
+// 因此用普通按钮代替真实的 GoogleSignInButton。
+vi.mock("@/components/GoogleSignInButton", () => ({
+  default: ({
+    onAuthenticated,
+  }: {
+    onAuthenticated: (result: LoginResponse) => void;
+  }) => (
+    <button
+      type="button"
+      onClick={() =>
+        // 点击按钮时，模拟 GoogleSignInButton
+        // 已经取得后端返回的 UUcars 登录结果。
+        onAuthenticated({
+          token: "google-uucars-token",
+          expiresAt: "2026-09-03T12:00:00Z",
+          user: {
+            id: 2,
+            username: "Google User",
+            email: "google-user@gmail.com",
+            role: "User",
+            createdAt: "2026-09-03T10:00:00Z",
+          },
+        })
+      }
+    >
+      Mock Google sign in
+    </button>
+  ),
+}));
+
 const renderLoginPage = () =>
   render(
     <MemoryRouter>
@@ -51,7 +83,11 @@ describe("LoginPage", () => {
     const user = userEvent.setup();
 
     // 直接点提交，不填任何内容
-    await user.click(screen.getByRole("button", { name: /sign in/i }));
+    await user.click(
+      screen.getByRole("button", {
+        name: /^sign in$/i,
+      }),
+    );
 
     // RHF + Zod 验证失败，应该显示错误提示
     // 这里必须用 waitFor：Zod resolver 内部走的是 Promise 链，
@@ -62,13 +98,13 @@ describe("LoginPage", () => {
       expect(screen.getByText(/password is required/i)).toBeInTheDocument();
     });
   });
-  screen.debug(undefined, 300000); // 临时加这行，看完整渲染结果
+
   it("输入无效邮箱格式时应该显示格式错误", async () => {
     renderLoginPage();
     const user = userEvent.setup();
 
     await user.type(screen.getByLabelText(/email/i), "not-an-email");
-    await user.click(screen.getByRole("button", { name: /sign in/i }));
+    await user.click(screen.getByRole("button", { name: /^sign in$/i }));
 
     await waitFor(() => {
       expect(screen.getByText(/invalid email/i)).toBeInTheDocument();
@@ -93,7 +129,7 @@ describe("LoginPage", () => {
 
     await user.type(screen.getByLabelText(/email/i), "test@example.com");
     await user.type(screen.getByLabelText(/password/i), "password123");
-    await user.click(screen.getByRole("button", { name: /sign in/i }));
+    await user.click(screen.getByRole("button", { name: /^sign in$/i }));
 
     await waitFor(() => {
       // 验证 login 确实被调用，且传了正确的参数
@@ -116,12 +152,53 @@ describe("LoginPage", () => {
 
     await user.type(screen.getByLabelText(/email/i), "test@example.com");
     await user.type(screen.getByLabelText(/password/i), "wrongpassword");
-    await user.click(screen.getByRole("button", { name: /sign in/i }));
+    await user.click(
+      screen.getByRole("button", {
+        name: /^sign in$/i,
+      }),
+    );
 
     await waitFor(() => {
       expect(
         screen.getByText(/invalid email or password/i),
       ).toBeInTheDocument();
+    });
+  });
+
+  /* -------------- 测试 4： ------------- */
+  // 验证 LoginPage 收到 Google 登录结果后，
+  // 会保存用户和 Access Token，并跳转到首页。
+  it("Google 登录成功后应该保存状态并跳转", async () => {
+    // 1. 渲染 LoginPage。
+    // 页面中的 GoogleSignInButton 已经被替换成普通测试按钮。
+    renderLoginPage();
+
+    // 2. 用户点击模拟的 Google 登录按钮。
+    const user = userEvent.setup();
+
+    await user.click(
+      screen.getByRole("button", {
+        name: /mock google sign in/i,
+      }),
+    );
+
+    // 3. 检查 LoginPage 是否把后端返回的
+    // User 和 Access Token 保存到认证状态中。
+    expect(mockSetAuth).toHaveBeenCalledWith(
+      {
+        id: 2,
+        username: "Google User",
+        email: "google-user@gmail.com",
+        role: "User",
+        createdAt: "2026-09-03T10:00:00Z",
+      },
+      "google-uucars-token",
+    );
+
+    // 4. 当前没有来源页面，并且登录用户不是 Admin，
+    // 所以登录成功后应该进入首页。
+    expect(mockNavigate).toHaveBeenCalledWith("/", {
+      replace: true,
     });
   });
 });

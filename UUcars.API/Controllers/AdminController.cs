@@ -13,10 +13,12 @@ namespace UUcars.API.Controllers;
 public class AdminController : ControllerBase
 {
     private readonly AdminCarService _adminCarService;
+    private readonly AdminStatsService _adminStatsService;
 
-    public AdminController(AdminCarService adminCarService)
+    public AdminController(AdminCarService adminCarService, AdminStatsService adminStatsService)
     {
         _adminCarService = adminCarService;
+        _adminStatsService = adminStatsService;
     }
 
     // POST /admin/cars/{id}/approve
@@ -65,5 +67,14 @@ public class AdminController : ControllerBase
     {
         await _adminCarService.AdminDeleteAsync(id, cancellationToken);
         return NoContent();
+    }
+
+    // 新增统计数据接口
+    // GET /admin/stats
+    [HttpGet("stats")]
+    public async Task<IActionResult> GetStats(CancellationToken cancellationToken)
+    {
+        var stats = await _adminStatsService.GetStatsAsync(cancellationToken);
+        return Ok(ApiResponse<AdminStatsResponse>.Ok(stats));
     }
 }

@@ -1,4 +1,5 @@
 import { defineConfig } from "@playwright/test";
+import { E2E_API_BASE_URL, E2E_FRONTEND_BASE_URL } from "./e2e/config";
 
 export default defineConfig({
   testDir: "./e2e",
@@ -22,7 +23,7 @@ export default defineConfig({
   timeout: 30000,
 
   use: {
-    baseURL: "http://localhost:5173",
+    baseURL: E2E_FRONTEND_BASE_URL,
 
     // 失败时自动截图，保存在 test-results/ 目录
     // 截图是 E2E 调试的关键工具——失败时能看到浏览器当时的状态
@@ -30,6 +31,36 @@ export default defineConfig({
 
     trace: "on-first-retry",
   },
+
+  webServer: [
+    {
+      name: "E2E API",
+      cwd: "..",
+      command:
+        "dotnet run --project UUcars.API/UUcars.API.csproj  --launch-profile e2e",
+      url: `${E2E_API_BASE_URL}/cars?page=1&pageSize=1`,
+      reuseExistingServer: false,
+      timeout: 120_000,
+      gracefulShutdown: {
+        signal: "SIGINT",
+        timeout: 5_000,
+      },
+    },
+    {
+      name: "Vite Frontend",
+      command: "npm run dev -- --port 5173 --strictPort",
+      url: E2E_FRONTEND_BASE_URL,
+      env: {
+        VITE_API_BASE_URL: E2E_API_BASE_URL,
+      },
+      reuseExistingServer: false,
+      timeout: 120_000,
+      gracefulShutdown: {
+        signal: "SIGINT",
+        timeout: 5_000,
+      },
+    },
+  ],
 
   projects: [
     {

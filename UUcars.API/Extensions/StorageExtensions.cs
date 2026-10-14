@@ -1,6 +1,7 @@
 using Amazon.Runtime;
 using Amazon.S3;
 using UUcars.API.Configurations;
+using UUcars.API.Services.Storage;
 
 namespace UUcars.API.Extensions;
 
@@ -31,6 +32,7 @@ public static class StorageExtensions
 
         // 注册 IAmazonS3（Singleton：S3 客户端是线程安全的，可以全局共享）
         services.AddSingleton<IAmazonS3>(s3Client);
+        services.AddScoped<IStorageService, R2StorageService>();
 
         return services;
     }

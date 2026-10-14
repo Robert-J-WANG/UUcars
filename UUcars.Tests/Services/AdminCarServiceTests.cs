@@ -9,6 +9,7 @@ using UUcars.API.Exceptions;
 using UUcars.API.Repositories;
 using UUcars.API.Services;
 using UUcars.API.Services.Audit;
+using UUcars.API.Services.Notifications;
 using UUcars.Tests.Fakes;
 
 namespace UUcars.Tests.Services;
@@ -20,7 +21,9 @@ public class AdminCarServiceTests
     // （GetAuditLogsAsync 才会真正用到它，并发冲突测试不会触碰）
     private static AdminCarService CreateService(
         ICarRepository carRepository,
-        IAuditLogService? auditLogService = null)
+        IAuditLogService? auditLogService = null,
+        // ✅ 新增
+        INotificationService? notificationService = null)
     {
         var options = new DbContextOptionsBuilder<AppDbContext>()
             .UseInMemoryDatabase(Guid.NewGuid().ToString())
@@ -36,7 +39,8 @@ public class AdminCarServiceTests
             NullLogger<AdminCarService>.Instance,
             auditLogService ?? new FakeAuditLogService(),
             currentUserService,
-            context
+            // ✅ 新增
+            context, notificationService ?? new FakeNotificationService()
         );
     }
 
@@ -120,6 +124,69 @@ public class AdminCarServiceTests
         // 所以 AdminCarService 里的 if (adminId.HasValue) 判断会跳过写审计日志
         // 这个测试验证的是"流程不报错"，真正的审计写入在集成测试里验证
         Assert.Empty(fakeAuditLog.Entries);
+    }
+
+    // 新增推送通知测试
+
+    [Fact]
+    public async Task ApproveAsync_WhenSuccessful_SendsNotificationToSeller()
+    {
+        var fakeRepo = new FakeCarRepository();
+        var fakeNotifications = new FakeNotificationService();
+        var service = CreateService(fakeRepo, notificationService: fakeNotifications);
+
+        fakeRepo.Seed(new Car
+        {
+            Id = 1,
+            SellerId = 42,
+            Title = "My Test Car",
+            Brand = "Toyota",
+            Model = "Corolla",
+            Year = 2020,
+            Price = 10000,
+            Mileage = 50000,
+            Status = CarStatus.PendingReview,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        });
+
+        await service.ApproveAsync(1);
+
+        // 验证通知被发送给卖家（SellerId = 42）
+        Assert.Single(fakeNotifications.SentNotifications);
+        Assert.Equal(42, fakeNotifications.SentNotifications[0].UserId);
+        Assert.Equal(NotificationTypes.CarApproved,
+            fakeNotifications.SentNotifications[0].Type);
+    }
+
+    [Fact]
+    public async Task RejectAsync_WhenSuccessful_SendsNotificationToSeller()
+    {
+        var fakeRepo = new FakeCarRepository();
+        var fakeNotifications = new FakeNotificationService();
+        var service = CreateService(fakeRepo, notificationService: fakeNotifications);
+
+        fakeRepo.Seed(new Car
+        {
+            Id = 1,
+            SellerId = 42,
+            Title = "My Test Car",
+            Brand = "Toyota",
+            Model = "Corolla",
+            Year = 2020,
+            Price = 10000,
+            Mileage = 50000,
+            Status = CarStatus.PendingReview,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        });
+
+        await service.RejectAsync(1);
+
+        Assert.Single(fakeNotifications.SentNotifications);
+        Assert.Equal(42, fakeNotifications.SentNotifications[0].UserId);
+        Assert.Equal(NotificationTypes.CarRejected,
+            fakeNotifications.SentNotifications[0].Type);
     }
 }
 

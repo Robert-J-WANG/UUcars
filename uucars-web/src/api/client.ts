@@ -74,10 +74,19 @@ apiClient.interceptors.response.use(
       _retry?: boolean;
     };
 
+    // 定义登录的请求
+    const isSignInRequest =
+      originalRequest.url === "/auth/login" ||
+      originalRequest.url === "/auth/google";
+
     // =============================================
     // 处理 401 Token 过期：自动刷新后重试
     // =============================================
-    if (error.response?.status === 401 && !originalRequest._retry) {
+    if (
+      error.response?.status === 401 &&
+      !originalRequest._retry &&
+      !isSignInRequest // 登录请求不执行刷新操作
+    ) {
       // 标记这个请求已经尝试过刷新
       // 防止刷新后重试的请求再次触发刷新（死循环）
       originalRequest._retry = true;

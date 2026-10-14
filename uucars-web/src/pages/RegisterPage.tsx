@@ -7,13 +7,11 @@ import { authApi } from "@/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
+import PasswordInput from "@/components/PasswordInput";
+import { Car } from "lucide-react";
+import GoogleSignInButton from "@/components/GoogleSignInButton";
+import { useAuthStore } from "@/stores/authStore";
+import type { LoginResponse } from "@/types";
 
 const registerSchema = z.object({
   username: z
@@ -38,6 +36,7 @@ function RegisterPage() {
   const [serverError, setServerError] = useState<string | null>(null);
   const [isSuccess, setIsSuccess] = useState(false);
   const navigate = useNavigate();
+  const { setAuth } = useAuthStore();
 
   const {
     register,
@@ -46,6 +45,14 @@ function RegisterPage() {
   } = useForm<RegisterForm>({
     resolver: zodResolver(registerSchema),
   });
+
+  const completeGoogleAuthentication = (result: LoginResponse) => {
+    // Google 登录已经得到 UUcars User 和 Access Token。
+    setAuth(result.user, result.token);
+
+    // RegisterPage 没有来源页，成功后直接进入首页。
+    navigate("/", { replace: true });
+  };
 
   const onSubmit = async (data: RegisterForm) => {
     setServerError(null);
@@ -63,105 +70,277 @@ function RegisterPage() {
   if (isSuccess) {
     console.log(isSuccess);
     return (
-      <div className="flex min-h-screen items-center justify-center bg-gray-50">
-        <Card className="w-full max-w-md">
-          <CardHeader>
-            <CardTitle>Check your email</CardTitle>
-            <CardDescription>
-              We've sent a verification link to your email. Please click the
-              link to activate your account.
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
+      <div
+        className="flex min-h-screen items-center justify-center px-4 py-12"
+        style={{ backgroundColor: "var(--color-bg)" }}
+      >
+        <div
+          className="pointer-events-none fixed inset-0 opacity-30"
+          style={{
+            background:
+              "radial-gradient(ellipse 80% 60% at 50% -10%, var(--color-primary-light), transparent)",
+          }}
+        />
+
+        <div className="relative w-full max-w-sm animate-fade-in-up">
+          <div className="mb-8 text-center">
+            <Link to="/" className="mb-3 inline-flex items-center gap-2">
+              <div
+                className="flex h-9 w-9 items-center justify-center rounded-xl"
+                style={{ backgroundColor: "var(--color-accent)" }}
+              >
+                <Car className="h-5 w-5 text-white" />
+              </div>
+              <span
+                className="text-xl font-bold"
+                style={{
+                  color: "var(--color-accent)",
+                  fontFamily: "'DM Serif Display', serif",
+                }}
+              >
+                UUcars
+              </span>
+            </Link>
+
+            <h1
+              className="text-2xl"
+              style={{
+                color: "var(--color-text-primary)",
+                fontFamily: "'DM Serif Display', serif",
+              }}
+            >
+              Check your email
+            </h1>
+            <p
+              className="mt-1 text-sm"
+              style={{ color: "var(--color-text-secondary)" }}
+            >
+              One more step to activate your account
+            </p>
+          </div>
+
+          <div
+            className="rounded-[var(--radius-xl)] border p-7"
+            style={{
+              backgroundColor: "var(--color-surface)",
+              borderColor: "var(--color-border)",
+              boxShadow: "var(--shadow-lg)",
+            }}
+          >
+            <p
+              className="mb-6 text-center text-sm leading-6"
+              style={{ color: "var(--color-text-secondary)" }}
+            >
+              We've sent a verification link to your email. Click the link to
+              activate your account.
+            </p>
+
             <Button
               variant="outline"
+              size="lg"
               className="w-full"
               onClick={() => navigate("/login")}
             >
               Back to sign in
             </Button>
-          </CardContent>
-        </Card>
+          </div>
+        </div>
       </div>
     );
   }
 
   // 注册表单
   return (
-    <div className="flex min-h-screen items-center justify-center bg-gray-50">
-      <Card className="w-full max-w-md">
-        <CardHeader className="space-y-1">
-          <CardTitle className="text-2xl font-bold">Create account</CardTitle>
-          <CardDescription>
-            Enter your details to create a new account
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+    <div
+      className="flex min-h-screen items-center justify-center px-4 py-12"
+      style={{ backgroundColor: "var(--color-bg)" }}
+    >
+      <div
+        className="pointer-events-none fixed inset-0 opacity-30"
+        style={{
+          background:
+            "radial-gradient(ellipse 80% 60% at 50% -10%, var(--color-primary-light), transparent)",
+        }}
+      />
+
+      <div className="relative w-full max-w-sm animate-fade-in-up">
+        <div className="mb-8 text-center">
+          <Link to="/" className="mb-3 inline-flex items-center gap-2">
+            <div
+              className="flex h-9 w-9 items-center justify-center rounded-xl"
+              style={{ backgroundColor: "var(--color-accent)" }}
+            >
+              <Car className="h-5 w-5 text-white" />
+            </div>
+            <span
+              className="text-xl font-bold"
+              style={{
+                color: "var(--color-accent)",
+                fontFamily: "'DM Serif Display', serif",
+              }}
+            >
+              UUcars
+            </span>
+          </Link>
+
+          <h1
+            className="text-2xl"
+            style={{
+              color: "var(--color-text-primary)",
+              fontFamily: "'DM Serif Display', serif",
+            }}
+          >
+            Create account
+          </h1>
+          <p
+            className="mt-1 text-sm"
+            style={{ color: "var(--color-text-secondary)" }}
+          >
+            Join UUcars to buy and sell cars
+          </p>
+        </div>
+
+        <div
+          className="rounded-[var(--radius-xl)] border p-7"
+          style={{
+            backgroundColor: "var(--color-surface)",
+            borderColor: "var(--color-border)",
+            boxShadow: "var(--shadow-lg)",
+          }}
+        >
+          <form
+            onSubmit={handleSubmit(onSubmit)}
+            noValidate
+            className="space-y-5"
+          >
             {serverError && (
-              <div className="rounded-md bg-red-50 p-3 text-sm text-red-600">
+              <div
+                className="rounded-[var(--radius-md)] px-4 py-3 text-sm"
+                style={{
+                  backgroundColor: "var(--color-danger-light)",
+                  color: "var(--color-danger)",
+                  border: "1px solid",
+                  borderColor:
+                    "color-mix(in srgb, var(--color-danger) 20%, transparent)",
+                }}
+              >
                 {serverError}
               </div>
             )}
 
-            <div className="space-y-2">
-              <Label htmlFor="username">Username</Label>
+            <div className="space-y-1.5">
+              <Label
+                htmlFor="username"
+                style={{ color: "var(--color-text-primary)" }}
+              >
+                Username
+              </Label>
               <Input
                 id="username"
                 placeholder="johndoe"
+                autoComplete="username"
                 {...register("username")}
               />
               {errors.username && (
-                <p className="text-sm text-red-500">
+                <p
+                  className="text-xs"
+                  style={{ color: "var(--color-danger)" }}
+                >
                   {errors.username.message}
                 </p>
               )}
             </div>
 
-            <div className="space-y-2">
-              <Label htmlFor="email">Email</Label>
+            <div className="space-y-1.5">
+              <Label
+                htmlFor="email"
+                style={{ color: "var(--color-text-primary)" }}
+              >
+                Email
+              </Label>
               <Input
                 id="email"
                 type="email"
                 placeholder="you@example.com"
+                autoComplete="email"
                 {...register("email")}
               />
               {errors.email && (
-                <p className="text-sm text-red-500">{errors.email.message}</p>
+                <p
+                  className="text-xs"
+                  style={{ color: "var(--color-danger)" }}
+                >
+                  {errors.email.message}
+                </p>
               )}
             </div>
 
-            <div className="space-y-2">
-              <Label htmlFor="password">Password</Label>
-              <Input
+            <div className="space-y-1.5">
+              <Label
+                htmlFor="password"
+                style={{ color: "var(--color-text-primary)" }}
+              >
+                Password
+              </Label>
+              <PasswordInput
                 id="password"
-                type="password"
                 placeholder="••••••••"
+                autoComplete="new-password"
                 {...register("password")}
               />
               {errors.password && (
-                <p className="text-sm text-red-500">
+                <p
+                  className="text-xs"
+                  style={{ color: "var(--color-danger)" }}
+                >
                   {errors.password.message}
                 </p>
               )}
             </div>
 
-            <Button type="submit" className="w-full" disabled={isSubmitting}>
+            <Button
+              type="submit"
+              className="w-full"
+              size="lg"
+              disabled={isSubmitting}
+            >
               {isSubmitting ? "Creating account..." : "Create account"}
             </Button>
-
-            <p className="text-center text-sm text-gray-600">
-              Already have an account?{" "}
-              <Link
-                to="/login"
-                style={{ color: "var(--color-accent)", fontWeight: "bold" }}
-              >
-                Sign in
-              </Link>
-            </p>
           </form>
-        </CardContent>
-      </Card>
+
+          {/* 分割线 */}
+          <div className="my-6 flex items-center gap-3">
+            <div className="h-px flex-1 bg-[var(--color-border-strong)]" />
+
+            <span className="shrink-0 text-sm text-muted-foreground">
+              Or continue with
+            </span>
+
+            <div className="h-px flex-1 bg-[var(--color-border-strong)]" />
+          </div>
+
+          {/* Google登录 */}
+          <div className="flex justify-center">
+            <GoogleSignInButton
+              onAuthenticated={completeGoogleAuthentication}
+            />
+          </div>
+        </div>
+
+        <p
+          className="mt-5 text-center text-sm"
+          style={{ color: "var(--color-text-secondary)" }}
+        >
+          Already have an account?{" "}
+          <Link
+            to="/login"
+            className="font-medium transition-colors hover:underline"
+            style={{ color: "var(--color-accent)" }}
+          >
+            Sign in
+          </Link>
+        </p>
+      </div>
     </div>
   );
 }

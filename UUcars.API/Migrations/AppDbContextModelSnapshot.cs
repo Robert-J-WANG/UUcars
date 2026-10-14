@@ -166,6 +166,42 @@ namespace UUcars.API.Migrations
                     b.ToTable("CarImages");
                 });
 
+            modelBuilder.Entity("UUcars.API.Entities.ExternalLogin", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("int");
+
+                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("datetime2");
+
+                    b.Property<string>("Provider")
+                        .IsRequired()
+                        .HasMaxLength(30)
+                        .HasColumnType("nvarchar(30)");
+
+                    b.Property<string>("ProviderSubject")
+                        .IsRequired()
+                        .HasMaxLength(255)
+                        .HasColumnType("nvarchar(255)");
+
+                    b.Property<int>("UserId")
+                        .HasColumnType("int");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("UserId")
+                        .HasDatabaseName("IX_ExternalLogins_UserId");
+
+                    b.HasIndex("Provider", "ProviderSubject")
+                        .IsUnique()
+                        .HasDatabaseName("IX_ExternalLogins_Provider_ProviderSubject");
+
+                    b.ToTable("ExternalLogins");
+                });
+
             modelBuilder.Entity("UUcars.API.Entities.Favorite", b =>
                 {
                     b.Property<int>("UserId")
@@ -182,6 +218,46 @@ namespace UUcars.API.Migrations
                     b.HasIndex("CarId");
 
                     b.ToTable("Favorites");
+                });
+
+            modelBuilder.Entity("UUcars.API.Entities.Notification", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("int");
+
+                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("datetime2");
+
+                    b.Property<bool>("IsRead")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bit")
+                        .HasDefaultValue(false);
+
+                    b.Property<string>("Message")
+                        .IsRequired()
+                        .HasMaxLength(300)
+                        .HasColumnType("nvarchar(300)");
+
+                    b.Property<int?>("RelatedId")
+                        .HasColumnType("int");
+
+                    b.Property<string>("Type")
+                        .IsRequired()
+                        .HasMaxLength(50)
+                        .HasColumnType("nvarchar(50)");
+
+                    b.Property<int>("UserId")
+                        .HasColumnType("int");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("UserId", "IsRead", "CreatedAt")
+                        .HasDatabaseName("IX_Notifications_UserId_IsRead_CreatedAt");
+
+                    b.ToTable("Notifications");
                 });
 
             modelBuilder.Entity("UUcars.API.Entities.Order", b =>
@@ -335,7 +411,6 @@ namespace UUcars.API.Migrations
                         .HasDefaultValue(false);
 
                     b.Property<string>("PasswordHash")
-                        .IsRequired()
                         .HasMaxLength(256)
                         .HasColumnType("nvarchar(256)");
 
@@ -413,6 +488,17 @@ namespace UUcars.API.Migrations
                     b.Navigation("Car");
                 });
 
+            modelBuilder.Entity("UUcars.API.Entities.ExternalLogin", b =>
+                {
+                    b.HasOne("UUcars.API.Entities.User", "User")
+                        .WithMany("ExternalLogins")
+                        .HasForeignKey("UserId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("User");
+                });
+
             modelBuilder.Entity("UUcars.API.Entities.Favorite", b =>
                 {
                     b.HasOne("UUcars.API.Entities.Car", "Car")
@@ -428,6 +514,17 @@ namespace UUcars.API.Migrations
                         .IsRequired();
 
                     b.Navigation("Car");
+
+                    b.Navigation("User");
+                });
+
+            modelBuilder.Entity("UUcars.API.Entities.Notification", b =>
+                {
+                    b.HasOne("UUcars.API.Entities.User", "User")
+                        .WithMany()
+                        .HasForeignKey("UserId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
 
                     b.Navigation("User");
                 });
@@ -511,6 +608,8 @@ namespace UUcars.API.Migrations
                     b.Navigation("BuyerOrders");
 
                     b.Navigation("Cars");
+
+                    b.Navigation("ExternalLogins");
 
                     b.Navigation("Favorites");
 

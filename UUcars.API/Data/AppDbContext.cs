@@ -20,12 +20,16 @@ public class AppDbContext : DbContext
     public DbSet<Order> Orders => Set<Order>();
     public DbSet<Favorite> Favorites => Set<Favorite>();
     public DbSet<Review> Reviews => Set<Review>();
+    public DbSet<Notification> Notifications => Set<Notification>();
 
     // 新增
     public DbSet<AuditLog> AuditLogs => Set<AuditLog>();
 
     // 注册refresh token
     public DbSet<RefreshToken> RefreshTokens => Set<RefreshToken>();
+
+    // 第三方授权登录
+    public DbSet<ExternalLogin> ExternalLogins => Set<ExternalLogin>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
