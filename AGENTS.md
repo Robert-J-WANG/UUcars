@@ -64,17 +64,19 @@ The implemented system currently covers:
 - V1: Step 01–35;
 - V2.0: Step 36–56;
 - V2.1: Step 56b;
-- V3: Step 57–70.
+- V3: Step 57–72.
 
-V3 Step 70 is complete.
+V3 Step 72 is complete. Step 73 is in progress. Its runtime upgrade, CI, real
+E2E and first gated production deployment are implemented; final close-out is
+not yet complete.
 
-V3 Step 71–75 remain roadmap items:
+The remaining V3 scope is:
 
-- Admin data dashboard;
-- Google OAuth;
-- CI/CD improvement;
-- bundle analysis and Web Vitals;
-- final V3 release and portfolio close-out.
+- Step 73: final documentation, validation and release close-out;
+- Step 74: measured frontend performance optimisation, followed by a release
+  through the same CI/CD flow;
+- Step 75: final configuration, documentation and release acceptance checks,
+  another CI/CD release, and the v3.3 tag.
 
 Do not describe roadmap items as implemented. Update this section when those
 steps are genuinely completed.
@@ -141,9 +143,9 @@ The established project stack is:
 
 ### Backend
 
-- .NET 9
+- .NET 10
 - ASP.NET Core Web API
-- Entity Framework Core 9
+- Entity Framework Core 10
 - SQL Server and Azure SQL Database
 - JWT Bearer authentication
 - Refresh-token rotation
@@ -400,9 +402,11 @@ npm run e2e
 Playwright requires the local API and frontend, prepared data and the expected
 test Admin account.
 
-The current GitHub Actions E2E job is a staging placeholder and does not execute
-the real Playwright suite. Do not report CI E2E as passing until that job is
-actually enabled against a staging environment.
+The current CI workflow runs the real Playwright suite with temporary SQL
+Server, Redis, API and frontend services on a GitHub Runner. Validate changes
+on the working feature branch before merging, and confirm develop CI after
+the merge. Dedicated Azure Staging is not required. Do not report CI E2E as
+passing without a real successful run.
 
 ### Documentation
 
@@ -488,7 +492,7 @@ README first and leave lower-level source documents inconsistent.
 Branch roles:
 
 ```text
-main       released milestones and tags
+main       production releases; milestone commits may receive tags
 develop    normal development baseline
 feature/*  feature work
 fix/*      isolated fixes
@@ -503,10 +507,24 @@ latest develop
 → implementation and tests
 → review
 → merge --no-ff into develop
-→ delete completed feature branch
+→ verify develop CI
+→ retain the feature branch until the step's release and close-out are complete
 ```
 
-Only milestone releases should merge `develop` into `main` and create a tag.
+From Step 73, production releases use a pull request from this repository's
+`develop` to `main`. Require the release-source check and Backend, Frontend
+and E2E checks before merging, using Create a merge commit. Daily feature
+merges into develop retain the existing local merge workflow; they do not
+require pull requests. Protect main without routine bypass permissions;
+another person's review is not required for this solo project.
+
+The implemented CD workflow deploys the exact commit from successful main push
+CI. Treat future rule or deployment changes as implemented only after their
+configuration and real execution have been verified.
+
+After a production release, synchronise the resulting `main` merge commit back
+into `develop`. Delete a feature branch only after its release and required
+checks are complete; never delete `develop` as the release source branch.
 
 Do not stage, commit, push, merge, rebase, delete a branch or create a pull
 request unless the owner explicitly requests that Git action.
