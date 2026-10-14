@@ -1,0 +1,256 @@
+name: CD
+
+on:
+  # main 的 CI 完成后创建 CD Run；是否真正发布由 Job 条件决定。
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+# 始终发布刚刚通过 CI 的提交，而不是 CD Workflow 自身所在的提交。
+env:
+  RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+
+jobs:
+  # =============================================
+  # Job 1：构建并保存前端部署产物
+  # =============================================
+  build-frontend:
+    name: Build Frontend Artifact
+    # 只接受本仓库 main Push 产生的成功 CI，拒绝失败、PR 或外部仓库事件。
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      contents: read
+
+    steps:
+      # Checkout 已通过 CI 的准确提交，避免构建期间 main 发生变化。
+      - name: Checkout verified commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_SHA }}
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install frontend dependencies
+        working-directory: uucars-web
+        run: npm ci
+
+      - name: Build frontend release
+        working-directory: uucars-web
+        run: npm run build
+
+      # 把提交 SHA 写入部署产物，并在上传前确认必要文件存在。
+      - name: Record frontend release
+        working-directory: uucars-web
+        run: |
+          node -e 'require("node:fs").writeFileSync("dist/release.json", JSON.stringify({ commit: process.env.RELEASE_SHA }))'
+          test -s dist/index.html
+          test -s dist/staticwebapp.config.json
+
+      # deploy Job 在另一台 Runner 上运行，因此通过 Artifact 传递 dist。
+      - name: Upload frontend artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-${{ env.RELEASE_SHA }}
+          path: uucars-web/dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  # =============================================
+  # Job 2：构建并推送后端镜像
+  # =============================================
+  build-backend:
+    name: Build Backend Image
+    # 与前端构建使用相同发布入口，两个 Job 可以并行运行。
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      image: ${{ steps.image.outputs.name }}
+      digest: ${{ steps.publish.outputs.digest }}
+
+    steps:
+      - name: Checkout verified commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_SHA }}
+
+      # GHCR 镜像路径必须使用小写 Owner。
+      - name: Set image name
+        id: image
+        env:
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          owner_lower=$(printf '%s' "$REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          echo "name=ghcr.io/$owner_lower/uucars-api" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # GITHUB_TOKEN 只用于本次 Workflow 向当前仓库的 GHCR Package 写入镜像。
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # SHA Tag 用于追踪来源，Digest 用于部署不可变的镜像内容。
+      - name: Build and push API image
+        id: publish
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.image.outputs.name }}:${{ env.RELEASE_SHA }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ env.RELEASE_SHA }}
+
+  # =============================================
+  # Job 3：按依赖顺序部署后端、前端并验证公网结果
+  # =============================================
+  deploy:
+    name: Deploy Production
+    needs:
+      - build-frontend
+      - build-backend
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+
+    # 不允许两个生产部署同时修改 Azure，也不强制中断已经开始的部署。
+    concurrency:
+      group: uucars-production
+      cancel-in-progress: false
+
+    env:
+      RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+      CONTAINER_APP: ${{ vars.AZURE_CONTAINER_APP }}
+      RELEASE_IMAGE: ${{ needs.build-backend.outputs.image }}@${{ needs.build-backend.outputs.digest }}
+
+    steps:
+      # 使用上一版已配置的 main Branch OIDC 身份登录 Azure。
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # 前端依赖 API，因此先把 Container App 更新为本次镜像 Digest。
+      - name: Deploy API image
+        uses: azure/container-apps-deploy-action@v1
+        with:
+          resourceGroup: ${{ env.RESOURCE_GROUP }}
+          containerAppName: ${{ env.CONTAINER_APP }}
+          imageToDeploy: ${{ env.RELEASE_IMAGE }}
+
+      # 从现有 Container App 读取公开地址，供最终冒烟检查使用。
+      - name: Read deployed API URL
+        id: backend
+        shell: bash
+        run: |
+          az extension add --name containerapp --upgrade --only-show-errors
+          fqdn=$(az containerapp show \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$CONTAINER_APP" \
+            --query properties.configuration.ingress.fqdn \
+            --output tsv)
+          test -n "$fqdn"
+          echo "api_url=https://$fqdn" >> "$GITHUB_OUTPUT"
+
+      # 下载 Job 1 为同一个 RELEASE_SHA 生成的预构建前端。
+      - name: Download frontend artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-${{ env.RELEASE_SHA }}
+          path: frontend-dist
+
+      - name: Check frontend artifact
+        run: |
+          test -s frontend-dist/index.html
+          test -s frontend-dist/staticwebapp.config.json
+          jq -e --arg commit "$RELEASE_SHA" \
+            '.commit == $commit' frontend-dist/release.json
+
+      # 直接上传 dist，不让 Static Web Apps 再次构建源码。
+      - name: Deploy frontend
+        id: frontend
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN_BLACK_COAST_04BA93800 }}
+          action: upload
+          app_location: frontend-dist
+          api_location: ""
+          output_location: ""
+          skip_app_build: true
+          skip_api_build: true
+          production_branch: main
+
+      # 同时验证 API 结构、前端入口和 release.json，确认两端均来自本次发布。
+      - name: Smoke test production
+        shell: bash
+        env:
+          API_URL: ${{ steps.backend.outputs.api_url }}
+          FRONTEND_URL: ${{ steps.frontend.outputs.static_web_app_url }}
+        run: |
+          set -euo pipefail
+          test -n "$API_URL"
+          test -n "$FRONTEND_URL"
+
+          api_response="$RUNNER_TEMP/smoke-cars.json"
+          page_response="$RUNNER_TEMP/smoke-index.html"
+          release_response="$RUNNER_TEMP/smoke-release.json"
+
+          for attempt in $(seq 1 12); do
+            if curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
+                 "${API_URL%/}/cars?page=1&pageSize=1" -o "$api_response" &&
+               jq -e '.success == true and (.data.items | type == "array")' \
+                 "$api_response" >/dev/null &&
+               curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
+                 "${FRONTEND_URL%/}/" -o "$page_response" &&
+               grep -q 'id="root"' "$page_response" &&
+               curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
+                 "${FRONTEND_URL%/}/release.json?commit=$RELEASE_SHA" \
+                 -o "$release_response" &&
+               jq -e --arg commit "$RELEASE_SHA" '.commit == $commit' \
+                 "$release_response" >/dev/null; then
+              echo "Production smoke checks passed for $RELEASE_SHA"
+              exit 0
+            fi
+
+            echo "Waiting for production responses: $attempt/12"
+            sleep 10
+          done
+
+          echo "::error::Production smoke checks failed."
+          exit 1

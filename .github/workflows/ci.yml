@@ -163,3 +163,29 @@ jobs:
             uucars-web/test-results/
           if-no-files-found: ignore
           retention-days: 7
+          
+
+  # =============================================
+  # Job 4：发布来源检查
+  # 只约束目标为 main 的 PR
+  # 来源分支必须是 develop
+  # 来源仓库必须是当前 UUcars 仓库
+  # =============================================
+  release-source:
+    name: Validate Release Source
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Require develop from this repository
+        env:
+          SOURCE_BRANCH: ${{ github.head_ref }}
+          SOURCE_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          TARGET_REPOSITORY: ${{ github.repository }}
+        run: |
+          if [ "$SOURCE_BRANCH" != "develop" ] ||
+             [ "$SOURCE_REPOSITORY" != "$TARGET_REPOSITORY" ]; then
+            echo "::error::Release PRs must come from develop in this repository."
+            exit 1
+          fi
+          echo "Release source verified."
