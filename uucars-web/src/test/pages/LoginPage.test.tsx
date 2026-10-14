@@ -83,7 +83,11 @@ describe("LoginPage", () => {
     const user = userEvent.setup();
 
     // 直接点提交，不填任何内容
-    await user.click(screen.getByRole("button", { name: /sign in/i }));
+    await user.click(
+      screen.getByRole("button", {
+        name: /^sign in$/i,
+      }),
+    );
 
     // RHF + Zod 验证失败，应该显示错误提示
     // 这里必须用 waitFor：Zod resolver 内部走的是 Promise 链，
@@ -100,7 +104,7 @@ describe("LoginPage", () => {
     const user = userEvent.setup();
 
     await user.type(screen.getByLabelText(/email/i), "not-an-email");
-    await user.click(screen.getByRole("button", { name: /sign in/i }));
+    await user.click(screen.getByRole("button", { name: /^sign in$/i }));
 
     await waitFor(() => {
       expect(screen.getByText(/invalid email/i)).toBeInTheDocument();
@@ -125,7 +129,7 @@ describe("LoginPage", () => {
 
     await user.type(screen.getByLabelText(/email/i), "test@example.com");
     await user.type(screen.getByLabelText(/password/i), "password123");
-    await user.click(screen.getByRole("button", { name: /sign in/i }));
+    await user.click(screen.getByRole("button", { name: /^sign in$/i }));
 
     await waitFor(() => {
       // 验证 login 确实被调用，且传了正确的参数
@@ -148,7 +152,11 @@ describe("LoginPage", () => {
 
     await user.type(screen.getByLabelText(/email/i), "test@example.com");
     await user.type(screen.getByLabelText(/password/i), "wrongpassword");
-    await user.click(screen.getByRole("button", { name: /sign in/i }));
+    await user.click(
+      screen.getByRole("button", {
+        name: /^sign in$/i,
+      }),
+    );
 
     await waitFor(() => {
       expect(

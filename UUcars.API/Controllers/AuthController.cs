@@ -1,6 +1,7 @@
 using Google.Apis.Auth;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
+using UUcars.API.Configurations;
 using UUcars.API.DTOs;
 using UUcars.API.DTOs.Requests;
 using UUcars.API.DTOs.Responses;
@@ -186,14 +187,14 @@ public class AuthController : ControllerBase
 
 
     // GET /auth/test-verification-token?email=xxx
-// ⚠️ 仅开发环境：供 E2E 测试绕过邮件验证
-// 非开发环境返回 404，和接口不存在完全一样
+    // 仅本地 Development 和 E2E 环境可用，供 E2E 测试绕过真实邮件投递。
     [HttpGet("test-verification-token")]
     public async Task<IActionResult> GetTestVerificationToken(
         [FromQuery] string email,
         CancellationToken cancellationToken)
     {
-        if (!_environment.IsDevelopment())
+        if (!_environment.IsDevelopment() &&
+            !_environment.IsEnvironment(AppEnvironments.E2E))
             return NotFound();
 
         var token = await _userService.GetEmailConfirmationTokenAsync(
@@ -235,16 +236,13 @@ public class AuthController : ControllerBase
             Path = "/" // 全站发送，避免非/auth路径下无法携带Cookie
         };
 
-        // 开发环境：Secure=false（本地没有 HTTPS）
-        // 通过环境变量判断，避免本地开发时 Cookie 无法设置
-        if (HttpContext.RequestServices
-            .GetRequiredService<IWebHostEnvironment>()
-            .IsDevelopment())
+        // Development 和 E2E 都使用本地 HTTP，因此不能要求 Secure Cookie。
+        if (_environment.IsDevelopment() ||
+            _environment.IsEnvironment(AppEnvironments.E2E))
         {
             cookieOptions.SameSite = SameSiteMode.Strict;
             cookieOptions.Secure = false;
         }
-
 
         Response.Cookies.Append("refreshToken", token, cookieOptions);
     }

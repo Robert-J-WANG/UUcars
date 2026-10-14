@@ -1,5 +1,6 @@
 using Resend;
 using UUcars.API.Configurations;
+using UUcars.API.Services.Email;
 
 namespace UUcars.API.Extensions;
 
@@ -26,6 +27,7 @@ public static class EmailExtensions
         services.AddHttpClient<ResendClient>();
         services.Configure<ResendClientOptions>(o => { o.ApiToken = apiKey; });
         services.AddTransient<IResend, ResendClient>();
+        services.AddScoped<IEmailService, ResendEmailService>();
 
         return services;
     }

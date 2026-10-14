@@ -1,5 +1,4 @@
 using System.IdentityModel.Tokens.Jwt;
-using Hangfire;
 using Microsoft.AspNetCore.Identity;
 using UUcars.API.Auth;
 using UUcars.API.DTOs.Responses;
@@ -7,15 +6,13 @@ using UUcars.API.Entities;
 using UUcars.API.Entities.Enums;
 using UUcars.API.Exceptions;
 using UUcars.API.Repositories;
-using UUcars.API.Services.Email;
+using UUcars.API.Services.BackgroundJobs;
 
 namespace UUcars.API.Services;
 
 public class UserService
 {
-    // 后台队列服务
-    private readonly IBackgroundJobClient _backgroundJobClient;
-    private readonly IEmailService _emailService;
+    private readonly IBackgroundJobService _backgroundJobService;
     private readonly JwtTokenGenerator _jwtTokenGenerator;
     private readonly ILogger<UserService> _logger;
     private readonly IPasswordHasher<User> _passwordHasher; // 改为接口
@@ -27,15 +24,13 @@ public class UserService
         IUserRepository userRepository,
         IPasswordHasher<User> passwordHasher, // 改为接口注入
         JwtTokenGenerator jwtTokenGenerator,
-        IEmailService emailService,
-        IBackgroundJobClient backgroundJobClient, // 新增后台队列
+        IBackgroundJobService backgroundJobService,
         ILogger<UserService> logger)
     {
         _userRepository = userRepository;
         _passwordHasher = passwordHasher;
         _jwtTokenGenerator = jwtTokenGenerator;
-        _emailService = emailService;
-        _backgroundJobClient = backgroundJobClient;
+        _backgroundJobService = backgroundJobService;
         _logger = logger;
     }
 
@@ -71,18 +66,9 @@ public class UserService
         // 4. 存入数据库
         var created = await _userRepository.AddAsync(user, cancellationToken);
 
-        // =============================================
-        // V3 更新：邮件发送改为 Hangfire 异步任务
-        // try/catch 不再需要：Hangfire 有内置重试机制（失败自动重试10次，指数退避）
-        // 邮件发送失败会在 Hangfire Dashboard 里显示，可以手动重试`
-        // =============================================
-        _backgroundJobClient.Enqueue<IEmailService>(service =>
-            service.SendEmailVerificationAsync(
-                created.Email,
-                created.EmailConfirmationToken!,
-                CancellationToken.None // Hangfire 序列化参数时不支持 CancellationToken，必须用 None
-            )
-        );
+        _backgroundJobService.EnqueueEmailVerification(
+            created.Email,
+            created.EmailConfirmationToken!);
 
         _logger.LogInformation(
             "New user registered: {Email}, verification email job enqueued", created.Email);
@@ -219,9 +205,7 @@ public class UserService
 
         await _userRepository.UpdateAsync(user, cancellationToken);
 
-        // v3: 改为 Hangfire 异步任务
-        _backgroundJobClient.Enqueue<IEmailService>(service =>
-            service.SendEmailVerificationAsync(user.Email, newToken, CancellationToken.None));
+        _backgroundJobService.EnqueueEmailVerification(user.Email, newToken);
 
         _logger.LogInformation(
             "Verification email resend job enqueued for: {Email}", email);
@@ -271,9 +255,7 @@ public class UserService
 
         await _userRepository.UpdateAsync(user, cancellationToken);
 
-        // v3: 改为 Hangfire 异步任务
-        _backgroundJobClient.Enqueue<IEmailService>(service =>
-            service.SendPasswordResetAsync(user.Email, resetToken, CancellationToken.None));
+        _backgroundJobService.EnqueuePasswordReset(user.Email, resetToken);
 
         _logger.LogInformation(
             "Password reset email job enqueued for: {Email}", email);
