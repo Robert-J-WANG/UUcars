@@ -57,29 +57,24 @@ a concrete need and the owner explicitly approves it.
 Security, data integrity and correctness are never optional merely because the
 project targets an early-career level.
 
-## 3. Current project status
+## 3. Project status handling
 
-The implemented system currently covers:
+Do not store current version or development-step completion status in this
+file. This file contains durable repository rules, not a progress snapshot.
 
-- V1: Step 01–35;
-- V2.0: Step 36–56;
-- V2.1: Step 56b;
-- V3: Step 57–72.
+Before starting, reviewing or documenting a development step:
 
-V3 Step 72 is complete. Step 73 is in progress. Its runtime upgrade, CI, real
-E2E and first gated production deployment are implemented; final close-out is
-not yet complete.
+- determine the current state using the source-of-truth order in section 5;
+- inspect the relevant development notes, source code, configuration, tests and
+  Git history;
+- verify relevant CI, deployment and production checks before relying on a
+  completion or release claim;
+- do not rely on remembered conversation context or a stale roadmap summary;
+- never describe planned or partially completed work as implemented.
 
-The remaining V3 scope is:
-
-- Step 73: final documentation, validation and release close-out;
-- Step 74: measured frontend performance optimisation, followed by a release
-  through the same CI/CD flow;
-- Step 75: final configuration, documentation and release acceptance checks,
-  another CI/CD release, and the v3.3 tag.
-
-Do not describe roadmap items as implemented. Update this section when those
-steps are genuinely completed.
+Keep changing implementation progress in the corresponding `docs/steps_v*.md`
+file. Keep public implementation and roadmap status in `README.md` where
+appropriate.
 
 ## 4. Language and communication
 
@@ -449,7 +444,7 @@ These are canonical version development outlines.
 - Keep them aligned with the confirmed implementation.
 - Do not include “original plan versus actual result” narration.
 - Remove technologies and features that are not part of that version.
-- Keep the V1, V2 and V3 format consistent.
+- Keep version outline formats consistent with the neighbouring versions.
 - Keep completed work and roadmap boundaries accurate.
 
 ### `docs/database-schema.md`
@@ -459,8 +454,9 @@ This is the current complete database reference.
 - Keep final fields, indexes, relationships and delete behaviour aligned with
   the Model Snapshot.
 - Mark which version introduced each table, field, index and relationship.
-- Preserve the V1 → V2 → V3 Migration timeline.
-- Do not make V1 instructions depend on V2 or V3 fields.
+- Preserve the version-to-version Migration timeline.
+- Do not make instructions for an earlier version depend on fields introduced
+  by a later version.
 
 ### `README.md`
 
@@ -487,7 +483,286 @@ After an implementation change, use this order where applicable:
 Before changing documentation, inspect and report discrepancies. Do not update
 README first and leave lower-level source documents inconsistent.
 
-## 14. Git workflow
+## 14. Development step outline rules
+
+Use these rules whenever creating, revising or reviewing the outline for any
+development step.
+
+### Establish the boundary first
+
+Before drafting the outline:
+
+- verify the previous step's real completion state against the source-of-truth
+  order in section 5;
+- identify the current implementation, configuration, test and delivery state;
+- state the concrete problem this step needs to solve;
+- define what is included, what is excluded and what proves the step complete;
+- keep later-step work out of the current step;
+- never describe planned work, checks or releases as completed.
+
+If the documents disagree with the implementation, report the discrepancy
+before using either version as the outline's starting point.
+
+### Organise around one real development carrier
+
+Choose one primary carrier that represents how the work actually proceeds. It
+may be a user journey, request flow, data flow, application lifecycle, delivery
+workflow or concrete artefact. Use it to connect the whole step.
+
+Do not organise an outline as a collection of unrelated technology topics. A
+technology belongs in the outline only where it supports the carrier and solves
+the problem at that stage.
+
+Order sections by real dependencies and implementation sequence. A typical
+sequence is:
+
+```text
+confirm the starting state
+→ establish the method or baseline
+→ gather evidence
+→ identify the actual problem
+→ make the smallest justified change
+→ compare and validate
+→ document and deliver
+```
+
+Adapt the sequence to the work instead of forcing every step into this exact
+shape. Each section should create the reason or evidence needed by the next
+section.
+
+### Keep decisions proportionate and evidence-led
+
+For every proposed item, check:
+
+- whether it solves a current and observable project problem;
+- whether it serves the expected users and normal project scenarios;
+- whether its benefit justifies its implementation and maintenance cost;
+- whether it belongs in this step rather than a later step;
+- whether the existing stack already provides a sufficient solution;
+- whether the owner can understand and explain the resulting design.
+
+Do not preselect an optimisation, abstraction, dependency or architecture before
+the preceding evidence supports it. The outline must permit a proposed change to
+be reduced or rejected when measurement shows that it has little value.
+
+Use techniques that are current, supported, production-relevant and compatible
+with the repository's actual versions. When compatibility or the correct
+approach is not yet established, plan an investigation and decision point rather
+than presenting an assumption as the chosen implementation.
+
+Keep related technical concepts distinct. Do not treat similar metrics, loading
+states, error boundaries, test levels, deployment stages or architectural
+patterns as interchangeable merely to simplify the outline.
+
+### Keep the outline at outline depth
+
+An outline should establish:
+
+- why the work is needed;
+- the carrier and logical sequence;
+- the evidence or decisions required at each stage;
+- the permitted change boundary;
+- the validation and completion criteria.
+
+Do not overload it with commands, long concept tutorials, speculative
+implementation detail or results that do not yet exist. The number of sections
+must follow the content: merging must not remove a required responsibility, and
+splitting must improve sequence or clarity rather than satisfy a preferred
+section count.
+
+Use wording that preserves the difference between intention and evidence. For
+example, write that a step will be released through the existing delivery flow
+until the required checks, deployment and production validation have actually
+succeeded.
+
+### Audit an outline before saving it
+
+Confirm all of the following:
+
+1. it matches the current source, configuration, tests and delivery state;
+2. it has a clear scope and does not pull later work forward;
+3. it avoids low-value edge cases, speculative optimisation and unnecessary
+   architecture;
+4. its techniques are current and compatible with the implemented stack;
+5. one real carrier connects the sections;
+6. the sections follow causal dependencies and actual development order;
+7. it does not repeat responsibilities or reveal unverified conclusions;
+8. its completion and release wording reflects evidence rather than intention.
+
+## 15. Development step detail-expansion rules
+
+Use these rules when expanding an approved development step outline into
+detailed development and learning notes.
+
+### Re-read the repository guidance first
+
+Before generating new development-step content or expanding existing content,
+re-read this entire `AGENTS.md` from the current workspace. Do this for every
+such request, even if the file was read earlier in the same conversation. Do not
+rely on remembered rules, an earlier summary or previous conversation context.
+
+After re-reading it:
+
+- identify the applicable edit authority, source-of-truth, scope, technical,
+  documentation and validation rules;
+- inspect the approved outline, adjacent sections and relevant implementation
+  evidence;
+- resolve or report any conflict before writing;
+- apply the rules to both the generated content and the final review.
+
+### Preserve the approved scope
+
+- Expand only the scope explicitly requested by the owner.
+- Treat the approved outline as the content contract for purpose, order and
+  boundaries.
+- Add the explanation, operations and validation needed to fulfil that contract,
+  but do not add a new objective or architecture direction.
+- Preserve every unrelated section.
+- If detailed investigation shows that the outline is inaccurate, conflicting
+  or incomplete, report the issue before changing its structure or scope.
+
+### Preserve chronological knowledge and the formal record
+
+Write from the knowledge available at that point in the development sequence.
+For example, a baseline section records the current state, an analysis section
+derives a conclusion from that evidence, an implementation section applies the
+supported change, and a comparison section decides whether it helped.
+
+Do not reveal a later finding, chosen solution, measurement result, test result
+or release outcome before the notes reach the stage where it became known. Do
+not make expected output look like executed output.
+
+Record durable implementation facts when they matter to the learning sequence,
+such as confirmed commits, configuration, technical decisions, executed output
+and validation results. Do not copy the writing session into the project record.
+Exclude:
+
+- drafting conversation and outline revision history;
+- the Agent's current editing activity;
+- temporary file modifications created only while drafting documentation;
+- deliberation about how the current writing task should be organised;
+- transient workspace details that do not affect the implemented system.
+
+If a temporary observation exposes a real implementation problem, record the
+problem and its resolution at the appropriate stage, not the surrounding
+conversation. Preserve genuine implementation history when section 13 requires
+it.
+
+### Maintain one causal and non-repetitive narrative
+
+Within each section, connect the content in this order where applicable:
+
+```text
+current state
+→ resulting problem or question
+→ reason this work is needed now
+→ action or decision
+→ validation and conclusion
+```
+
+Sequential explanatory paragraphs should have an explicit causal or
+transitional relationship. Keep the same user journey, request flow, data flow,
+lifecycle, workflow or artefact as the local narrative carrier. Do not switch
+between unrelated technology explanations merely because they belong to the
+same broad topic.
+
+Check repetition by meaning, not only by matching words. Explain a concept fully
+where it first becomes necessary, then refer only to the part needed later. State
+the step goal, full workflow, scope exclusions and release process at the level
+where each belongs; do not repeat their complete form in later operational
+sections.
+
+### Use the minimum sufficient explanation
+
+Detailed notes must be understandable without becoming either a bare operation
+manual or a general textbook. Keep explanation that is needed to establish:
+
+- why the work is needed at this point;
+- the concrete project problem addressed by the action;
+- non-obvious tool behaviour, parameters or technical consequences;
+- what an observed or expected result means;
+- how the result creates the next development step.
+
+Remove explanation that only:
+
+- describes an obvious normal operation;
+- repeats a reason already established nearby or in another section;
+- defends against a low-probability case outside the agreed scope;
+- repeats a scope boundary that is already clear;
+- adds words without changing the reader's understanding or decision.
+
+After showing a result, explain its immediate significance once. Do not extend
+the same conclusion through several paraphrased benefits. When considering a
+deletion, ask whether the reader can still understand why the action occurs,
+what happened and what the result means. If all three remain clear, remove the
+sentence.
+
+Explain an unfamiliar technique only when it is needed for the current work.
+Cover the concrete problem, how the technique addresses it, the simpler
+alternative where relevant and why added complexity is justified. Keep the
+depth suitable for section 2. Verify code, commands, paths, configuration keys
+and tool behaviour against the current repository and dependency versions.
+
+### Keep overviews concise
+
+A step overview should normally be limited to:
+
+1. the transition from the previous completed state;
+2. the current step's central problem;
+3. the primary development or user carrier;
+4. the governing implementation principle;
+5. the goal and scope boundary.
+
+Do not turn the overview into a summary of every later section. Leave detailed
+technology choices, tutorials, commands, measurements and outcomes to the stage
+where they are introduced or verified.
+
+### Preserve evidence boundaries
+
+Clearly distinguish:
+
+- observed state from an assumption;
+- expected output from actual output;
+- a local or controlled measurement from production user data;
+- an automated check from manual verification;
+- a correlation from a demonstrated cause;
+- planned delivery from a completed release.
+
+Never invent command output, measurements, passing tests or deployment results.
+When a result is unchanged or inconclusive, record that honestly rather than
+manufacturing a stronger learning outcome.
+
+### Audit each expanded section
+
+Before considering a section complete, re-read the resulting section and its
+adjacent sections. Confirm that it:
+
+- still fulfils the approved outline responsibility;
+- follows naturally from the preceding section and prepares the next one;
+- contains no semantic repetition, drafting traces, transient writing-session
+  details or premature conclusions;
+- preserves necessary reasoning without explaining routine actions at length;
+- is neither a bare command list nor an unrelated concept tutorial;
+- uses technically accurate and current guidance;
+- keeps commands and examples executable and free of secrets;
+- labels unexecuted work and evidence limitations honestly;
+- changes no unrelated content;
+- has valid Markdown structure and code fences.
+
+For every paragraph, ask:
+
+1. Does it record or explain the real implementation rather than the writing
+   process?
+2. Does it contribute information that is not already present elsewhere?
+3. Would removing it damage understanding of the reason, action or result?
+4. Is it project-specific and useful rather than an explanation of an obvious
+   normal operation?
+5. Does it remain in the section where that information first becomes necessary?
+
+Delete, merge or move the paragraph when the answers show that it is redundant,
+misplaced or part of the drafting context.
+
+## 16. Git workflow
 
 Branch roles:
 
@@ -511,12 +786,12 @@ latest develop
 → retain the feature branch until the step's release and close-out are complete
 ```
 
-From Step 73, production releases use a pull request from this repository's
-`develop` to `main`. Require the release-source check and Backend, Frontend
-and E2E checks before merging, using Create a merge commit. Daily feature
-merges into develop retain the existing local merge workflow; they do not
-require pull requests. Protect main without routine bypass permissions;
-another person's review is not required for this solo project.
+Production releases use a pull request from this repository's `develop` to
+`main`. Require the release-source check and Backend, Frontend and E2E checks
+before merging, using Create a merge commit. Daily feature merges into develop
+retain the existing local merge workflow; they do not require pull requests.
+Protect main without routine bypass permissions; another person's review is not
+required for this solo project.
 
 The implemented CD workflow deploys the exact commit from successful main push
 CI. Treat future rule or deployment changes as implemented only after their
@@ -538,7 +813,7 @@ Before suggesting Git commands:
 
 Never use destructive Git recovery commands without explicit approval.
 
-## 15. Definition of done
+## 17. Definition of done
 
 A change is complete only when:
 
