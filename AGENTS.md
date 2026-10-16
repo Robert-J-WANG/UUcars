@@ -178,6 +178,12 @@ the change or the environment.
 The repository uses five document categories. Do not make one category perform
 another category's job.
 
+Before creating, revising or reviewing a design proposal or personal learning
+note, re-read this entire `AGENTS.md` from the current workspace. Do this for
+every such request rather than relying on conversation memory or an earlier
+summary. Then inspect the target document, its adjacent sections and the relevant
+implementation evidence before writing.
+
 ### Design proposals — `docs/design/`
 
 Design documents define the intended scope, constraints, sequence and acceptance
@@ -188,6 +194,16 @@ criteria for a version or substantial change.
 - Do not turn the proposal into an execution diary or copy of current source.
 - Keep decisions coherent and remove alternatives that are no longer part of
   the approved design.
+- Organise the sequence around one real development, user, request, data or
+  delivery flow rather than a catalogue of technologies.
+- Keep proposed decisions proportionate to evidence available at the planning
+  boundary; do not pull in speculative optimisation or low-value edge cases.
+- Keep the proposal at outline depth: state why the work is needed, its logical
+  sequence, decision boundaries, validation and acceptance criteria without
+  turning it into a command-by-command tutorial.
+- Before saving, verify that the scope is complete, sections follow causal
+  dependencies, responsibilities are not repeated and unverified results are
+  not presented as known outcomes.
 
 ### Technical documentation — `docs/technical/`
 
@@ -244,11 +260,22 @@ Before drafting, identify the exact version, step and subsection being learned.
 Use only facts, concepts, files and results available by the end of that boundary.
 Treat every later section as unknown.
 
+The current part may use only facts established earlier, observations and
+actions introduced in the current part, and assumptions explicitly identified
+from evidence already available there. It must not name a later heading, use a
+later decision or result to justify the current action, or explain an exclusion
+by assigning it to a known later part.
+
 Do not mention, hint at, justify work through or create dependencies on later
 sections, even if the repository already contains them. Phrases such as “later
 we will”, “this prepares for the next section” and references to later results
 are spoilers. A design proposal is the only document type that may intentionally
 describe approved future scope.
+
+During the final audit, read the part as though every following section were
+hidden. Rewrite any sentence that needs later knowledge to make sense, and end
+with only the conclusion, open question or immediate evidence requirement known
+at the current boundary.
 
 ### Write a causal explanation
 
