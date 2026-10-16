@@ -2,13 +2,13 @@
 
 > 当前 Schema 以 `UUcars.API/Migrations/AppDbContextModelSnapshot.cs`、EF Core Migrations 和实体配置为准。
 >
-> 本文覆盖 V1–V3 Step 70 已实现的数据库结构。后续开发若新增 Migration，应先更新本文
+> 本文覆盖当前已实现的完整数据库结构。后续开发若新增 Migration，应同步更新本文。
 
 ---
 
 ## 数据库概览
 
-当前使用 SQL Server，共 9 张业务表：
+当前使用 SQL Server，共 10 张业务表：
 
 ```text
 Users           V1 创建，V2 扩展
@@ -20,6 +20,7 @@ Reviews         V2
 RefreshTokens   V3
 AuditLogs       V3
 Notifications   V3
+ExternalLogins  V3
 ```
 
 ### 版本演进
@@ -44,7 +45,9 @@ V3 Schema 增量
 ├── RefreshTokens
 ├── Cars.RowVersion
 ├── AuditLogs
-└── Notifications
+├── Notifications
+├── Users.PasswordHash 改为可空
+└── ExternalLogins
 ```
 
 版本标记说明：
@@ -57,7 +60,7 @@ V3 Schema 增量
 
 ### 关系图
 
-下图表示 Step 70 时的当前完整关系；开发早期版本时，应结合各表的版本标记使用。
+下图表示当前完整关系；开发早期版本时，应结合各表的版本标记使用。
 
 ```mermaid
 erDiagram
@@ -76,6 +79,7 @@ erDiagram
     USERS ||--o{ REVIEWS : receives
 
     USERS ||--o{ REFRESH_TOKENS : owns
+    USERS ||--o{ EXTERNAL_LOGINS : links
     USERS ||--o{ AUDIT_LOGS : performs
     USERS ||--o{ NOTIFICATIONS : receives
 ```
@@ -85,11 +89,12 @@ erDiagram
 - `Favorites` 使用 `(UserId, CarId)` 联合主键，实现 Users 与 Cars 的多对多收藏关系。
 - `Orders` 同时通过 `BuyerId` 和 `SellerId` 关联 Users。
 - `Reviews.OrderId` 是唯一索引，因此一个订单最多对应一条评价。
+- `ExternalLogins` 使用 `(Provider, ProviderSubject)` 唯一索引标识外部身份。
 - `AuditLogs.EntityId` 和 `Notifications.RelatedId` 是通用业务关联字段，不配置数据库外键。
 
 ---
 
-## Users `[V1 创建，V2 扩展]`
+## Users `[V1 创建，V2、V3 扩展]`
 
 用户、认证和账户恢复信息。
 
@@ -98,7 +103,7 @@ erDiagram
 | Id | int | 否 | PK, Identity | V1 | 自增主键 |
 | Username | nvarchar(50) | 否 | | V1 | 用户名 |
 | Email | nvarchar(100) | 否 | UNIQUE | V1 | 登录邮箱 |
-| PasswordHash | nvarchar(256) | 否 | | V1 | ASP.NET Core PasswordHasher 生成的密码 Hash |
+| PasswordHash | nvarchar(256) | 是 | | V1 创建，V3 改为可空 | 本地密码账号使用的 ASP.NET Core PasswordHasher 结果；仅外部登录账号可以为空 |
 | Role | nvarchar(20) | 否 | | V1 | `User` / `Admin` |
 | EmailConfirmed | bit | 否 | DEFAULT `false` | V1 预留，V2 使用 | 邮箱是否已验证 |
 | EmailConfirmationToken | nvarchar(200) | 是 | | V2 | 一次性邮箱验证 Token |
@@ -424,6 +429,42 @@ Refresh Token 每次使用后撤销，并签发新的 Token。过期或撤销记
 
 ---
 
+## ExternalLogins `[V3]`
+
+外部身份与站内用户的关联记录。当前实现使用 Google OpenID Connect，保存
+Provider 和经过验证的稳定 Subject，不保存 Google Access Token 或 Refresh Token。
+
+| 字段 | SQL 类型 | Null | 约束或默认值 | 引入版本 | 说明 |
+|---|---|---:|---|---|---|
+| Id | int | 否 | PK, Identity | V3 | 自增主键 |
+| Provider | nvarchar(30) | 否 | | V3 | 外部身份提供方，当前为 Google |
+| ProviderSubject | nvarchar(255) | 否 | | V3 | 提供方签发的稳定用户标识 |
+| UserId | int | 否 | FK → Users.Id | V3 | 关联的站内用户 |
+| CreatedAt | datetime2 | 否 | | V3 | 关联创建时间 |
+
+### 索引
+
+```text
+PK_ExternalLogins (Id)
+IX_ExternalLogins_Provider_ProviderSubject UNIQUE
+  (Provider, ProviderSubject)
+IX_ExternalLogins_UserId (UserId)
+```
+
+唯一索引保证同一提供方的同一外部身份只能关联一个站内用户。`UserId`
+索引用于读取用户关联的外部身份。
+
+### 关系与删除行为
+
+```text
+ExternalLogins.UserId → Users.Id
+DeleteBehaviour: Cascade
+```
+
+用户删除后，外部身份关联失去意义，因此随用户一并删除。
+
+---
+
 ## AuditLogs `[V3]`
 
 Admin 关键操作审计记录。该表只新增记录，不更新历史记录。
@@ -524,6 +565,7 @@ DeleteBehaviour: Cascade
 | Users | Reviews | ReviewerId | Restrict | V2 | 保留评价人关系 |
 | Users | Reviews | RevieweeId | Restrict | V2 | 保留被评价人关系 |
 | Users | RefreshTokens | UserId | Cascade | V3 | 用户删除后 Token 无效 |
+| Users | ExternalLogins | UserId | Cascade | V3 | 用户删除后外部身份关联无效 |
 | Users | AuditLogs | AdminId | Restrict | V3 | 保护审计历史 |
 | Users | Notifications | UserId | Cascade | V3 | 用户删除后通知无独立意义 |
 
@@ -579,6 +621,7 @@ Cloudflare R2 图片上传沿用 V1 的 `CarImages.ImageUrl`，因此没有单�
 20260616120500_AddCarRowVersion
 20260619231332_AddAuditLogsTable
 20260721041503_AddNotificationsTable
+20260903014903_AddExternalLoginsForGoogleOidc
 ```
 
 依次增加：
@@ -590,6 +633,8 @@ RefreshTokens
 Cars.RowVersion
 AuditLogs
 Notifications
+Users.PasswordHash 改为可空
+ExternalLogins
 ```
 
 新增或修改数据库结构时：
