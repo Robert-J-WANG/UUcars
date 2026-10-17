@@ -42,6 +42,8 @@ export default function ImageGallery({ images, title }: ImageGalleryProps) {
               key={activeIndex} // key 变化时触发重新渲染，产生淡入效果
               src={images[activeIndex].imageUrl}
               alt={`${title} - photo ${activeIndex + 1}`}
+              loading="eager"
+              fetchPriority="high"
               className="h-full w-full object-cover transition-opacity duration-300"
             />
 
@@ -126,6 +128,8 @@ export default function ImageGallery({ images, title }: ImageGalleryProps) {
               <img
                 src={img.imageUrl}
                 alt={`Thumbnail ${i + 1}`}
+                loading="lazy"
+                fetchPriority="low"
                 className="h-full w-full object-cover"
               />
             </button>

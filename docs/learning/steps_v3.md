@@ -31531,3 +31531,1409 @@ git push origin develop
 git branch -d fix/add-images-when-create-car
 git push origin --delete fix/add-images-when-create-car
 ```
+
+
+
+## Step 74 · Bundle 优化与 Web Vitals
+
+### 这一步做什么
+
+Step 73 已经打通并验证了从源码检查到 Azure 生产部署的完整交付路径。不过，应用能够可靠发布，只说明构建产物可以到达生产环境；当用户真正打开网站时，浏览器需要下载多少资源、页面多快显示主要内容以及何时能够稳定交互，仍然需要单独验证。
+
+Step 74 从交付终点继续向用户侧推进，以一条连续的访问路径作为分析载体：
+
+```text
+首次进入首页
+→ 浏览车辆列表
+→ 打开车辆详情
+→ 按需进入其他功能页面
+```
+
+在这条路径中，浏览器需要取得并处理页面代码、样式、接口数据和图片等资源。资源的体积、加载时机和处理顺序共同决定用户何时看到内容、页面是否保持稳定，以及操作后能否及时获得反馈。因此，前端性能不能只根据源码结构或单个文件大小判断，也不能在测量前直接认定某一种资源就是瓶颈。
+
+本步骤先在固定条件下记录 Production Build、浏览器加载过程和 Web Vitals Baseline，再沿同一条访问路径定位实际问题。只有测量结果能够说明收益时，才实施范围最小、原因明确的优化；完成修改后，再用相同条件重新测量，并通过现有测试确认功能和交互没有回退。
+
+Step 74 不增加业务功能，不重建交付基础设施，也不为了追求单一性能分数引入额外架构。它的目标是在保留现有业务行为的前提下，形成一套可以复查的前端性能优化过程，并将验证后的改动沿 Step 73 建立的 CI/CD 路径发布到生产环境。
+
+
+
+### 1. 准备功能分支
+
+Step 74 需要比较同一项目在优化前后的表现，因此先固定开发基线，并把本步骤的测量、代码修改和验证记录放在独立功能分支中。这样后续出现差异时，可以明确判断它是否来自本步骤。
+
+#### 1.1 检查 Step 73 完成状态
+
+Step 74 会继续使用 Step 73 建立的 CI/CD 路径。创建新分支前，先确认 Step 73 的发布提交已经同步到两个长期分支，并且旧功能分支已经完成清理：
+
+```bash
+git fetch origin --prune
+git status --short --branch
+git log --oneline --decorate -n 8
+git branch --list "feature/v3-runtime-cicd"
+git branch --remotes --list "origin/feature/v3-runtime-cicd"
+```
+
+检查结果：
+
+```text
+main、develop、origin/main、origin/develop
+→ f005a15 Merge pull request #2 from Robert-J-WANG/develop
+
+Step 73 最终收尾合并
+→ 612fb18 merge: complete Step 73
+
+feature/v3-runtime-cicd
+→ 本地和远端跟踪引用均已清理
+```
+
+`git fetch origin --prune` 更新远端跟踪引用，同时移除远端已经删除的分支引用。检查结果表明，Step 73 的发布 Merge Commit 已经同步回 `develop`，不会再从发布前的旧提交开始 Step 74。
+
+Step 73 的 Required Checks、`main` CI、Azure CD、Production Smoke Test 和 `release.json` 已在上一步完成验证。结合当前 Git 状态，`f005a15` 可以作为 Step 74 的开发基线。
+
+#### 1.2 创建并验证 Step 74 功能分支
+
+确认工作区没有混入其他任务的修改后，从已经包含 Step 73 发布结果的 `develop` 创建功能分支：
+
+```bash
+git status --short --branch
+git switch develop
+git pull --ff-only origin develop
+git switch -c feature/v3-frontend-performance
+git push -u origin feature/v3-frontend-performance
+```
+
+`git pull --ff-only` 保证本地 `develop` 只接受快进更新，不在准备阶段产生额外 Merge Commit。`git push -u` 建立本地分支与远端同名分支的跟踪关系。
+
+创建后检查分支起点和跟踪状态：
+
+```bash
+git status --short --branch
+git branch --verbose --verbose
+git log -1 --oneline --decorate
+```
+
+预期状态：
+
+```text
+feature/v3-frontend-performance
+→ 跟踪 origin/feature/v3-frontend-performance
+→ 基于 f005a15
+```
+
+### 2. 建立性能测量规则
+
+优化前后的性能数据只有在测量对象、访问路径和测试条件一致时才具有可比性。记录 Baseline 前，先固定比较场景、控制条件和证据记录方式。
+
+#### 2.1 固定比较场景
+
+前后测量使用三个可以重复的访问场景：
+
+```text
+直接访问首页 /
+→ 观察用户首次进入网站时需要加载的内容
+
+直接访问车辆详情页 /cars/:id
+→ 观察详情页作为入口时的代码、数据和图片加载
+
+从首页进入同一车辆详情页
+→ 观察客户端导航期间新增的页面资源和加载反馈
+```
+
+三个场景分别覆盖首页初始加载、详情页初始加载和站内导航，不能用其中一个场景的结果代替另外两个。Baseline 开始前选择一辆已发布且图片完整的车辆，优化前后始终使用同一个详情页 URL，避免车辆内容和图片数量变化干扰比较。其他页面不承担主要前后测量；只有 Bundle 或 Network 证据显示其影响初始加载时，才增加针对性检查。
+
+#### 2.2 固定比较条件
+
+测量对象是 Production Build。Vite Development Server 包含 HMR 和开发阶段的模块加载行为，不适合作为最终构建产物的性能依据。优化前后应分别重新构建各自源码，但使用相同的 Build、Preview 和浏览器测量方式。
+
+前后测量保持以下条件一致：
+
+- 同一台开发电脑；
+- 同一 Chrome 版本和无扩展的测试 Profile；
+- 相同 viewport、Lighthouse 设备模式和网络限制；
+- 相同页面 URL、车辆数据和进入路径；
+- 相同缓存状态。
+
+直接访问场景使用禁用浏览器缓存后的重新加载。站内导航场景先打开首页，再清空 Network 记录并点击同一辆车。两次比较必须复现同一种进入方式，不能把详情页直接加载和首页跳转的数据放在一起比较。
+
+首页和详情页各连续运行三次 Lighthouse Navigation 测量，保留三次原始结果，并分别计算 Performance、LCP、CLS 和 TBT 的中位数。页面内容未正常加载、API 请求失败或测试条件发生变化时，该次结果无效，恢复相同条件后重新测量。
+
+#### 2.3 固定记录和解释方式
+
+每次测量都沿同一条证据链记录：
+
+```text
+代码状态
+→ HEAD Commit 和相关工作区修改
+
+构建结果
+→ 入口资源、页面 Chunk、文件体积和主要模块组成
+
+页面访问
+→ 请求资源、传输体积、加载顺序和关键图片
+
+实验室结果
+→ Performance、LCP、CLS、TBT、LCP 元素和主要诊断
+```
+
+这四组记录依次说明“测量的是哪份代码、生成了什么、浏览器实际加载了什么、页面最终表现如何”。代码状态和测试条件一致时，它们才能共同解释前后差异。
+
+LCP 除了数值还要记录对应元素，才能判断变化来自 Hero、车辆图片还是其他首屏内容。CLS 只反映本次实验室加载期间观察到的布局移动；TBT 用来辅助判断加载阶段的主线程阻塞，不能当作真实用户 INP。Lighthouse Performance 分数只作为汇总参考，不代表生产用户的实际体验。
+
+
+
+### 3. 记录优化前 Baseline
+
+Baseline 要描述当前页面真实的加载状态，因此先保存构建产物，再查看模块组成，最后用同一份普通 Production Build 完成浏览器测量。下面的命令和配置需要实际执行，标记为 Baseline 记录的表格只填写执行后取得的结果；终端完整输出、请求清单和临时报告不用全部抄入笔记。路由导入和图片加载策略在整组记录完成前保持不变。
+
+正式记录前先整理发布输入：删除没有代码引用的 `public/1.svg`，并通过 `prebuild` 调用一个不依赖第三方包的 Node.js 脚本，在每次 Production Build 前递归清理 `public` 下的 `.DS_Store`。这是因为 `.gitignore` 只能阻止 Git 跟踪文件，不能阻止 Vite 将 `public` 内容复制到 `dist`。使用 Node.js 24 重新构建后，发布目录中只保留预期文件；清理修改固定在 `1b4a8fa`，后续 Baseline 从该提交开始记录。
+
+#### 3.1 保存当前 Production Build 结果
+
+先记录源码状态并执行前端 Production Build：
+
+```bash
+git rev-parse --short HEAD
+git status --short
+
+cd uucars-web
+VITE_API_BASE_URL=http://localhost:5065 npm run build
+```
+
+`VITE_API_BASE_URL` 在构建阶段写入前端产物。这里显式使用本地 API，避免本地测量连接到 `.env.production` 中的 Azure 地址。
+
+Vite Build 输出提供资源文件名、原始大小和 gzip 大小。执行后填写第一组 Baseline 记录：
+
+| Build Baseline | 实际结果 |
+| --- | --- |
+| HEAD Commit 与相关工作区修改 | `1b4a8fa`；前端源码无未提交修改 |
+| Build 结果 | 成功；`prebuild` 正常执行，Vite `8.3.3` 共转换 `2703` 个模块 |
+| 入口 JavaScript 名称、原始大小、gzip 大小 | `index-P-73-3G8.js`；`1,230.01 kB`；gzip `366.33 kB` |
+| CSS 名称、原始大小、gzip 大小 | `index-CAmaLt_f.css`；`42.12 kB`；gzip `8.63 kB` |
+| 主要图片和字体资源 | `hero-bg-CDjpd0E3.jpg`：`241.59 kB`；`seller-banner-DujkCyC4.jpg`：`405.03 kB`；本次构建未输出独立字体文件 |
+| JavaScript Chunk 数量与大 Chunk 警告 | `1` 个 JavaScript Chunk；入口文件超过 minify 后 `500 kB` 的警告阈值 |
+
+Build 耗时反映本机的构建速度，不代表浏览器加载性能，因此不纳入前后性能比较。
+
+#### 3.2 核对 `dist` 的发布内容
+
+Vite 输出只汇总主要资源，继续查看完整目录：
+
+```bash
+find dist -type f -print | sort
+```
+
+`dist` 应包含入口 HTML、构建生成的 JavaScript、CSS 和图片，以及从 `public` 复制的站点图标和 Azure Static Web Apps 配置。实际核对结果如下：
+
+| 发布内容 | 实际结果 |
+| --- | --- |
+| 入口和构建资源 | `index.html`、`1` 个 JavaScript、`1` 个 CSS、`2` 张图片 |
+| 公共静态文件 | `favicon.svg`、`staticwebapp.config.json` |
+| 缺失或意外文件 | 无 |
+| Bundle 分析报告 | 未生成 |
+
+当前目录只包含应用运行和部署需要的文件，可以作为后续浏览器测量使用的普通 Production Artifact。Bundle 分析报告属于本地诊断文件，仅在显式启用分析构建时生成。
+
+#### 3.3 接入按需启用的 Bundle 分析
+
+构建日志能够说明每个文件有多大，但不能解释入口文件由哪些页面和依赖组成。这里使用 `rollup-plugin-visualizer` 补充模块级证据：该工具支持 Vite 与 Rolldown，要求 Node.js 22 或更高版本，符合当前 Vite 8 和 Node.js 24 环境。它只作为 dev dependency 参与构建分析，不进入浏览器运行时代码。
+
+安装已经核对兼容性的版本：
+
+```bash
+npm install -D rollup-plugin-visualizer@7.1.1
+```
+
+安装后，在 `uucars-web/vite.config.ts` 中加入按环境变量启用的分析插件：
+
+```ts
+import { configDefaults, defineConfig } from "vitest/config";
+import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
+
+// 新增
+import type { PluginOption } from "vite";
+import { visualizer } from "rollup-plugin-visualizer";
+
+import path from "node:path";
+
+// 新增
+const plugins: PluginOption[] = [react(), tailwindcss()];
+
+if (process.env.ANALYZE_BUNDLE === "true") {
+  plugins.push(
+    visualizer({
+      filename: "dist/bundle-report.html",
+      template: "treemap",
+      gzipSize: true,
+      brotliSize: true,
+      open: false,
+    }) as PluginOption,
+  );
+}
+
+export default defineConfig({
+    // 使用新的plugins
+  plugins,
+  resolve: {
+    alias: {
+      "@": path.resolve(import.meta.dirname, "./src"),
+    },
+  },
+  test: {
+    environment: "jsdom",
+    setupFiles: ["./src/test/setup.ts"],
+    globals: true,
+    exclude: [...configDefaults.exclude, "e2e/**"],
+  },
+});
+```
+
+插件放在现有插件之后，只在 `ANALYZE_BUNDLE=true` 时运行。本阶段使用构建模块图比较模块组成和相对大小，并计算 gzip 和 Brotli 大小，不额外生成 Source Map。普通 `npm run build`、Frontend CI 和 CD Build 没有设置这个变量，因此不会生成报告。
+
+#### 3.4 生成并阅读优化前 Bundle Report
+
+执行一次分析构建：
+
+```bash
+ANALYZE_BUNDLE=true VITE_API_BASE_URL=http://localhost:5065 npm run build
+```
+
+用浏览器打开 `dist/bundle-report.html`。先从顶层 Chunk 确认构建边界，再展开入口文件，填写第二组 Baseline 记录：
+
+| Bundle Baseline | 实际结果 |
+| --- | --- |
+| 顶层 Chunk 及其边界 | 只有 `assets/index-P-73-3G8.js` 一个顶层 JavaScript Chunk；应用代码和第三方依赖均位于该入口中，没有形成路由级边界 |
+| 入口中的 Router、Layout 和主要共享组件 | `router.tsx`、`Layout.tsx`、`AuthInitializer`、`ProtectedRoute`、`AdminRoute`、`ErrorBoundary` 和 `NotificationBell` 均进入入口 Chunk |
+| 进入初始入口的页面模块 | Router 静态导入的 `18` 个页面模块全部进入入口，包括认证、首页与详情、个人中心和 Admin 页面；访问首页前已经打包其他路由页面代码 |
+| 随入口提前打包的页面专用依赖 | Admin Dashboard 使用的 Recharts 及 D3 相关模块、车辆表单使用的 dnd-kit、轮播使用的 Embla，以及表单使用的 React Hook Form 和 Zod 均随入口打包 |
+| 占据主要体积的项目模块和第三方依赖 | 项目模块中较大的包括 `AdminDashboardPage.tsx`（约 `13.5 kB`）、`Layout.tsx`（约 `12.6 kB`）、`CarDetailPage.tsx`（约 `10.8 kB`）和 `RegisterPage.tsx`（约 `10.4 kB`）；第三方依赖中 Recharts（约 `568.1 kB`）、React DOM（约 `449.0 kB`）和 React Router（约 `207.3 kB`）占比最明显 |
+| 已有独立 Chunk 及其来源 | 无独立 JavaScript Chunk；报告只显示入口 `index-P-73-3G8.js` |
+| 重复模块证据 | 未发现跨 Chunk 重复模块；当前只有一个 JavaScript Chunk，报告中的每个模块均只映射到该入口 |
+
+模块是否“较大”必须根据报告中的相对占比判断，不能只根据依赖名称推测。最终 Chunk 的文件大小和 gzip 大小以 Vite Build 输出为准；报告中的模块大小用于解释 Chunk 的组成，不能相加后当作最终文件体积。`bundle-report.html` 位于已经被 `.gitignore` 排除的 `dist` 中，只保留必要结论，不提交报告文件。
+
+分析完成后重新运行不带分析变量的普通 Build。Vite 会清理并重建 `dist`，随后用于 Preview 的产物不会包含分析报告：
+
+```bash
+VITE_API_BASE_URL=http://localhost:5065 npm run build
+```
+
+#### 3.5 记录首页首次访问
+
+使用两个终端启动本地 API，并预览第 3.4 节最后重新生成的普通 Production Build：
+
+终端一在仓库根目录运行：
+
+```bash
+dotnet run --project UUcars.API --launch-profile http
+```
+
+终端二在 `uucars-web` 目录运行：
+
+```bash
+npm run preview -- --host localhost --port 5173 --strictPort
+```
+
+Preview 使用 `http://localhost:5173`，与当前 Development CORS 允许的 Origin 一致。浏览器使用固定的未登录测试 Profile，并在优化前后复用以下条件：
+
+| 浏览器测量条件 | Baseline |
+| --- | --- |
+| Chrome 版本 | `155.0.8059.41` |
+| viewport 宽度 × 高度 | `390 × 844` CSS px（Chrome DevTools `Responsive`） |
+| Network Throttling | `Fast 4G`；启用 `Disable cache` |
+| 固定车辆 ID 与详情页 URL | `7003`；`http://localhost:5173/cars/7003` |
+
+在 DevTools Network 中清空记录后直接访问首页，完成一次冷加载记录：
+
+```text
+http://localhost:5173/
+```
+
+Network 记录用于核对入口资源、首页 API 和图片的加载顺序及传输大小。随后在相同条件下使用 Performance 面板的 Reload Recording 重新加载首页，记录 LCP 和 Layout Shift。Network 与 Performance 来自两次条件相同的加载，不把两个时间轴上的时间点合并比较。
+
+实测结果如下：
+
+| 首页 Baseline | 实际结果 |
+| --- | --- |
+| 页面总请求与传输量 | 18 个请求；传输 `2.4 MB`；资源量 `3.5 MB`；Finish `3.06 s`；DOMContentLoaded `829 ms`；Load `830 ms` |
+| 初始下载的 JavaScript 文件及传输大小 | 应用入口 `index-P-73-3G8.js`：`364 kB`、`535 ms`；Google Identity Services `client`：`102 kB`、`795 ms`；合计 `466 kB` |
+| 页面专用代码是否包含在初始下载中 | 是；初始加载只有一个应用 JavaScript Chunk，其他路由页面及其依赖仍包含在入口文件中 |
+| 首页 API 的启动位置 | 入口脚本执行后出现两次相同的 `GET /cars?page=1&pageSize=6`；均返回 `200`，各传输 `2.9 kB`、耗时 `183 ms` 与 `189 ms` |
+| Hero 与车辆图片的请求顺序 | Hero 和 Seller Banner 在页面初始化阶段请求；首页车辆 API 返回后开始请求 6 张车辆封面 |
+| 初次加载的图片 | 共 8 张：Hero `242 kB`、Seller Banner `405 kB`，以及 6 张车辆封面 `214 kB`、`213 kB`、`234 kB`、`172 kB`、`207 kB`、`191 kB`；图片合计传输 `1,877 kB` |
+| 首屏以下车辆图片是否立即下载 | 是；首次加载已经请求全部 6 张车辆封面，滚动到页面底部后没有新增图片请求 |
+| LCP | `2.84 s`；LCP 元素为 `hero-bg-CDjpd0E3.jpg` |
+| LCP 分解 | TTFB `7 ms`；资源加载延迟 `902 ms`；资源加载耗时 `1,885 ms`；元素渲染延迟 `43 ms` |
+| Layout Shift | CLS `0.13`；最明显的偏移簇约发生在 `1.14 s`，DevTools 标出的主要来源为两项 Web Font |
+
+这组数据表明，当前首页的主要加载成本来自图片和单一入口脚本。Hero 图片是本次记录的 LCP 元素，其资源加载延迟和下载耗时占据了大部分 LCP 时间；同时，首屏以下的车辆图片也在首次加载时全部请求。字体引起了可观察的布局偏移。重复的车辆列表请求和这些加载现象将在完成全部 Baseline 后统一分析，本节只保留优化前事实。
+
+#### 3.6 记录车辆详情的两种进入方式
+
+详情页使用第 3.5 节固定的车辆 `7003`。分别记录直接访问和从首页点击进入，才能区分完整冷加载与站内导航实际新增的成本。
+
+```text
+http://localhost:5173/cars/7003
+```
+
+直接访问时，在与首页相同的 viewport、`Fast 4G` 和 `Disable cache` 条件下清空 Network 记录后加载详情页，再使用 Performance Reload Recording 测量 LCP 和 CLS：
+
+| 直接访问详情页 Baseline | 实际结果 |
+| --- | --- |
+| 请求总量与传输量 | 14 个请求；传输 `1.4 MB`；资源量 `2.5 MB`；Finish `2.21 s`；DOMContentLoaded `943 ms`；Load `944 ms` |
+| 初始 JavaScript | 应用入口 `index-P-73-3G8.js`：`364 kB`、`540 ms`；Google Identity Services `client`：`102 kB`、`705 ms`；没有详情页专用 Chunk |
+| 车辆详情 API | `GET /cars/7003`：`200`、`1.5 kB`、`168 ms` |
+| 主图与缩略图请求 | 5 张车辆图片均在初始加载中请求：主图 `191 kB`，4 张缩略图对应图片为 `165 kB`、`188 kB`、`192 kB`、`87.3 kB` |
+| LCP | `2.16 s`；LCP 元素为主图 `152f8b93-9257-438d-98df-0f48fb1205c1.jpg` |
+| LCP 分解 | TTFB `7 ms`；资源加载延迟 `1,088 ms`；资源加载耗时 `1,012 ms`；元素渲染延迟 `49 ms` |
+| Layout Shift | CLS `0.06`；最严重的偏移簇约发生在 `1.11 s`，DevTools 未能识别具体偏移来源 |
+
+随后重新加载首页，等待首页完整加载后清空 Network 记录，再点击车辆 `7003`。这次记录只包含客户端导航后新增的请求：
+
+| 从首页进入详情页 Baseline | 实际结果 |
+| --- | --- |
+| 新增请求与传输量 | 6 个请求；传输 `635 kB` |
+| 新增 JavaScript 或 Chunk | 无；详情页代码仍在已加载的入口 Chunk 中 |
+| 车辆详情 API | `GET /cars/7003`：`200`、`1.5 kB`、`179 ms` |
+| 新增图片请求 | 4 张非封面车辆图片：`165 kB`、`188 kB`、`192 kB`、`87.3 kB`。主图已在首页车辆卡片中加载，因此没有再次请求 |
+| 导航时的加载反馈 | 未观察到详情区域短暂空白 |
+| 图廊布局稳定性 | 主图和缩略图出现后没有观察到明显跳动、撑开或错位 |
+
+直接访问的 LCP 由车辆主图决定，且大部分时间位于资源发现前的等待和图片下载；站内导航则避免了重新下载应用入口和主图，但仍会请求详情所需的其余 4 张图片。直接访问中记录到的 CLS 与站内导航时图廊未出现明显跳动是两项不同证据，后续分析时不能把它们视为同一结论。
+
+#### 3.7 记录优化前 Lighthouse
+
+按照第 2.2 节的三轮测量规则，在 Chrome Lighthouse 中固定使用以下设置：
+
+- Mode：Navigation；
+- Device：Mobile；
+- Category：Performance；
+- 启用 `Clear storage`；
+- Throttling：`Simulated throttling (default)`；报告显示为 Emulated Moto G Power 和 Slow 4G throttling。
+
+`Clear storage` 是 Lighthouse 自己的首次访问控制，不能用 Network 面板的 `Disable cache` 代替。Lighthouse 的 Mobile 测试使用自己的模拟装置和视口；第 3.5、3.6 节手动 Network 与 Performance 记录使用的 `390 × 844` Device Toolbar 条件，不会改变 Lighthouse 测量窗口。
+
+对首页 `/` 与详情页 `/cars/7003` 各执行三次 Navigation 测量。原始结果如下：
+
+| 页面 | 轮次 | Performance | FCP（s） | LCP（s） | TBT（ms） | CLS | Speed Index（s） |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `/` | 1 | 58 | 3.6 | 7.5 | 250 | 0.134 | 4.1 |
+| `/` | 2 | 56 | 3.6 | 7.4 | 240 | 0.158 | 4.1 |
+| `/` | 3 | 55 | 3.6 | 7.7 | 300 | 0.134 | 4.1 |
+| `/cars/7003` | 1 | 62 | 3.6 | 11.0 | 210 | 0.071 | 3.6 |
+| `/cars/7003` | 2 | 63 | 3.6 | 10.7 | 190 | 0.071 | 3.6 |
+| `/cars/7003` | 3 | 63 | 3.6 | 11.0 | 190 | 0.071 | 3.7 |
+
+三次结果按页面分别取中位数：
+
+| 页面 | Performance 中位数 | FCP 中位数（s） | LCP 中位数（s） | TBT 中位数（ms） | CLS 中位数 | Speed Index 中位数（s） |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `/` | 56 | 3.6 | 7.5 | 250 | 0.134 | 4.1 |
+| `/cars/7003` | 63 | 3.6 | 11.0 | 190 | 0.071 | 3.6 |
+
+Lighthouse 的主要诊断与前两节的资源记录相互印证：
+
+| 页面 | 与资源记录对应的主要诊断 |
+| --- | --- |
+| `/` | Render-blocking requests 估算节省 `600 ms`；Improve image delivery 估算节省 `1,014 KiB`；Use efficient cache lifetimes 估算节省 `1,201 KiB`；Reduce unused JavaScript 估算节省 `325 KiB`；Minimize main-thread work `2.9 s`；8 个 long tasks；46 个非合成动画元素 |
+| `/cars/7003` | Render-blocking requests 估算节省 `600 ms`；Use efficient cache lifetimes 估算节省 `804 KiB`；Improve image delivery 估算节省 `725 KiB`；Reduce unused JavaScript 估算节省 `327 KiB`；7 个 long tasks；CLS、LCP breakdown 与 3rd parties 审计通过 |
+
+首页的 LCP 资源在第 3.5 节记录为 Hero 图片 `hero-bg-CDjpd0E3.jpg`；详情页的 LCP 资源在第 3.6 节记录为主图 `152f8b93-9257-438d-98df-0f48fb1205c1.jpg`。Lighthouse 的三次结果用于后续优化的数值基线，单次分数波动、没有资源证据支持的笼统建议，以及无法在相同条件下复现的现象，不作为优化依据。
+
+
+
+### 4. 确定实际性能问题
+
+第 3 节已经从 Production Build、Bundle Report、Network、Performance 和 Lighthouse 五个角度记录了同一份优化前代码。本节只解释这些证据能够确认的问题，并区分已经成立的结论、尚需进一步判断的线索和没有证据支持的假设。具体修改方式仍需在进入相应实施阶段后选择，当前候选方案不是既定结果。
+
+两组性能数据使用了不同的受控方法。DevTools Performance 在 `390 × 844`、`Fast 4G` 下记录首页 LCP `2.84 s`、详情页 LCP `2.16 s`，并分别把 Hero 和详情主图识别为 LCP 元素。Lighthouse 使用 Emulated Moto G Power 和 Simulated Slow 4G，三次中位数分别为 `7.5 s` 和 `11.0 s`，并给出图片交付诊断。
+
+Lighthouse 记录没有单独保存 LCP Element 审计结果，因此这组数据只用于补充 LCP 数值和图片压力证据，不重复断言具体 LCP 元素。两种方法的绝对值不能直接比较，优化前后也必须各自使用原测量方法复测。
+
+#### 4.1 分析首页初始代码
+
+当前 `router.tsx` 静态导入全部 `18` 个页面模块。Vite 因此只生成一个 `1,230.01 kB`、gzip `366.33 kB` 的 JavaScript Chunk；浏览器在渲染首页路由前必须先下载包含这些模块的完整入口。Tree Shaking 可以移除未被引用的导出，但不能把已经被 Router 静态引用的完整页面自动变成按路由下载。
+
+首页首次渲染所需职责与当前入口内容并不相同：
+
+| 类别 | 首页首次访问是否需要 | 当前入口状态 |
+| --- | --- | --- |
+| React、React DOM、React Router、TanStack Query、Axios、Zustand、`AuthInitializer`、`ErrorBoundary` | 需要 | 它们负责应用启动、路由、请求缓存、认证恢复和错误反馈，属于共享运行职责 |
+| `Layout`、首页、Hero、筛选、分页、车辆卡片和 Latest Carousel | 需要 | 这些模块直接组成匿名首页；Embla 由首页轮播使用 |
+| 认证与账号恢复页面 | 首页不需要 | 登录、注册、邮箱验证和密码恢复页面均由 Router 静态导入；其中表单页面还会带入 React Hook Form、Zod 和 Google 登录组件 |
+| 创建和编辑车辆页面 | 首页不需要 | 它们通过 `ImagePicker`、`ImageUploader` 间接带入 dnd-kit |
+| Profile 及订单、收藏、车辆管理页面 | 首页不需要 | 这些页面只有登录后进入，但目前仍位于匿名首页的单一入口 Chunk |
+| Admin 页面 | 首页不需要 | `AdminDashboardPage` 静态导入 Recharts；Bundle Report 中 Recharts 约 `568.1 kB`，是最明显的页面专用模块组 |
+
+这个差异与 Lighthouse 的 unused JavaScript 诊断一致：首页估算可减少 `325 KiB`，详情页估算可减少 `327 KiB`。估算值不能直接当作最终可节省体积，但结合“单一 Chunk + 全部页面静态导入”的模块证据，可以确认当前入口承担了超出首次访问需要的页面代码。问题在于代码边界与用户访问路径不匹配，而不是 JavaScript 文件数量本身太少。
+
+首页还存在一项与 Chunk 无关的重复工作。`HomePage` 和 `LatestCarousel` 都调用：
+
+```text
+GET /cars?page=1&pageSize=6
+```
+
+两个查询分别使用 `cars` 和 `cars-latest-carousel` Query Key，TanStack Query 会把它们视为不同数据，因此冷加载中实际发出了两次请求。两次响应各为 `2.9 kB`，传输体积不大，但在当前无筛选、第一页的首页场景中，请求参数和返回数据相同。这可以确认存在两次结果重合的数据读取；是否应该合并，还需要判断列表与轮播是否属于同一项数据职责。
+
+#### 4.2 分析后续页面代码
+
+沿着用户从首页进入后续功能页面的路径，源码与 Bundle Report 可以对应出以下依赖来源：
+
+| 后续功能 | 依赖进入当前入口的路径 | 当前问题或判断 |
+| --- | --- | --- |
+| Admin Dashboard | `router.tsx` → `AdminDashboardPage` → Recharts | 匿名首页不使用图表，但 Recharts 已进入当前入口，是最清楚的页面专用负担 |
+| 创建和编辑车辆 | `router.tsx` → `CreateCarPage` / `EditCarPage` → 图片选择或上传组件 → dnd-kit | 拖拽排序只在 Seller 操作图片时使用，匿名首页不需要这组代码 |
+| Profile 子页面 | `router.tsx` → `ProfilePage` 及 Listings、Favorites、Purchases、Sales | 这些登录后页面全部通过静态导入进入当前入口 |
+| 认证页面 | `router.tsx` → Login、Register、Verify、Forgot、Reset 页面 | 表单、验证和账号恢复逻辑不参与公开首页渲染，但当前仍随入口下载 |
+| Google 登录 | `main.tsx` 全局 `GoogleOAuthProvider` → `@react-oauth/google` | Provider 位于应用根部，使没有 Google 登录按钮的公开页面也加载相关客户端脚本 |
+| 通知 | `Layout` → `NotificationBell` → `@microsoft/signalr` | 匿名状态不会渲染通知铃铛或建立 Hub 连接，但现有记录还不足以证明 SignalR 是当前入口的主要体积来源 |
+
+Network 为 Google Provider 提供了额外证据：匿名访问首页和详情页时都会下载 Google Identity Services `client`，传输约 `102 kB`，而 Google 登录按钮只出现在 Login 和 Register。由此可以确认，全局 Provider 让公开浏览路径承担了与当前页面无关的第三方脚本请求。任何后续改动都必须保留 Google 登录与 Client ID 配置检查的现有行为。
+
+车辆详情页没有表现出相同程度的代码交付问题。它是公开核心路径，Bundle Report 中的页面模块约 `10.8 kB`，没有像 Recharts 或 dnd-kit 那样明显的大型页面专用依赖；从首页进入车辆 `7003` 时也没有新增 JavaScript 请求或可见空白。现有证据因此不能支持把详情页代码本身列为优先问题。
+
+同样，现有报告显示的是页面职责进入同一入口，并没有证明第三方包之间需要人为编排 Chunk。`manualChunks`、逐个拆分所有页面或单独延迟 SignalR 都不能仅凭当前记录成为确定结论。
+
+#### 4.3 分析图片加载
+
+首页和详情页的图片问题不是同一种加载路径，必须分别判断。
+
+**首页。** Hero `hero-bg-CDjpd0E3.jpg` 是 Performance 记录中的 LCP 元素，传输 `242 kB`。其 LCP 分解中资源加载延迟为 `902 ms`、下载耗时为 `1,885 ms`，说明首屏主要内容同时受到图片发现时机和传输时间影响。由于同一次记录不能证明延迟主要来自哪一部分，本节只能确认 Hero 是需要优先调查的关键资源，不能直接断定某一种资源提示一定有效。
+
+首页其余图片需要按是否在首屏可见分别处理。Seller Banner 在 `390 px` 宽度下由 CSS 隐藏，冷加载仍请求了这张 `405 kB` 图片；车辆轮播和列表位于 Hero 之后，冷加载也请求了全部 6 张封面，共计使图片传输达到 `1,877 kB`。滚动到底部后图片数量没有变化，证明当前没有在滚动时再按需请求图片，但“位于 Hero 之后”不等于所有车辆图片在每种视口下都位于首屏之外。
+
+`SellerBanner`、`CarCard` 和 `CarCardHorizontal` 当前均未设置 `loading` 属性。轮播和列表复用相同封面 URL，浏览器没有重复传输同一文件，因此这里的问题不是同一张图片下载两遍，而是不可见或尚未需要的图片也在首次加载期间参与网络竞争。哪些图片在不同视口中属于首屏内容，仍需在修改前逐一确认。
+
+**车辆详情。** 主图 `152f8b93-9257-438d-98df-0f48fb1205c1.jpg` 是详情页 LCP 元素。当前 `ImageGallery` 同时渲染主图和全部缩略图，因而直接访问时 5 张原始 R2 图片全部开始请求；主图 `191 kB` 之外的 4 张图片合计约 `632 kB`。Lighthouse 详情页的 LCP 中位数达到 `11.0 s`，并估算图片交付可减少 `725 KiB`。这些证据确认主图正在与未作为当前主图展示的其他原图竞争网络资源，但尚未说明应当采用哪一种请求顺序或缩略图实现。
+
+现有证据没有把图片布局识别为主要 CLS 来源。`CarCard` 使用 `aspect-[4/3]`，`ImageGallery` 主图使用 `aspectRatio: "4 / 3"`，缩略图按钮固定为 `72 × 54`；实际站内导航也没有观察到图廊撑开或错位。稳定的现有图片容器属于修改时必须保留的行为，但不能据此声称所有 CLS 已经由图片尺寸解决。
+
+与图片布局相比，Performance 将 Web Font 列为首页 CLS `0.13` 的偏移线索；详情页 CLS 为 `0.06`，Lighthouse 中位数为 `0.071`。`index.css` 确实在顶部通过远程 `@import` 加载 Google Fonts，但 Lighthouse 给出约 `600 ms` 的 Render-blocking requests 估算时，本次没有保存对应的具体资源清单，不能把全部时间直接归因于字体。字体目前只能作为待进一步验证的线索，不能列为已经确认的优化目标。
+
+#### 4.4 汇总已经确认的问题
+
+综合以上分析，当前已经确认两组需要修改的问题：初始入口包含与公开浏览无关的页面代码和 Google 脚本；首页与详情页的关键图片在首次加载期间与其他图片竞争网络资源。首页的两次车辆请求同样有运行记录支持，但是否属于应当消除的重复仍取决于列表和轮播的数据职责，需要在选择实现时再判断。
+
+另一方面，现有证据不能证明车辆详情页代码、图片尺寸、SignalR 或字体是当前主要瓶颈。它们不能仅凭静态依赖、单次诊断或一般性能建议被加入修改范围。本节结论止于问题范围；下一阶段仍需逐项选择最小改动，并且只有实际执行后的构建、请求和性能结果才能说明改动是否有效。
+
+
+
+### 5. 优化初始代码与数据交付
+
+第 4 节确认了两类代码交付问题：匿名首页会取得尚未访问的业务页面代码，并且会加载只供登录和注册使用的 Google Client。同时，Network 中还出现了两次参数相同的第一页车辆请求。请求重复是需要分析的现象，但仅凭参数相同，还不能断定两个界面必须共用同一份查询状态。
+
+本节先缩小初始 JavaScript 和第三方脚本的加载范围，再根据轮播图与车辆列表各自的职责判断是否应该合并查询。图片交付属于另一类问题，不在这里同时修改，避免不同类型的变化互相干扰。
+
+#### 5.1 理解路由 Lazy Loading 如何工作
+
+改动前，`router.tsx` 在文件顶部使用 Static Import：
+
+```tsx
+import AdminDashboardPage from "@/pages/AdminDashboardPage";
+```
+
+Static Import 会在模块加载时建立固定依赖。Vite 构建入口时会沿着这条关系继续收集页面及其依赖，因此即使用户只打开首页，`AdminDashboardPage` 使用的 Recharts 仍有机会进入初始代码。React Router 只能决定当前渲染哪个路由元素，不能撤销已经发生的导入。
+
+Dynamic Import 把模块地址放进 `import()` 函数调用中：
+
+```tsx
+import("@/pages/AdminDashboardPage");
+```
+
+执行 `import()` 会返回一个 Promise，并在这时取得对应模块。Vite 和 Rolldown 会把这个位置视为代码拆分边界，使页面代码有机会离开初始入口。路由配置需要的是 React 组件而不是 Promise，因此还需要 `React.lazy()` 把异步模块转换成可渲染的组件。
+
+`React.lazy()` 接收一个执行 Dynamic Import 的函数，并返回可以像普通组件一样使用的 Lazy Component：
+
+```tsx
+const AdminDashboardPage = lazy(
+  () => import("@/pages/AdminDashboardPage"),
+);
+```
+
+创建这个变量时不会立即取得页面模块。React 第一次尝试渲染 `<AdminDashboardPage />` 时，`lazy()` 才执行传入的函数；Promise 完成以前，组件还不能产生页面内容。Promise 成功后，`lazy()` 会把模块的 Default Export 作为页面组件，当前页面的导出方式符合这个要求。
+
+这段等待不能直接留白。React 提供的 `Suspense` 可以为尚未完成渲染的 Lazy Component 显示临时内容：
+
+```tsx
+<Suspense fallback={<RouteLoading />}>
+  <AdminDashboardPage />
+</Suspense>
+```
+
+React 尝试渲染 `Suspense` 的子组件时，如果 Lazy Component 仍在等待模块，`Suspense` 就暂时显示 `fallback`；模块取得成功后，再用真正页面替换这段反馈。它在这里处理的是页面代码等待，不会自动处理普通 `useEffect`、任意 API 请求或加载失败。
+
+React Router 的 `route.lazy` 也能延迟取得路由代码，但需要把页面导出适配成路由模块使用的 `Component`、`ErrorBoundary` 等配置。当前项目已经用 `element` 组织集中式路由树，并通过包装函数复用错误边界。`React.lazy()` 可以保留这些结构，因此本次选择它作为改动较小的方案。
+
+Dynamic Import 只建立拆分机会，不保证每个页面最终对应一个独立 Chunk。Bundler 仍可能提取共享模块或合并较小模块，实际结果必须由新的 Bundle Report 确认。
+
+#### 5.2 确定拆分边界与决策点
+
+Lazy Loading 没有消除页面代码，只是把下载时机从应用启动移到首次访问对应页面。拆分过多会增加请求和维护边界，因此本次只处理已有证据支持的页面：
+
+| 处理方式 | 页面或组件 | 原因 |
+| --- | --- | --- |
+| 改为 Lazy Component | `AdminPage`、`AdminDashboardPage`、`AdminPendingPage` | 只服务 Admin 路径，其中 Dashboard 使用 Recharts |
+| 改为 Lazy Component | `CreateCarPage`、`EditCarPage` | 只服务车辆创建和编辑流程，并会使用 dnd-kit 相关代码 |
+| 改为 Lazy Component | `LoginPage`、`RegisterPage`、`GoogleAuthLayout` | Google 登录只属于登录和注册路径 |
+| 保持 Static Import | `HomePage`、`CarDetailPage`、`NotFoundPage` | 首页是当前初始入口；详情页是公开核心路径且没有明显的大型专用依赖；404 页面很小 |
+| 保持 Static Import | Profile、邮箱验证和密码恢复页面 | 当前证据没有显示它们是主要体积来源，不为扩大拆分范围而增加改动 |
+| 保持 Static Import | `Layout`、`ProtectedRoute`、`AdminRoute`、`AuthInitializer` | 它们负责共享布局、访问控制和启动时的认证恢复 |
+
+这个边界直接针对 Recharts、dnd-kit 和 Google Client，不引入 `manualChunks`，也不为了增加 Chunk 数量而拆分所有页面。
+
+#### 5.3 为路由模块补充等待反馈并复用现有错误边界
+
+页面改成 Lazy Component 后，首次进入该路由时可能短暂等待模块。第 5.1 节中的 `Suspense` 需要一个实际的 `fallback` 组件来说明“页面代码仍在加载”；项目现有的 Error Boundary 只处理失败，不能代替正常等待状态。
+
+##### 区分认证恢复与页面模块等待
+
+`src/components/AuthInitializer.tsx` 是项目自己的启动组件，并在 `main.tsx` 中包裹整个 `RouterProvider`。Zustand 只把用户信息持久化到 Local Storage，Access Token 仍只保存在内存中，所以刷新页面后可能出现“有已登录用户信息，但内存中没有 Access Token”的状态。
+
+应用启动时，`AuthInitializer` 调用 Store 的 `initialize()`。如果没有已保存的用户信息，它直接结束初始化；如果存在用户信息，它通过 HttpOnly Refresh Token Cookie 请求 `/auth/refresh`，重新取得 Access Token。结果确定以前，组件不会渲染 Router，而是显示全屏反馈。
+
+原来的 `Loading...` 没有说明这段等待来自认证恢复，容易与页面代码加载混淆，因此改为：
+
+```tsx
+Restoring session...
+```
+
+这个调整不改变认证流程，只让文字与组件职责一致。认证初始化完成后，`AuthInitializer` 才渲染 Router；Lazy Component 的等待发生在 Router 内部，由另一套反馈处理。
+
+##### 新增路由等待组件
+
+新建 `src/components/RouteLoading.tsx`：
+
+```tsx
+export default function RouteLoading() {
+  return (
+    <div
+      className="flex min-h-[40vh] items-center justify-center text-sm text-muted-foreground"
+      role="status"
+    >
+      Loading page...
+    </div>
+  );
+}
+```
+
+`RouteLoading` 是传给 `Suspense` 的普通 React 组件，只负责显示页面代码仍在加载。`min-h-[40vh]` 为提示保留一块稳定区域，`role="status"` 让辅助技术能够识别这项状态信息。
+
+##### 组合等待边界与错误边界
+
+改动前的 `withEB()` 只添加 Error Boundary。路由元素现在同时需要处理正常等待和加载失败，因此将它改为 `withRouteBoundary()`：
+
+```tsx
+import { Suspense, type ReactNode } from "react";
+import RouteLoading from "@/components/RouteLoading";
+
+const withRouteBoundary = (element: ReactNode) => (
+  <ErrorBoundary>
+    <Suspense fallback={<RouteLoading />}>{element}</Suspense>
+  </ErrorBoundary>
+);
+```
+
+Router 中原有的 `withEB(...)` 调用同步改为 `withRouteBoundary(...)`。当 Lazy Component 仍在等待模块时，内层 `Suspense` 显示 `RouteLoading`；如果 Dynamic Import 被拒绝或页面渲染抛错，外层 `ErrorBoundary` 显示现有错误界面。静态页面也继续使用同一个包装函数，但没有组件进入等待状态时，`Suspense` 会直接渲染原页面。
+
+这些包装位于 `Layout` 的子路由元素上，因此切换业务页面时，被替换的是 `Outlet` 中的页面内容，导航栏和外层布局仍然保留。
+
+仅加入 `Suspense` 不会改变当前页面的加载方式；页面改成 Lazy Component 后，`RouteLoading` 才可能出现。
+
+#### 5.4 先拆分依赖明确的业务页面
+
+等待与错误反馈就位后，开始把选定页面改成 Lazy Component。Lazy Component 最初如果直接声明在 `router.tsx`，会使路由配置文件同时承担组件定义职责，并触发项目的 `react-refresh/only-export-components` 检查。Fast Refresh 依赖稳定的组件模块边界，因此把这些声明集中到独立文件，而不是关闭规则。
+
+新建 `src/routes/lazyRouteComponents.ts`：
+
+```tsx
+import { lazy } from "react";
+
+export const CreateCarPage = lazy(() => import("@/pages/CreateCarPage"));
+export const EditCarPage = lazy(() => import("@/pages/EditCarPage"));
+
+export const AdminPage = lazy(() => import("@/pages/AdminPage"));
+export const AdminDashboardPage = lazy(
+  () => import("@/pages/AdminDashboardPage"),
+);
+export const AdminPendingPage = lazy(
+  () => import("@/pages/AdminPendingPage"),
+);
+```
+
+随后从 `router.tsx` 删除这些页面原来的 Static Import，改为从 `@/routes/lazyRouteComponents` 导入。`lazy()` 返回的变量仍是 React 组件，所以路由对象继续使用 `<AdminPage />`、`<CreateCarPage />` 等写法，现有 URL、`ProtectedRoute`、`AdminRoute` 和页面 Props 都不需要改变。
+
+```tsx
+import {
+  AdminDashboardPage,
+  AdminPage,
+  AdminPendingPage,
+  CreateCarPage,
+  EditCarPage,
+} from "@/routes/lazyRouteComponents";
+```
+
+这一步建立了 Dynamic Import 边界，使 Recharts 和 dnd-kit 有机会不再随首页入口加载；是否形成预期 Chunk 仍要以实际构建产物为准。
+
+#### 5.5 将 Google Provider 限制到认证路由
+
+仅把 `LoginPage` 和 `RegisterPage` 改成 Lazy Component 仍不能移除首页的 Google Client，因为 `GoogleOAuthProvider` 继续在 `main.tsx` 中随应用根节点渲染。这个 Provider 为内部组件提供 Google 登录所需的 Context，并在挂载时加载 Google Client；Google 按钮只属于登录和注册，因此 Provider 也要移入这两个路由共享的边界。
+
+无路径父路由不增加 URL Segment，只为一组子路由提供共同的渲染结构。当 `/login` 或 `/register` 匹配时，React Router 会在父组件的 `Outlet` 位置渲染对应子页面。把 `Outlet` 放在 `GoogleOAuthProvider` 内部，两个页面就能共享 Google Context，其他路由则不会进入这个 Provider。
+
+新增 `src/components/GoogleAuthLayout.tsx`：
+
+```tsx
+import { GoogleOAuthProvider } from "@react-oauth/google";
+import { Outlet } from "react-router-dom";
+
+export default function GoogleAuthLayout() {
+  const clientId = import.meta.env.VITE_GOOGLE_CLIENT_ID;
+
+  if (!clientId) {
+    throw new Error("VITE_GOOGLE_CLIENT_ID is not configured");
+  }
+
+  return (
+    <GoogleOAuthProvider clientId={clientId}>
+      <Outlet />
+    </GoogleOAuthProvider>
+  );
+}
+```
+
+`GoogleAuthLayout` 本身也必须通过 `lazy()` 导入，否则它对 `@react-oauth/google` 的 Static Import 仍会从 `router.tsx` 进入初始依赖。将它与 `LoginPage`、`RegisterPage` 一起加入 `src/routes/lazyRouteComponents.ts`：
+
+```tsx
+export const GoogleAuthLayout = lazy(
+  () => import("@/components/GoogleAuthLayout"),
+);
+export const LoginPage = lazy(() => import("@/pages/LoginPage"));
+export const RegisterPage = lazy(() => import("@/pages/RegisterPage"));
+```
+
+然后在集中式 Router 中用一个无路径父路由包住两个认证页面：
+
+```tsx
+{
+  element: withRouteBoundary(<GoogleAuthLayout />),
+  children: [
+    { path: "/login", element: withRouteBoundary(<LoginPage />) },
+    { path: "/register", element: withRouteBoundary(<RegisterPage />) },
+  ],
+},
+```
+
+最后从 `main.tsx` 删除全局 Provider、对应 import 和启动阶段的 Client ID 检查，保留 `QueryClientProvider`、`AuthInitializer`、`RouterProvider` 与 `Toaster` 的原有层级。Client ID 检查已经移动到 `GoogleAuthLayout`：缺少配置时抛出的错误由认证父路由外层的 Error Boundary 处理，不会阻止公开页面启动。`VITE_GOOGLE_CLIENT_ID` 仍是浏览器可见的 OAuth Client ID，不是后端秘密。
+
+验证邮箱和密码恢复页面不使用 Google 按钮，不进入这个父路由。Google Client 是否真正离开首页，仍由 Network 记录确认。
+
+#### 5.6 保留轮播图与车辆列表的独立查询
+
+`HomePage` 和 `LatestCarousel` 当前都会请求 `page: 1`、`pageSize: 6`，但它们解决的不是同一个界面问题。
+
+`HomePage` 的查询服务于 `All Listings`：页码和筛选条件会进入 Query Key，查询结果还要驱动车辆总数、空状态和分页。它使用 Query Client 默认的 1 分钟 `staleTime`。`LatestCarousel` 则固定读取第一页车辆，只负责 `Latest Listings` 轮播，并单独使用 5 分钟 `staleTime`。
+
+两次请求当前可能返回相同车辆，只是因为第一页大小、筛选和排序恰好一致。这种结果重合不等于职责相同。把列表结果通过 Props 传给轮播，会让轮播的数量、排序和新鲜度依赖列表；其中一方改变展示需求时，另一方也会被迫参与修改。
+
+因此本节不修改 `HomePage` 和 `LatestCarousel` 的数据归属：
+
+- `HomePage` 保留带分页和筛选条件的 `useQuery`；
+- `LatestCarousel` 保留 `cars-latest-carousel` Query Key、固定数量和独立 `staleTime`；
+- 首页仍可能出现两次车辆请求，这是职责隔离带来的明确取舍，不将其记录为已经消除的请求。
+
+这个决定保留了两个组件独立变化的能力，也意味着本轮不能把车辆 XHR 减少作为优化成果。只有在业务语义明确要求两处共享同一数据集合时，才适合重新设计查询归属。
+
+#### 5.7 根据构建和 Network 结果决定保留范围
+
+代码中出现 `lazy()` 只能证明建立了 Dynamic Import，不能证明最终 Chunk 边界和浏览器请求符合预期。因此先生成优化后的 Bundle Report，再重新生成不含报告的普通 Production Build，并用同一份产物完成 Network 验证：
+
+```bash
+cd uucars-web
+ANALYZE_BUNDLE=true VITE_API_BASE_URL=http://localhost:5065 npm run build
+VITE_API_BASE_URL=http://localhost:5065 npm run build
+npm run preview -- --host localhost --port 5173 --strictPort
+```
+
+两次 Build 均成功，共转换 `2706` 个模块。优化前只有一个 JavaScript Chunk；优化后，入口和共享代码之外已经形成认证、车辆表单和 Admin 路由的独立 Chunk：
+
+| Build 对比 | 优化前 | 优化后 | 变化 |
+| --- | ---: | ---: | --- |
+| 主入口文件 | `1,230.01 kB` | `537.46 kB` | 减少 `692.55 kB`，约 `56.3%` |
+| 主入口 gzip | `366.33 kB` | `159.55 kB` | 减少 `206.78 kB`，约 `56.4%` |
+| JavaScript 边界 | 所有页面位于一个入口 | 初始/共享 Chunk 加多个路由 Chunk | 页面代码具备按路由加载的边界 |
+
+主入口文件的变化不能直接当作首页实际 JavaScript 降幅，因为首页还需要 `jsx-runtime` 和 `button` 两个共享 Chunk。实际请求必须以 Network 为准。
+
+Bundle Report 显示：
+
+- Recharts 及 D3 模块位于 `AdminDashboardPage` Chunk；该文件为 `393.52 kB`，gzip `112.84 kB`；
+- dnd-kit 位于 `SortableImageItem` Chunk；该文件为 `47.05 kB`，gzip `15.49 kB`；
+- `GoogleAuthLayout`、`LoginPage`、`RegisterPage` 和 Google 登录组件均形成认证路径使用的独立文件；
+- 初始入口仍包含 React DOM、SignalR、Radix UI、TanStack Query 和保持 Static Import 的页面，没有发现 Recharts 或 dnd-kit 在主入口中重复出现。
+
+主入口仍超过 Vite 默认的 `500 kB` 警告阈值，但这个警告只说明文件较大，不等于必须继续拆分。报告中其余 Profile 和账号页面没有带入与 Recharts、dnd-kit 相当的大型页面专用依赖，因此当前证据不支持扩大路由拆分范围，也不支持加入 `manualChunks`。
+
+随后沿用 Baseline 的 `390 × 844`、Fast 4G、Disable cache 和无痕窗口条件检查普通 Production Preview。首页冷加载及客户端导航结果如下：
+
+| 场景 | 实际请求 | 验证结果 |
+| --- | --- | --- |
+| 直接访问首页 | 初始请求 `3` 个 JavaScript：主入口 `159 kB`、`jsx-runtime` `34.2 kB`、`button` `41.1 kB`，合计约 `234 kB` | 未请求认证、车辆表单或 Admin Chunk，也未请求 Google Client |
+| 首页车辆数据 | 两次 `GET /cars?page=1&pageSize=6`，均为 `2.9 kB`，耗时 `181 ms` 和 `178 ms` | 两次独立查询与 5.6 的职责决定一致，未把它们记录为已消除的请求 |
+| 首页进入登录页 | 新增 `GoogleAuthLayout`、OAuth 模块、`LoginPage`、`GoogleSignInButton` 和 Google Client；共传输约 `108 kB` | `103 kB` 的 Google Client 到进入 `/login` 后才请求 |
+| Seller 进入创建车辆页 | 新增 `CreateCarPage` 与 `SortableImageItem`；合计传输约 `17.5 kB` | dnd-kit 相关代码到进入 `/cars/new` 后才请求，没有提前加载 Admin Chunk |
+| Admin 登录后进入 Dashboard | 新增 `AdminPage`、`AdminDashboardPage` 和共享图标；合计传输约 `114 kB` | Recharts 到进入 Admin Dashboard 后才请求 |
+| Dashboard 进入 Pending Review | 只新增 `AdminPendingPage`，传输 `1.6 kB` | 已加载的 Admin 父页面和 Dashboard Chunk 没有重复请求 |
+
+优化前首页会下载 `364 kB` 的应用入口和 `102 kB` 的 Google Client，初始 JavaScript 合计约 `466 kB`；本次记录中的首页初始 JavaScript约为 `234 kB`，减少约 `232 kB`，即约 `49.8%`。各目标 Chunk 均返回 `200`，对应页面正常显示。
+
+这些结果同时满足两个条件：公开首页移除了已经确认的页面专用代码和 Google Client，目标功能又能在实际访问时取得所需 Chunk。因此保留当前拆分边界；Profile、其余账号页面、SignalR 和手动分包继续保持现状。
+
+#### 5.8 回归功能并记录实际结论
+
+5.7 已经确认目标页面代码会在访问对应路由时才请求，但请求边界正确不等于页面行为一定正确。按需加载改变了页面代码的到达时间，因此还要确认 URL、权限判断、嵌套路由和原有交互没有因为等待过程而发生变化。
+
+人工回归继续使用普通 Production Preview，并保持 `390 × 844`、Fast 4G、Disable cache 和无痕窗口条件。Production Preview 直接运行 Build 生成的文件，可以同时观察真实路由 Chunk、`RouteLoading` 和最终页面是否正常衔接。实际结果如下：
+
+| 检查场景 | 实际结果 | 说明 |
+| --- | --- | --- |
+| 公开页面与认证页面 | 首页能够直接访问，Login 与 Register 页面可以正常切换 | 公开入口和认证路由保持可用 |
+| Protected Route | 未登录直接访问 `/cars/new` 会跳转到 `/login`，且不会请求 `CreateCarPage` | 权限判断先于受保护页面渲染，无权限访问不会额外加载表单页面代码 |
+| Profile 嵌套路由 | `/profile` 正常显示默认的 My Listings；进入 `/profile/favorites` 时只替换子路由内容 | Profile 外层布局和 `Outlet` 关系没有改变 |
+| 车辆创建与编辑 | 创建页正常显示；编辑页能够回填车辆数据，并按需请求 `EditCarPage` 与 `SortableImageItem` | 表单页面和图片排序依赖仍能在需要时取得 |
+| Admin Route 与刷新 | Dashboard 和 Pending Review 正常显示；刷新 `/admin/pending` 时短暂出现 `Loading page...`，随后恢复原 URL 和页面内容 | Admin 权限与嵌套路由正常，`RouteLoading` 在等待页面代码时提供反馈 |
+| 404 | 直接访问不存在的 URL 会保留该地址并显示现有 Page Not Found 页面 | 通配路由没有被 Lazy Route 改动破坏 |
+
+人工回归完成后停止 Preview 和手动启动的 API，因为 Playwright 会在 `5173` 和 `5065` 端口启动自己的前端与 E2E API。E2E 运行时仍需要可用的 SQL Server、Redis、`E2EConnection`、Admin Seed 和 `VITE_GOOGLE_CLIENT_ID`；临时用户、车辆与订单由测试辅助代码创建，不需要手动准备。
+
+以下检查从不同层面验证同一改动。每项命令、结果及其含义记录在一起；命令均在 `uucars-web` 目录执行：
+
+| 检查目的 | 命令 | 实际结果与含义 |
+| --- | --- | --- |
+| ESLint 检查静态规则 | `npm run lint` | 通过，结果为 `0 errors`、`1 warning`。`CarForm.tsx:77:26` 的 `react-hooks/incompatible-library` 表示 React Compiler 无法安全记忆化 React Hook Form 的 `watch()`，会跳过这项优化；它不是 error，不会阻断 Lint |
+| Production Build 同时检查 TypeScript 并生成生产文件 | `VITE_API_BASE_URL=http://localhost:5065 npm run build` | 通过，共转换 `2706` 个模块，用时 `521 ms`。主入口为 `537.46 kB`、gzip `159.55 kB`，因此仍有超过默认 `500 kB` 阈值的已知提示；该提示没有使 Build 失败 |
+| Vitest 与 React Testing Library 检查现有组件和页面行为 | `npm test -- --run` | `5` 个测试文件、`15` 个测试全部通过，用时 `3.15 s` |
+| Playwright 通过真实浏览器检查核心用户流程 | `npm run e2e` | 单 Worker 执行 `5` 条 E2E，全部通过，用时 `33.4 s`；注册、Seller 提交车辆、Admin 审核、Buyer 下单和 Seller 查看订单均保持正常 |
+
+Build、Bundle Report 和 Network 证明当前代码能够生成预期的生产文件，并在访问目标路由时取得对应 Chunk；人工回归、组件测试和 E2E 则没有在已检查的 URL、权限、嵌套路由和核心流程中发现功能回归。因此保留本节采用的路由拆分，结论只覆盖以上实际验证范围。
+
+
+
+### 6. 优化页面图片加载
+
+第 4 节已经确认，首页冷加载会取得 Hero、Seller Banner 和 6 张车辆封面，图片传输共 `1,877 kB`；直接访问车辆详情时，主图与 4 张其余车辆图片也会同时请求。问题不在于页面不能显示图片，而在于当前所有图片都按默认方式开始加载，关键图片会与尚未需要的图片竞争网络资源。
+
+本节只调整公开页面中现有图片的请求时机和相对优先级，不改变图片内容、车辆查询或上传流程。判断标准也不是“尽量多加 `lazy`”，而是先区分图片在当前页面中的职责：决定主要内容何时出现的图片应优先取得，暂时不可见的图片才适合推迟。
+
+#### 6.1 优化首页关键内容
+
+首页 Baseline 已经把 `hero-bg-CDjpd0E3.jpg` 识别为 LCP 元素。LCP 是页面首次加载期间最终成为最大可见内容的元素；浏览器越晚取得这张图片，用户越晚看到完整的首屏主要内容。因此 Hero 不能使用 `loading="lazy"`，否则浏览器可能主动推迟真正需要优先显示的资源。
+
+`loading` 控制图片是否允许延迟请求，`fetchPriority` 则是在浏览器已经发现资源后，提示它应当如何安排相对优先级。两者解决的不是同一个问题：`fetchPriority="high"` 可以让 Hero 在与其他图片竞争时优先，但不能让浏览器在 React 创建 `<img>` 以前就发现它。
+
+在 `src/components/HeroBanner.tsx` 中明确 Hero 的加载策略：
+
+```tsx
+<img
+  src={heroBg}
+  alt=""
+  aria-hidden="true"
+  loading="eager"
+  fetchPriority="high"
+  className="absolute inset-0 h-full w-full object-cover"
+  style={{ objectPosition: "center center" }}
+/>
+```
+
+`eager` 是普通 `<img>` 的默认行为，这里显式写出是为了让关键图片的职责可见；真正新增的调度提示是 `fetchPriority="high"`。本页只把 Hero 标记为高优先级，不能同时把轮播图或 Banner 也标成 `high`，否则多个“最高优先级”会重新互相竞争。
+
+本次不在共享的 `index.html` 中加入 Hero Preload。这个 HTML 同时服务首页和其他前端路由，全局 Preload 会让直接访问登录页或车辆详情页的用户也下载首页 Hero。为了提前几百毫秒发现一张图片而让所有路由承担额外请求，不符合当前最小改动范围。Hero 的实际发现时间和优先级仍要通过 Network Waterfall 验证，不能仅凭 JSX 属性宣称 LCP 已经改善。
+
+#### 6.2 分别处理首页轮播、车辆列表和 Seller Banner
+
+首页有三个位置会显示非关键图片，但它们不能共用一个笼统规则：
+
+| 区域 | 在页面中的位置 | 本次加载策略 |
+| --- | --- | --- |
+| `LatestCarousel` | 紧接 Hero；手机最初显示 1 张，`sm` 以上显示 2 张 | 第 1、2 张立即加载，其余轮播图片允许延迟 |
+| 首页的 `All Listings` | 位于 Hero、轮播和 Seller Banner 之后 | 所有车辆封面允许延迟 |
+| 筛选或翻页后的车辆列表 | Hero、轮播和 Seller Banner 不再渲染，列表成为页面主要内容 | 前 3 张立即加载，其余车辆封面允许延迟 |
+| Seller Banner | 位于轮播之后，并且图片在 `sm` 以下隐藏 | 允许延迟，并降低请求优先级 |
+
+`LatestCarousel` 和 `All Listings` 是两个职责独立的功能。它们当前可能取得相同车辆，但这种结果重合不是数据约定；轮播图片怎样加载只取决于轮播布局，列表图片怎样加载只取决于列表在当前页面中的位置。即使两组车辆完全不同，上表中的判断仍然成立。
+
+浏览器原生 `loading="lazy"` 表示图片可以延迟请求。当图片已经可见或距离视口较近时，浏览器仍可能提前请求，因此 `lazy` 是调度提示，不是保证图片在滚动后才下载的开关。`fetchPriority="low"` 解决另一个问题：如果一张允许延迟的图片仍被浏览器提前请求，它应当把网络优先级让给 Hero 等关键资源。本节只使用浏览器已有能力，不增加第三方 Lazy Loading 库。
+
+##### 让卡片组件接收父组件的加载决定
+
+`CarCardHorizontal` 只知道怎样显示一辆车，不知道自己是轮播中的第几张；`CarCard` 也不知道当前页面是否还显示 Hero。真正掌握这些位置信息的是调用它们的父组件，因此先增加一个 `imageLoading` Prop，再由 `LatestCarousel` 和 `HomePage` 分别传入自己的决定。
+
+两个组件使用相同的 Prop 名称，只是因为它们都要把一个标准 `<img>` 属性传给封面图片，不代表轮播和列表共享查询、车辆数据或加载状态。
+
+在 `src/components/CarCardHorizontal.tsx` 中完成三处修改。第一处是在 Props 中加入可选的 `imageLoading`：
+
+```tsx
+interface CarCardHorizontalProps {
+  car: Car;
+  imageLoading?: "eager" | "lazy";
+}
+```
+
+第二处是替换组件函数签名。默认值使用 `eager`，所以没有传入这个 Prop 的调用位置仍保持立即加载；函数后面的 `return` 和其他逻辑保持原样：
+
+```tsx
+export default function CarCardHorizontal({
+  car,
+  imageLoading = "eager",
+}: CarCardHorizontalProps) {
+    ...
+}
+```
+
+第三处是在已有的车辆封面 `<img>` 中加入 `loading` 和 `fetchPriority`，其他属性保持不变：
+
+```tsx
+<img
+  src={car.coverImageUrl}
+  alt={car.title}
+  loading={imageLoading}
+  fetchPriority={imageLoading === "lazy" ? "low" : "auto"}
+  className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
+/>
+```
+
+`auto` 表示不覆盖浏览器的正常优先级判断；只有允许延迟的图片才显式使用 `low`。
+
+`src/components/CarCard.tsx` 按相同顺序完成三处修改。先扩展现有 Props：
+
+```tsx
+interface CarCardProps {
+  car: Car;
+  highlightKeyword?: string;
+  imageLoading?: "eager" | "lazy";
+}
+```
+
+再替换函数签名，原有函数体保持不变：
+
+```tsx
+export default function CarCard({
+  car,
+  highlightKeyword,
+  imageLoading = "eager",
+}: CarCardProps) {
+    ....
+}
+```
+
+最后在现有车辆封面 `<img>` 中加入相同的两个属性：
+
+```tsx
+<img
+  src={car.coverImageUrl}
+  alt={car.title}
+  loading={imageLoading}
+  fetchPriority={imageLoading === "lazy" ? "low" : "auto"}
+  className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
+/>
+```
+
+到这里，两个卡片组件只是具备了接收策略的能力。它们仍然默认立即加载，必须由各自的父组件传入 `lazy`，实际行为才会改变。
+
+##### 为轮播图指定自己的加载策略
+
+`LatestCarousel` 使用 `w-full sm:w-1/2`：手机最初显示 1 张，`sm` 以上最初显示 2 张。为避免宽屏中第二张可见卡片被延迟，前两张都使用 `eager`；第 3 张以后的图片才使用 `lazy`。
+
+在 `src/components/LatestCarousel.tsx` 的轮播容器中，用下面的代码替换原来的 `data.items.map((car) => ...)`。这里的 `index` 从 `0` 开始，所以 `index < 2` 对应第 1、2 张：
+
+```tsx
+{data.items.map((car, index) => (
+  <div key={car.id} className="flex-none pl-4 w-full sm:w-1/2">
+    <CarCardHorizontal
+      car={car}
+      imageLoading={index < 2 ? "eager" : "lazy"}
+    />
+  </div>
+))}
+```
+
+手机上第二张卡片虽然尚未显示，但会为了兼容现有两列布局提前加载。这里接受一张图片的有限提前请求，避免为了精确区分断点再增加媒体查询状态。这个索引判断只属于轮播内部，不依赖 `All Listings` 返回哪些车辆。
+
+##### 为车辆列表指定自己的加载策略
+
+同一个 `CarCard` 会出现在两种页面位置。`isHomepage` 为 `true` 时，列表位于三个首页区块之后，车辆封面都可以延迟；`isHomepage` 为 `false` 时，列表位于页面主要位置，需要让第一行及时显示。
+
+当前网格最多使用 `xl:grid-cols-3`，所以第一行最多有 3 张卡片。在 `src/pages/HomePage.tsx` 的车辆卡片网格中，保留原有 `isLoading` 和 `CarCardSkeleton`，只把数据分支改成下面的写法：
+
+```tsx
+{isLoading
+  ? Array.from({ length: PAGE_SIZE }).map((_, i) => (
+      <CarCardSkeleton key={i} />
+    ))
+  : data?.items.map((car, index) => (
+      <CarCard
+        key={car.id}
+        car={car}
+        highlightKeyword={debouncedBrand || undefined}
+        imageLoading={isHomepage || index >= 3 ? "lazy" : "eager"}
+      />
+    ))}
+```
+
+这里的条件可以分成两种情况理解：
+
+```text
+isHomepage === true
+→ 所有列表图片使用 lazy
+
+isHomepage === false
+→ 索引 0、1、2 使用 eager
+→ 从索引 3 开始使用 lazy
+```
+
+较窄屏幕的第一行只有一张或两张卡片，因此最多会多提前加载一两张图片。这个简单规则覆盖了现有最大列数，并避免把 viewport 判断加入列表业务逻辑。
+
+##### 单独处理 Seller Banner
+
+Seller Banner 不属于轮播或车辆列表，但它同样会在首页初始阶段参与图片请求。Baseline 已经确认，在 `390 px` 宽度下它的图片区域虽然被 `hidden sm:block` 隐藏，浏览器仍传输了这张 `405 kB` 图片。
+
+在 `src/components/SellerBanner.tsx` 的现有 `<img>` 中加入 `loading` 和 `fetchPriority`：
+
+```tsx
+<img
+  src={sellerImg}
+  alt="Sell your car"
+  loading="lazy"
+  fetchPriority="low"
+  className="h-full w-full object-cover"
+  style={{ minHeight: "200px" }}
+/>
+```
+
+修改后，三个区域仍然分别维护自己的数据和显示职责；新增的属性只改变图片的请求时机和相对优先级。轮播最初可见的图片和筛选列表首行仍然立即加载，当前页面暂时不需要的图片则允许浏览器延迟处理。由于 `lazy` 只是提示，具体减少了哪些初始请求仍要以实际 Network 记录为准。
+
+#### 6.3 处理车辆详情图片
+
+车辆详情 Baseline 已经确认，直接进入详情页时会同时请求 5 张原始 R2 图片，其中当前显示的大图是该页面的 LCP。原因来自 `ImageGallery` 的现有渲染结构：详情 API 返回图片数组后，大图区域使用 `images[activeIndex]` 显示当前图片，缩略图区域又通过 `images.map()` 渲染数组中的每一张图片。
+
+假设数组包含 A、B、C、D、E，页面初次渲染时，大图区域显示 A，缩略图区域则显示 A 到 E。大图 A 和第一个缩略图虽然引用相同 URL，浏览器可以复用同一份资源，但 B 到 E 的地址也会立即出现在页面中，因此它们可能与作为 LCP 的 A 竞争网络资源。
+
+本次不删除缩略图，也不改变切图逻辑，只明确两类图片的加载优先级：当前大图需要尽快显示，使用 `eager` 和 `high`；缩略图只是切换入口，使用 `lazy` 和 `low`，允许浏览器推迟暂时不需要的请求，并在请求已经开始时优先处理大图。
+
+在 `src/components/ImageGallery.tsx` 中找到主图区域现有的 `<img>`，加入 `loading="eager"` 和 `fetchPriority="high"`：
+
+```tsx
+<img
+  key={activeIndex}
+  src={images[activeIndex].imageUrl}
+  alt={`${title} - photo ${activeIndex + 1}`}
+  loading="eager"
+  fetchPriority="high"
+  className="h-full w-full object-cover transition-opacity duration-300"
+/>
+```
+
+这里的 `images[activeIndex].imageUrl` 是当前大图地址。`eager` 表示该元素出现后立即加载，`high` 表示浏览器发现它以后应优先安排这个请求。
+
+然后在同一文件的 `images.map()` 中找到缩略图 `<img>`，加入 `loading="lazy"` 和 `fetchPriority="low"`：
+
+```tsx
+<img
+  src={img.imageUrl}
+  alt={`Thumbnail ${i + 1}`}
+  loading="lazy"
+  fetchPriority="low"
+  className="h-full w-full object-cover"
+/>
+```
+
+`lazy` 允许浏览器推迟距离视口较远的缩略图，`low` 则让已经开始的缩略图请求把相对优先级让给当前大图。这两个属性不会隐藏缩略图，也不会改变 `images` 数组或按钮的 `onClick`。
+
+用户点击另一张缩略图时，现有 `setActiveIndex(i)` 会更新索引，大图的 `src` 随即切换为所选图片。大图上的 `eager` 和 `high` 仍然生效：如果该图片已经作为缩略图加载完成，浏览器可以复用缓存；如果尚未加载，则按当前大图的优先级处理。
+
+详情图片地址只有在 `/cars/:id` 响应返回后才能确定，初始 `index.html` 并不知道应该预加载哪一个 URL，因此这里不增加固定的 Preload。完成修改后需要通过 Network 观察当前主图是否优先，并实际点击缩略图确认切换正常。`lazy` 只是浏览器调度提示，靠近视口的缩略图仍可能提前请求，所以不能只根据代码断言初始请求一定减少。
+
+#### 6.4 确认图片加载不会引入新的 CLS
+
+`lazy` 允许图片稍后到达，但图片下载期间仍要为它保留显示空间。如果容器的高度必须等到图片出现后才能确定，后续内容就会被突然推开并产生 CLS。CLS 衡量的是加载过程中可见元素发生的意外位置变化，因此它与图片请求早晚是两个不同问题。
+
+当前图片组件已经在资源到达前确定了显示空间：
+
+- `CarCard` 和 `CarCardHorizontal` 的图片容器使用 `aspect-[4/3]`；
+- `ImageGallery` 主图容器使用 `aspectRatio: "4 / 3"`；
+- 缩略图按钮固定为 `72 × 54`；
+- Hero 图片使用绝对定位，外层容器的高度由已有内容确定，不依赖图片撑开。
+
+这些尺寸规则意味着图片即使延迟加载，周围布局也不需要等待图片尺寸才能确定，因此本节不新增布局代码，只保留现有容器样式。`CarImage` 目前只提供 `imageUrl`，没有原图的真实宽高；现有容器已经完成空间预留，没有必要猜测并填写 `<img>` 的 `width` 和 `height`。当前需要确认的是加载策略没有破坏这些尺寸规则，而不是在没有证据的情况下重构图片布局。
+
+#### 6.5 保持其他图片流程不变
+
+本节处理的是公开浏览页面中关键图片与非关键图片的请求竞争。创建和编辑车辆时使用的上传预览、拖拽排序与本地 `ObjectURL` 不参与这些页面的初始加载，因此修改它们不能解决当前问题，保持现状即可。
+
+R2 图片转换、响应式图片 CDN、WebP/AVIF 自动转换和裁剪压缩流水线可以改变图片文件本身，但也会引入新的存储、转换或交付流程。当前改动只需要利用现有 `<img>` 属性调整请求时机和相对优先级，没有证据支持扩大到图片基础设施。
+
+图片 URL、API Contract、车辆图片数量和 Gallery 交互同样保持不变。这样，页面请求行为发生变化时，可以判断它来自加载策略，而不是图片内容、接口数据或交互逻辑同时发生了改变。
+
+#### 6.6 验证图片体验
+
+代码修改完成后，先执行静态检查和 Production Build，确认 JSX 属性、TypeScript 类型和构建产物有效：
+
+```bash
+cd uucars-web
+npm run lint
+VITE_API_BASE_URL=http://localhost:5065 npm run build
+```
+
+随后用本地 API 和普通 Production Preview 复用 Baseline 的 `390 × 844`、Fast 4G、Disable cache 条件。Network 面板需要显示 `Img` 请求和 `Priority` 列；每个场景先清空记录再重新加载，避免缓存把新的请求顺序隐藏掉。
+
+验证按图片职责展开：
+
+| 场景 | 需要观察的结果 |
+| --- | --- |
+| 直接访问首页 | Elements 中的 Hero 保持 `loading="eager"`，Network 中对应请求显示为高优先级；`390 px` 下隐藏的 Seller Banner 不应继续在初始阶段传输 |
+| 首页初始轮播 | 第一张卡片正常显示，`sm` 以上最初可见的两张均能及时出现；其余轮播图片允许在接近可见位置时请求 |
+| 首页滚动 | 向下接近 Seller Banner 和 `All Listings` 时，延迟图片能够加载，卡片空间不发生明显跳动 |
+| 带筛选条件的列表页 | Hero、轮播和 Seller Banner 不渲染时，首行车辆图片仍能及时显示，其余图片按视口接近程度请求 |
+| 直接访问车辆详情 | 当前主图优先于缩略图，主图区域在图片到达前保持 `4:3` 空间 |
+| 操作 Gallery | 逐一点击缩略图和左右按钮，图片都能显示，计数器、选中状态和键盘可操作性保持正常，不出现持续空白 |
+
+原生 `loading="lazy"` 会结合距离、网络和浏览器策略决定何时请求，所以“仍有部分视口外图片提前加载”不自动等于实现错误。真正需要判断的是：关键图片有没有被延迟，明显不可见的图片是否减少了初始竞争，以及 Gallery 和轮播是否产生交互回归。如果浏览器仍在首屏阶段请求全部 6 张轮播图片，就如实记录原生策略在当前布局下没有形成清晰收益，不能把代码中出现 `lazy` 当作优化已经生效。
+
+最后使用 Performance Reload Recording 检查首页和详情页的 LCP Element 与 Layout Shift。Hero 和详情主图仍应是可正常显示的主要内容，现有图片容器不应出现新的明显偏移。`alt`、`aria-hidden`、缩略图按钮标签和现有错误占位均未因加载策略删除，图片可访问性与失败时的页面结构也应保持原有行为。只有实际执行后的请求、交互和布局记录才能作为本节结果；未运行的检查不填写为通过。
+
+
+
+### 7. 对比优化前后结果
+
+使用第 2 节确定的相同条件重新测量。
+
+#### 7.1 对比 Production Build
+
+记录：
+
+- 入口 JavaScript 前后变化；
+- 新增页面 Chunk；
+- 主要依赖所在 Chunk；
+- CSS 是否发生变化；
+- 总 Bundle 和初始加载体积的区别；
+- 是否出现不合理的小 Chunk；
+- Build 是否仍无错误。
+
+重点比较初始加载，不把“总文件数量增加”直接理解为性能退化。
+
+#### 7.2 对比 Bundle Report
+
+确认：
+
+- 首页是否只保留必要共享代码；
+- 页面专用依赖是否按需加载；
+- 是否存在新的重复模块；
+- 是否出现循环依赖或异常 Chunk；
+- 是否需要保留当前拆分边界。
+
+#### 7.3 对比首页 Network
+
+检查：
+
+- 首次加载入口；
+- 页面代码请求；
+- API 请求；
+- Hero；
+- 首屏车辆图片；
+- 首屏以下车辆图片；
+- 导航到其他页面时新增的 Chunk。
+
+#### 7.4 对比车辆详情 Network
+
+检查：
+
+- 详情页面 Chunk；
+- 详情 API；
+- 主图；
+- 缩略图；
+- 从首页导航进入与直接访问的差异；
+- 浏览器缓存后的行为。
+
+#### 7.5 对比 Lighthouse
+
+在相同条件下重新记录首页和详情页：
+
+- LCP；
+- CLS；
+- TBT；
+- Performance；
+- 主要诊断信息。
+
+不要求所有数值都改善。如果某项数据接近，应如实记录为“没有观察到明确变化”。
+
+#### 7.6 决定保留或撤销修改
+
+每项修改分别判断：
+
+```text
+有明确收益且复杂度合理
+→ 保留
+
+结果接近但实现简单、职责更清楚
+→ 说明理由后决定是否保留
+
+没有收益且增加复杂度
+→ 撤销
+
+产生回归或请求碎片化
+→ 撤销或缩小范围
+```
+
+最终结果可以小于最初候选方案，但不能保留无法解释的复杂配置。
+
+
+
+### 8. 完成功能回归和开发记录
+
+#### 8.1 运行前端静态检查
+
+执行：
+
+- ESLint；
+- TypeScript；
+- Production Build；
+- `git diff --check`。
+
+#### 8.2 运行组件测试
+
+运行现有 Vitest 和 React Testing Library Tests。
+
+如果 Lazy Route 改变测试边界，只补充必要测试：
+
+- Lazy 页面最终能够渲染；
+- Loading Fallback 能够显示；
+- Protected Route 和 Admin Route 行为保持不变。
+
+不测试 Bundler 内部实现，也不通过大量 Mock 锁定 Chunk 文件名。
+
+#### 8.3 运行 Playwright E2E
+
+运行现有五条核心流程：
+
+- 注册；
+- Seller 创建车辆并提交审核；
+- Admin 审核；
+- Buyer 下单；
+- Seller 查看订单。
+
+重点确认：
+
+- 页面按需加载没有破坏导航；
+- Loading 状态没有造成定位不稳定；
+- Protected Route 正常；
+- Admin 页面正常；
+- 直接访问和刷新仍然工作。
+
+Playwright 当前使用 Vite Development Server，因此它验证的是功能和导航回归，不用于证明 Production Chunk 的最终组成；Production Chunk 以 Build、Bundle Report 和 Production Preview 的 Network 结果为准。
+
+#### 8.4 检查变更范围
+
+确认：
+
+- 没有后端业务修改；
+- 没有数据库 Migration；
+- 没有改变 API Contract；
+- 没有新增 Secret；
+- 没有提交 Bundle Report、Lighthouse Cache、截图或临时文件；
+- 没有为了分数进行无关 UI 重构；
+- 没有保留未使用的依赖或配置。
+
+#### 8.5 记录 Step 74 结果
+
+在开发记录中写明：
+
+- 优化前 Baseline；
+- Bundle 主要组成；
+- 实际发现的问题；
+- 实施的修改；
+- 检查后保持现状的部分；
+- 被放弃或撤销的方案；
+- 优化前后数据；
+- 本地验证结果；
+- 尚未执行的检查。
+
+不把未运行的测试记录为通过。
+
+
+
+### 9. 通过现有 CI/CD 发布 Step 74
+
+#### 9.1 推送功能分支
+
+推送前检查：
+
+- 修改只属于 Step 74；
+- 临时分析文件未进入 Git；
+- Commit Message 使用英文；
+- `git diff --check` 通过。
+
+#### 9.2 验证功能分支 CI
+
+确认当前提交真实通过：
+
+- Backend；
+- Frontend；
+- E2E。
+
+即使 Step 74 只修改前端，也继续使用完整 CI，确保应用组合行为没有回归。
+
+#### 9.3 合并回 `develop`
+
+使用现有本地 `merge --no-ff` 流程合并。
+
+推送后确认 `develop` 的：
+
+- Backend；
+- Frontend；
+- E2E；
+
+全部通过。
+
+#### 9.4 创建发布 PR
+
+创建：
+
+```text
+develop → main
+```
+
+确认 Required Checks：
+
+- Validate Release Source；
+- Backend；
+- Frontend；
+- E2E。
+
+全部通过后使用 Create a merge commit。
+
+#### 9.5 确认生产 CD
+
+确认：
+
+- `main` CI 成功；
+- CD 使用同一个 Release SHA；
+- 前端 Artifact 来自该提交；
+- 后端 Image 来自同一个提交；
+- Azure Container Apps 部署成功；
+- Azure Static Web Apps 部署成功；
+- Workflow Production Smoke Test 通过；
+- `release.json` 对应本次发布提交。
+
+Step 74 不改变现有同提交发布架构。
+
+#### 9.6 执行相关生产 Smoke Test
+
+生产环境只执行非破坏性检查：
+
+- 首页正常打开；
+- 首页车辆内容正常显示；
+- 车辆详情正常打开；
+- 浏览器直接刷新页面正常；
+- 登录页正常加载；
+- 至少访问一个本次实际采用 Lazy Loading、并且可以安全验证的路由，确认对应 Chunk 正常加载；
+- Console 没有 Chunk 加载错误；
+- Network 显示页面代码按预期加载；
+- `release.json` 对应本次提交。
+
+优先选择公开页面或认证页面；只有本次修改确实涉及 Admin 路由，并且已有安全测试账号时，才检查 Admin 页面。
+
+不在生产环境运行会创建车辆、订单或修改审核状态的完整 E2E。
+
+#### 9.7 同步长期分支
+
+生产发布和 Smoke Test 成功后：
+
+- 将 `main` 的发布 Merge Commit 同步回 `develop`；
+- 确认本地和远程长期分支一致；
+- 保留验证记录；
+- 删除已经完成的 Step 74 功能分支。
+
+只有在发布和要求的检查完成后才能删除功能分支。
+
+
+
+### Step 74 完成状态
+
+```text
+概念理解：
+□ 理解 Production Bundle 与初始加载体积的区别
+□ 理解 Static Import 与 Dynamic Import
+□ 理解 Route-level Code Splitting
+□ 理解 React.lazy 与 React Router route.lazy 的适用边界
+□ 理解 Suspense Fallback 只处理支持 Suspense 的等待过程
+□ 理解 React Lazy Error Boundary 与 Router Route Error 的边界
+□ 理解 Tree Shaking 不等于 Route Splitting
+□ 理解 Network Waterfall
+□ 理解首页 LCP 与关键资源发现和加载顺序
+□ 理解图片 Lazy Loading 不能用于 LCP 图片
+□ 理解 CLS 与图片空间预留
+□ 理解 Lighthouse Lab Data 的作用和局限
+□ 理解 Lighthouse 不能代表真实用户 INP
+
+测量与分析：
+□ 固定优化前后测试条件
+□ 记录优化前 Production Build
+□ 检查优化前 dist
+□ 选择兼容 Vite 8 和 Rolldown 的分析工具
+□ 确认分析模式不会改变标准 CI/CD Build
+□ 生成优化前 Bundle Report
+□ 记录首页 Network Baseline
+□ 记录详情页 Network Baseline
+□ 记录首页 Lighthouse Baseline
+□ 记录详情页 Lighthouse Baseline
+□ 根据证据形成最小修改清单
+
+代码交付：
+□ 选择适合当前 Router 的 Lazy Loading 方案
+□ 只拆分报告支持的高收益路由
+□ 页面专用依赖按需加载或有明确的保留理由
+□ 提供简单、可理解的 Loading Fallback
+□ 正确处理 React Lazy 或 Router Lazy 的错误边界
+□ 保留现有页面运行错误反馈
+□ 没有增加不必要的手动分包配置
+□ 没有为了拆分而产生过多无意义的小 Chunk
+
+图片加载：
+□ 确认首页实际 LCP Element
+□ 首屏关键图片没有被错误 Lazy Load
+□ 区分资源发现过晚与请求优先级不足
+□ 仅在证据支持时使用 Preload 或 fetchPriority
+□ 首屏以下车辆图片按需加载
+□ 详情主图和缩略图采用合适加载策略
+□ 图片区域在加载前保持稳定
+□ 没有把图片上传功能扩展进本步骤
+
+结果比较：
+□ 对比优化前后 Production Build
+□ 对比优化前后 Bundle Report
+□ 对比首页 Network
+□ 对比详情页 Network
+□ 对比首页 Lighthouse
+□ 对比详情页 Lighthouse
+□ 如实记录没有明确变化的指标
+□ 撤销没有收益但增加复杂度的修改
+
+本地验证：
+□ ESLint 通过
+□ TypeScript 和 Production Build 通过
+□ Vitest / React Testing Library 通过
+□ Playwright E2E 通过
+□ git diff --check 通过
+□ 没有提交临时分析文件
+□ 没有修改无关后端、数据库或 API Contract
+
+发布：
+□ 功能分支 Backend、Frontend 和 E2E CI 通过
+□ 合并后的 develop CI 通过
+□ develop → main 发布 PR Required Checks 通过
+□ main CI 成功
+□ Azure CD 成功
+□ 生产 Smoke Test 通过
+□ release.json 对应本次发布提交
+□ main 发布 Merge Commit 已同步回 develop
+□ Step 74 功能分支在发布完成后清理
+```

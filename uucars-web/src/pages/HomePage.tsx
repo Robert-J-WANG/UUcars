@@ -110,11 +110,12 @@ export default function HomePage() {
                 <CarCardSkeleton key={i} />
               ))
             : // 改之后
-              data?.items.map((car) => (
+              data?.items.map((car, index) => (
                 <CarCard
                   key={car.id}
                   car={car}
                   highlightKeyword={debouncedBrand || undefined}
+                  imageLoading={isHomepage || index >= 3 ? "lazy" : "eager"}
                 />
               ))}
         </div>

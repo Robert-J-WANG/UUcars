@@ -54,6 +54,8 @@ export default function HeroBanner() {
         src={heroBg}
         alt=""
         aria-hidden="true"
+        loading="eager"
+        fetchPriority="high"
         className="absolute inset-0 h-full w-full object-cover"
         // object-position 控制图片焦点，根据图片内容调整
         // 比如人物在右侧就用 "right center"

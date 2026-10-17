@@ -76,10 +76,13 @@ export default function LatestCarousel() {
       {/* 轮播容器 */}
       <div ref={emblaRef} className="overflow-hidden">
         <div className="flex -ml-4">
-          {data.items.map((car) => (
+          {data.items.map((car, index) => (
             // w-full（手机1张） / sm:w-1/2（平板、桌面2张）
             <div key={car.id} className="flex-none pl-4 w-full sm:w-1/2">
-              <CarCardHorizontal car={car} />
+              <CarCardHorizontal
+                car={car}
+                imageLoading={index < 2 ? "eager" : "lazy"}
+              />
             </div>
           ))}
         </div>
