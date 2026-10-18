@@ -21,6 +21,8 @@ export default function SellerBanner() {
         <img
           src={sellerImg}
           alt="Sell your car"
+          loading="lazy"
+          fetchPriority="low"
           className="h-full w-full object-cover"
           // 高度撑满右侧内容区，由右侧 padding 决定
           style={{ minHeight: "200px" }}

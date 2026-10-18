@@ -1,10 +1,29 @@
 import { configDefaults, defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
+// 新增
+import type { PluginOption } from "vite";
+import { visualizer } from "rollup-plugin-visualizer";
 import path from "node:path";
 
+// 新增
+const plugins: PluginOption[] = [react(), tailwindcss()];
+
+if (process.env.ANALYZE_BUNDLE === "true") {
+  plugins.push(
+    visualizer({
+      filename: "dist/bundle-report.html",
+      template: "treemap",
+      gzipSize: true,
+      brotliSize: true,
+      open: false,
+    }) as PluginOption,
+  );
+}
+
 export default defineConfig({
-  plugins: [react(), tailwindcss()],
+  // 使用新的plugins
+  plugins,
   resolve: {
     alias: {
       "@": path.resolve(import.meta.dirname, "./src"),

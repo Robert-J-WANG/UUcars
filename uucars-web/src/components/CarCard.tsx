@@ -9,6 +9,7 @@ import { highlight } from "@/lib/highlight";
 interface CarCardProps {
   car: Car;
   highlightKeyword?: string; // 可选：当前搜索词，有值时高亮匹配部分
+  imageLoading?: "eager" | "lazy";
 }
 
 // 计算距今多久（用于显示发布时间）
@@ -18,7 +19,11 @@ function getRelativeTime(dateStr: string): string {
   return `${days}d ago`;
 }
 
-export default function CarCard({ car, highlightKeyword }: CarCardProps) {
+export default function CarCard({
+  car,
+  highlightKeyword,
+  imageLoading = "eager",
+}: CarCardProps) {
   return (
     <Link
       to={`/cars/${car.id}`}
@@ -39,6 +44,8 @@ export default function CarCard({ car, highlightKeyword }: CarCardProps) {
             <img
               src={car.coverImageUrl}
               alt={car.title}
+              loading={imageLoading}
+              fetchPriority={imageLoading === "lazy" ? "low" : "auto"}
               className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
             />
           ) : (
