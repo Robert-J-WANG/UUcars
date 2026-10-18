@@ -7,6 +7,7 @@ import { cn } from "@/lib/utils";
 
 interface CarCardHorizontalProps {
   car: Car;
+  imageLoading?: "eager" | "lazy";
 }
 
 // 与 CarCard 保持一致的相对时间函数
@@ -16,7 +17,10 @@ function getRelativeTime(dateStr: string): string {
   return `${days}d ago`;
 }
 
-export default function CarCardHorizontal({ car }: CarCardHorizontalProps) {
+export default function CarCardHorizontal({
+  car,
+  imageLoading = "eager",
+}: CarCardHorizontalProps) {
   return (
     <Link to={`/cars/${car.id}`} className="block group">
       <article
@@ -36,6 +40,8 @@ export default function CarCardHorizontal({ car }: CarCardHorizontalProps) {
             <img
               src={car.coverImageUrl}
               alt={car.title}
+              loading={imageLoading}
+              fetchPriority={imageLoading === "lazy" ? "low" : "auto"}
               className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
             />
           ) : (

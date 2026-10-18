@@ -39,7 +39,7 @@ export default function AuthInitializer({
             className="text-sm"
             style={{ color: "var(--color-text-muted)" }}
           >
-            Loading...
+            Restoring session...
           </span>
         </div>
       </div>

@@ -296,10 +296,17 @@ operation manual.
 
 ### Preserve facts without preserving the conversation
 
-Record confirmed observations, decisions and results. Remove questions,
-assistant replies, correction history, drafting commentary, apologies and other
-traces of the writing session. Never invent a command run, result, motivation or
-decision.
+Record only confirmed observations, decisions and results that are necessary to
+establish the current problem, justify a decision, explain the implementation or
+validate the current result. An observation does not belong in the note merely
+because it is true or was manually verified.
+
+Identify discussion-process traces by their actual meaning and function, not by
+surface wording alone. Rewriting a question, conversational detour, correction
+or curiosity-driven check as neutral declarative prose does not turn it into
+learning material. Omit incidental experiments, transient observations and
+other discussion details that do not change the current explanation, decision
+or validation. Never invent a command run, result, motivation or decision.
 
 ### Use minimal sufficient detail
 
@@ -308,15 +315,37 @@ Remove generic introductions, repeated summaries, empty transitions and facts
 that do not help with the current task. Keep necessary context and causal links;
 brevity must not turn the text into unexplained instructions.
 
+### Re-read from the learner's position
+
+Before saving, re-read the complete changed part as a learner who knows only
+what the note has established up to the current knowledge boundary. Do not fill
+gaps with the author's intent, repository knowledge or concepts explained
+elsewhere.
+
+At the first use of every unfamiliar concept, the text must make clear what it
+is, what concrete behaviour it has, why it is needed here and how it relates to
+the surrounding code. A learner must be able to explain the reason and mechanism
+in their own words, not merely copy the shown command or code. If understanding
+requires guessing an undefined term, supplying a missing causal step or already
+knowing the concept, the draft fails and must be rewritten.
+
+This comprehension pass does not justify exhaustive background material. Add
+only the missing explanation required to follow the current causal narrative,
+then remove details that do not improve that understanding.
+
 ### Run the five-part editorial gate
 
 Before saving learning-note changes, verify all five conditions:
 
-1. no discussion or drafting-process traces remain;
+1. no semantic traces of discussion, exploration or drafting remain, even when
+   they have been rewritten as neutral factual prose;
 2. no information crosses the current knowledge boundary;
 3. the explanation follows one causal narrative rather than a technology list;
-4. principles, reasons and expected effects accompany operations;
-5. every paragraph contributes necessary context, reasoning, action or evidence.
+4. principles, reasons and expected effects accompany operations, and the
+   learner-position re-read confirms that every newly introduced concept and
+   its role in the shown code can be understood without unstated knowledge;
+5. removing any paragraph would lose necessary current-boundary context,
+   reasoning, action or evidence; otherwise remove it.
 
 If any condition fails, revise before presenting the text. Do not rely on a later
 review to catch these failures.
