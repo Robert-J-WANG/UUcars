@@ -447,7 +447,7 @@ public async Task<(List<Car> Cars, int TotalCount)> GetPagedAsync(
 ```ts
 // UUcars.API/Repositories/EfCarRepository.cs
 
-// GetBySellerAsync：加 AsNoTracking + Select 投影 
+// GetBySellerAsync：加 AsNoTracking + Select 投影
 public async Task<(List<Car> Cars, int TotalCount)> GetBySellerAsync(
     int sellerId,
     CarQueryRequest request,
@@ -520,11 +520,11 @@ public async Task<(List<Car> Cars, int TotalCount)> GetBySellerAsync(
 注意：EfCarRepository里的其他方法不需要加AsNoTracking和投影
 
 ```c#
-// ── GetByIdAsync：保持原样，不改 
+// ── GetByIdAsync：保持原样，不改
 // 原因：查出来之后要修改状态，必须保留 EF Core 变更追踪
 // 不加 AsNoTracking，不加投影
 
-// ── GetDetailByIdAsync：保持原样，不改 
+// ── GetDetailByIdAsync：保持原样，不改
 // 原因：详情页展示用，需要加载完整 Images 列表
 // 虽然是只读，但加 AsNoTracking 后如果收藏/下单操作里间接读到这个 Car 对象，会有追踪丢失的隐患
 // 保持现状，清晰优于微小的性能收益
@@ -1090,7 +1090,7 @@ public interface ICacheService
     // factory：一个异步函数，当缓存未命中时调用，返回要缓存的数据
     Task<T> GetOrSetAsync<T>(
         string key,
-        Func<Task<T>> factory, 
+        Func<Task<T>> factory,
         TimeSpan ttl,
         CancellationToken cancellationToken = default);
 
@@ -1125,15 +1125,15 @@ public interface ICacheService
     {
         byte[]?      Get(string key);
         Task<byte[]?> GetAsync(string key, CancellationToken token = default);
-    
+
         void         Set(string key, byte[] value, DistributedCacheEntryOptions options);
         Task         SetAsync(string key, byte[] value,
                               DistributedCacheEntryOptions options,
                               CancellationToken token = default);
-    
+
         void         Refresh(string key);
         Task         RefreshAsync(string key, CancellationToken token = default);
-    
+
         void         Remove(string key);
         Task         RemoveAsync(string key, CancellationToken token = default);
     }
@@ -1468,7 +1468,7 @@ public class AdminCarService
         _carRepository = carRepository;
         _logger = logger;
         _cache = cache;
-    }	
+    }
 
 	...
 
@@ -1521,7 +1521,7 @@ public class AdminCarService
 public class AdminCarService
 {
    ...
-       
+
     public async Task<CarResponse> ApproveAsync(
         int carId,
         CancellationToken cancellationToken = default)
@@ -1575,7 +1575,7 @@ public class AdminCarService
     }
 
 	...
-        
+
     public async Task AdminDeleteAsync(
         int carId,
         CancellationToken cancellationToken = default)
@@ -1635,7 +1635,7 @@ public class CarService
         car.UpdatedAt = DateTime.UtcNow;
 
         var updated = await _carRepository.UpdateAsync(car, cancellationToken);
-        
+
         //清除待审核车辆列表缓存
         await _cache.RemoveByPrefixAsync(CacheKeys.PendingCarsPrefix, cancellationToken);
 
@@ -1674,8 +1674,8 @@ public class OrderService
         {
             CarId = car.Id,
             BuyerId = buyerId,
-            SellerId = car.SellerId, 
-            Price = car.Price, 
+            SellerId = car.SellerId,
+            Price = car.Price,
             Status = OrderStatus.Pending,
             CreatedAt = DateTime.UtcNow,
             UpdatedAt = DateTime.UtcNow
@@ -1698,7 +1698,7 @@ public class OrderService
         var created = await _orderRepository.GetByIdAsync(order.Id, cancellationToken);
         return MapToResponse(created!);
     }
-    
+
 
     public async Task<OrderResponse> CancelAsync(
         int orderId,
@@ -1843,7 +1843,7 @@ EXIT
 
 ### 11. 编译和测试
 
-#### 单元测试里的 CarService 怎么处理 ICacheService？ 
+#### 单元测试里的 CarService 怎么处理 ICacheService？
 
 测试里用的是 Fake Repository，但现在 CarService 多了 `ICacheService` 依赖。需要给测试提供一个 fake 的 ICacheService——最简单的方式是用 `NSubstitute` 或直接实现一个 `FakeCacheService`（直接执行 factory，不做任何缓存）。
 
@@ -2209,7 +2209,7 @@ public static class RateLimitingExtensions
                     response, cancellationToken);
             };
 
- 
+
             // ── 限流策略(比如给注册接口限流）
             // 算法：固定窗口
             // 规则：同一 IP，每小时最多 5 次
@@ -2350,7 +2350,7 @@ resend-verification 固定窗口  每IP 3次/时             POST /auth/resend-v
 browse              令牌桶    登录120/分，未登录60/分  GET /cars
                                                     GET /cars/{id}
                                                     GET /reviews/seller/{id}
-                                                    
+
 write               令牌桶    每用户 30次/分           POST /cars
                                                      POST /cars/{id}/images
                                                      POST /orders
@@ -2589,12 +2589,12 @@ public class AuthController : ControllerBase
     [HttpPost("forgot-password")]
     [EnableRateLimiting(RateLimitPolicies.ForgotPassword)]
     public async Task<IActionResult> ForgotPassword(...) { ... }
-    
+
     // ✅ 重发验证邮件
     [HttpPost("resend-verification")]
     [EnableRateLimiting(RateLimitPolicies.ResendVerification)]
     public async Task<IActionResult> ResendVerification(...) {...}
-    
+
 
     // 验证邮箱、重置密码接口不加限流
     // 原因：需要有效的 token 参数才能操作，攻击者无法无限枚举
@@ -2621,14 +2621,14 @@ public class CarsController : ControllerBase
     [HttpGet("{id:int}")]
     [EnableRateLimiting(RateLimitPolicies.Browse)]
     public async Task<IActionResult> GetById(...) { ... }
-    
-    
+
+
     // ✅ 创建车辆草稿：令牌桶限流
     [HttpPost]
     [Authorize]
     [EnableRateLimiting(RateLimitPolicies.Write)]
     public async Task<IActionResult> Create(...) { ... }
-    
+
     // ✅ 上传车辆图片：令牌桶限流
     [HttpPost("{id:int}/images")]
     [Authorize]
@@ -2647,7 +2647,7 @@ public class CarsController : ControllerBase
 ```c#
 [ApiController]
 [Route("orders")]
-[Authorize] 
+[Authorize]
 public class OrdersController : ControllerBase
 {
     ...
@@ -2663,10 +2663,10 @@ public class OrdersController : ControllerBase
     [Authorize]
     [EnableRateLimiting(RateLimitPolicies.Write)]
     public async Task<IActionResult> Cancel(...) { ... }
-    
+
     // 其他接口无需格外的限流
     ...
-    
+
 }
 ```
 
@@ -2677,7 +2677,7 @@ public class OrdersController : ControllerBase
 ```c#
 [ApiController]
 [Route("favorites")]
-[Authorize] 
+[Authorize]
 public class FavoritesController : ControllerBase
 {
     ...
@@ -2691,10 +2691,10 @@ public class FavoritesController : ControllerBase
     [Authorize]
     [EnableRateLimiting(RateLimitPolicies.Write)]
     public async Task<IActionResult> RemoveFavorite(...) { ... }
-    
+
     // 其他接口无需格外的限流
     ...
-    
+
 }
 ```
 
@@ -2712,10 +2712,10 @@ public class UsersController : ControllerBase
 
     // PUT /users/me
     [HttpPut("me")]
-        
+
     public async Task<IActionResult> UpdateMe( ... ) { ... }
-    
-    
+
+
 }
 ```
 
@@ -2735,11 +2735,11 @@ public class ReviewsController : ControllerBase
     [Authorize]
     [EnableRateLimiting(RateLimitPolicies.Write)]
     public async Task<IActionResult> Create( ... ) { ... }
-    
+
     [HttpGet("seller/{id:int}")]
     [EnableRateLimiting(RateLimitPolicies.Browse)]
     public async Task<IActionResult> GetSellerRating( ...) { ... }
-       
+
 }
 ```
 
@@ -2871,7 +2871,7 @@ protected override void ConfigureWebHost(IWebHostBuilder builder)
             foreach (var d in rateLimiterDescriptors)
                 services.Remove(d);
 
-            // 再注册完全无限制的 
+            // 再注册完全无限制的
             services.AddRateLimiter(options =>
             {
                 // 覆盖全局限流
@@ -3030,7 +3030,7 @@ public class UserService
         // 5. 返回 DTO（不包含 PasswordHash）
         return MapToResponse(created);
     }
-    
+
     ...
 
 }
@@ -3058,14 +3058,14 @@ public class UserService
 - Resend 短暂故障 → 注册失败（虽然用户数据已经写入数据库）
 - Resend 超时 → 用户看到 500 错误，但账号其实已经创建了
 
-**这是一个典型的"主流程不应该依赖外部服务"的问题。** 
+**这是一个典型的"主流程不应该依赖外部服务"的问题。**
 
 在真实生产项目里，任何发邮件、发短信、发通知的操作，都应该异步化——把任务放入队列，立即返回给用户，后台慢慢处理。
 
 这样用户的体验从：
 
 ```
-用户点击"注册" 
+用户点击"注册"
 → 等待... 等待... 等待...（3秒，邮件发完才返回）
 → "注册成功"
 
@@ -3171,8 +3171,8 @@ BackgroundJob.Enqueue(() => emailService.SendAsync(...));
 ##### **Recurring Job（定时任务）**
 
 ```csharp
-RecurringJob.AddOrUpdate("cleanup-tokens", 
-    () => cleanupService.CleanExpiredTokensAsync(), 
+RecurringJob.AddOrUpdate("cleanup-tokens",
+    () => cleanupService.CleanExpiredTokensAsync(),
     Cron.Daily);
 ```
 
@@ -4291,7 +4291,7 @@ public async Task Login_WithValidCredentials_ShouldReturnToken()
 public static class HangfireExtensions
 {
     public static IServiceCollection AddHangfireServices(
-        this IServiceCollection services, 
+        this IServiceCollection services,
         IConfiguration configuration,
         IWebHostEnvironment environment // 新增
     )
@@ -4445,7 +4445,7 @@ app.UseAuthentication();
 app.UseAuthorization();
 
 ...
-// 定时清除过期token    
+// 定时清除过期token
 app.UseHangfireJobs();
 
 app.MapControllers();
@@ -4503,9 +4503,9 @@ public class HangfireAdminAuthorizationFilter : IDashboardAuthorizationFilter
 >
 > ```c#
 > using Hangfire.Dashboard;
-> 
+>
 > namespace UUcars.API.Auth;
-> 
+>
 > /// <summary>
 > /// 开发环境专用：直接放行，不做任何认证检查
 > /// 只在 IsDevelopment() 时使用，生产环境永远不用这个
@@ -4600,7 +4600,7 @@ dotnet add package Microsoft.ApplicationInsights.AspNetCore --version 2.22.0
     InstrumentationKey=5b68dc35-74f5-4651-b081-e8cd17527ffb;IngestionEndpoint=https://australiaeast-1.in.applicationinsights.azure.com/;LiveEndpoint=https://australiaeast.livediagnostics.monitor.azure.com/;ApplicationId=e7f5c240-d73b-4987-adcb-a1aa860c5634
     ```
 
-    
+
 
 #### 8.3 配置 Connection String
 
@@ -4937,7 +4937,7 @@ V2 的认证流程，Token 的生命周期是这样的：
 
 这个流程有两个问题：
 
-**问题一：用户体验差** 
+**问题一：用户体验差**
 
 - 用户正在填写一个表单（比如发布车辆），突然页面跳转到登录页，填写的内容全部丢失
 
@@ -5178,7 +5178,7 @@ public DbSet<RefreshToken> RefreshTokens => Set<RefreshToken>();
 
 ```bash
 cd UUcars.API
-dotnet ef migrations add AddRefreshTokensTable 
+dotnet ef migrations add AddRefreshTokensTable
 ```
 
 检查生成的 Migration 文件，确认：
@@ -5440,7 +5440,7 @@ public class RefreshTokenService
 
         // 5. Token 轮换：撤销旧 Token
         await _refreshTokenRepository.RevokeAsync(existingToken, cancellationToken);
-        
+
         // 6. 签发新 AccessToken
         var newAccessToken = _jwtTokenGenerator.GenerateToken(user);
 
@@ -5550,7 +5550,7 @@ public class AuthController : ControllerBase
 {
 	...
     /// 其他公开接口不变
-    
+
     /// <summary>
     /// 把 RefreshToken 写入 HttpOnly Cookie
     /// 提取为私有方法：Login 和 Refresh 都需要调用
@@ -6192,9 +6192,9 @@ import type {
 } from "@/types";
 
 export const authApi = {
- 
+
   ...
-    
+
   // 新增logout接口
   logout: async (): Promise<void> => {
     await apiClient.post<ApiResponse<void>>("/auth/logout");
@@ -6205,7 +6205,7 @@ export const authApi = {
 
 ```
 
-更新logout逻辑 
+更新logout逻辑
 
 调用后端接口， 清除后端token
 
@@ -6358,7 +6358,7 @@ isAuthenticated: () => {
 ```ts
 interface AuthState {
   ...
-  
+
   // 新增：是否在做启动时的token恢复
   isInitializing: boolean;
 
@@ -6414,7 +6414,7 @@ export const useAuthStore = create<AuthState>()(
 
 ```
 
-注意：调用端口时用原生 `axios` 而不是 `apiClient` 
+注意：调用端口时用原生 `axios` 而不是 `apiClient`
 
 ```typescript
 const response = await axios.post(
@@ -6502,12 +6502,12 @@ export default function AuthInitializer({
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <QueryClientProvider client={queryClient}>
-        
+
       <AuthInitializer>
         <RouterProvider router={router} />
       </AuthInitializer>
-        
- 
+
+
       <Toaster position="bottom-right" />
     </QueryClientProvider>
   </StrictMode>,
@@ -6558,7 +6558,7 @@ npm run dev
 
 2. 打开 DevTools → Application → Cookies → `http://localhost:5173`
 
-3. 应该看到 
+3. 应该看到
 
     ```
     refreshToken
@@ -6881,7 +6881,7 @@ public class Car : BaseEntity
 >
 > ```
 > 数据库启动后维护一个内部计数器：1, 2, 3, 4, 5 ...
-> 
+>
 > 任何表的任何行被 UPDATE → 计数器 +1 → 把新值写入该行的 rowversion 字段
 > ```
 >
@@ -6903,7 +6903,7 @@ public class Car : BaseEntity
 
 ```bash
 cd UUcars.API
-dotnet ef migrations add AddCarRowVersion 
+dotnet ef migrations add AddCarRowVersion
 ```
 
 检查生成的 Migration 文件，确认：
@@ -7215,7 +7215,7 @@ public class AdminCarServiceTests
 ///     专门用于测试并发冲突的假 Repository
 ///     UpdateAsync 固定抛 DbUpdateConcurrencyException，模拟 RowVersion 不匹配的场景
 /// </summary>
-/// 
+///
 /// <remarks>
 ///     为什么用显式接口实现而不是 override 或 new？
 ///
@@ -7226,7 +7226,7 @@ public class AdminCarServiceTests
 ///
 ///     显式接口实现（ICarRepository.UpdateAsync(...)）会直接绑定到
 ///     接口的方法映射上，优先级高于继承来的实现，所以通过接口调用时会走这里。
-/// 
+///
 ///     其他未显式实现的方法仍继承自 FakeCarRepository。
 /// </remarks>
 internal class ConcurrencyCarRepository : FakeCarRepository, ICarRepository
@@ -7364,7 +7364,7 @@ git push origin --delete feature/v3-optimistic-lock
 2. **JWT 算法固定**：`TokenValidationParameters` 里没有明确限制算法 → 需要新增
 3. **审计日志**：Admin 操作（审核通过/拒绝/强制删除）没有持久化的操作记录 → 需要新增
 
-   
+
 
 ### 1. 切出功能分支
 
@@ -8480,7 +8480,7 @@ V2 的图片上传体验有一个明显短板：**一次只能上传一张**。
 
 每个请求各自独立查询"当前已有多少张图"，"查询数量"和"写入数据"之间存在时间窗口，多个请求可以同时挤进这个窗口。前端循环无法解决这个问题，因为校验逻辑本来就在服务端每次单独执行。
 
-批量接口在一次请求里统一校验 `已有数量 + 本次数量 > 上限`，不存在竞态问题。 
+批量接口在一次请求里统一校验 `已有数量 + 本次数量 > 上限`，不存在竞态问题。
 
 同时所有图片的数据库写入在一个事务里完成，不会出现"传了 5 张，只成功插入 3 张"的中间状态。
 
@@ -9459,18 +9459,18 @@ export default function ImageUploader({ carId, images }: ImageUploaderProps) {
 export default function ImageUploader({ carId, images }: ImageUploaderProps) {
   // 已上传的图片顺序（本地副本，拖拽时先在本地更新，再异步调接口）
   const [localImages, setLocalImages] = useState(images);
- 
+
   // images prop 变化时（比如上传成功后 invalidateQueries 触发重新拉取），
   // 同步更新本地已上传图片列表
   if (images !== localImages && images.length !== localImages.length) {
     setLocalImages(images);
   }
- 
+
   ...
- 
+
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     ...
- 
+
     // 数量上限：已有图片数 + 正在处理的数 + 这次新选的数，超过上限就拒绝，不发任何请求
     const totalAfter = localImages.length + pendingFiles.length + fileArray.length;
     if (totalAfter > MAX_IMAGES) {
@@ -9482,10 +9482,10 @@ export default function ImageUploader({ carId, images }: ImageUploaderProps) {
       if (inputRef.current) inputRef.current.value = "";
       return;
     }
- 
+
     ...
   };
-    
+
     ...
 }
 ```
@@ -9506,15 +9506,15 @@ export default function ImageUploader({ carId, images }: ImageUploaderProps) {
   if (images !== localImages && images.length !== localImages.length) {
     setLocalImages(images);
   }
- 
+
   ...
- 
+
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     ...
   };
-    
+
     ...
-    
+
     {/* 已上传的图片列表：可拖拽排序 */}
     {localImages.length > 0 && (
       <DndContext sensors={sensors} collisionDetection={closestCenter}>
@@ -9623,7 +9623,7 @@ import { PointerSensor, useSensor, useSensors, closestCenter } from "@dnd-kit/co
 import { SortableContext } from "@dnd-kit/sortable";
 ```
 
-这个容器组件定义了一个prop属性 - `items`, 用来记录参与排序元素的id。 
+这个容器组件定义了一个prop属性 - `items`, 用来记录参与排序元素的id。
 
 ```tsx
 <DndContext sensors={sensors} collisionDetection={closestCenter}>
@@ -9656,7 +9656,7 @@ items: (string | number)[]
 import { rectSortingStrategy } from "@dnd-kit/sortable";
 
 <DndContext sensors={sensors} collisionDetection={closestCenter}>
-  <SortableContext 
+  <SortableContext
       items={localImages.map((img) => img.id)}
       strategy={rectSortingStrategy}
   >
@@ -9799,7 +9799,7 @@ export default SortableImageItem;
 
 ```
 
-使用`useSortable` hook 
+使用`useSortable` hook
 
 ```tsx
 import { useSortable } from "@dnd-kit/sortable";
@@ -9811,7 +9811,7 @@ function SortableImageItem({
   onDelete,
   isDeleting,
 }: SortableImageItemProps) {
-  
+
   // useSortable 把这个元素注册为可排序项
   // attributes/listeners 只绑定到拖拽手柄，不绑定整个卡片
   // 原因：整个卡片都能拖拽时，"点删除"和"开始拖拽"会冲突，浏览器无法区分意图
@@ -9835,7 +9835,7 @@ function SortableImageItem({
       }}
     >
      ...
-     
+
     </div>
   );
 }
@@ -10533,7 +10533,7 @@ interface CarFormProps {
   isSubmitting: boolean;
   submitLabel: string;
   // ✅ 新增：由调用方传入，格式如 "car-draft-new" 或 "car-draft-5"
-  draftKey: string; 
+  draftKey: string;
 }
 ```
 
@@ -10550,7 +10550,7 @@ export default function CarForm({
   submitLabel,
   draftKey,
 }: CarFormProps) {
-    
+
   const {
     register,
     handleSubmit,
@@ -10601,7 +10601,7 @@ export default function CarForm({
   submitLabel,
   draftKey,
 }: CarFormProps) {
-    
+
   const {
     register,
     handleSubmit,
@@ -10970,7 +10970,7 @@ export const router = createBrowserRouter([
 
 #### 8.2 ErrorBoundary
 
-1. 临时在 
+1. 临时在
 
     ```
     CarDetailPage.tsx
@@ -11277,14 +11277,14 @@ useEffect(() => {
   /* ── 添加收藏 mutation ── */
   const addFavoriteMutation = useMutation({
     mutationFn: () => favoritesApi.add(carId),
-      
+
     // onMutate：请求发出之前立即执行
     onMutate: async () => {
       // 取消正在进行的 favorites 查询
       // 原因：如果有正在飞行的 invalidateQuery 请求，
       // 它的响应可能会覆盖我们即将做的乐观更新，造成状态混乱
       await queryClient.cancelQueries({ queryKey: ["favorites"] });
-      // 保存操作之前的收藏列表的快照（第一页，万一 API 失败用来回滚）  
+      // 保存操作之前的收藏列表的快照（第一页，万一 API 失败用来回滚）
       const FavoritesBeforeThisAction = queryClient.getQueryData([
         "favorites",
         { page: 1, pageSize: 10 },
@@ -12093,7 +12093,7 @@ export default defineConfig({
 
 ```
 
->注意：`defineConfig`的导入方法换成`import { defineConfig } from "vitest/config"`： 
+>注意：`defineConfig`的导入方法换成`import { defineConfig } from "vitest/config"`：
 >
 >`vitest/config` 导出的 `defineConfig` 是 Vite 原版的一个包装版本，它把 `test` 字段的类型声明合并进了 `UserConfigExport` 类型里，其余用法（`plugins`、`resolve` 等）完全兼容，不需要改任何其他代码。
 
@@ -12337,7 +12337,7 @@ userEvent.click(button)
      暴露的问题（比如某个 onBlur 校验逻辑）
 ```
 
-**因此，我们使用用 `userEvent`，不用 `fireEvent`。** 
+**因此，我们使用用 `userEvent`，不用 `fireEvent`。**
 
 
 
@@ -12793,7 +12793,7 @@ Playwright E2E（端到端）：
 
    - 测试5：卖家查看销售订单
 
-     
+
 
 ### 3. 测试数据污染
 
@@ -12868,7 +12868,7 @@ import { defineConfig } from "@playwright/test";
 export default defineConfig({
   // 测试文件根目录
   testDir: "./e2e",
-    
+
   // 生成 HTML 测试报告，跑完后可以用 npx playwright show-report 查看
   reporter: "html",
 
@@ -13162,7 +13162,7 @@ export class LoginPage {
 import { test, expect } from "@playwright/test";
 
 test.describe("核心用户流程", () => {
-    
+
   // ── 测试1：注册流程 ────────────
   test("测试1：用户注册并收到验证提示", async ({ page }) => {
     const uid = Date.now().toString().slice(-6);
@@ -13180,7 +13180,7 @@ test.describe("核心用户流程", () => {
       timeout: 10000,
     });
   });
-    
+
 })
 ```
 
@@ -13232,7 +13232,7 @@ test.describe("核心用户流程", () => {
   // ── 测试1：注册流程 ────────────
   ...
 
-  
+
   test("测试2：卖家发布车辆并提交审核", async ({ page, request }) => {
     const uid = Date.now().toString().slice(-6);
     const email = `test-seller-${uid}@example.com`;
@@ -13308,7 +13308,7 @@ const API = "http://localhost:5065";
 test.describe("核心用户流程", () => {
   // ── 测试1：注册流程 ────────────
   ...
-  
+
   // ── 测试2：卖家发布车辆并提交审核 ────────────
   ...
 
@@ -13464,7 +13464,7 @@ test.describe("核心用户流程", () => {
   ...
   // ── 测试4：买家下单 ───────────
   ...
-  
+
   // ── 测试5：卖家查看收到的订单 ────────────
   // 车辆和订单的准备全部走 API
   // 卖家查看订单页面是这个测试真正要验证的行为，走 UI
@@ -13723,11 +13723,11 @@ Admin 审核通过了卖家的车 → 卖家不知道，只能自己刷新页面
 
     服务器可以一直往浏览器推送消息， 浏览器不能通过同一条连接发消息，只能单向。
 
-最终的解决方案是WebSocket。 
+最终的解决方案是WebSocket。
 
 
 
-### 1. WebSocket 
+### 1. WebSocket
 
 WebSocket：是一种网络协议（Protocol）， 它的作用是：让浏览器和服务器建立一条持续存在的双向通信连接：
 
@@ -13739,7 +13739,7 @@ Browser → HTTP 请求（Upgrade: websocket） → Server → 101 Switching Pro
 
 从这一刻开始， HTTP 就结束了。双方进入：
 
-```bash 
+```bash
 Browser <========> Server
 ```
 
@@ -13779,7 +13779,7 @@ WebSocket是底层的网络协议，原生的配置很麻烦，比如：
 
 
 
-### 2. SignalR 
+### 2. SignalR
 
 **SignalR 是 ASP.NET Core 生态里，专门把上面这些重复的基础设施工作封装掉的一个库**。它不是取代 WebSocket，而是站在 WebSocket（以及 SSE、Long Polling）之上的一层抽象：自动协商用哪种传输方式、自动处理降级、把"发消息"包装成像直接调用函数一样的编程体验、内置自动重连、提供"给一群连接批量发消息"的能力。
 
@@ -13802,7 +13802,7 @@ Long Polling（最后手段）：
 
 SignalR 自动处理这个降级逻辑，使用者不需要关心底层用的是哪种。
 
-#### 2.1  Hub 
+#### 2.1  Hub
 
 **Hub** 是 SignalR 的核心概念，一个 Hub 就是一个通信端点，类似于 Controller，但不是处理 HTTP 请求，而是处理 WebSocket 连接。 客户端连接到这个Hub 后，服务器就可以调用这个连接上注册的方法， 而客户端就可以接收服务端推送的消息。
 
@@ -13883,7 +13883,7 @@ git push -u origin feature/v3-signalr-notifications
 SignalR 是 ASP.NET Core 内置的一部分，不需要额外装 NuGet 包。打开 `UUcars.API/Program.cs`，在服务注册部分加入：
 
 ```c#
-// 实时通信 - SignalR 
+// 实时通信 - SignalR
 builder.Services.AddSignalR();
 ```
 
@@ -13972,10 +13972,10 @@ export default function NotificationBell() {
 ```tsx
 {/* 右侧 */}
 <div className="flex items-center gap-3">
-    
+
   {/* 1. 通知铃铛组件 */}
   <NotificationBell />
-    
+
   {isAuthenticated() ? (
     ...
   )}
@@ -13986,7 +13986,7 @@ export default function NotificationBell() {
   </button>
 ```
 
-组件`NotificationBell`中使用 `signalr`库来建立signalR的连接 : 
+组件`NotificationBell`中使用 `signalr`库来建立signalR的连接 :
 
 把建立连接的逻辑写进副作用钩子 `useEffect`中， 这样组件初次挂载就执行一次。
 
@@ -14072,7 +14072,7 @@ SignalR 内部把`start()`封装了很多事情:
 - `connection.on(事件名, 回调函数)`  - 用来监听 SignalR hub里定义的方法， 客户端无需主动发起请求，服务端只要触发hub里定义的方法， 客户端就能监听到
 - `connection.invoke(方法名, 参数)` - 用来主动发起请求触发服务端SignalR hub里定义的方法
 
-#### 4.5 创建Hub 方法 
+#### 4.5 创建Hub 方法
 
 到目前为止， 浏览器已经连接到了 Hub。但是服务器什么都没有做，SignalR 框架是怎么知道连接建立的时候该执行我们写的逻辑的？
 
@@ -14109,7 +14109,7 @@ public class NotificationHub : Hub
 
 `OnConnectedAsync()`这个方法，属于"生命周期钩子", 触发它的不是前端代码里某一行调用,而是 SignalR 框架本身。只要握手成功、这条 WebSocket 连接真正建立起来了,框架会**自动**在服务器端实例化一个 `Hub` 对象来处理这条连接,并且自动调用它的 `OnConnectedAsync()`。前端唯一需要做的事就是:
 
-1. 建立连接 
+1. 建立连接
 
 2. 监听或者主动调用
 
@@ -14128,7 +14128,7 @@ public class NotificationHub : Hub
     {
         // Clients.All：发给所有连接的人
         await Clients.All.SendAsync("ReceiveNotification", "Hello All from server!");
-            
+
         // 不要把基类的行为完全覆盖丢掉
         await base.OnConnectedAsync();
     }
@@ -14274,10 +14274,10 @@ export default function NotificationBell() {
 > connection.on(事件名, 回调函数)   → 被动监听：服务器主动推送消息时执行这个回调
 > connection.invoke(方法名, 参数)  → 主动调用：前端主动"喊"服务器 Hub 里的某个自定义方法
 > ```
-> 
+>
 > `invoke()` 对应的是**前端主动发起、服务器执行后可能还要返回结果**的场景——有点像前端在正常调用一个后端 API,只是走的是 WebSocket 通道而不是普通 HTTP 请求。
 >
-> 
+>
 
 #### 4.6 JWT身份认证
 
@@ -14421,30 +14421,30 @@ public class NotificationHub : Hub
     ```tsx
     import { useAuthStore } from "@/stores/authStore";
     ...
-    
+
     export default function NotificationBell() {
       ...
-      
+
       useEffect(() => {
         // 创建了连接对象。
         const connection = new signalR.HubConnectionBuilder()
           .withUrl("http://localhost:5065/hubs/notification", {
-              
+
             // 告诉 SignalR 建立连接时带上 Token
             accessTokenFactory: () => useAuthStore.getState().accessToken ?? "",
           })
           .withAutomaticReconnect()
           .build();
-    
+
         // 开始连接
         ...
       }, []);
-    
+
       return (
        ...
       );
     }
-    
+
     ```
 
     >`accessTokenFactory` 是一个函数，而不是固定的 Token 值。
@@ -14496,7 +14496,7 @@ public class NotificationHub : Hub
                     {
                         ...
                     };
-    
+
                     // ===== 核心新增：配置 JwtBearer 事件响应以兼容 SignalR Query Token =====
                     options.Events = new JwtBearerEvents
                     {
@@ -14504,22 +14504,22 @@ public class NotificationHub : Hub
                         {
                             // 1. 从 URL Query 参数中尝试读取 access_token
                             var accessToken = context.Request.Query["access_token"];
-    
+
                             // 2. 获取当前请求的路径
                             var path = context.HttpContext.Request.Path;
-    
+
                             // 3. 判断：如果有 access_token 且请求路径指向 SignalR Hub
                             //  匹配具体的 Hub 路径，如 "/chatHub" 或以特定前缀开头的路径）
                             if (!string.IsNullOrEmpty(accessToken) &&
                                 path.StartsWithSegments("/hubs")) // 💡 根路由路径或根前缀
                              // 将 Token 赋给上下文，JwtBearer 中间件后续就会拿这个Token去做签名和合法性校验
                                 context.Token = accessToken;
-    
+
                             return Task.CompletedTask;
                         }
                     };
                 });
-    
+
             return services;
         }
     }
@@ -14791,7 +14791,7 @@ public class AdminCarService
             var updated = await _carRepository.UpdateAsync(car, cancellationToken);
             await _cache.RemoveByPrefixAsync(CacheKeys.PublishedCarsPrefix, cancellationToken);
             await _cache.RemoveByPrefixAsync(CacheKeys.PendingCarsPrefix, cancellationToken);
-            
+
 			// 审核通过，推送消息给车主
             await _notificationService.SendNotificationAsync(car.SellerId, $"Your car {car.Title} has been approved.");
 
@@ -14927,7 +14927,7 @@ public DbSet<Notification> Notifications => Set<Notification>();
 
 ```bash
 cd UUcars.API
-dotnet ef migrations add AddNotificationsTable 
+dotnet ef migrations add AddNotificationsTable
 dotnet ef database update
 ```
 
@@ -15320,7 +15320,7 @@ public class AdminCarService
             var updated = await _carRepository.UpdateAsync(car, cancellationToken);
             await _cache.RemoveByPrefixAsync(CacheKeys.PublishedCarsPrefix, cancellationToken);
             await _cache.RemoveByPrefixAsync(CacheKeys.PendingCarsPrefix, cancellationToken);
-            
+
 			// 审核通过，推送消息给车主
             await _notificationService.SendNotificationAsync(car.SellerId, "test",
                 $"Your car {car.Title} has been approved.", carId, cancellationToken);
@@ -15342,7 +15342,7 @@ public class AdminCarService
 
 admin登录，并通过一台待审核车辆，通知数据写入数据库， 车主能收到通知。
 
-其他接口，用 Scalar 手动调一下，确认 `GET /notifications` 能查到、`PUT .../read` 能改状态。 
+其他接口，用 Scalar 手动调一下，确认 `GET /notifications` 能查到、`PUT .../read` 能改状态。
 
 ### 6. 数据的优化渲染
 
@@ -15564,7 +15564,7 @@ export default function NotificationBell() {
   const queryClient = useQueryClient();
   // 当前用户的id
   const userId = useAuthStore((state) => state.user?.id);
- 
+
   // 1. 获取未读消息列表（自动托管 loading / error / data 状态）
   const { data: notifications = [] } = useQuery({
     queryKey: queryKey: notificationKeys.unread(userId),
@@ -15597,7 +15597,7 @@ export default function NotificationBell() {
 
   // 4. SignalR 监听逻辑（仅在组件挂载时建立一次连接）
   useEffect(() => {
-      
+
     if (userId === undefined) return;
 
       /*
@@ -15605,7 +15605,7 @@ export default function NotificationBell() {
        * userId 改变时，Effect 会重新执行并生成新用户的 Query Key。
        */
     const queryKey = notificationKeys.unread(userId);
-      
+
     const connection = new signalR.HubConnectionBuilder()
       .withUrl(`${import.meta.env.VITE_API_BASE_URL}/hubs/notification`, {
         // 告诉 SignalR 建立连接时带上 Token
@@ -16090,12 +16090,12 @@ namespace UUcars.Tests.Services;
 
 public class AdminCarServiceTests
 {
-    
+
     private static AdminCarService CreateService(
         ICarRepository carRepository,
         IAuditLogService? auditLogService = null,
         // ✅ 新增
-        INotificationService? notificationService = null) 
+        INotificationService? notificationService = null)
     {
         var options = new DbContextOptionsBuilder<AppDbContext>()
             .UseInMemoryDatabase(Guid.NewGuid().ToString())
@@ -16112,7 +16112,7 @@ public class AdminCarServiceTests
             auditLogService ?? new FakeAuditLogService(),
             currentUserService,
             // ✅ 新增
-            context, notificationService ?? new FakeNotificationService() 
+            context, notificationService ?? new FakeNotificationService()
         );
     }
 
@@ -16229,11 +16229,11 @@ public class OrderServiceTests
     }
 
     ...
-    
+
 }
 ```
 
-#### 9.5 新增orderService里通知的测试 
+#### 9.5 新增orderService里通知的测试
 
  新增2个创建订单通知测试：
 
@@ -21110,7 +21110,7 @@ public class AuthController : ControllerBase
     }
 
 ...
-   
+
 }
 ```
 
@@ -21175,7 +21175,7 @@ const googleClientId = import.meta.env.VITE_GOOGLE_CLIENT_ID;
 
  <GoogleOAuthProvider clientId={googleClientId}>
     ...
- </GoogleOAuthProvider>   
+ </GoogleOAuthProvider>
 ```
 
 它表示Google 将这个 Token 签发给哪个应用。
@@ -21232,12 +21232,12 @@ builder.Services.Configure<GoogleAuthSettings>(
 public class GoogleIdTokenService
 {
     private readonly GoogleAuthSettings _settings;
-    
+
     public GoogleIdTokenService(IOptions<GoogleAuthSettings> options)
     {
         _settings = options.Value;
     }
-    
+
     public async Task<GoogleJsonWebSignature.Payload> ValidateAsync(string idToken,
         CancellationToken cancellationToken = default)
     {
@@ -21755,11 +21755,11 @@ public class ExternalLoginService
     {
         // 获取认证后的payload
         var payload = await _googleIdTokenService.ValidateAsync(idToken, cancellationToken);
-        
+
         // 查询关联用户的逻辑
     }
-    
-    
+
+
 }
 ```
 
@@ -21783,18 +21783,18 @@ public class ExternalLoginService
     {
         // 获取认证后的payload
         var payload = await _googleIdTokenService.ValidateAsync(idToken, cancellationToken);
-        
+
         // 查询关联用户
         var user=await FindOrCreateUserAsync(payload, cancellationToken);
     }
-    
-    
+
+
     private async Task<User?> FindOrCreateUserAsync(GoogleJsonWebSignature.Payload payload,
         CancellationToken cancellationToken = default)
     {
-        // ... 
+        // ...
     }
-    
+
 }
 ```
 
@@ -21888,7 +21888,7 @@ public class ExternalLoginService
 
     ```c#
     namespace UUcars.API.Exceptions;
-    
+
     public class ExternalLoginNotAllowedException : AppException
     {
         public ExternalLoginNotAllowedException(string message)
@@ -21902,7 +21902,7 @@ public class ExternalLoginService
 
     ```c#
     namespace UUcars.API.Exceptions;
-    
+
     public class ExternalLoginConflictException : AppException
     {
         public ExternalLoginConflictException()
@@ -21923,7 +21923,7 @@ public class ExternalLoginService
 {
     private readonly IGoogleIdTokenService _googleIdTokenService;
     private readonly IExternalLoginRepository _externalLoginRepository;
-    
+
     public ExternalLoginService(IGoogleIdTokenService googleIdTokenService,
         IExternalLoginRepository externalLoginRepository)
     {
@@ -21949,7 +21949,7 @@ public class ExternalLoginService
         if (existingLogin != null) return existingLogin.User;
 
         // 2. 没有关联用户——————————————————————————————
-        
+
         // 处理邮件的逻辑
         if (string.IsNullOrWhiteSpace(payload.Email) ||
             !payload.EmailVerified)
@@ -22145,7 +22145,7 @@ public class ExternalLoginService
         var username = string.IsNullOrWhiteSpace(payload.Name)
             ? email.Split('@')[0]
             : payload.Name.Trim();
-        
+
         var user = new User
         {
             Username = username[..Math.Min(username.Length, 50)],
@@ -23058,7 +23058,7 @@ public class SqlServerTestFactory : WebApplicationFactory<Program>, IAsyncLifeti
         builder.ConfigureServices(services =>
         {
             ...
-            
+
             // =================================================
             // Google 登录：
             // 测试服务器不请求真实 Google，改为注入固定结果的 Fake
@@ -23191,7 +23191,7 @@ public class CoreFlowIntegrationTests : IntegrationTestBase
         Assert.Equal(HttpStatusCode.OK, currentUserResponse.StatusCode);
     }
 
-    
+
     // =========================================================
     // 认证保护：受保护接口必须要求有效 UUcars Access Token
     // =========================================================
@@ -23644,7 +23644,7 @@ export default function LoginPage() {
   const completeAuthentication = (result: LoginResponse) => {
     ...
   };
-      
+
   const onSubmit = async (data: LoginForm) => {
    ...
   };
@@ -24107,15 +24107,15 @@ describe("GoogleSignInButton", () => {
 ```ts
 describe("GoogleSignInButton", () => {
   beforeEach(() => {
-      
+
     // 清除上一个测试留下的 Mock 调用记录。
     vi.clearAllMocks();
   });
 
-  /* -------------- 测试 1： ------------- */  
+  /* -------------- 测试 1： ------------- */
   // 验证 Google 返回 credential 后，组件会把它传给 UUcars 的 Google 登录接口。
   it("应该把 Google credential 发送给后端", async () => {
-      
+
     // 1. 规定 Mock 接口本次调用成功，并返回上面准备好的 UUcars 登录结果。
     vi.mocked(authApi.googleLogin).mockResolvedValueOnce(loginResult);
 
@@ -30447,1096 +30447,24 @@ git status -sb
 
 如果仍保留本步骤创建的临时 Stash，只在确认其中内容已经进入提交后删除；没有 Stash 就直接跳过。
 
-### Step 73 完成检查
+### Step 73 完成状态
 
 ```text
-□ 后端、Docker 和 GitHub Actions 的 .NET 运行时版本已统一
-□ 本地配置来源与 API 启动流程已整理并验证
-□ 后端构建、单元测试和集成测试全部通过
-□ 前端 TypeScript、ESLint、组件测试和生产构建全部通过
-□ Playwright 核心业务流程在本地和 CI 中全部通过
-□ Docker 镜像能够构建，Compose 后端环境能够正常启动和响应
-□ GitHub Actions 的 Backend、Frontend 和 E2E Jobs 全部正常运行
-□ main 发布门禁、前后端同提交产物和 Azure 自动部署均已验证
-□ 生产环境页面、API、Google 登录、SignalR 及外部服务运行正常
-□ Step 73 配置和文档已同步，长期分支与临时工作已完成清理
+✓ 后端、Docker 和 GitHub Actions 的 .NET 运行时版本已统一
+✓ 本地配置来源与 API 启动流程已整理并验证
+✓ 后端构建、单元测试和集成测试全部通过
+✓ 前端 TypeScript、ESLint、组件测试和生产构建全部通过
+✓ Playwright 核心业务流程在本地和 CI 中全部通过
+✓ Docker 镜像能够构建，Compose 后端环境能够正常启动和响应
+✓ GitHub Actions 的 Backend、Frontend 和 E2E Jobs 全部正常运行
+✓ main 发布门禁、前后端同提交产物和 Azure 自动部署均已验证
+✓ 生产环境页面、API、Google 登录、SignalR 及外部服务运行正常
+✓ Step 73 配置和文档已同步，长期分支与临时工作已完成清理
 ```
-
-## fixed Issues 
-
-### Fix 1. 并发 Refresh Token 请求竞态条件（Refresh Token Rotation Race Condition）
-
-#### 1. 切出fix分支
-
-```bash
-git checkout develop
-git pull origin develop
-git checkout -b fix/refresh-token-rotation-race-condition
-git push -u origin fix/refresh-token-rotation-race-condition
-```
-
-#### 2. 问题描述
-
-前端应用启动, 并成功登陆后，快速连续刷新登录后的页面，用户被自动登出。
-
-具体来说：前端在应用启动时通过 `AuthInitializer` 组件调用 `authStore.initialize()`，检测到 localStorage 里有 `user` 数据后，向 `/auth/refresh` 发送请求，用 HttpOnly cookie 里的 refresh token 换取新的 access token，实现页面刷新后的静默重登录。
-
-**当用户快速连续刷新页面时**，浏览器会在极短时间内启动多个页面实例，每个实例都独立执行 `initialize()`。由于 `isInitializing` 只是 Zustand 的 UI 渲染标志，无法阻止两个调用同时执行到 `axios.post` 那一行，结果是两个请求几乎同时发出，携带的是**同一个 refresh token**。
-
-后端 `RefreshTokenService.RefreshAsync()` 实现了 token rotation：第一个请求到达后，旧 token 被标记为 `IsRevoked = true`，新 token 写入数据库。第二个请求随后到达，查到的 token 已经是 revoked 状态，触发安全机制 `RevokeAllByUserIdAsync()`，撤销该用户所有 token，返回 400。前端 `catch` 块执行 `clearAuth()`，用户被登出。
-
-#### 3. 根本原因
-
-`isInitializing` 是 Zustand state，只控制 UI 渲染，不是执行锁。两个并发的 `initialize()` 调用都能同时通过 `if (!user)` 检查并到达 `axios.post`，形成竞态。
-
-#### 4. 解决方案
-
-设置模块级 Promise 锁（In-flight Deduplication）
-
-在 `authStore.ts` 模块级别（store 外部）声明一个 `initializePromise` 变量。`initialize()` 执行时先检查这个变量：
-
-- 如果已有飞行中的 Promise，直接返回它，不发新请求
-- 如果没有，创建 Promise 并赋值给 `initializePromise`，`finally` 里清空
-
-这样无论多少个并发调用，实际只会发出一个 HTTP 请求，后续调用都等待并复用第一个请求的结果。这个模式叫做 **Request Coalescing（请求合并）** 或 **In-flight Deduplication（飞行中去重）**。
-
-```c#
-import { create } from "zustand";
-import { persist } from "zustand/middleware";
-import type { User } from "@/types";
-import axios from "axios";
-
-interface AuthState {
-  ...
-}
-
-// fix： 定义模块级 Promise 锁
-let initializePromise: Promise<void> | null = null;
-
-export const useAuthStore = create<AuthState>()(
-  persist(
-    (set, get) => ({
-     
-      ...
-
-      initialize: async () => {
-        const { user } = get();
-
-        // localStorage里没有user信息 → 从未登录过，无需refresh
-        if (!user) {
-          set({ isInitializing: false });
-          return;
-        }
-
-        // 有user信息 → 尝试用 refresh token (cookie) 换新的 access token
-
-        if (initializePromise) {
-          console.log(111);
-          return initializePromise;
-        }
-
-        initializePromise = (async () => {
-          try {
-            const response = await axios.post(
-              `${import.meta.env.VITE_API_BASE_URL}/auth/refresh`,
-              null,
-              { withCredentials: true },
-            );
-            const newAccessToken = response.data.data.accessToken;
-            set({ accessToken: newAccessToken, isInitializing: false });
-          } catch {
-            // refresh token也失效了 → 清除登录态
-            set({ user: null, accessToken: null, isInitializing: false });
-          } finally {
-            initializePromise = null;
-          }
-        })();
-        return initializePromise;
-      },
-    }),
-    {
-      name: "auth-storage", // localStorage 里的 key 名称
-      ...
-      }),
-    },
-  ),
-);
-
-```
-
-#### 5. 测试并合并分支
-
-用户登录成功后，在当期页面连续刷新，Dev tools后台工具的Network里观察到只发送一次refresh请求。
-
-合并回主分支
-
-```bash
-git add .
-git commit -m "fix: prevent concurrent refresh token requests on initialize"
-git push origin fix/refresh-token-rotation-race-condition
-
-# 合并回 develop
-git checkout develop
-git merge --no-ff fix/refresh-token-rotation-race-condition \
-  -m "merge: fix/refresh-token-rotation-race-condition into develop"
-git push origin develop
-
-# 删除功能分支
-git branch -d fix/refresh-token-rotation-race-condition
-git push origin --delete fix/refresh-token-rotation-race-condition
-```
-
-
-
-### Fix 2：生产环境 Refresh Token Cookie 跨域丢失
-
-#### 1. 切出 fix 分支
-
-```bash
-git checkout develop
-git pull origin develop
-git checkout -b fix/cookie-samesite-production
-git push -u origin fix/cookie-samesite-production
-```
-
-#### 2. 问题描述
-
-部署到 Azure 后，用户登录成功，但浏览器里没有 `refreshToken` cookie。本地开发完全正常。导致生产环境任何页面刷新都会登出，因为 `initialize()` 调用 `/auth/refresh` 时没有 cookie 可以携带。
-
-#### 3. 根本原因
-
-本地开发时前端（`localhost:5173`）和后端（`localhost:5000`）同域，我们在SetRefreshTokenCookie里显式设置的`SameSite=Strict` 没有问题。
-
-```c#
-var cookieOptions = new CookieOptions
-{
-    HttpOnly = true,
-    Secure = true,
-    SameSite = SameSiteMode.Strict, // ← 显式设置
-    Expires = expiresAt,
-    Path = "/"
-};
-```
-
-但是， 部署到 Azure 后，前端（`xxx.azurestaticapps.net`）和后端（`xxx.azurecontainerapps.io`）是不同域名，属于跨域。浏览器对 `SameSite=Strict` 的处理是：跨域请求时直接拒绝存储 cookie，`Set-Cookie` 响应头被静默忽略。
-
-同理，`Logout` 里的 `Cookies.Delete` 也因为属性不匹配而删不掉 cookie。
-
-**那么之前的版本为什么要设置 `SameSite = SameSiteMode.Strict`?**
-
-`SameSite` 的本质目的是防御 **CSRF（跨站请求伪造）攻击**。
-
-攻击场景：用户登录了网站，坏人的网站偷偷发一个请求到 API，浏览器会自动携带 cookie，服务器以为是合法用户操作。
-
-- `Strict`：最严格，任何跨域请求都不带 cookie，CSRF 完全无法成立
-- `Lax`：部分防护，导航跳转可以带，`fetch`/`XHR` 不带
-- `None`：不防护，所有请求都带 cookie，但需要额外的 CSRF 防护手段
-
-当前架构是**前后端分离 + 不同域名**，这本身就是跨域。前端发的每一个请求对浏览器来说都是"跨站"的，`Strict` 和 `Lax` 都会把自己的请求拦掉。
-
-用了 `None` 之后 CSRF 防护就靠其他手段来补：
-
-- 我们的 CORS 已经配了 `WithOrigins(allowedOrigins)`，只允许指定域名，不是 `*`
-- `AllowCredentials()` 配合指定 Origin，浏览器会验证请求来源
-- 这两个加在一起已经把 CSRF 的风险降到很低了
-
-#### 4. 解决方案
-
-跨域场景下 cookie 必须设置 `SameSite=None` + `Secure=true`。生产环境通过 `IsDevelopment()` 判断切换。
-
-- 本地环境
-
-    ```bash
-    SameSite=None
-    Secure=false
-    ```
-
-- 生成环境
-
-    ```bash
-    SameSite=None
-    Secure=true
-    ```
-
-修改``AuthController.cs`里的`SetRefreshTokenCookie` 方法：
-
-```c#
-
-private void SetRefreshTokenCookie(string token, DateTime expiresAt)
-{
-    var cookieOptions = new CookieOptions
-    {
-        HttpOnly = true, 
-        Secure = true, 
-        SameSite = SameSiteMode.None, //允许跨域， 防 CSRF 通过其他配置
-        Expires = expiresAt, 
-        Path = "/" 
-    };
-
-    ,,,
-}
-```
-
-更新 `Logout`
-
-```c#
-
-[HttpPost("logout")]
-[EnableRateLimiting(RateLimitPolicies.Write)]
-public async Task<IActionResult> Logout(CancellationToken cancellationToken)
-{
-    ...
-
-    // 清除 Cookie
-    Response.Cookies.Delete("refreshToken", new CookieOptions
-    {
-        Path = "/", // 和 SetRefreshTokenCookie 里的 Path 保持一致，否则删不掉
-        SameSite = SameSiteMode.None, // 必须和 Set-Cookie 时的属性一致才能删掉
-        Secure = true
-    });
-
-    return Ok(ApiResponse<object>.Ok("Logged out successfully"));
-}
-```
-
-#### 5. 测试并合并分支
-
-部署到 Azure 后，登录成功，浏览器 Application → Cookies 里可以看到 `refreshToken`。刷新页面不再登出。Logout 后 cookie 被正确清除。
-
-合并分支：
-
-```bash
-git add .
-git commit -m "fix: use SameSite=None in production for cross-origin cookie"
-git push origin fix/cookie-samesite-production
-
-git checkout develop
-git merge --no-ff fix/cookie-samesite-production \
-  -m "merge: fix/cookie-samesite-production into develop"
-git push origin develop
-
-git branch -d fix/cookie-samesite-production
-git push origin --delete fix/cookie-samesite-production
-
-```
-
-合并回main分支
-
-```bash
-git checkout main
-git pull origin main
-git merge --no-ff develop \
-  -m "merge: fix/cookie-samesite-production into main"
-git push origin main
-git checkout develop
-```
-
-
-
-### Fix3：图片上传组件体验优化
-
-#### 1. 切出 fix 分支
-
-```bash
-git checkout develop
-git pull origin develop	
-git checkout -b fix/ImageUploader-ux-improvements
-git push -u origin fix/ImageUploader-ux-improvements
-```
-
-#### 2.  问题描述
-
-图片上传组件的拖拽和删除各占一小块固定区域，操作不直观。`SortableImageItem` 中拖拽手柄是右下角一个独立小图标，而删除按钮是右上角另一个独立小图标，用户必须精确点在对应的小区域内才能触发操作。不如那种"整卡片可拖、悬浮才显示反馈、删除区域自动隔离"的模式直观。
-
-同时，添加图片按钮 `Add Images`是网格下方独立按钮，不是网格内的方块, 这导致 **图片网格和`Add Images`按钮是视觉上分离的两段**。按钮是标准横向按钮，不是跟图片同尺寸、排在网格末尾的方块，这种设计和"添加照片"方块体验相比有差距。
-
-#### 3. 根本原因
-
-根本原因是：现有设计靠"手柄和删除按钮物理位置分开"来避免两者抢事件，这是可行但不够友好的规避方式；没有用到 dnd-kit `activationConstraint`（8px 位移阈值）本身已经具备的"单纯点击不触发拖拽"能力，也没有给删除按钮做事件隔离。
-
-而对应添加图片功能按钮的设计， 三块内容（已上传图片、待上传预览、添加按钮）原本写成了三个独立的 `<div>`，天然不在同一个 flex 布局里，所以"添加"没法自然排进网格序列的最后一项。
-
-#### 4. 解决方案
-
-要实现整卡片可拖，删除按钮完全隔离拖拽感知，不再靠"手柄和删除按钮物理位置分开"这种规避方式，而是让整个卡片都能响应拖拽手势，删除按钮自己拦截事件、确保永远不会被误判成拖拽起点。
-
-**优化 `SortableImageItem`组件：**
-
-- `{...attributes} {...listeners}` 从手柄按钮挪到整个卡片
-- 拖拽手柄整个去掉， 不再需要一个独立的小手柄，整张卡片本身就是拖拽触发区
-
-```tsx
-import type { CarImage } from "@/types";
-import { useSortable } from "@dnd-kit/sortable";
-import { CSS } from "@dnd-kit/utilities";
-
-interface SortableImageItemProps {
-  image: CarImage;
-  onDelete: () => void;
-  isDeleting: boolean;
-}
-/* -- 已上传图片：可拖拽排序的单个图片项 - */
-function SortableImageItem({
-  image,
-  onDelete,
-  isDeleting,
-}: SortableImageItemProps) {
-  // useSortable 把这个元素注册为可排序项
-  // attributes/listeners 绑在整个卡片上（不再是独立手柄）：
-  // 单纯点击（没有产生 8px 位移，见 ImageUploader 里的 activationConstraint）
-  // 不会触发拖拽，配合删除按钮自己拦截事件（见下面），足以区分"点删除"和"开始拖拽"
-  const {
-    attributes,
-    listeners,
-    setNodeRef,
-    transform,
-    transition,
-    isDragging,
-  } = useSortable({ id: image.id });
-
-  return (
-    <div
-      ref={setNodeRef}
-      className="relative"
-      {...attributes}
-      {...listeners}
-      style={{
-        transform: CSS.Transform.toString(transform),
-        transition,
-        opacity: isDragging ? 0.5 : 1,
-      }}
-    >
-      <img
-        src={image.imageUrl}
-        alt="Car"
-        className="h-24 w-24 rounded-lg object-cover"
-      />
-
-      {/* 删除按钮 */}
-      <button
-        onClick={onDelete}
-        disabled={isDeleting}
-        className="absolute -right-2 -top-2 flex h-5 w-5
-                           items-center justify-center rounded-full
-                           bg-red-500 text-xs text-white
-                           hover:bg-red-600"
-      >
-        ×
-      </button>
-    </div>
-  );
-}
-
-export default SortableImageItem;
-
-```
-
-**图片删除图标阻止冒泡**：
-
-给删除按钮加 `onPointerDown={(e) => e.stopPropagation()}`，这样按下删除按钮的这个动作，根本不会冒泡到外层触发拖拽感知，不管按下去之后手指有没有轻微移动，都不会被误判成拖拽起点。同时删除按钮显式加了 `cursor-pointer`，覆盖父级 `cursor-grab` 的光标样式，鼠标移到删除图标上会正确切回普通指针
-
-```tsx
-function SortableImageItem({
-  image,
-  onDelete,
-  isDeleting,
-}: SortableImageItemProps) {
-  ...
-
-  return (
-    <div
-      ref={setNodeRef}
-      className="relative"
-      {...attributes}
-      {...listeners}
-      style={{
-        transform: CSS.Transform.toString(transform),
-        transition,
-        opacity: isDragging ? 0.5 : 1,
-      }}
-    >
-      ...
-
-      {/* 删除按钮：onPointerDown 阻止冒泡，保证按下这个按钮永远不会被
-          外层的拖拽感知捕获，不管按下后有没有轻微位移 */}
-      <button
-        onClick={onDelete}
-        onPointerDown={(e) => {e.stopPropagation()}}
-        disabled={isDeleting}
-        className="absolute -right-2 -top-2 flex h-5 w-5
-                           items-center justify-center rounded-full
-                           bg-red-500 text-xs text-white
-                           hover:bg-red-600 cursor-pointer"
-      >
-        ×
-      </button>
-    </div>
-  );
-}
-```
-
-**新增悬浮遮罩**:
-
- 使用Tailwind 的 `group`/`group-hover`， 这样鼠标移入卡片时才显现半透明遮罩，提示"这里可以拖动"；`pointer-events-none` 保证这层遮罩不会挡住下面删除按钮的点击。
-
-```tsx
-function SortableImageItem({
-  image,
-  onDelete,
-  isDeleting,
-}: SortableImageItemProps) {
-  ...
-  return (
-    <div
-      ref={setNodeRef}
-      className="group relative cursor-move active:cursor-grabbing"
-      {...attributes}
-      {...listeners}
-      style={{
-        transform: CSS.Transform.toString(transform),
-        transition,
-        opacity: isDragging ? 0.5 : 1,
-      }}
-    >
-      <img
-        src={image.imageUrl}
-        alt="Car"
-        className="h-24 w-24 rounded-lg object-cover"
-      />
-
-      {/* 悬浮遮罩：只在鼠标移入时显现，提示"这里可以拖动"；
-          pointer-events-none 避免挡住下面删除按钮的点击 */}
-      <div className="pointer-events-none absolute inset-0 rounded-lg bg-black/0 transition-colors group-hover:bg-black/20" />
-
-      {/* 删除按钮 */}
-      ...
-    </div>
-  );
-}
-```
-
-**添加图片按钮 `Add Images`的布局优化：**
-
-优化`ImageUploader`组件， 把原来三个独立区块（已上传图片网格、待上传预览网格、按钮区块）合并成一个 `flex flex-wrap` 容器， 这样三个功能快在同一行横向依次显示
-
-```tsx
-...
-
-export default function ImageUploader({ carId, images }: ImageUploaderProps) {
-  ...
-
-  return (
-    <div className="space-y-4">
-      <h2 className="font-semibold">Images</h2>
-          
-      {/* 图片网格：已上传图片（可拖拽排序）+ 待上传预览 + 末尾的"添加"方块，统一放在同一行 */}
-      <DndContext
-        sensors={sensors}
-        collisionDetection={closestCenter}
-        onDragEnd={handleDragEnd}
-      >
-        <SortableContext
-          items={localImages.map((img) => img.id)}
-          strategy={rectSortingStrategy}
-        >
-          <div className="flex flex-wrap gap-3">
-              
-            {/* 已上传的图片列表：可拖拽排序 */}
-            {localImages.map((image) => (
-              <SortableImageItem
-                key={image.id}
-                image={image}
-                onDelete={() => deleteMutation.mutate(image.id)}
-                isDeleting={
-                  deleteMutation.isPending &&
-                  deleteMutation.variables === image.id
-                }
-              />
-            ))}
-
-            {/* 待上传文件：每一项独立显示上传中或失败重试，互不影响 */}
-            {pendingFiles.map((pending) => (
-              <div key={pending.id} className="relative">
-                <img
-                  src={pending.previewUrl}
-                  alt="Preview"
-                  className="h-24 w-24 rounded-lg object-cover"
-                />
-
-                ...
-              </div>
-            ))}
-
-            {/* 选择新图片：上传图片按钮 */}
-            <div className="space-y-3">
-              ...
-            </div>
-          </div>
-        </SortableContext>
-      </DndContext>
-    </div>
-  );
-}
-```
-
-`DndContext`/`SortableContext` 现在包住整个网格（不只是已上传图片那部分）。 这不影响拖拽逻辑，因为 dnd-kit 只会追踪调用了 `useSortable` 的元素，待上传预览和添加图片本身没有调用这个 Hook，混在同一个容器里不会被误判成可拖拽项。
-
-**改造添加图片按钮：**
-
-新增一个 `h-24 w-24` 虚线边框方块（`Plus` 图标 + "Add" 文字），用 `canAddMore` 控制显隐，作为整个 `.map()` 序列里的最后一项。
-
-```tsx
-...
-
-export default function ImageUploader({ carId, images }: ImageUploaderProps) {
-  ...
-
-  // 已有图片 + 待上传数量是否已达上限，达到就不再显示"添加"方块
-  const canAddMore = localImages.length + pendingFiles.length < MAX_IMAGES;
-
-  return (
-    <div className="space-y-4">
-      <h2 className="font-semibold">Images</h2>
-          
-      {/* 图片网格：已上传图片（可拖拽排序）+ 待上传预览 + 末尾的"添加"方块，统一放在同一行 */}
-      <DndContext
-        sensors={sensors}
-        collisionDetection={closestCenter}
-        onDragEnd={handleDragEnd}
-      >
-        <SortableContext
-          items={localImages.map((img) => img.id)}
-          strategy={rectSortingStrategy}
-        >
-          <div className="flex flex-wrap gap-3">
-            {/* 已上传的图片列表：可拖拽排序 */}
-              
-            ...
-
-            {/* 待上传文件：每一项独立显示上传中或失败重试，互不影响 */}
-
-            ...
-
-            {/* 添加图片：跟图片同尺寸的方块，始终排在网格最后一个 */}
-            {canAddMore && (
-              <button
-                type="button"
-                onClick={() => inputRef.current?.click()}
-                className="flex h-24 w-24 flex-col items-center justify-center gap-1 rounded-lg border-2 border-dashed border-gray-300 text-gray-400 transition-colors hover:border-gray-400 hover:text-gray-500"
-              >
-                <Plus className="h-5 w-5" />
-                <span className="text-[10px]">Add</span>
-              </button>
-            )}
-          </div>
-        </SortableContext>
-      </DndContext>
-
-      {/* 隐藏的原生文件选择 input，multiple 允许一次选多个文件 */}
-      <input
-        ref={inputRef}
-        type="file"
-        accept="image/jpeg,image/png,image/webp"
-        multiple
-        className="hidden"
-        onChange={handleFileChange}
-      />
-      <p className="text-xs text-gray-500">
-        JPEG, PNG or WebP · Max 5 MB per image · Up to {MAX_IMAGES} images total
-      </p>
-    </div>
-  );
-}
-
-```
-
-**格外的一个小改动**：
-
-现在的 `Edit Car`页面中，"文本表单 + Save Changes 按钮"在上面、"Images + Add Images 按钮"在下面，非常自然地会以为"是不是要先点 Save Changes，图片才会跟着车辆信息一起保存"。而实际上，`Save Changes` 只负责保存**文本字段**（Title/Brand/Model 这些），跟图片完全无关——图片是选中即上传、每张独立立刻持久化的，不需要点 `Save Changes` 才生效。
-
-这个纯粹由布局顺序制造出来的误导需要优化一下：把 `Images` 区块整体挪到 `CarForm` 上面。
-
-```tsx
-export default function EditCarPage() {
-  ...
-
-  return (
-    <div className="mx-auto max-w-2xl space-y-8">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold">Edit Car</h1>
-        {/* 提交审核按钮 */}
-        <Button
-          onClick={() => submitMutation.mutate()}
-          disabled={submitMutation.isPending}
-        >
-          {submitMutation.isPending ? "Submitting..." : "Submit for Review"}
-        </Button>
-      </div>
-
-      {/* 图片上传 */}
-      <ImageUploader carId={carId} images={car.images} />
-
-      {/* 车辆信息表单，defaultValues 填入已有数据 */}
-      ...
-    </div>
-  );
-}
-
-```
-
-#### 5. 测试并合并分支
-
-修改完成之后:
-
-- 拖拽手柄移除，整个卡片能实现拖拽
-- 添加图片按钮和图片卡片外形一致，并并列展示
-- 车辆编辑页面的图片区域移到`CarForm`之前
-
-合并分支
-
-```bash
-git add .
-git commit -m "fix: improve ImageUploader UX"
-git push origin fix/ImageUploader-ux-improvements
-
-git checkout develop
-git merge --no-ff fix/ImageUploader-ux-improvements \
-  -m "merge: fix/ImageUploader-ux-improvements into develop"
-git push origin develop
-
-git branch -d fix/ImageUploader-ux-improvements
-git push origin --delete fix/ImageUploader-ux-improvements
-```
-
-
-
-### Fix4：车辆发布体验优化（图片预上传）
-
-#### 1. 切出 fix 分支
-
-```bash
-git checkout develop
-git pull origin develop
-git checkout -b fix/add-images-when-create-car
-git push -u origin fix/add-images-when-create-car
-```
-
-#### 2. 问题描述
-
-创建车辆阶段无法预先选图片，当前流程：
-
-CreateCarPage 只有 CarForm，用户填完信息点 Create Draft 后，carsApi.create 成功才跳转到 EditCarPage，图片必须等跳转过去之后才能添加。用户体验上应该允许"填资料的同时就能选好图片"，不需要先创建、再跳页面、再选图。
-
-#### 3. 根本原因
-
-CarImage 在数据库里通过 CarId 外键归属于一辆具体的车（AddImagesBatchAsync 第一步就是 _carRepository.GetByIdAsync(carId, ...)，车不存在直接 404）。这意味着图片必须挂在一个已存在的 carId 上，而 CreateCarPage 阶段车辆还没创建，天然不具备这个前提。
-
-#### 4. 解决方案
-
-不改后端任何接口，前端在 CreateCarPage 里让用户"先选图片、暂存在本地、不真正上传"，等 carsApi.create 真正成功拿到 car.id 之后，紧接着调用已有的 carsApi.uploadImagesBatch(car.id, files) 把暂存的文件批量传上去；如果图片上传失败，不影响创建结果，依然跳转 EditCarPage，让用户在编辑页重新添加。
-
-**新增本地状态数组**：
-
-`CreateCarPage` 现状完全没有跟图片相关的状态。要让用户"先选图片、暂存本地、提交时才真正上传"，需要一个新的本地状态数组，装"已选中但还没上传"的文件。 这里跟 ImageUploader 里的 PendingFile 不同——PendingFile 需要 status: "uploading" | "error"，是因为那边选完立即发请求；这里选完完全不发请求，只是本地暂存，所以不需要状态字段，只需要文件本身和预览地址： 
-
-```tsx
-// 创建阶段本地暂存的图片：车辆还不存在，不能真正上传，
-// 只在本地生成预览，等提交成功拿到 carId 才批量上传
-interface LocalImage {
-  id: string;
-  file: File;
-  previewUrl: string;
-}
-
-export default function CreateCarPage() {
- ...
-}
-
-```
-
-对应组件内部新增状态： 
-
-```tsx
-export default function CreateCarPage() {
-  // 本地暂存的图片（车辆还不存在，不能真正上传）
-  const [localImages, setLocalImages] = useState<LocalImage[]>([]);
-  ...
-}
-```
-
-如果我们有了本地暂存的图片数据，需要渲染这部分数据， 这部分数据渲染的功能，我们创建一个独立的组件`ImagePicker`, 并把数据和更新数据的操作传递过去, 这样根据本地不同的数据，就能渲染出不同的车辆图片。
-
-```tsx
-export default function CreateCarPage() {
-  // 本地暂存的图片（车辆还不存在，不能真正上传）
-  const [localImages, setLocalImages] = useState<LocalImage[]>([]);
-
-  ...
-
-  return (
-    <div className="mx-auto max-w-2xl space-y-6">
-      <h1 className="text-2xl font-bold">List Your Car</h1>
-          
-      {/* image selector */}
-      <ImagePicker images={localImages} onChange={setLocalImages} />
-
-      <CarForm
-        onSubmit={handleSubmit}
-        isSubmitting={createMutation.isPending}
-        submitLabel="Create Draft"
-      />
-    </div>
-  );
-}
-```
-
-**创建图片本地选择器组件`ImagePicker`**
-
-和`ImageUploader`不同，`ImagePicker`内部**完全不需要**任何网络请求:
-
-- 没有 `carsApi` 导入
-- 没有 `useMutation`
-- 没有 `useQueryClient`
-
-但需要选择、删除、拖拽这三件事， 他们全部只是纯数组操作。同时`ImagePicker` 只负责"展示 + 触发变化",不自己拥有状态,这是标准的**受控组件**模式,跟 `CarForm` 的 `onSubmit`/`defaultValues` 是同一个思路。
-
-```tsx
-interface ImagePickerProps {
-  // 受控组件：状态由父组件持有，这里只负责展示和触发变化
-  images: LocalImage[];
-  onChange: (images: LocalImage[]) => void;
-}
-
-export default function ImagePicker({ images, onChange }: ImagePickerProps) {
- 
-
-  /* --- 选择 --- */
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    ...
-    onChange(...);
-  };
-  /* --- 删除 --- */
-  // 纯本地数组操作，没有对应的后端记录，不发请求
-  const handleDelete = (id: string) => {
-    ...
-    onChange(...);
-  };
-
-  /* --- 拖拽 --- */
-  // 拖拽结束：纯本地重排，没有已持久化的 SortOrder 需要同步给后端
-  const handleDragEnd = (event: DragEndEvent) => {
-    ...
-    onChange(...);
-  };
-
-  const canAddMore = images.length < MAX_IMAGES;
-
-  return (
-    <div className="space-y-2">
-      ...
-    </div>
-  );
-}
-
-```
-
-完善选择+删除+拖拽逻辑，渲染数据（复用可拖拽卡`SortableImageItem`)
-
-```tsx
-import { useRef } from "react";
-import { toast } from "sonner";
-import { Plus } from "lucide-react";
-import {
-  DndContext,
-  closestCenter,
-  PointerSensor,
-  useSensor,
-  useSensors,
-  type DragEndEvent,
-} from "@dnd-kit/core";
-import {
-  SortableContext,
-  rectSortingStrategy,
-  arrayMove,
-} from "@dnd-kit/sortable";
-import SortableImageItem from "./SortableImageItem";
-import type { LocalImage } from "@/pages/CreateCarPage";
-
-const MAX_IMAGES = 10; // 与后端 AddImagesBatchAsync 的上限保持一致
-
-interface ImagePickerProps {
-  // 受控组件：状态由父组件持有，这里只负责展示和触发变化
-  images: LocalImage[];
-  onChange: (images: LocalImage[]) => void;
-}
-
-export default function ImagePicker({ images, onChange }: ImagePickerProps) {
-  const inputRef = useRef<HTMLInputElement>(null);
-  const sensors = useSensors(
-    useSensor(PointerSensor, {
-      activationConstraint: { distance: 8 },
-    }),
-  );
-  const canAddMore = images.length < MAX_IMAGES;
-
-  /* --- 选择 --- */
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
-    if (!files || files.length === 0) return;
-
-    const fileArray = Array.from(files);
-
-    // 数量上限：只在本地拦截，此时没有 carId，无法调后端校验
-    if (images.length + fileArray.length > MAX_IMAGES) {
-      toast.error(
-        `A car can have at most ${MAX_IMAGES} images. ` +
-          `Currently selected ${images.length}, ` +
-          `you selected ${fileArray.length} more.`,
-      );
-      if (inputRef.current) inputRef.current.value = "";
-      return;
-    }
-
-    const newImages: LocalImage[] = fileArray.map((file) => ({
-      id: `local-${Date.now()}-${Math.random()}`,
-      file,
-      previewUrl: URL.createObjectURL(file),
-    }));
-
-    onChange([...images, ...newImages]);
-
-    if (inputRef.current) inputRef.current.value = "";
-  };
-  /* --- 删除 --- */
-  // 纯本地数组操作，没有对应的后端记录，不发请求
-  const handleDelete = (id: string) => {
-    const target = images.find((img) => img.id === id);
-    if (target) URL.revokeObjectURL(target.previewUrl);
-    onChange(images.filter((img) => img.id !== id));
-  };
-
-  /* --- 拖拽 --- */
-  // 拖拽结束：纯本地重排，没有已持久化的 SortOrder 需要同步给后端
-  const handleDragEnd = (event: DragEndEvent) => {
-    const { active, over } = event;
-    if (!over || active.id === over.id) return;
-
-    const oldIndex = images.findIndex((img) => img.id === active.id);
-    const newIndex = images.findIndex((img) => img.id === over.id);
-
-    onChange(arrayMove(images, oldIndex, newIndex));
-  };
-
-  return (
-    <div className="space-y-2">
-      <h2 className="font-semibold">Images</h2>
-      <DndContext
-        sensors={sensors}
-        collisionDetection={closestCenter}
-        onDragEnd={handleDragEnd}
-      >
-        <SortableContext
-          items={images.map((img) => img.id)}
-          strategy={rectSortingStrategy}
-        >
-          <div className="flex flex-wrap gap-3">
-            {images.map((img) => (
-              <SortableImageItem
-                key={img.id}
-                image={{ id: img.id, imageUrl: img.previewUrl }}
-                onDelete={() => handleDelete(img.id)}
-                isDeleting={false}
-              />
-            ))}
-
-            {/* 添加图片：跟图片同尺寸的方块，始终排在最后一个 */}
-            {canAddMore && (
-              <button
-                type="button"
-                onClick={() => inputRef.current?.click()}
-                className="flex h-24 w-24 flex-col items-center justify-center gap-1
-                           rounded-lg border-2 border-dashed border-gray-300
-                           text-gray-400 transition-colors
-                           hover:border-gray-400 hover:text-gray-500"
-              >
-                <Plus className="h-5 w-5" />
-                <span className="text-[10px]">Add</span>
-              </button>
-            )}
-          </div>
-        </SortableContext>
-      </DndContext>
-          
-	  {/* 隐藏的原生文件选择 input，multiple 允许一次选多个文件 */}
-      <input
-        ref={inputRef}
-        type="file"
-        accept="image/jpeg,image/png,image/webp"
-        multiple
-        className="hidden"
-        onChange={handleFileChange}
-      />
-      <p className="text-xs text-gray-500">
-        JPEG, PNG or WebP · Max 5 MB per image · Up to {MAX_IMAGES} images total
-      </p>
-    </div>
-  );
-}
-```
-
-注意：复用`SortableImageItem` 会有类型不匹配
-
-`SortableImageItem` 现在的 prop 类型是 `image: CarImage`,而本地暂存的文件对象长得不一样(`id` 是字符串、字段叫 `previewUrl` 不是 `imageUrl`)。
-
-需要把 `SortableImageItem` 依赖的类型**收窄成它真正需要的最小形状**——它其实只用到 `id` 和 `imageUrl` 两个字段,不需要整个 `CarImage`。这样两边都能类型安全地复用同一个展示组件。
-
-```tsx
-// 只依赖"展示 + 拖拽 + 删除"真正需要的字段，不绑定具体是
-// 已持久化的 CarImage，还是本地文件生成的预览对象——
-// CarImage 结构上天然满足这个形状，可以直接传入，不需要改 ImageUploader
-export interface ImageLike {
-  id: string | number;
-  imageUrl: string;
-}
-
-interface SortableImageItemProps {
-  image: ImageLike;
-  onDelete: () => void;
-  isDeleting: boolean;
-}
-/* -- 已上传图片：可拖拽排序的单个图片项 - */
-function SortableImageItem() {
- ...
-}
-```
-
-**重写表单提交逻辑**
-
-之前的提交逻辑不包含上传图片的部分，使用`useMutation`合理，现在的提交动作是"创建车辆 → 上传图片 → 跳转"三步连续的流程，`useMutation` 的 `isPending` 只反映 `mutationFn` 本身（原来的 `carsApi.create`）有没有完成——`create` 请求一返回，`isPending` 立刻变回 `false`，哪怕紧接着的图片上传还没做完，按钮会提前恢复可点击状态，用户可能在图片还在传的时候又点一次提交。因此，我们选择**手写一个 `async` 函数配合自己的 `isSubmitting` 状态更直接**。
-
-之前的逻辑：
-
-```tsx
-const createMutation = useMutation({
-  mutationFn: (values: CarFormValues) => carsApi.create(values),
-  onSuccess: (car) => {
-    toast.success("Draft created!");
-    navigate(`/cars/${car.id}/edit`);
-  },
-  onError: (error) => {
-    toast.error(error.message);
-  },
-});
-
-const handleSubmit = async (values: CarFormValues) => {
-  createMutation.mutate(values);
-};
-```
-
-修改提交逻辑
-
-```tsx
-import { useNavigate } from "react-router-dom";
-import { toast } from "sonner";
-import { carsApi } from "@/api";
-import CarForm from "@/components/CarForm";
-import type { CarFormValues } from "@/components/CarForm";
-import { useState } from "react";
-import ImagePicker from "@/components/ImagePicker";
-
-// 车辆创建前本地暂存的图片：还没有 carId，不会真正上传，
-// 只在本地生成预览、支持删除和拖拽排序；真正的上传由父组件
-// 在拿到 carId 之后调用 carsApi.uploadImagesBatch 完成
-export interface LocalImage {
-  id: string;
-  file: File;
-  previewUrl: string;
-}
-
-export default function CreateCarPage() {
-  const navigate = useNavigate();
-
-  // 本地暂存的图片：车辆还不存在，选择、删除、排序都只发生在本地，
-  // 全部逻辑交给 ImageSelector，这里只持有状态，提交时读出来用
-  const [localImages, setLocalImages] = useState<LocalImage[]>([]);
-  // 提交状态：涵盖"创建车辆 + 上传图片"整个过程，不只是创建这一步
-  const [isSubmitting, setIsSubmitting] = useState(false);
-
-  const handleSubmit = async (values: CarFormValues) => {
-    setIsSubmitting(true);
-    try {
-      // 第一步：创建车辆，拿到真实的 carId
-      const car = await carsApi.create(values);
-      toast.success("Draft created!");
-
-      // 第二步：如果用户选过图片，用刚拿到的 carId 批量上传
-      if (localImages.length > 0) {
-        try {
-          await carsApi.uploadImagesBatch(
-            car.id,
-            localImages.map((img) => img.file),
-          );
-        } catch {
-          // 图片上传失败不影响车辆已创建这个事实，只提示用户去编辑页补传
-          toast.error(
-            "Draft created, but images failed to upload. You can add them on the next page.",
-          );
-        }
-      }
-
-      // 第三步：跳转编辑页（车辆一定已存在，图片传没传成功都可以在这里补）
-      navigate(`/cars/${car.id}/edit`);
-    } catch (error) {
-      toast.error(
-        error instanceof Error ? error.message : "Failed to create draft.",
-      );
-    } finally {
-      setIsSubmitting(false);
-    }
-  };
-
-  return (
-    <div className="mx-auto max-w-2xl space-y-6">
-      <h1 className="text-2xl font-bold">List Your Car</h1>
-
-      <ImagePicker images={localImages} onChange={setLocalImages} />
-
-      <CarForm
-        onSubmit={handleSubmit}
-        isSubmitting={isSubmitting}
-        submitLabel="Create Draft"
-      />
-    </div>
-  );
-}
-
-```
-
-#### 5. 测试并合并分支
-
-修改之后，创建车辆草稿时，能批量上传图片（预览+拖拽排序+删除）
-
-合并分支
-
-```tsx
-git add .
-git commit -m "fix: improve car listing UX, add images"
-git push origin fix/add-images-when-create-car
-
-git checkout develop
-git merge --no-ff fix/add-images-when-create-car \
-  -m "merge: fix/add-images-when-create-car into develop"
-git push origin develop
-
-git branch -d fix/add-images-when-create-car
-git push origin --delete fix/add-images-when-create-car
-```
-
-
 
 ## Step 74 · Bundle 优化与 Web Vitals
 
-### 这一步做什么
+### Step 74 目标
 
 Step 73 已经打通并验证了从源码检查到 Azure 生产部署的完整交付路径。不过，应用能够可靠发布，只说明构建产物可以到达生产环境；当用户真正打开网站时，浏览器需要下载多少资源、页面多快显示主要内容以及何时能够稳定交互，仍然需要单独验证。
 
@@ -31899,7 +30827,7 @@ http://localhost:5173/cars/7003
 | 导航时的加载反馈 | 未观察到详情区域短暂空白 |
 | 图廊布局稳定性 | 主图和缩略图出现后没有观察到明显跳动、撑开或错位 |
 
-直接访问的 LCP 由车辆主图决定，且大部分时间位于资源发现前的等待和图片下载；站内导航则避免了重新下载应用入口和主图，但仍会请求详情所需的其余 4 张图片。直接访问中记录到的 CLS 与站内导航时图廊未出现明显跳动是两项不同证据，后续分析时不能把它们视为同一结论。
+直接访问的 LCP 由车辆主图决定，且大部分时间位于资源发现前的等待和图片下载；站内导航则避免了重新下载应用入口和主图，但仍会请求详情所需的其余 4 张图片。直接访问中记录到的 CLS 与站内导航时图廊未出现明显跳动是两项不同证据，不能视为同一结论。
 
 #### 3.7 记录优化前 Lighthouse
 
@@ -31938,7 +30866,7 @@ Lighthouse 的主要诊断与前两节的资源记录相互印证：
 | `/` | Render-blocking requests 估算节省 `600 ms`；Improve image delivery 估算节省 `1,014 KiB`；Use efficient cache lifetimes 估算节省 `1,201 KiB`；Reduce unused JavaScript 估算节省 `325 KiB`；Minimize main-thread work `2.9 s`；8 个 long tasks；46 个非合成动画元素 |
 | `/cars/7003` | Render-blocking requests 估算节省 `600 ms`；Use efficient cache lifetimes 估算节省 `804 KiB`；Improve image delivery 估算节省 `725 KiB`；Reduce unused JavaScript 估算节省 `327 KiB`；7 个 long tasks；CLS、LCP breakdown 与 3rd parties 审计通过 |
 
-首页的 LCP 资源在第 3.5 节记录为 Hero 图片 `hero-bg-CDjpd0E3.jpg`；详情页的 LCP 资源在第 3.6 节记录为主图 `152f8b93-9257-438d-98df-0f48fb1205c1.jpg`。Lighthouse 的三次结果用于后续优化的数值基线，单次分数波动、没有资源证据支持的笼统建议，以及无法在相同条件下复现的现象，不作为优化依据。
+首页的 LCP 资源在第 3.5 节记录为 Hero 图片 `hero-bg-CDjpd0E3.jpg`；详情页的 LCP 资源在第 3.6 节记录为主图 `152f8b93-9257-438d-98df-0f48fb1205c1.jpg`。Lighthouse 的三次结果构成数值基线；单次分数波动、没有资源证据支持的笼统建议，以及无法在相同条件下复现的现象，不作为优化依据。
 
 
 
@@ -31946,11 +30874,9 @@ Lighthouse 的主要诊断与前两节的资源记录相互印证：
 
 第 3 节已经从 Production Build、Bundle Report、Network、Performance 和 Lighthouse 五个角度记录了同一份优化前代码。本节只解释这些证据能够确认的问题，并区分已经成立的结论、尚需进一步判断的线索和没有证据支持的假设。具体修改方式仍需在进入相应实施阶段后选择，当前候选方案不是既定结果。
 
-两组性能数据使用了不同的受控方法。DevTools Performance 在 `390 × 844`、`Fast 4G` 下记录首页 LCP `2.84 s`、详情页 LCP `2.16 s`，并分别把 Hero 和详情主图识别为 LCP 元素。Lighthouse 使用 Emulated Moto G Power 和 Simulated Slow 4G，三次中位数分别为 `7.5 s` 和 `11.0 s`，并给出图片交付诊断。
+DevTools Performance 与 Lighthouse 使用不同的设备和网络条件，因此只在各自相同的方法内比较优化前后结果；LCP 元素继续以保存了资源证据的 Performance Recording 为准。
 
-Lighthouse 记录没有单独保存 LCP Element 审计结果，因此这组数据只用于补充 LCP 数值和图片压力证据，不重复断言具体 LCP 元素。两种方法的绝对值不能直接比较，优化前后也必须各自使用原测量方法复测。
-
-#### 4.1 分析首页初始代码
+#### 4.1 分析初始代码边界
 
 当前 `router.tsx` 静态导入全部 `18` 个页面模块。Vite 因此只生成一个 `1,230.01 kB`、gzip `366.33 kB` 的 JavaScript Chunk；浏览器在渲染首页路由前必须先下载包含这些模块的完整入口。Tree Shaking 可以移除未被引用的导出，但不能把已经被 Router 静态引用的完整页面自动变成按路由下载。
 
@@ -31975,24 +30901,13 @@ GET /cars?page=1&pageSize=6
 
 两个查询分别使用 `cars` 和 `cars-latest-carousel` Query Key，TanStack Query 会把它们视为不同数据，因此冷加载中实际发出了两次请求。两次响应各为 `2.9 kB`，传输体积不大，但在当前无筛选、第一页的首页场景中，请求参数和返回数据相同。这可以确认存在两次结果重合的数据读取；是否应该合并，还需要判断列表与轮播是否属于同一项数据职责。
 
-#### 4.2 分析后续页面代码
+#### 4.2 界定代码拆分范围
 
-沿着用户从首页进入后续功能页面的路径，源码与 Bundle Report 可以对应出以下依赖来源：
+源码中的依赖路径进一步说明，最明确的页面专用负担来自 `AdminDashboardPage` 引入的 Recharts，以及创建、编辑车辆流程引入的 dnd-kit。Profile 和账号页面也不参与匿名首页渲染，但没有出现同等规模的专用依赖，因此不能仅凭“当前页面不使用”就把所有路由全部拆分。
 
-| 后续功能 | 依赖进入当前入口的路径 | 当前问题或判断 |
-| --- | --- | --- |
-| Admin Dashboard | `router.tsx` → `AdminDashboardPage` → Recharts | 匿名首页不使用图表，但 Recharts 已进入当前入口，是最清楚的页面专用负担 |
-| 创建和编辑车辆 | `router.tsx` → `CreateCarPage` / `EditCarPage` → 图片选择或上传组件 → dnd-kit | 拖拽排序只在 Seller 操作图片时使用，匿名首页不需要这组代码 |
-| Profile 子页面 | `router.tsx` → `ProfilePage` 及 Listings、Favorites、Purchases、Sales | 这些登录后页面全部通过静态导入进入当前入口 |
-| 认证页面 | `router.tsx` → Login、Register、Verify、Forgot、Reset 页面 | 表单、验证和账号恢复逻辑不参与公开首页渲染，但当前仍随入口下载 |
-| Google 登录 | `main.tsx` 全局 `GoogleOAuthProvider` → `@react-oauth/google` | Provider 位于应用根部，使没有 Google 登录按钮的公开页面也加载相关客户端脚本 |
-| 通知 | `Layout` → `NotificationBell` → `@microsoft/signalr` | 匿名状态不会渲染通知铃铛或建立 Hub 连接，但现有记录还不足以证明 SignalR 是当前入口的主要体积来源 |
+Google Provider 还有独立的 Network 证据：匿名访问首页和详情页时都会下载约 `102 kB` 的 Google Identity Services `client`，而 Google 登录按钮只出现在 Login 和 Register。全局 Provider 因而使公开浏览路径承担了与当前页面无关的第三方脚本请求，调整范围必须同时保留 Google 登录和 Client ID 配置检查。
 
-Network 为 Google Provider 提供了额外证据：匿名访问首页和详情页时都会下载 Google Identity Services `client`，传输约 `102 kB`，而 Google 登录按钮只出现在 Login 和 Register。由此可以确认，全局 Provider 让公开浏览路径承担了与当前页面无关的第三方脚本请求。任何后续改动都必须保留 Google 登录与 Client ID 配置检查的现有行为。
-
-车辆详情页没有表现出相同程度的代码交付问题。它是公开核心路径，Bundle Report 中的页面模块约 `10.8 kB`，没有像 Recharts 或 dnd-kit 那样明显的大型页面专用依赖；从首页进入车辆 `7003` 时也没有新增 JavaScript 请求或可见空白。现有证据因此不能支持把详情页代码本身列为优先问题。
-
-同样，现有报告显示的是页面职责进入同一入口，并没有证明第三方包之间需要人为编排 Chunk。`manualChunks`、逐个拆分所有页面或单独延迟 SignalR 都不能仅凭当前记录成为确定结论。
+车辆详情页是公开核心路径，页面模块约 `10.8 kB`，也没有明显的大型专用依赖；SignalR 则缺少足以证明其属于主要体积来源的证据。当前范围因此聚焦 Admin、车辆表单和 Google 认证路径，不加入 `manualChunks`，也不逐个拆分其余页面。
 
 #### 4.3 分析图片加载
 
@@ -32010,15 +30925,15 @@ Network 为 Google Provider 提供了额外证据：匿名访问首页和详情�
 
 与图片布局相比，Performance 将 Web Font 列为首页 CLS `0.13` 的偏移线索；详情页 CLS 为 `0.06`，Lighthouse 中位数为 `0.071`。`index.css` 确实在顶部通过远程 `@import` 加载 Google Fonts，但 Lighthouse 给出约 `600 ms` 的 Render-blocking requests 估算时，本次没有保存对应的具体资源清单，不能把全部时间直接归因于字体。字体目前只能作为待进一步验证的线索，不能列为已经确认的优化目标。
 
-#### 4.4 汇总已经确认的问题
+#### 4.4 确认优化范围
 
 综合以上分析，当前已经确认两组需要修改的问题：初始入口包含与公开浏览无关的页面代码和 Google 脚本；首页与详情页的关键图片在首次加载期间与其他图片竞争网络资源。首页的两次车辆请求同样有运行记录支持，但是否属于应当消除的重复仍取决于列表和轮播的数据职责，需要在选择实现时再判断。
 
-另一方面，现有证据不能证明车辆详情页代码、图片尺寸、SignalR 或字体是当前主要瓶颈。它们不能仅凭静态依赖、单次诊断或一般性能建议被加入修改范围。本节结论止于问题范围；下一阶段仍需逐项选择最小改动，并且只有实际执行后的构建、请求和性能结果才能说明改动是否有效。
+另一方面，现有证据不能证明车辆详情页代码、图片尺寸、SignalR 或字体是当前主要瓶颈。它们不能仅凭静态依赖、单次诊断或一般性能建议被加入修改范围。任何改动仍需限制在已经确认的问题内，并由实际构建、请求和性能结果判断是否有效。
 
 
 
-### 5. 优化初始代码与数据交付
+### 5. 优化初始 JavaScript 加载
 
 第 4 节确认了两类代码交付问题：匿名首页会取得尚未访问的业务页面代码，并且会加载只供登录和注册使用的 Google Client。同时，Network 中还出现了两次参数相同的第一页车辆请求。请求重复是需要分析的现象，但仅凭参数相同，还不能断定两个界面必须共用同一份查询状态。
 
@@ -32243,7 +31158,7 @@ export const RegisterPage = lazy(() => import("@/pages/RegisterPage"));
 
 这个决定保留了两个组件独立变化的能力，也意味着本轮不能把车辆 XHR 减少作为优化成果。只有在业务语义明确要求两处共享同一数据集合时，才适合重新设计查询归属。
 
-#### 5.7 根据构建和 Network 结果决定保留范围
+#### 5.7 验证代码拆分结果
 
 代码中出现 `lazy()` 只能证明建立了 Dynamic Import，不能证明最终 Chunk 边界和浏览器请求符合预期。因此先生成优化后的 Bundle Report，再重新生成不含报告的普通 Production Build，并用同一份产物完成 Network 验证：
 
@@ -32288,11 +31203,11 @@ Bundle Report 显示：
 
 这些结果同时满足两个条件：公开首页移除了已经确认的页面专用代码和 Google Client，目标功能又能在实际访问时取得所需 Chunk。因此保留当前拆分边界；Profile、其余账号页面、SignalR 和手动分包继续保持现状。
 
-#### 5.8 回归功能并记录实际结论
+#### 5.8 回归路由功能
 
 5.7 已经确认目标页面代码会在访问对应路由时才请求，但请求边界正确不等于页面行为一定正确。按需加载改变了页面代码的到达时间，因此还要确认 URL、权限判断、嵌套路由和原有交互没有因为等待过程而发生变化。
 
-人工回归继续使用普通 Production Preview，并保持 `390 × 844`、Fast 4G、Disable cache 和无痕窗口条件。Production Preview 直接运行 Build 生成的文件，可以同时观察真实路由 Chunk、`RouteLoading` 和最终页面是否正常衔接。实际结果如下：
+人工回归继续使用普通 Production Preview，并沿用第 2.2 节的浏览器条件。Production Preview 直接运行 Build 生成的文件，可以同时观察真实路由 Chunk、`RouteLoading` 和最终页面是否正常衔接。实际结果如下：
 
 | 检查场景 | 实际结果 | 说明 |
 | --- | --- | --- |
@@ -32303,24 +31218,13 @@ Bundle Report 显示：
 | Admin Route 与刷新 | Dashboard 和 Pending Review 正常显示；刷新 `/admin/pending` 时短暂出现 `Loading page...`，随后恢复原 URL 和页面内容 | Admin 权限与嵌套路由正常，`RouteLoading` 在等待页面代码时提供反馈 |
 | 404 | 直接访问不存在的 URL 会保留该地址并显示现有 Page Not Found 页面 | 通配路由没有被 Lazy Route 改动破坏 |
 
-人工回归完成后停止 Preview 和手动启动的 API，因为 Playwright 会在 `5173` 和 `5065` 端口启动自己的前端与 E2E API。E2E 运行时仍需要可用的 SQL Server、Redis、`E2EConnection`、Admin Seed 和 `VITE_GOOGLE_CLIENT_ID`；临时用户、车辆与订单由测试辅助代码创建，不需要手动准备。
-
-以下检查从不同层面验证同一改动。每项命令、结果及其含义记录在一起；命令均在 `uucars-web` 目录执行：
-
-| 检查目的 | 命令 | 实际结果与含义 |
-| --- | --- | --- |
-| ESLint 检查静态规则 | `npm run lint` | 通过，结果为 `0 errors`、`1 warning`。`CarForm.tsx:77:26` 的 `react-hooks/incompatible-library` 表示 React Compiler 无法安全记忆化 React Hook Form 的 `watch()`，会跳过这项优化；它不是 error，不会阻断 Lint |
-| Production Build 同时检查 TypeScript 并生成生产文件 | `VITE_API_BASE_URL=http://localhost:5065 npm run build` | 通过，共转换 `2706` 个模块，用时 `521 ms`。主入口为 `537.46 kB`、gzip `159.55 kB`，因此仍有超过默认 `500 kB` 阈值的已知提示；该提示没有使 Build 失败 |
-| Vitest 与 React Testing Library 检查现有组件和页面行为 | `npm test -- --run` | `5` 个测试文件、`15` 个测试全部通过，用时 `3.15 s` |
-| Playwright 通过真实浏览器检查核心用户流程 | `npm run e2e` | 单 Worker 执行 `5` 条 E2E，全部通过，用时 `33.4 s`；注册、Seller 提交车辆、Admin 审核、Buyer 下单和 Seller 查看订单均保持正常 |
-
-Build、Bundle Report 和 Network 证明当前代码能够生成预期的生产文件，并在访问目标路由时取得对应 Chunk；人工回归、组件测试和 E2E 则没有在已检查的 URL、权限、嵌套路由和核心流程中发现功能回归。因此保留本节采用的路由拆分，结论只覆盖以上实际验证范围。
+针对路由修改运行的 ESLint、Production Build、`15` 个组件测试和 `5` 条 Playwright E2E 均通过。结合 Bundle Report、Network 和人工回归，当前拆分能够按访问路径取得目标 Chunk，并且没有在已检查的 URL、权限、嵌套路由和核心流程中发现功能回归，因此保留本节采用的拆分范围。
 
 
 
 ### 6. 优化页面图片加载
 
-第 4 节已经确认，首页冷加载会取得 Hero、Seller Banner 和 6 张车辆封面，图片传输共 `1,877 kB`；直接访问车辆详情时，主图与 4 张其余车辆图片也会同时请求。问题不在于页面不能显示图片，而在于当前所有图片都按默认方式开始加载，关键图片会与尚未需要的图片竞争网络资源。
+第 4 节已经确认，首页冷加载会取得 Hero、Seller Banner 和 6 个不同 URL 的车辆封面，图片传输共 `1,877 kB`。轮播和 `All Listings` 当时取得相同车辆，所以两组 `<img>` 可以复用这 6 份资源，而不是分别传输 12 张图片；直接访问车辆详情时，主图与 4 张其余车辆图片也会同时请求。问题不在于页面不能显示图片，而在于当前所有图片都按默认方式开始加载，关键图片会与尚未需要的图片竞争网络资源。
 
 本节只调整公开页面中现有图片的请求时机和相对优先级，不改变图片内容、车辆查询或上传流程。判断标准也不是“尽量多加 `lazy`”，而是先区分图片在当前页面中的职责：决定主要内容何时出现的图片应优先取得，暂时不可见的图片才适合推迟。
 
@@ -32344,13 +31248,13 @@ Build、Bundle Report 和 Network 证明当前代码能够生成预期的生产�
 />
 ```
 
-`eager` 是普通 `<img>` 的默认行为，这里显式写出是为了让关键图片的职责可见；真正新增的调度提示是 `fetchPriority="high"`。本页只把 Hero 标记为高优先级，不能同时把轮播图或 Banner 也标成 `high`，否则多个“最高优先级”会重新互相竞争。
+`eager` 是普通 `<img>` 的默认行为，这里显式写出是为了让关键图片的职责可见；真正新增的调度提示是 `fetchPriority="high"`。本节只把首页 Hero 标记为高优先级，不能同时把轮播图或 Banner 也标成 `high`，否则多个“最高优先级”会重新互相竞争。
 
 本次不在共享的 `index.html` 中加入 Hero Preload。这个 HTML 同时服务首页和其他前端路由，全局 Preload 会让直接访问登录页或车辆详情页的用户也下载首页 Hero。为了提前几百毫秒发现一张图片而让所有路由承担额外请求，不符合当前最小改动范围。Hero 的实际发现时间和优先级仍要通过 Network Waterfall 验证，不能仅凭 JSX 属性宣称 LCP 已经改善。
 
 #### 6.2 分别处理首页轮播、车辆列表和 Seller Banner
 
-首页有三个位置会显示非关键图片，但它们不能共用一个笼统规则：
+公开车辆浏览流程包含首页轮播、首页列表、筛选或翻页后的列表以及 Seller Banner。它们所处的位置不同，不能共用一个笼统规则：
 
 | 区域 | 在页面中的位置 | 本次加载策略 |
 | --- | --- | --- |
@@ -32385,7 +31289,7 @@ export default function CarCardHorizontal({
   car,
   imageLoading = "eager",
 }: CarCardHorizontalProps) {
-    ...
+  // 其余函数体保持不变
 }
 ```
 
@@ -32421,7 +31325,7 @@ export default function CarCard({
   highlightKeyword,
   imageLoading = "eager",
 }: CarCardProps) {
-    ....
+  // 其余函数体保持不变
 }
 ```
 
@@ -32552,7 +31456,7 @@ Seller Banner 不属于轮播或车辆列表，但它同样会在首页初始阶
 
 详情图片地址只有在 `/cars/:id` 响应返回后才能确定，初始 `index.html` 并不知道应该预加载哪一个 URL，因此这里不增加固定的 Preload。完成修改后需要通过 Network 观察当前主图是否优先，并实际点击缩略图确认切换正常。`lazy` 只是浏览器调度提示，靠近视口的缩略图仍可能提前请求，所以不能只根据代码断言初始请求一定减少。
 
-#### 6.4 确认图片加载不会引入新的 CLS
+#### 6.4 保持图片区域布局稳定
 
 `lazy` 允许图片稍后到达，但图片下载期间仍要为它保留显示空间。如果容器的高度必须等到图片出现后才能确定，后续内容就会被突然推开并产生 CLS。CLS 衡量的是加载过程中可见元素发生的意外位置变化，因此它与图片请求早晚是两个不同问题。
 
@@ -32573,9 +31477,11 @@ R2 图片转换、响应式图片 CDN、WebP/AVIF 自动转换和裁剪压缩流
 
 图片 URL、API Contract、车辆图片数量和 Gallery 交互同样保持不变。这样，页面请求行为发生变化时，可以判断它来自加载策略，而不是图片内容、接口数据或交互逻辑同时发生了改变。
 
-#### 6.6 验证图片体验
+#### 6.6 验证图片请求与交互
 
-代码修改完成后，先执行静态检查和 Production Build，确认 JSX 属性、TypeScript 类型和构建产物有效：
+图片加载属性只向浏览器提供调度提示，代码中出现 `eager`、`lazy` 或 `fetchPriority` 并不能证明实际请求顺序符合预期。验证需要同时覆盖静态检查、Production Build、冷加载 Network、真实交互和 Performance Recording，分别回答“代码是否有效”“浏览器怎样请求”和“页面体验是否稳定”。
+
+先在 `uucars-web` 目录执行静态检查和 Production Build：
 
 ```bash
 cd uucars-web
@@ -32583,357 +31489,1451 @@ npm run lint
 VITE_API_BASE_URL=http://localhost:5065 npm run build
 ```
 
-随后用本地 API 和普通 Production Preview 复用 Baseline 的 `390 × 844`、Fast 4G、Disable cache 条件。Network 面板需要显示 `Img` 请求和 `Priority` 列；每个场景先清空记录再重新加载，避免缓存把新的请求顺序隐藏掉。
+ESLint 以 `0 errors`、`1 warning` 完成，Production Build 成功转换 `2706` 个模块。已知的 React Hook Form Lint Warning 和主入口超过 `500 kB` 的 Vite Warning 都没有变化，也没有出现新的检查错误。
 
-验证按图片职责展开：
+然后分别启动本地 API 和刚生成的 Production Preview。API 命令在仓库根目录执行，Preview 命令在 `uucars-web` 目录执行：
 
-| 场景 | 需要观察的结果 |
-| --- | --- |
-| 直接访问首页 | Elements 中的 Hero 保持 `loading="eager"`，Network 中对应请求显示为高优先级；`390 px` 下隐藏的 Seller Banner 不应继续在初始阶段传输 |
-| 首页初始轮播 | 第一张卡片正常显示，`sm` 以上最初可见的两张均能及时出现；其余轮播图片允许在接近可见位置时请求 |
-| 首页滚动 | 向下接近 Seller Banner 和 `All Listings` 时，延迟图片能够加载，卡片空间不发生明显跳动 |
-| 带筛选条件的列表页 | Hero、轮播和 Seller Banner 不渲染时，首行车辆图片仍能及时显示，其余图片按视口接近程度请求 |
-| 直接访问车辆详情 | 当前主图优先于缩略图，主图区域在图片到达前保持 `4:3` 空间 |
-| 操作 Gallery | 逐一点击缩略图和左右按钮，图片都能显示，计数器、选中状态和键盘可操作性保持正常，不出现持续空白 |
-
-原生 `loading="lazy"` 会结合距离、网络和浏览器策略决定何时请求，所以“仍有部分视口外图片提前加载”不自动等于实现错误。真正需要判断的是：关键图片有没有被延迟，明显不可见的图片是否减少了初始竞争，以及 Gallery 和轮播是否产生交互回归。如果浏览器仍在首屏阶段请求全部 6 张轮播图片，就如实记录原生策略在当前布局下没有形成清晰收益，不能把代码中出现 `lazy` 当作优化已经生效。
-
-最后使用 Performance Reload Recording 检查首页和详情页的 LCP Element 与 Layout Shift。Hero 和详情主图仍应是可正常显示的主要内容，现有图片容器不应出现新的明显偏移。`alt`、`aria-hidden`、缩略图按钮标签和现有错误占位均未因加载策略删除，图片可访问性与失败时的页面结构也应保持原有行为。只有实际执行后的请求、交互和布局记录才能作为本节结果；未运行的检查不填写为通过。
-
-
-
-### 7. 对比优化前后结果
-
-使用第 2 节确定的相同条件重新测量。
-
-#### 7.1 对比 Production Build
-
-记录：
-
-- 入口 JavaScript 前后变化；
-- 新增页面 Chunk；
-- 主要依赖所在 Chunk；
-- CSS 是否发生变化；
-- 总 Bundle 和初始加载体积的区别；
-- 是否出现不合理的小 Chunk；
-- Build 是否仍无错误。
-
-重点比较初始加载，不把“总文件数量增加”直接理解为性能退化。
-
-#### 7.2 对比 Bundle Report
-
-确认：
-
-- 首页是否只保留必要共享代码；
-- 页面专用依赖是否按需加载；
-- 是否存在新的重复模块；
-- 是否出现循环依赖或异常 Chunk；
-- 是否需要保留当前拆分边界。
-
-#### 7.3 对比首页 Network
-
-检查：
-
-- 首次加载入口；
-- 页面代码请求；
-- API 请求；
-- Hero；
-- 首屏车辆图片；
-- 首屏以下车辆图片；
-- 导航到其他页面时新增的 Chunk。
-
-#### 7.4 对比车辆详情 Network
-
-检查：
-
-- 详情页面 Chunk；
-- 详情 API；
-- 主图；
-- 缩略图；
-- 从首页导航进入与直接访问的差异；
-- 浏览器缓存后的行为。
-
-#### 7.5 对比 Lighthouse
-
-在相同条件下重新记录首页和详情页：
-
-- LCP；
-- CLS；
-- TBT；
-- Performance；
-- 主要诊断信息。
-
-不要求所有数值都改善。如果某项数据接近，应如实记录为“没有观察到明确变化”。
-
-#### 7.6 决定保留或撤销修改
-
-每项修改分别判断：
-
-```text
-有明确收益且复杂度合理
-→ 保留
-
-结果接近但实现简单、职责更清楚
-→ 说明理由后决定是否保留
-
-没有收益且增加复杂度
-→ 撤销
-
-产生回归或请求碎片化
-→ 撤销或缩小范围
+```bash
+dotnet run --project UUcars.API --launch-profile http
 ```
 
-最终结果可以小于最初候选方案，但不能保留无法解释的复杂配置。
+```bash
+npm run preview -- --host localhost --port 5173 --strictPort
+```
+
+API 正常运行在 `http://localhost:5065`，Preview 正常运行在 `http://localhost:5173`。浏览器继续使用 Baseline 的无痕窗口、`390 × 844`、Fast 4G 和 Disable cache 条件；Network 面板筛选 `Img` 并显示 `Priority` 列。Disable cache 用于观察真正的冷加载请求，不把已有缓存误当作本次加载策略的效果。
+
+##### 首页与车辆列表的实际请求
+
+首页冷加载共出现 7 个图片请求，传输约 `1,472 kB`。Hero 为 `242 kB`，Priority 显示 `High`；当前首屏轮播封面也被浏览器安排为 `High`，其余 5 张车辆图片显示为 `Low`。`390 px` 下隐藏的 `405 kB` Seller Banner 没有请求，相比 Baseline 确实移除了这项无效的移动端传输。
+
+轮播和 `All Listings` 的独立查询当前返回了相同 6 辆车，因此两组 `<img>` 引用了相同的 6 个车辆图片 URL，浏览器可以复用同一份网络资源。Network 证明的是这 6 个不同 URL 都在首页初始阶段开始请求，不能把它们全部归属于轮播。代码中，轮播前两张使用 `eager + auto`，其余轮播图片和首页列表图片使用 `lazy + low`；Network 最终把当前首屏封面安排为 `High`，其余 5 个车辆资源安排为 `Low`。这个结果由显式加载属性与浏览器自己的可见性判断共同决定。原生 `loading="lazy"` 只是允许浏览器延迟，相关元素距离视口很近时，Chrome 仍可提前下载。滚动首页时没有新增车辆图片请求，因为 6 个不同 URL 都已完成加载；页面内容正常显示，没有图片造成的布局跳动。
+
+为了验证车辆列表自己的策略，使用 `/?minPrice=0` 进入不渲染 Hero、轮播和 Seller Banner 的筛选结果。冷加载最初请求 4 张封面：第一张为 `High`，其余 3 张为 `Low`。代码明确立即加载前三张，但靠近视口的第 4 张 Lazy Image 仍被浏览器提前取得；继续向下滚动后又出现 2 个 `Low` 请求。没有图片的车辆继续显示原有占位布局。首行图片能够及时出现，后续图片按接近视口的过程取得，滚动期间没有明显跳动、持续空白或破图。
+
+这些记录证明 Seller Banner 的移动端初始传输已经消失，关键图片获得了较高优先级；同时也说明浏览器在当前轮播距离下没有把所有 Lazy Image 推迟到滚动以后。因此本节的收益应描述为“减少无效 Banner 请求并降低非关键图片的竞争优先级”，不能描述为“首页只请求可见图片”。
+
+##### 详情页与 Gallery 的实际行为
+
+Disable cache 条件下直接访问 `/cars/7003` 时共请求 5 张车辆图片。当前主图约 `191 kB`，Priority 为 `High`；其余 4 张约 `165–192 kB`，均为 `Low`。缩略图靠近视口，因此浏览器仍然提前取得全部图片，但主图的请求优先级高于其余图片。主图容器在资源到达前保留 `4:3` 空间，页面滚动时没有明显布局跳动、持续空白或破图。
+
+缩略图、左右箭头、计数器和选中边框均能正常工作；缩略图按钮也可以通过 `Tab` 聚焦，并用 `Enter` 或 `Space` 切换图片。强制 Disable cache 时，每次切换主图会短暂出现空白，并能看到相同 URL 的重复请求。`key={activeIndex}` 变化会卸载旧主图并创建新的 `<img>`，新元素等待图片资源期间会露出容器背景，这解释了短暂空白；Disable cache 则阻止浏览器在切回已经查看过的 URL 时复用缓存，这解释了相同 URL 的重复下载。
+
+关闭 Disable cache、刷新并清空 Network 后重新操作 Gallery，5 张图片均从 Disk Cache 在约 `2–4 ms` 内取得，传输量为 `0 kB`；缩略图和箭头切换不再出现空白，仍无破图或布局变化。正常缓存条件代表用户重复查看已加载 Gallery 图片时的实际行为，因此本节不把强制无缓存下的瞬时空白判定为功能回归；但保留这项限制，避免把测试结果描述成所有网络条件下都完全无切换等待。
+
+##### Performance Reload Recording
+
+最后在相同视口和 Fast 4G 条件下，以 Disable cache 执行 Performance 的 Record and Reload。这里关注 LCP 和 CLS：LCP 反映首屏主要内容何时出现，CLS 反映加载过程中是否发生意外布局位移。
+
+| 页面 | LCP | CLS | Trace 结论 |
+| --- | ---: | ---: | --- |
+| 首页 `/` | `1.47 s` | `0.16` | LCP 处于良好范围；Layout Shift Culprits 将 Web font 列为首要原因，没有把车辆图片或其容器列为主要原因 |
+| 详情页 `/cars/7003` | `2.19 s` | `0.06` | LCP 和 CLS 均处于良好范围；LCP 资源是当前车辆主图，主图区域没有造成新的明显位移 |
+
+首页 `CLS 0.16` 高于理想的 `0.10`，Trace 将首要原因定位为 Google Web Font 替换初始字体，没有把车辆图片或其容器列为主要原因。因此不能把这次位移直接归因于本节的 Lazy Image，也不能因为图片容器稳定就写成首页 CLS 已通过。字体加载属于独立问题，本节如实保留测量结果，不扩大图片优化范围。
+
+详情页 LCP Breakdown 为：
+
+| LCP 阶段 | 耗时 |
+| --- | ---: |
+| Time to first byte | `9 ms` |
+| Resource load delay | `1,159 ms` |
+| Resource load duration | `990 ms` |
+| Element render delay | `36 ms` |
+
+LCP Request Discovery 同时确认主图已应用 `fetchpriority=high`，并且没有使用 `loading=lazy`。它不能从初始 HTML 直接发现，因为主图 URL 必须等待 `/cars/7003` API 响应后才会进入 React 渲染；这解释了 `1,159 ms` 的 Resource Load Delay。图片下载本身又使用了 `990 ms`，而最终 Element Render Delay 只有 `36 ms`，因此详情页剩余的 LCP 时间主要来自数据返回后的资源发现和原图传输，不是 React 把已下载图片渲染得很慢。
+
+综合静态检查、冷加载请求、滚动、Gallery 鼠标与键盘操作、正常缓存复测以及 Performance Trace，本节采用的图片优先级和空间预留没有造成已检查范围内的功能回归。验证也保留了两个边界：Native Lazy Loading 不保证轮播附近的图片一定延迟，首页字体替换仍会产生 `0.16` 的 CLS。结论只覆盖本次本地 Production Preview、Fast 4G 和指定页面，不把单次本地数据当作所有设备与网络环境的绝对性能值。
+
+### 7. 对比优化前后证据并确定保留范围
+
+本节按照第 2 节的规则整合前后证据，并分别判断各组修改应当保留、缩小还是撤销。
+
+#### 7.1 补齐最终比较证据
+
+第 3 节已经保存优化前的 Build、Bundle、Network、Performance 和 Lighthouse，第 5、6 节也记录了优化后的构建边界、首页冷加载、详情页直接访问及图片交互。最终比较还缺少优化后的站内导航 Network，以及首页和详情页各三轮 Lighthouse。
+
+因此只补测这两组缺口；筛选列表和 Gallery 没有对应 Baseline，只用于确认功能、缓存和布局没有回归，不写成前后性能提升。
+
+#### 7.2 对比 Production Build 与 Bundle Report
+
+最终文件大小使用第 6.6 节图片调整完成后的普通 Production Build；模块归属使用第 5.7 节的优化后 Bundle Report。与第 3.1 节的 Baseline 对比如下：
+
+| Build 项目 | 优化前 | 优化后 | 变化 |
+| --- | ---: | ---: | --- |
+| Build 结果 | 成功；转换 `2703` 个模块 | 成功；转换 `2706` 个模块 | 保持成功，增加 `3` 个模块 |
+| 主入口原始大小 | `1,230.01 kB` | `537.83 kB` | 减少 `692.18 kB`，约 `56.27%` |
+| 主入口 gzip | `366.33 kB` | `159.67 kB` | 减少 `206.66 kB`，约 `56.41%` |
+| 全部 JavaScript 原始大小 | `1,230.01 kB` | 约 `1,232.25 kB` | 增加约 `2.24 kB`，约 `0.18%` |
+| 全部 JavaScript gzip | `366.33 kB` | 约 `374.19 kB` | 增加约 `7.86 kB`，约 `2.15%` |
+| JavaScript Chunk 数量 | `1` | `15` | 形成入口、共享和路由 Chunk |
+| CSS 原始大小 / gzip | `42.12 kB` / `8.63 kB` | `42.17 kB` / `8.65 kB` | 基本不变 |
+| Hero / Seller Banner | `241.59 kB` / `405.03 kB` | `241.59 kB` / `405.03 kB` | 文件大小不变 |
+| 大 Chunk 提示 | 主入口超过 `500 kB` | 主入口仍超过 `500 kB` | 已知 warning 保留，没有 Build error |
+
+“全部 JavaScript”由 Vite 输出中已经四舍五入的各文件大小相加，因此只记录为约数。结果表明，本次修改没有删除大量代码：JavaScript 总体积基本不变，分开压缩后 gzip 合计还略有增加。实际变化是原来的单一入口被拆开，主入口减少约 `56%`，其余代码可以在对应路由需要时再取得。CSS 和两张本地静态图片没有发生实质变化，说明 Build 差异来自 JavaScript 边界，而不是样式或图片文件被替换。
+
+Bundle Report 进一步说明了代码移动到哪里：
+
+| Bundle 项目 | 优化前 | 优化后 |
+| --- | --- | --- |
+| 顶层边界 | `18` 个页面模块及第三方依赖全部位于单一入口 | 入口和共享代码之外形成认证、车辆表单与 Admin 路由 Chunk |
+| Recharts 与 D3 | 随 Admin Dashboard 进入主入口 | 位于 `AdminDashboardPage` Chunk；`393.52 kB`，gzip `112.84 kB` |
+| dnd-kit | 随创建和编辑车辆页面进入主入口 | 位于 `SortableImageItem` Chunk；`47.05 kB`，gzip `15.49 kB` |
+| Google 登录相关代码 | Provider、认证页面和登录组件随入口加载 | `GoogleAuthLayout`、Login、Register 和 Google 登录组件形成认证路径文件 |
+| 共享与保留的 Static Import | 所有共享代码和页面均在入口 | React DOM、SignalR、Radix UI、TanStack Query 及保留 Static Import 的页面仍在入口或共享 Chunk |
+| 目标大型依赖重复 | 只有一个 JavaScript Chunk，不存在跨 Chunk 比较 | 主入口中未重复出现 Recharts 或 dnd-kit |
+
+优化后的 `15` 个 JavaScript 文件中，部分路由文件只有约 `0.18–6.35 kB`。这些小文件分别对应共享图标、认证布局和具体页面，能够从现有路由边界解释；首页初始加载也只请求入口、`jsx-runtime` 和 `button` 三个 JavaScript 文件，没有同时请求全部路由 Chunk。因此当前没有证据表明这些小文件已经造成不合理碎片化。
+
+主入口 `537.83 kB` 仍超过 Vite 默认阈值，但 Recharts 和 dnd-kit 已经移出，剩余页面没有显示出同等级的大型专用依赖。继续扩大 Lazy Route、加入 `manualChunks`，或只提高警告阈值都缺少新的证据支持。Bundle Report 也不用于判断循环依赖；这里的结论只覆盖模块位置、目标依赖重复和 Chunk 边界。
+
+综合 Build 与 Bundle Report，当前拆分以约 `2.15%` 的总 gzip 增量换取约 `56%` 的主入口缩减，并把已经确认的页面专用依赖移出公开入口。这个代价可解释，也没有观察到需要继续拆分的异常边界，因此保留现有路由拆分和 Bundle 配置。
+
+#### 7.3 对比首页 Network 与 Performance
+
+首页使用第 3.5 节与第 5.7、6.6 节在相同视口、限速和缓存条件下保存的直接访问记录。Network 与 Performance 来自两次独立 Reload Recording，因此这里只分别比较同类指标，不合并两个时间轴。
+
+| 首页项目 | 优化前 | 优化后 | 变化与边界 |
+| --- | --- | --- | --- |
+| 初始 JavaScript | 应用入口 `364 kB` 加 Google Client `102 kB`，合计约 `466 kB` | 主入口、`jsx-runtime` 和 `button` 合计约 `234 kB` | 减少约 `232 kB`，约 `49.8%` |
+| 页面专用代码 | 认证、车辆表单和 Admin 页面均在单一入口内 | 首页未请求对应路由 Chunk | 页面专用代码移出首页初始请求 |
+| Google Client | 首页初始化时请求 | 首页未请求；进入 `/login` 后才随认证路径取得 | 认证能力按实际访问加载 |
+| 车辆 API | 两次 `GET /cars?page=1&pageSize=6` | 仍为两次相同请求 | 两个独立界面职责保留，不记作已消除请求 |
+| 图片请求 | Hero、Seller Banner 和 6 张车辆封面，共 8 张、约 `1,877 kB` | Hero 和 6 张车辆封面，共 7 张、约 `1,472 kB` | 减少约 `405 kB`，即移动端未显示的 Seller Banner 请求 |
+| 图片优先级 | 记录中没有区分关键与非关键车辆图片 | Hero 与当前轮播封面为 `High`，其余 5 张车辆图片为 `Low` | 关键图片优先，非关键图片降低竞争优先级 |
+| 滚动后的图片请求 | 6 张车辆封面已全部请求，滚动后没有新增 | 6 个不同车辆 URL 也已在初始阶段请求，滚动后没有新增 | Native Lazy Loading 没有在这个距离下推迟车辆图片，不能写成“只加载可见图片” |
+| 滚动体验 | 未记录图片造成的明显异常 | 内容正常，无明显跳动、持续空白或破图 | 图片布局与占位行为没有观察到回归 |
+
+图片传输减少约 `21.6%`，来源是 `390 px` 视口下不再请求隐藏的 Seller Banner。车辆图片数量没有减少，因此这部分策略的作用是区分请求优先级，而不是减少车辆图片请求数。
+
+Performance 对比如下：
+
+| 首页 Performance | 优化前 | 优化后 | 变化 |
+| --- | ---: | ---: | ---: |
+| LCP | `2.84 s` | `1.47 s` | 减少 `1.37 s`，约 `48.2%` |
+| LCP 元素 | Hero 图片 | Hero 图片 | 保持一致 |
+| CLS | `0.13` | `0.16` | 增加 `0.03`，没有改善 |
+
+LCP 的下降与入口缩小、Google Client 延后、Seller Banner 不再传输和 Hero 优先级调整同时发生，现有记录不能把收益归于某一个属性。CLS 没有改善，Trace 仍将 Google Web Font 列为首要偏移来源。
+
+#### 7.4 对比详情页直接访问与站内导航
+
+详情页继续使用固定车辆 `7003`，分别比较直接访问和从首页进入的站内导航。`CarDetailPage` 在优化后仍由 Router 静态导入，因此直接访问时使用与首页相同的公开入口，初始 JavaScript 也从约 `466 kB` 降至约 `234 kB`；这项入口变化已经在 7.3 解释，这里只比较详情页自己的数据与图片行为。
+
+直接访问 `/cars/7003` 的结果如下：
+
+| 详情页直接访问 | 优化前 | 优化后 | 变化与边界 |
+| --- | --- | --- | --- |
+| 页面专用 JavaScript | 没有独立 Chunk，代码位于单一入口 | 没有独立 Chunk，仍由公开入口提供 | 详情页本身没有新增路由请求边界 |
+| 车辆详情 API | `1.5 kB`，`168 ms` | `1.5 kB`，约 `167 ms` | 基本不变 |
+| 车辆图片 | 主图 `191 kB`；其余 4 张为 `165 kB`、`188 kB`、`192 kB`、`87.3 kB` | 图片数量和文件大小不变 | 没有通过更换图片文件减少传输量 |
+| 图片 Priority | Baseline 未保存分级结果 | 主图为 `High`，其余 4 张为 `Low` | 主图与缩略图的请求职责更明确 |
+| LCP | `2.16 s` | `2.19 s` | 增加 `0.03 s`，没有观察到改善 |
+| LCP 元素 | 车辆主图 | 同一车辆主图 | 保持一致 |
+| CLS | `0.06` | `0.06` | 保持不变 |
+
+两次 LCP Breakdown 也接近：
+
+| LCP 阶段 | 优化前 | 优化后 | 变化 |
+| --- | ---: | ---: | ---: |
+| Time to first byte | `7 ms` | `9 ms` | `+2 ms` |
+| Resource load delay | `1,088 ms` | `1,159 ms` | `+71 ms` |
+| Resource load duration | `1,012 ms` | `990 ms` | `-22 ms` |
+| Element render delay | `49 ms` | `36 ms` | `-13 ms` |
+
+优化后的主图已经使用 `fetchpriority="high"` 且没有使用 `loading="lazy"`，但图片 URL 仍要等待详情 API 返回后才能由 React 创建，因此 Resource Load Delay 仍占 `1,159 ms`；原图下载又使用 `990 ms`。请求优先级更加明确没有在这次单次记录中转化为更低的详情页 LCP，不能把 `2.19 s` 描述成性能改善。
+
+第 6.6 节记录的 Gallery 交互与缓存复测没有发现功能或布局回归，但这项结果不作为 LCP 改善证据。
+
+站内导航使用未登录状态，先等待首页完整加载，再清空 Network 并从车辆卡片进入 `/cars/7003`。这样只保留导航后新增的资源，不混入首页入口、CSS 和字体：
+
+| 首页进入详情页 | 优化前 | 优化后 | 变化与边界 |
+| --- | --- | --- | --- |
+| 新增请求与传输量 | `6` 个请求，`635 kB` | `6` 个请求，`635 kB` | 保持不变 |
+| 新增 JavaScript | 无 | 无 | `CarDetailPage` 已包含在公开入口中 |
+| 车辆详情 API | `GET /cars/7003`：`1.5 kB`、`179 ms` | `GET /cars/7003`：`1.5 kB`、`178 ms` | 基本不变 |
+| 新增车辆图片 | 4 张非封面图片：`165 kB`、`188 kB`、`192 kB`、`87.3 kB` | 相同 4 张图片，均为 `Low` Priority | 主图已由首页加载，没有再次请求 |
+| 其他请求 | 第 6 个请求的名称未单独记录 | `favicon.svg` 构成第 6 个请求 | 当前额外项与详情数据和图片策略无关 |
+| 加载反馈 | 未观察到详情区域短暂空白 | 短暂显示 Loading 和空白，缩略图随后逐步出现 | 当前代码在详情查询期间显示 `Loading...`；没有新增路由 Chunk，不能把等待归因于代码拆分 |
+| 布局稳定性 | 无明显跳动、撑开或错位 | 无明显布局跳动 | 空间预留继续有效 |
+
+站内导航的请求数量、传输量、API 时间和图片文件均没有下降，说明这条路径没有获得可量化的网络传输收益。它也没有因为现有路由拆分增加 JavaScript 请求；图片调整只让 4 张非封面图片以较低优先级取得。综合直接访问和站内导航证据，详情页不能宣称 LCP 或传输量已经改善，但请求优先级、Gallery 交互和布局稳定性符合预期，同时保留了查询与图片到达期间可见的短暂等待这一限制。
+
+#### 7.5 重新运行并对比 Lighthouse
+
+使用与 Baseline 相同的 Navigation、Mobile、Performance、`Clear storage` 和 `Simulated throttling (default)` 设置，对首页 `/` 与详情页 `/cars/7003` 各运行三次。报告环境为 Lighthouse `13.4.1`、Chromium `155.0.0.0`、Emulated Moto G Power 和 Slow 4G throttling；六轮中页面、API 和图片均正常加载。
+
+优化后的原始结果如下：
+
+| 页面 | 轮次 | Performance | FCP（s） | LCP（s） | TBT（ms） | CLS | Speed Index（s） |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `/` | 1 | 65 | 2.9 | 5.8 | 90 | 0.158 | 4.0 |
+| `/` | 2 | 67 | 2.9 | 5.8 | 100 | 0.134 | 3.5 |
+| `/` | 3 | 66 | 2.9 | 5.8 | 90 | 0.158 | 3.7 |
+| `/cars/7003` | 1 | 69 | 2.9 | 7.3 | 70 | 0.071 | 3.1 |
+| `/cars/7003` | 2 | 70 | 2.9 | 7.1 | 60 | 0.071 | 3.1 |
+| `/cars/7003` | 3 | 70 | 2.9 | 7.0 | 60 | 0.071 | 3.1 |
+
+三轮中位数与第 3.7 节的 Baseline 对比如下：
+
+| 页面 | 指标 | 优化前中位数 | 优化后中位数 | 变化 |
+| --- | --- | ---: | ---: | ---: |
+| `/` | Performance | 56 | 66 | `+10` |
+| `/` | FCP | `3.6 s` | `2.9 s` | `-0.7 s` |
+| `/` | LCP | `7.5 s` | `5.8 s` | `-1.7 s` |
+| `/` | TBT | `250 ms` | `90 ms` | `-160 ms` |
+| `/` | CLS | `0.134` | `0.158` | `+0.024`，没有改善 |
+| `/` | Speed Index | `4.1 s` | `3.7 s` | `-0.4 s` |
+| `/cars/7003` | Performance | 63 | 70 | `+7` |
+| `/cars/7003` | FCP | `3.6 s` | `2.9 s` | `-0.7 s` |
+| `/cars/7003` | LCP | `11.0 s` | `7.1 s` | `-3.9 s` |
+| `/cars/7003` | TBT | `190 ms` | `60 ms` | `-130 ms` |
+| `/cars/7003` | CLS | `0.071` | `0.071` | 不变 |
+| `/cars/7003` | Speed Index | `3.6 s` | `3.1 s` | `-0.5 s` |
+
+代表性报告中的主要诊断变化为：
+
+| 页面 | 诊断项目 | 优化前 | 优化后 | 结果 |
+| --- | --- | ---: | ---: | --- |
+| `/` | Reduce unused JavaScript | `325 KiB` | `118 KiB` | 估算减少 `207 KiB`，与路由和认证代码移出首页入口一致 |
+| `/` | Minimize main-thread work | `2.9 s` | `2.3 s` | 减少 `0.6 s` |
+| `/` | Render-blocking requests | `600 ms` | `300 ms` | 估算节省减少 `300 ms` |
+| `/` | Improve image delivery | `1,014 KiB` | `899 KiB` | 仍有较大的原图交付空间 |
+| `/` | Use efficient cache lifetimes | `1,201 KiB` | `1,015 KiB` | 仍有缓存寿命提示 |
+| `/` | Long tasks / non-composited animations | `8` / `46` | `8` / `46` | 没有变化 |
+| `/cars/7003` | Reduce unused JavaScript | `327 KiB` | `125 KiB` | 估算减少 `202 KiB`，与入口缩小一致 |
+| `/cars/7003` | Render-blocking requests | `600 ms` | `300 ms` | 估算节省减少 `300 ms` |
+| `/cars/7003` | Improve image delivery | `725 KiB` | `725 KiB` | 没有变化 |
+| `/cars/7003` | Use efficient cache lifetimes | `804 KiB` | `804 KiB` | 没有变化 |
+| `/cars/7003` | Long tasks | `7` | `9` | 增加 `2` 个，不能声称所有诊断均改善 |
+
+Unused JavaScript 的下降与 Build、Bundle Report 和 Network 记录的入口缩小一致。首页的大部分加载指标改善，但 CLS 没有改善；详情页 Lighthouse LCP 中位数下降，也不能覆盖 Fast 4G Performance Recording 中 LCP 基本不变的结果，因为两种工具使用不同的模拟条件。
+
+图片交付、缓存寿命、详情图发现延迟和 Long Task 波动仍然存在。当前修改没有压缩原图，也没有改变详情图必须等待 API 返回后才能发现的结构，因此这些提示继续作为未改善项保留。
+
+#### 7.6 按改动组作出保留或调整决定
+
+前面的对比已经保存具体数值，这里只记录每组修改的最终决定和边界：
+
+| 改动组 | 最终决定 | 保留边界 |
+| --- | --- | --- |
+| Route Lazy Loading | 保留当前拆分范围 | 页面专用依赖已移出公开入口；主入口仍超过 `500 kB`，但不加入 `manualChunks`，也不提高阈值隐藏 Warning |
+| Google Provider 路由范围 | 保留 | Google Client 只在认证路径取得；额外的一层 Layout 与实际职责一致 |
+| 首页图片策略 | 保留当前窄范围策略 | 保留隐藏图片不请求、关键图片优先级和尺寸预留；不宣称只加载可见图片或 CLS 已改善 |
+| Gallery 图片策略 | 保留当前简单实现 | 保留优先级、Lazy Loading 和空间预留；不增加 Preload、自定义加载器或更多预取逻辑 |
+
+这些决定确认了初始 JavaScript 和首页加载的实际收益，同时保留主入口体积、原图交付、详情图发现延迟和首页 CLS 等未改善项，不把局部结果描述成所有页面和网络条件都全面变快。
 
 
 
-### 8. 完成功能回归和开发记录
+### 8. 完成最终本地回归
 
-#### 8.1 运行前端静态检查
+第 7 节已经完成性能证据对比和修改保留决定。最后再运行现有静态检查、构建、组件测试和核心 E2E，确认这些优化没有破坏既有功能；这里不重复前面的性能数据。
 
-执行：
+#### 8.1 运行 ESLint 和 Production Build
 
-- ESLint；
-- TypeScript；
-- Production Build；
-- `git diff --check`。
+最终前端代码完成后已经执行：
 
-#### 8.2 运行组件测试
+```bash
+cd uucars-web
+npm run lint
+VITE_API_BASE_URL=http://localhost:5065 npm run build
+```
 
-运行现有 Vitest 和 React Testing Library Tests。
+ESLint 以 `0 errors` 完成，保留 `1 warning`：`CarForm.tsx:77:26` 的 `react-hooks/incompatible-library`。该提示来自 React Hook Form 的 `watch()` 无法安全 Memoise，React Compiler 会跳过该部分优化，不会导致 Lint 失败。
 
-如果 Lazy Route 改变测试边界，只补充必要测试：
+普通 Production Build 成功转换 `2706` 个模块，主入口为 `537.83 kB`，gzip 后为 `159.67 kB`。Vite 仍提示主 Chunk 超过 `500 kB`；这是第 7 节已经保留的限制，不通过提高阈值隐藏。此后没有运行时代码变化，因此没有重复运行相同的前端检查。
 
-- Lazy 页面最终能够渲染；
-- Loading Fallback 能够显示；
-- Protected Route 和 Admin Route 行为保持不变。
+#### 8.2 运行现有组件测试
 
-不测试 Bundler 内部实现，也不通过大量 Mock 锁定 Chunk 文件名。
+运行全部 Vitest 与 React Testing Library Tests：
 
-#### 8.3 运行 Playwright E2E
+```bash
+npm test -- --run
+```
 
-运行现有五条核心流程：
+Vitest `v4.1.11` 共运行 `5` 个测试文件和 `15` 个测试，全部通过，失败数为 `0`，总耗时 `3.04 s`。现有测试已经覆盖基础检查、`ProtectedRoute`、`GoogleSignInButton`、`CarCard` 和 `LoginPage`；本次没有增加用于锁定 Chunk 文件名或短暂加载时序的脆弱测试。
 
-- 注册；
-- Seller 创建车辆并提交审核；
-- Admin 审核；
-- Buyer 下单；
-- Seller 查看订单。
+#### 8.3 运行五条 Playwright E2E
 
-重点确认：
+运行 E2E 前停止手动启动的 API，并确认 `uucars-sqlserver` 与 `uucars-redis` 容器正在运行。Playwright 随后自动启动测试 API、Vite Development Server 和 Chromium，并使用单个 Worker 执行现有 Suite：
 
-- 页面按需加载没有破坏导航；
-- Loading 状态没有造成定位不稳定；
-- Protected Route 正常；
-- Admin 页面正常；
-- 直接访问和刷新仍然工作。
+```bash
+npm run e2e
+```
 
-Playwright 当前使用 Vite Development Server，因此它验证的是功能和导航回归，不用于证明 Production Chunk 的最终组成；Production Chunk 以 Build、Bundle Report 和 Production Preview 的 Network 结果为准。
+注册、Seller 创建车辆并提交审核、Admin 审核、Buyer 下单和 Seller 查看订单共 `5` 条流程全部通过，失败数为 `0`，耗时 `30.2 s`。这次结果确认 Lazy Route、Loading 状态、Protected Route、Admin Route 和核心业务导航没有产生功能回归。
 
-#### 8.4 检查变更范围
+该 Suite 使用 Vite Development Server，因此它验证浏览器功能与导航；Production Chunk 的组成仍由普通 Production Build 和第 7 节的构建证据负责。
 
-确认：
+#### 8.4 检查最终变更范围与临时文件
 
-- 没有后端业务修改；
-- 没有数据库 Migration；
-- 没有改变 API Contract；
-- 没有新增 Secret；
-- 没有提交 Bundle Report、Lighthouse Cache、截图或临时文件；
-- 没有为了分数进行无关 UI 重构；
-- 没有保留未使用的依赖或配置。
+最后检查功能分支累计范围和当前工作区：
 
-#### 8.5 记录 Step 74 结果
+```bash
+git status --short
+git diff --name-status develop...HEAD
+git diff --name-status
+git diff --check develop...HEAD
+git diff --check
+```
 
-在开发记录中写明：
+分支累计修改集中在 Step 74 的前端加载、图片和构建配置，没有后端业务、数据库 Migration 或 API Contract 变化，也没有发现被纳入版本控制的分析报告、Playwright 输出或其他临时文件。
 
-- 优化前 Baseline；
-- Bundle 主要组成；
-- 实际发现的问题；
-- 实施的修改；
-- 检查后保持现状的部分；
-- 被放弃或撤销的方案；
-- 优化前后数据；
-- 本地验证结果；
-- 尚未执行的检查。
+两个 `git diff --check` 均无输出，说明分支累计变更和当前工作区都没有空白字符错误。
 
-不把未运行的测试记录为通过。
+结合前面的 ESLint、Production Build、组件测试、Playwright 和变更范围检查，最终代码通过了本步骤需要的本地回归。现有 ESLint Warning 和主 Chunk Warning 仍被明确保留，不会被误写为已经解决。
 
 
 
-### 9. 通过现有 CI/CD 发布 Step 74
+### 9. 通过现有 CI/CD 完成发布
 
-#### 9.1 推送功能分支
+本地验收完成后，Step 74 沿用 Step 73 已建立的 CI/CD 流程完成发布，不改变现有发布架构。
 
-推送前检查：
+#### 9.1 推送功能分支并验证 CI
 
-- 修改只属于 Step 74；
-- 临时分析文件未进入 Git；
-- Commit Message 使用英文；
-- `git diff --check` 通过。
-
-#### 9.2 验证功能分支 CI
-
-确认当前提交真实通过：
+提交并推送最终修改，确认功能分支的完整 CI 通过：
 
 - Backend；
 - Frontend；
 - E2E。
 
-即使 Step 74 只修改前端，也继续使用完整 CI，确保应用组合行为没有回归。
+Step 74 虽然以前端修改为主，仍运行全部 Jobs，避免只验证单一应用层。
 
-#### 9.3 合并回 `develop`
+#### 9.2 合并到 `develop` 并创建发布 PR
 
-使用现有本地 `merge --no-ff` 流程合并。
-
-推送后确认 `develop` 的：
-
-- Backend；
-- Frontend；
-- E2E；
-
-全部通过。
-
-#### 9.4 创建发布 PR
-
-创建：
+功能分支 CI 通过后，使用现有 `merge --no-ff` 流程合并到 `develop`。推送并确认 `develop` 的 Backend、Frontend 和 E2E 全部通过，再创建发布 PR：
 
 ```text
 develop → main
 ```
 
-确认 Required Checks：
+PR 必须通过以下 Required Checks：
 
 - Validate Release Source；
 - Backend；
 - Frontend；
 - E2E。
 
-全部通过后使用 Create a merge commit。
+全部通过后使用 Create a merge commit，将已验证的 `develop` 提交发布到 `main`。
 
-#### 9.5 确认生产 CD
+#### 9.3 验证生产部署与 Smoke Test
 
-确认：
+`main` CI 成功后，确认 CD 完成以下结果：
 
-- `main` CI 成功；
-- CD 使用同一个 Release SHA；
-- 前端 Artifact 来自该提交；
-- 后端 Image 来自同一个提交；
+- 前端 Artifact 与后端 Image 使用同一个 Release SHA；
 - Azure Container Apps 部署成功；
 - Azure Static Web Apps 部署成功；
-- Workflow Production Smoke Test 通过；
+- Workflow 自动 Smoke Test 通过；
 - `release.json` 对应本次发布提交。
 
-Step 74 不改变现有同提交发布架构。
-
-#### 9.6 执行相关生产 Smoke Test
-
-生产环境只执行非破坏性检查：
+随后执行与本次前端加载修改直接相关的非破坏性人工检查：
 
 - 首页正常打开；
-- 首页车辆内容正常显示；
 - 车辆详情正常打开；
-- 浏览器直接刷新页面正常；
-- 登录页正常加载；
-- 至少访问一个本次实际采用 Lazy Loading、并且可以安全验证的路由，确认对应 Chunk 正常加载；
+- 登录页和至少一个 Lazy Route 可以正常导航及直接刷新；
 - Console 没有 Chunk 加载错误；
-- Network 显示页面代码按预期加载；
-- `release.json` 对应本次提交。
+- Network 显示对应页面 Chunk 按需加载。
 
-优先选择公开页面或认证页面；只有本次修改确实涉及 Admin 路由，并且已有安全测试账号时，才检查 Admin 页面。
+人工检查优先使用公开页面或认证页面，不在生产环境运行会创建车辆、订单或修改审核状态的完整 E2E。
 
-不在生产环境运行会创建车辆、订单或修改审核状态的完整 E2E。
+#### 9.4 同步分支并完成收尾
 
-#### 9.7 同步长期分支
-
-生产发布和 Smoke Test 成功后：
+生产部署和 Smoke Test 成功后：
 
 - 将 `main` 的发布 Merge Commit 同步回 `develop`；
 - 确认本地和远程长期分支一致；
-- 保留验证记录；
 - 删除已经完成的 Step 74 功能分支。
 
-只有在发布和要求的检查完成后才能删除功能分支。
+功能分支只在发布、生产验证和长期分支同步均完成后删除。
+
+#### 9.5 记录发布结果
+
+| 发布边界 | 成功状态 |
+| --- | --- |
+| CI | 功能分支、`develop`、发布 PR 和 `main` 的要求检查全部通过 |
+| CD | 前后端使用同一个 Release SHA，Azure Container Apps 与 Azure Static Web Apps 部署成功 |
+| 生产验收 | Workflow 自动 Smoke Test 与人工前端检查通过，Lazy Route 导航、直接刷新和 Chunk 加载正常 |
+| 分支收尾 | `main` 发布 Merge Commit 已同步回 `develop`，Step 74 功能分支已删除 |
 
 
 
 ### Step 74 完成状态
 
 ```text
-概念理解：
-□ 理解 Production Bundle 与初始加载体积的区别
-□ 理解 Static Import 与 Dynamic Import
-□ 理解 Route-level Code Splitting
-□ 理解 React.lazy 与 React Router route.lazy 的适用边界
-□ 理解 Suspense Fallback 只处理支持 Suspense 的等待过程
-□ 理解 React Lazy Error Boundary 与 Router Route Error 的边界
-□ 理解 Tree Shaking 不等于 Route Splitting
-□ 理解 Network Waterfall
-□ 理解首页 LCP 与关键资源发现和加载顺序
-□ 理解图片 Lazy Loading 不能用于 LCP 图片
-□ 理解 CLS 与图片空间预留
-□ 理解 Lighthouse Lab Data 的作用和局限
-□ 理解 Lighthouse 不能代表真实用户 INP
+性能优化与本地回归：完成
+CI/CD 发布、生产验收与分支收尾：完成
+Step 74：完成
+```
 
-测量与分析：
-□ 固定优化前后测试条件
-□ 记录优化前 Production Build
-□ 检查优化前 dist
-□ 选择兼容 Vite 8 和 Rolldown 的分析工具
-□ 确认分析模式不会改变标准 CI/CD Build
-□ 生成优化前 Bundle Report
-□ 记录首页 Network Baseline
-□ 记录详情页 Network Baseline
-□ 记录首页 Lighthouse Baseline
-□ 记录详情页 Lighthouse Baseline
-□ 根据证据形成最小修改清单
 
-代码交付：
-□ 选择适合当前 Router 的 Lazy Loading 方案
-□ 只拆分报告支持的高收益路由
-□ 页面专用依赖按需加载或有明确的保留理由
-□ 提供简单、可理解的 Loading Fallback
-□ 正确处理 React Lazy 或 Router Lazy 的错误边界
-□ 保留现有页面运行错误反馈
-□ 没有增加不必要的手动分包配置
-□ 没有为了拆分而产生过多无意义的小 Chunk
+## 后续修复记录
 
-图片加载：
-□ 确认首页实际 LCP Element
-□ 首屏关键图片没有被错误 Lazy Load
-□ 区分资源发现过晚与请求优先级不足
-□ 仅在证据支持时使用 Preload 或 fetchPriority
-□ 首屏以下车辆图片按需加载
-□ 详情主图和缩略图采用合适加载策略
-□ 图片区域在加载前保持稳定
-□ 没有把图片上传功能扩展进本步骤
+### Fix 1 · 并发 Refresh Token 请求竞态条件（Refresh Token Rotation Race Condition）
 
-结果比较：
-□ 对比优化前后 Production Build
-□ 对比优化前后 Bundle Report
-□ 对比首页 Network
-□ 对比详情页 Network
-□ 对比首页 Lighthouse
-□ 对比详情页 Lighthouse
-□ 如实记录没有明确变化的指标
-□ 撤销没有收益但增加复杂度的修改
+#### 1. 创建修复分支
 
-本地验证：
-□ ESLint 通过
-□ TypeScript 和 Production Build 通过
-□ Vitest / React Testing Library 通过
-□ Playwright E2E 通过
-□ git diff --check 通过
-□ 没有提交临时分析文件
-□ 没有修改无关后端、数据库或 API Contract
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b fix/refresh-token-rotation-race-condition
+git push -u origin fix/refresh-token-rotation-race-condition
+```
 
-发布：
-□ 功能分支 Backend、Frontend 和 E2E CI 通过
-□ 合并后的 develop CI 通过
-□ develop → main 发布 PR Required Checks 通过
-□ main CI 成功
-□ Azure CD 成功
-□ 生产 Smoke Test 通过
-□ release.json 对应本次发布提交
-□ main 发布 Merge Commit 已同步回 develop
-□ Step 74 功能分支在发布完成后清理
+#### 2. 问题描述
+
+前端应用启动, 并成功登陆后，快速连续刷新登录后的页面，用户被自动登出。
+
+具体来说：前端在应用启动时通过 `AuthInitializer` 组件调用 `authStore.initialize()`，检测到 localStorage 里有 `user` 数据后，向 `/auth/refresh` 发送请求，用 HttpOnly cookie 里的 refresh token 换取新的 access token，实现页面刷新后的静默重登录。
+
+**当用户快速连续刷新页面时**，浏览器会在极短时间内启动多个页面实例，每个实例都独立执行 `initialize()`。由于 `isInitializing` 只是 Zustand 的 UI 渲染标志，无法阻止两个调用同时执行到 `axios.post` 那一行，结果是两个请求几乎同时发出，携带的是**同一个 refresh token**。
+
+后端 `RefreshTokenService.RefreshAsync()` 实现了 token rotation：第一个请求到达后，旧 token 被标记为 `IsRevoked = true`，新 token 写入数据库。第二个请求随后到达，查到的 token 已经是 revoked 状态，触发安全机制 `RevokeAllByUserIdAsync()`，撤销该用户所有 token，返回 400。前端 `catch` 块执行 `clearAuth()`，用户被登出。
+
+#### 3. 根本原因
+
+`isInitializing` 是 Zustand state，只控制 UI 渲染，不是执行锁。两个并发的 `initialize()` 调用都能同时通过 `if (!user)` 检查并到达 `axios.post`，形成竞态。
+
+#### 4. 解决方案
+
+设置模块级 Promise 锁（In-flight Deduplication）
+
+在 `authStore.ts` 模块级别（store 外部）声明一个 `initializePromise` 变量。`initialize()` 执行时先检查这个变量：
+
+- 如果已有飞行中的 Promise，直接返回它，不发新请求
+- 如果没有，创建 Promise 并赋值给 `initializePromise`，`finally` 里清空
+
+这样无论多少个并发调用，实际只会发出一个 HTTP 请求，后续调用都等待并复用第一个请求的结果。这个模式叫做 **Request Coalescing（请求合并）** 或 **In-flight Deduplication（飞行中去重）**。
+
+```c#
+import { create } from "zustand";
+import { persist } from "zustand/middleware";
+import type { User } from "@/types";
+import axios from "axios";
+
+interface AuthState {
+  ...
+}
+
+// fix： 定义模块级 Promise 锁
+let initializePromise: Promise<void> | null = null;
+
+export const useAuthStore = create<AuthState>()(
+  persist(
+    (set, get) => ({
+
+      ...
+
+      initialize: async () => {
+        const { user } = get();
+
+        // localStorage里没有user信息 → 从未登录过，无需refresh
+        if (!user) {
+          set({ isInitializing: false });
+          return;
+        }
+
+        // 有user信息 → 尝试用 refresh token (cookie) 换新的 access token
+
+        if (initializePromise) {
+          console.log(111);
+          return initializePromise;
+        }
+
+        initializePromise = (async () => {
+          try {
+            const response = await axios.post(
+              `${import.meta.env.VITE_API_BASE_URL}/auth/refresh`,
+              null,
+              { withCredentials: true },
+            );
+            const newAccessToken = response.data.data.accessToken;
+            set({ accessToken: newAccessToken, isInitializing: false });
+          } catch {
+            // refresh token也失效了 → 清除登录态
+            set({ user: null, accessToken: null, isInitializing: false });
+          } finally {
+            initializePromise = null;
+          }
+        })();
+        return initializePromise;
+      },
+    }),
+    {
+      name: "auth-storage", // localStorage 里的 key 名称
+      ...
+      }),
+    },
+  ),
+);
+
+```
+
+#### 5. 测试并合并分支
+
+用户登录成功后，在当期页面连续刷新，Dev tools后台工具的Network里观察到只发送一次refresh请求。
+
+合并回主分支
+
+```bash
+git add .
+git commit -m "fix: prevent concurrent refresh token requests on initialize"
+git push origin fix/refresh-token-rotation-race-condition
+
+# 合并回 develop
+git checkout develop
+git merge --no-ff fix/refresh-token-rotation-race-condition \
+  -m "merge: fix/refresh-token-rotation-race-condition into develop"
+git push origin develop
+
+# 删除功能分支
+git branch -d fix/refresh-token-rotation-race-condition
+git push origin --delete fix/refresh-token-rotation-race-condition
+```
+
+
+
+### Fix 2 · 生产环境 Refresh Token Cookie 跨域丢失
+
+#### 1. 创建修复分支
+
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b fix/cookie-samesite-production
+git push -u origin fix/cookie-samesite-production
+```
+
+#### 2. 问题描述
+
+部署到 Azure 后，用户登录成功，但浏览器里没有 `refreshToken` cookie。本地开发完全正常。导致生产环境任何页面刷新都会登出，因为 `initialize()` 调用 `/auth/refresh` 时没有 cookie 可以携带。
+
+#### 3. 根本原因
+
+本地开发时前端（`localhost:5173`）和后端（`localhost:5000`）同域，我们在SetRefreshTokenCookie里显式设置的`SameSite=Strict` 没有问题。
+
+```c#
+var cookieOptions = new CookieOptions
+{
+    HttpOnly = true,
+    Secure = true,
+    SameSite = SameSiteMode.Strict, // ← 显式设置
+    Expires = expiresAt,
+    Path = "/"
+};
+```
+
+但是， 部署到 Azure 后，前端（`xxx.azurestaticapps.net`）和后端（`xxx.azurecontainerapps.io`）是不同域名，属于跨域。浏览器对 `SameSite=Strict` 的处理是：跨域请求时直接拒绝存储 cookie，`Set-Cookie` 响应头被静默忽略。
+
+同理，`Logout` 里的 `Cookies.Delete` 也因为属性不匹配而删不掉 cookie。
+
+**那么之前的版本为什么要设置 `SameSite = SameSiteMode.Strict`?**
+
+`SameSite` 的本质目的是防御 **CSRF（跨站请求伪造）攻击**。
+
+攻击场景：用户登录了网站，坏人的网站偷偷发一个请求到 API，浏览器会自动携带 cookie，服务器以为是合法用户操作。
+
+- `Strict`：最严格，任何跨域请求都不带 cookie，CSRF 完全无法成立
+- `Lax`：部分防护，导航跳转可以带，`fetch`/`XHR` 不带
+- `None`：不防护，所有请求都带 cookie，但需要额外的 CSRF 防护手段
+
+当前架构是**前后端分离 + 不同域名**，这本身就是跨域。前端发的每一个请求对浏览器来说都是"跨站"的，`Strict` 和 `Lax` 都会把自己的请求拦掉。
+
+用了 `None` 之后 CSRF 防护就靠其他手段来补：
+
+- 我们的 CORS 已经配了 `WithOrigins(allowedOrigins)`，只允许指定域名，不是 `*`
+- `AllowCredentials()` 配合指定 Origin，浏览器会验证请求来源
+- 这两个加在一起已经把 CSRF 的风险降到很低了
+
+#### 4. 解决方案
+
+跨域场景下 cookie 必须设置 `SameSite=None` + `Secure=true`。生产环境通过 `IsDevelopment()` 判断切换。
+
+- 本地环境
+
+    ```bash
+    SameSite=None
+    Secure=false
+    ```
+
+- 生成环境
+
+    ```bash
+    SameSite=None
+    Secure=true
+    ```
+
+修改``AuthController.cs`里的`SetRefreshTokenCookie` 方法：
+
+```c#
+
+private void SetRefreshTokenCookie(string token, DateTime expiresAt)
+{
+    var cookieOptions = new CookieOptions
+    {
+        HttpOnly = true,
+        Secure = true,
+        SameSite = SameSiteMode.None, //允许跨域， 防 CSRF 通过其他配置
+        Expires = expiresAt,
+        Path = "/"
+    };
+
+    ,,,
+}
+```
+
+更新 `Logout`
+
+```c#
+
+[HttpPost("logout")]
+[EnableRateLimiting(RateLimitPolicies.Write)]
+public async Task<IActionResult> Logout(CancellationToken cancellationToken)
+{
+    ...
+
+    // 清除 Cookie
+    Response.Cookies.Delete("refreshToken", new CookieOptions
+    {
+        Path = "/", // 和 SetRefreshTokenCookie 里的 Path 保持一致，否则删不掉
+        SameSite = SameSiteMode.None, // 必须和 Set-Cookie 时的属性一致才能删掉
+        Secure = true
+    });
+
+    return Ok(ApiResponse<object>.Ok("Logged out successfully"));
+}
+```
+
+#### 5. 测试并合并分支
+
+部署到 Azure 后，登录成功，浏览器 Application → Cookies 里可以看到 `refreshToken`。刷新页面不再登出。Logout 后 cookie 被正确清除。
+
+合并分支：
+
+```bash
+git add .
+git commit -m "fix: use SameSite=None in production for cross-origin cookie"
+git push origin fix/cookie-samesite-production
+
+git checkout develop
+git merge --no-ff fix/cookie-samesite-production \
+  -m "merge: fix/cookie-samesite-production into develop"
+git push origin develop
+
+git branch -d fix/cookie-samesite-production
+git push origin --delete fix/cookie-samesite-production
+
+```
+
+合并回main分支
+
+```bash
+git checkout main
+git pull origin main
+git merge --no-ff develop \
+  -m "merge: fix/cookie-samesite-production into main"
+git push origin main
+git checkout develop
+```
+
+
+
+### Fix 3 · 图片上传组件体验优化
+
+#### 1. 创建修复分支
+
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b fix/ImageUploader-ux-improvements
+git push -u origin fix/ImageUploader-ux-improvements
+```
+
+#### 2.  问题描述
+
+图片上传组件的拖拽和删除各占一小块固定区域，操作不直观。`SortableImageItem` 中拖拽手柄是右下角一个独立小图标，而删除按钮是右上角另一个独立小图标，用户必须精确点在对应的小区域内才能触发操作。不如那种"整卡片可拖、悬浮才显示反馈、删除区域自动隔离"的模式直观。
+
+同时，添加图片按钮 `Add Images`是网格下方独立按钮，不是网格内的方块, 这导致 **图片网格和`Add Images`按钮是视觉上分离的两段**。按钮是标准横向按钮，不是跟图片同尺寸、排在网格末尾的方块，这种设计和"添加照片"方块体验相比有差距。
+
+#### 3. 根本原因
+
+根本原因是：现有设计靠"手柄和删除按钮物理位置分开"来避免两者抢事件，这是可行但不够友好的规避方式；没有用到 dnd-kit `activationConstraint`（8px 位移阈值）本身已经具备的"单纯点击不触发拖拽"能力，也没有给删除按钮做事件隔离。
+
+而对应添加图片功能按钮的设计， 三块内容（已上传图片、待上传预览、添加按钮）原本写成了三个独立的 `<div>`，天然不在同一个 flex 布局里，所以"添加"没法自然排进网格序列的最后一项。
+
+#### 4. 解决方案
+
+要实现整卡片可拖，删除按钮完全隔离拖拽感知，不再靠"手柄和删除按钮物理位置分开"这种规避方式，而是让整个卡片都能响应拖拽手势，删除按钮自己拦截事件、确保永远不会被误判成拖拽起点。
+
+**优化 `SortableImageItem`组件：**
+
+- `{...attributes} {...listeners}` 从手柄按钮挪到整个卡片
+- 拖拽手柄整个去掉， 不再需要一个独立的小手柄，整张卡片本身就是拖拽触发区
+
+```tsx
+import type { CarImage } from "@/types";
+import { useSortable } from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+
+interface SortableImageItemProps {
+  image: CarImage;
+  onDelete: () => void;
+  isDeleting: boolean;
+}
+/* -- 已上传图片：可拖拽排序的单个图片项 - */
+function SortableImageItem({
+  image,
+  onDelete,
+  isDeleting,
+}: SortableImageItemProps) {
+  // useSortable 把这个元素注册为可排序项
+  // attributes/listeners 绑在整个卡片上（不再是独立手柄）：
+  // 单纯点击（没有产生 8px 位移，见 ImageUploader 里的 activationConstraint）
+  // 不会触发拖拽，配合删除按钮自己拦截事件（见下面），足以区分"点删除"和"开始拖拽"
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: image.id });
+
+  return (
+    <div
+      ref={setNodeRef}
+      className="relative"
+      {...attributes}
+      {...listeners}
+      style={{
+        transform: CSS.Transform.toString(transform),
+        transition,
+        opacity: isDragging ? 0.5 : 1,
+      }}
+    >
+      <img
+        src={image.imageUrl}
+        alt="Car"
+        className="h-24 w-24 rounded-lg object-cover"
+      />
+
+      {/* 删除按钮 */}
+      <button
+        onClick={onDelete}
+        disabled={isDeleting}
+        className="absolute -right-2 -top-2 flex h-5 w-5
+                           items-center justify-center rounded-full
+                           bg-red-500 text-xs text-white
+                           hover:bg-red-600"
+      >
+        ×
+      </button>
+    </div>
+  );
+}
+
+export default SortableImageItem;
+
+```
+
+**图片删除图标阻止冒泡**：
+
+给删除按钮加 `onPointerDown={(e) => e.stopPropagation()}`，这样按下删除按钮的这个动作，根本不会冒泡到外层触发拖拽感知，不管按下去之后手指有没有轻微移动，都不会被误判成拖拽起点。同时删除按钮显式加了 `cursor-pointer`，覆盖父级 `cursor-grab` 的光标样式，鼠标移到删除图标上会正确切回普通指针
+
+```tsx
+function SortableImageItem({
+  image,
+  onDelete,
+  isDeleting,
+}: SortableImageItemProps) {
+  ...
+
+  return (
+    <div
+      ref={setNodeRef}
+      className="relative"
+      {...attributes}
+      {...listeners}
+      style={{
+        transform: CSS.Transform.toString(transform),
+        transition,
+        opacity: isDragging ? 0.5 : 1,
+      }}
+    >
+      ...
+
+      {/* 删除按钮：onPointerDown 阻止冒泡，保证按下这个按钮永远不会被
+          外层的拖拽感知捕获，不管按下后有没有轻微位移 */}
+      <button
+        onClick={onDelete}
+        onPointerDown={(e) => {e.stopPropagation()}}
+        disabled={isDeleting}
+        className="absolute -right-2 -top-2 flex h-5 w-5
+                           items-center justify-center rounded-full
+                           bg-red-500 text-xs text-white
+                           hover:bg-red-600 cursor-pointer"
+      >
+        ×
+      </button>
+    </div>
+  );
+}
+```
+
+**新增悬浮遮罩**:
+
+ 使用Tailwind 的 `group`/`group-hover`， 这样鼠标移入卡片时才显现半透明遮罩，提示"这里可以拖动"；`pointer-events-none` 保证这层遮罩不会挡住下面删除按钮的点击。
+
+```tsx
+function SortableImageItem({
+  image,
+  onDelete,
+  isDeleting,
+}: SortableImageItemProps) {
+  ...
+  return (
+    <div
+      ref={setNodeRef}
+      className="group relative cursor-move active:cursor-grabbing"
+      {...attributes}
+      {...listeners}
+      style={{
+        transform: CSS.Transform.toString(transform),
+        transition,
+        opacity: isDragging ? 0.5 : 1,
+      }}
+    >
+      <img
+        src={image.imageUrl}
+        alt="Car"
+        className="h-24 w-24 rounded-lg object-cover"
+      />
+
+      {/* 悬浮遮罩：只在鼠标移入时显现，提示"这里可以拖动"；
+          pointer-events-none 避免挡住下面删除按钮的点击 */}
+      <div className="pointer-events-none absolute inset-0 rounded-lg bg-black/0 transition-colors group-hover:bg-black/20" />
+
+      {/* 删除按钮 */}
+      ...
+    </div>
+  );
+}
+```
+
+**添加图片按钮 `Add Images`的布局优化：**
+
+优化`ImageUploader`组件， 把原来三个独立区块（已上传图片网格、待上传预览网格、按钮区块）合并成一个 `flex flex-wrap` 容器， 这样三个功能快在同一行横向依次显示
+
+```tsx
+...
+
+export default function ImageUploader({ carId, images }: ImageUploaderProps) {
+  ...
+
+  return (
+    <div className="space-y-4">
+      <h2 className="font-semibold">Images</h2>
+
+      {/* 图片网格：已上传图片（可拖拽排序）+ 待上传预览 + 末尾的"添加"方块，统一放在同一行 */}
+      <DndContext
+        sensors={sensors}
+        collisionDetection={closestCenter}
+        onDragEnd={handleDragEnd}
+      >
+        <SortableContext
+          items={localImages.map((img) => img.id)}
+          strategy={rectSortingStrategy}
+        >
+          <div className="flex flex-wrap gap-3">
+
+            {/* 已上传的图片列表：可拖拽排序 */}
+            {localImages.map((image) => (
+              <SortableImageItem
+                key={image.id}
+                image={image}
+                onDelete={() => deleteMutation.mutate(image.id)}
+                isDeleting={
+                  deleteMutation.isPending &&
+                  deleteMutation.variables === image.id
+                }
+              />
+            ))}
+
+            {/* 待上传文件：每一项独立显示上传中或失败重试，互不影响 */}
+            {pendingFiles.map((pending) => (
+              <div key={pending.id} className="relative">
+                <img
+                  src={pending.previewUrl}
+                  alt="Preview"
+                  className="h-24 w-24 rounded-lg object-cover"
+                />
+
+                ...
+              </div>
+            ))}
+
+            {/* 选择新图片：上传图片按钮 */}
+            <div className="space-y-3">
+              ...
+            </div>
+          </div>
+        </SortableContext>
+      </DndContext>
+    </div>
+  );
+}
+```
+
+`DndContext`/`SortableContext` 现在包住整个网格（不只是已上传图片那部分）。 这不影响拖拽逻辑，因为 dnd-kit 只会追踪调用了 `useSortable` 的元素，待上传预览和添加图片本身没有调用这个 Hook，混在同一个容器里不会被误判成可拖拽项。
+
+**改造添加图片按钮：**
+
+新增一个 `h-24 w-24` 虚线边框方块（`Plus` 图标 + "Add" 文字），用 `canAddMore` 控制显隐，作为整个 `.map()` 序列里的最后一项。
+
+```tsx
+...
+
+export default function ImageUploader({ carId, images }: ImageUploaderProps) {
+  ...
+
+  // 已有图片 + 待上传数量是否已达上限，达到就不再显示"添加"方块
+  const canAddMore = localImages.length + pendingFiles.length < MAX_IMAGES;
+
+  return (
+    <div className="space-y-4">
+      <h2 className="font-semibold">Images</h2>
+
+      {/* 图片网格：已上传图片（可拖拽排序）+ 待上传预览 + 末尾的"添加"方块，统一放在同一行 */}
+      <DndContext
+        sensors={sensors}
+        collisionDetection={closestCenter}
+        onDragEnd={handleDragEnd}
+      >
+        <SortableContext
+          items={localImages.map((img) => img.id)}
+          strategy={rectSortingStrategy}
+        >
+          <div className="flex flex-wrap gap-3">
+            {/* 已上传的图片列表：可拖拽排序 */}
+
+            ...
+
+            {/* 待上传文件：每一项独立显示上传中或失败重试，互不影响 */}
+
+            ...
+
+            {/* 添加图片：跟图片同尺寸的方块，始终排在网格最后一个 */}
+            {canAddMore && (
+              <button
+                type="button"
+                onClick={() => inputRef.current?.click()}
+                className="flex h-24 w-24 flex-col items-center justify-center gap-1 rounded-lg border-2 border-dashed border-gray-300 text-gray-400 transition-colors hover:border-gray-400 hover:text-gray-500"
+              >
+                <Plus className="h-5 w-5" />
+                <span className="text-[10px]">Add</span>
+              </button>
+            )}
+          </div>
+        </SortableContext>
+      </DndContext>
+
+      {/* 隐藏的原生文件选择 input，multiple 允许一次选多个文件 */}
+      <input
+        ref={inputRef}
+        type="file"
+        accept="image/jpeg,image/png,image/webp"
+        multiple
+        className="hidden"
+        onChange={handleFileChange}
+      />
+      <p className="text-xs text-gray-500">
+        JPEG, PNG or WebP · Max 5 MB per image · Up to {MAX_IMAGES} images total
+      </p>
+    </div>
+  );
+}
+
+```
+
+**格外的一个小改动**：
+
+现在的 `Edit Car`页面中，"文本表单 + Save Changes 按钮"在上面、"Images + Add Images 按钮"在下面，非常自然地会以为"是不是要先点 Save Changes，图片才会跟着车辆信息一起保存"。而实际上，`Save Changes` 只负责保存**文本字段**（Title/Brand/Model 这些），跟图片完全无关——图片是选中即上传、每张独立立刻持久化的，不需要点 `Save Changes` 才生效。
+
+这个纯粹由布局顺序制造出来的误导需要优化一下：把 `Images` 区块整体挪到 `CarForm` 上面。
+
+```tsx
+export default function EditCarPage() {
+  ...
+
+  return (
+    <div className="mx-auto max-w-2xl space-y-8">
+      <div className="flex items-center justify-between">
+        <h1 className="text-2xl font-bold">Edit Car</h1>
+        {/* 提交审核按钮 */}
+        <Button
+          onClick={() => submitMutation.mutate()}
+          disabled={submitMutation.isPending}
+        >
+          {submitMutation.isPending ? "Submitting..." : "Submit for Review"}
+        </Button>
+      </div>
+
+      {/* 图片上传 */}
+      <ImageUploader carId={carId} images={car.images} />
+
+      {/* 车辆信息表单，defaultValues 填入已有数据 */}
+      ...
+    </div>
+  );
+}
+
+```
+
+#### 5. 测试并合并分支
+
+修改完成之后:
+
+- 拖拽手柄移除，整个卡片能实现拖拽
+- 添加图片按钮和图片卡片外形一致，并并列展示
+- 车辆编辑页面的图片区域移到`CarForm`之前
+
+合并分支
+
+```bash
+git add .
+git commit -m "fix: improve ImageUploader UX"
+git push origin fix/ImageUploader-ux-improvements
+
+git checkout develop
+git merge --no-ff fix/ImageUploader-ux-improvements \
+  -m "merge: fix/ImageUploader-ux-improvements into develop"
+git push origin develop
+
+git branch -d fix/ImageUploader-ux-improvements
+git push origin --delete fix/ImageUploader-ux-improvements
+```
+
+
+
+### Fix 4 · 车辆发布体验优化（图片预上传）
+
+#### 1. 创建修复分支
+
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b fix/add-images-when-create-car
+git push -u origin fix/add-images-when-create-car
+```
+
+#### 2. 问题描述
+
+创建车辆阶段无法预先选图片，当前流程：
+
+CreateCarPage 只有 CarForm，用户填完信息点 Create Draft 后，carsApi.create 成功才跳转到 EditCarPage，图片必须等跳转过去之后才能添加。用户体验上应该允许"填资料的同时就能选好图片"，不需要先创建、再跳页面、再选图。
+
+#### 3. 根本原因
+
+CarImage 在数据库里通过 CarId 外键归属于一辆具体的车（AddImagesBatchAsync 第一步就是 _carRepository.GetByIdAsync(carId, ...)，车不存在直接 404）。这意味着图片必须挂在一个已存在的 carId 上，而 CreateCarPage 阶段车辆还没创建，天然不具备这个前提。
+
+#### 4. 解决方案
+
+不改后端任何接口，前端在 CreateCarPage 里让用户"先选图片、暂存在本地、不真正上传"，等 carsApi.create 真正成功拿到 car.id 之后，紧接着调用已有的 carsApi.uploadImagesBatch(car.id, files) 把暂存的文件批量传上去；如果图片上传失败，不影响创建结果，依然跳转 EditCarPage，让用户在编辑页重新添加。
+
+**新增本地状态数组**：
+
+`CreateCarPage` 现状完全没有跟图片相关的状态。要让用户"先选图片、暂存本地、提交时才真正上传"，需要一个新的本地状态数组，装"已选中但还没上传"的文件。 这里跟 ImageUploader 里的 PendingFile 不同——PendingFile 需要 status: "uploading" | "error"，是因为那边选完立即发请求；这里选完完全不发请求，只是本地暂存，所以不需要状态字段，只需要文件本身和预览地址：
+
+```tsx
+// 创建阶段本地暂存的图片：车辆还不存在，不能真正上传，
+// 只在本地生成预览，等提交成功拿到 carId 才批量上传
+interface LocalImage {
+  id: string;
+  file: File;
+  previewUrl: string;
+}
+
+export default function CreateCarPage() {
+ ...
+}
+
+```
+
+对应组件内部新增状态：
+
+```tsx
+export default function CreateCarPage() {
+  // 本地暂存的图片（车辆还不存在，不能真正上传）
+  const [localImages, setLocalImages] = useState<LocalImage[]>([]);
+  ...
+}
+```
+
+如果我们有了本地暂存的图片数据，需要渲染这部分数据， 这部分数据渲染的功能，我们创建一个独立的组件`ImagePicker`, 并把数据和更新数据的操作传递过去, 这样根据本地不同的数据，就能渲染出不同的车辆图片。
+
+```tsx
+export default function CreateCarPage() {
+  // 本地暂存的图片（车辆还不存在，不能真正上传）
+  const [localImages, setLocalImages] = useState<LocalImage[]>([]);
+
+  ...
+
+  return (
+    <div className="mx-auto max-w-2xl space-y-6">
+      <h1 className="text-2xl font-bold">List Your Car</h1>
+
+      {/* image selector */}
+      <ImagePicker images={localImages} onChange={setLocalImages} />
+
+      <CarForm
+        onSubmit={handleSubmit}
+        isSubmitting={createMutation.isPending}
+        submitLabel="Create Draft"
+      />
+    </div>
+  );
+}
+```
+
+**创建图片本地选择器组件`ImagePicker`**
+
+和`ImageUploader`不同，`ImagePicker`内部**完全不需要**任何网络请求:
+
+- 没有 `carsApi` 导入
+- 没有 `useMutation`
+- 没有 `useQueryClient`
+
+但需要选择、删除、拖拽这三件事， 他们全部只是纯数组操作。同时`ImagePicker` 只负责"展示 + 触发变化",不自己拥有状态,这是标准的**受控组件**模式,跟 `CarForm` 的 `onSubmit`/`defaultValues` 是同一个思路。
+
+```tsx
+interface ImagePickerProps {
+  // 受控组件：状态由父组件持有，这里只负责展示和触发变化
+  images: LocalImage[];
+  onChange: (images: LocalImage[]) => void;
+}
+
+export default function ImagePicker({ images, onChange }: ImagePickerProps) {
+
+
+  /* --- 选择 --- */
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    ...
+    onChange(...);
+  };
+  /* --- 删除 --- */
+  // 纯本地数组操作，没有对应的后端记录，不发请求
+  const handleDelete = (id: string) => {
+    ...
+    onChange(...);
+  };
+
+  /* --- 拖拽 --- */
+  // 拖拽结束：纯本地重排，没有已持久化的 SortOrder 需要同步给后端
+  const handleDragEnd = (event: DragEndEvent) => {
+    ...
+    onChange(...);
+  };
+
+  const canAddMore = images.length < MAX_IMAGES;
+
+  return (
+    <div className="space-y-2">
+      ...
+    </div>
+  );
+}
+
+```
+
+完善选择+删除+拖拽逻辑，渲染数据（复用可拖拽卡`SortableImageItem`)
+
+```tsx
+import { useRef } from "react";
+import { toast } from "sonner";
+import { Plus } from "lucide-react";
+import {
+  DndContext,
+  closestCenter,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  rectSortingStrategy,
+  arrayMove,
+} from "@dnd-kit/sortable";
+import SortableImageItem from "./SortableImageItem";
+import type { LocalImage } from "@/pages/CreateCarPage";
+
+const MAX_IMAGES = 10; // 与后端 AddImagesBatchAsync 的上限保持一致
+
+interface ImagePickerProps {
+  // 受控组件：状态由父组件持有，这里只负责展示和触发变化
+  images: LocalImage[];
+  onChange: (images: LocalImage[]) => void;
+}
+
+export default function ImagePicker({ images, onChange }: ImagePickerProps) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  const sensors = useSensors(
+    useSensor(PointerSensor, {
+      activationConstraint: { distance: 8 },
+    }),
+  );
+  const canAddMore = images.length < MAX_IMAGES;
+
+  /* --- 选择 --- */
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+
+    const fileArray = Array.from(files);
+
+    // 数量上限：只在本地拦截，此时没有 carId，无法调后端校验
+    if (images.length + fileArray.length > MAX_IMAGES) {
+      toast.error(
+        `A car can have at most ${MAX_IMAGES} images. ` +
+          `Currently selected ${images.length}, ` +
+          `you selected ${fileArray.length} more.`,
+      );
+      if (inputRef.current) inputRef.current.value = "";
+      return;
+    }
+
+    const newImages: LocalImage[] = fileArray.map((file) => ({
+      id: `local-${Date.now()}-${Math.random()}`,
+      file,
+      previewUrl: URL.createObjectURL(file),
+    }));
+
+    onChange([...images, ...newImages]);
+
+    if (inputRef.current) inputRef.current.value = "";
+  };
+  /* --- 删除 --- */
+  // 纯本地数组操作，没有对应的后端记录，不发请求
+  const handleDelete = (id: string) => {
+    const target = images.find((img) => img.id === id);
+    if (target) URL.revokeObjectURL(target.previewUrl);
+    onChange(images.filter((img) => img.id !== id));
+  };
+
+  /* --- 拖拽 --- */
+  // 拖拽结束：纯本地重排，没有已持久化的 SortOrder 需要同步给后端
+  const handleDragEnd = (event: DragEndEvent) => {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+
+    const oldIndex = images.findIndex((img) => img.id === active.id);
+    const newIndex = images.findIndex((img) => img.id === over.id);
+
+    onChange(arrayMove(images, oldIndex, newIndex));
+  };
+
+  return (
+    <div className="space-y-2">
+      <h2 className="font-semibold">Images</h2>
+      <DndContext
+        sensors={sensors}
+        collisionDetection={closestCenter}
+        onDragEnd={handleDragEnd}
+      >
+        <SortableContext
+          items={images.map((img) => img.id)}
+          strategy={rectSortingStrategy}
+        >
+          <div className="flex flex-wrap gap-3">
+            {images.map((img) => (
+              <SortableImageItem
+                key={img.id}
+                image={{ id: img.id, imageUrl: img.previewUrl }}
+                onDelete={() => handleDelete(img.id)}
+                isDeleting={false}
+              />
+            ))}
+
+            {/* 添加图片：跟图片同尺寸的方块，始终排在最后一个 */}
+            {canAddMore && (
+              <button
+                type="button"
+                onClick={() => inputRef.current?.click()}
+                className="flex h-24 w-24 flex-col items-center justify-center gap-1
+                           rounded-lg border-2 border-dashed border-gray-300
+                           text-gray-400 transition-colors
+                           hover:border-gray-400 hover:text-gray-500"
+              >
+                <Plus className="h-5 w-5" />
+                <span className="text-[10px]">Add</span>
+              </button>
+            )}
+          </div>
+        </SortableContext>
+      </DndContext>
+
+	  {/* 隐藏的原生文件选择 input，multiple 允许一次选多个文件 */}
+      <input
+        ref={inputRef}
+        type="file"
+        accept="image/jpeg,image/png,image/webp"
+        multiple
+        className="hidden"
+        onChange={handleFileChange}
+      />
+      <p className="text-xs text-gray-500">
+        JPEG, PNG or WebP · Max 5 MB per image · Up to {MAX_IMAGES} images total
+      </p>
+    </div>
+  );
+}
+```
+
+注意：复用`SortableImageItem` 会有类型不匹配
+
+`SortableImageItem` 现在的 prop 类型是 `image: CarImage`,而本地暂存的文件对象长得不一样(`id` 是字符串、字段叫 `previewUrl` 不是 `imageUrl`)。
+
+需要把 `SortableImageItem` 依赖的类型**收窄成它真正需要的最小形状**——它其实只用到 `id` 和 `imageUrl` 两个字段,不需要整个 `CarImage`。这样两边都能类型安全地复用同一个展示组件。
+
+```tsx
+// 只依赖"展示 + 拖拽 + 删除"真正需要的字段，不绑定具体是
+// 已持久化的 CarImage，还是本地文件生成的预览对象——
+// CarImage 结构上天然满足这个形状，可以直接传入，不需要改 ImageUploader
+export interface ImageLike {
+  id: string | number;
+  imageUrl: string;
+}
+
+interface SortableImageItemProps {
+  image: ImageLike;
+  onDelete: () => void;
+  isDeleting: boolean;
+}
+/* -- 已上传图片：可拖拽排序的单个图片项 - */
+function SortableImageItem() {
+ ...
+}
+```
+
+**重写表单提交逻辑**
+
+之前的提交逻辑不包含上传图片的部分，使用`useMutation`合理，现在的提交动作是"创建车辆 → 上传图片 → 跳转"三步连续的流程，`useMutation` 的 `isPending` 只反映 `mutationFn` 本身（原来的 `carsApi.create`）有没有完成——`create` 请求一返回，`isPending` 立刻变回 `false`，哪怕紧接着的图片上传还没做完，按钮会提前恢复可点击状态，用户可能在图片还在传的时候又点一次提交。因此，我们选择**手写一个 `async` 函数配合自己的 `isSubmitting` 状态更直接**。
+
+之前的逻辑：
+
+```tsx
+const createMutation = useMutation({
+  mutationFn: (values: CarFormValues) => carsApi.create(values),
+  onSuccess: (car) => {
+    toast.success("Draft created!");
+    navigate(`/cars/${car.id}/edit`);
+  },
+  onError: (error) => {
+    toast.error(error.message);
+  },
+});
+
+const handleSubmit = async (values: CarFormValues) => {
+  createMutation.mutate(values);
+};
+```
+
+修改提交逻辑
+
+```tsx
+import { useNavigate } from "react-router-dom";
+import { toast } from "sonner";
+import { carsApi } from "@/api";
+import CarForm from "@/components/CarForm";
+import type { CarFormValues } from "@/components/CarForm";
+import { useState } from "react";
+import ImagePicker from "@/components/ImagePicker";
+
+// 车辆创建前本地暂存的图片：还没有 carId，不会真正上传，
+// 只在本地生成预览、支持删除和拖拽排序；真正的上传由父组件
+// 在拿到 carId 之后调用 carsApi.uploadImagesBatch 完成
+export interface LocalImage {
+  id: string;
+  file: File;
+  previewUrl: string;
+}
+
+export default function CreateCarPage() {
+  const navigate = useNavigate();
+
+  // 本地暂存的图片：车辆还不存在，选择、删除、排序都只发生在本地，
+  // 全部逻辑交给 ImageSelector，这里只持有状态，提交时读出来用
+  const [localImages, setLocalImages] = useState<LocalImage[]>([]);
+  // 提交状态：涵盖"创建车辆 + 上传图片"整个过程，不只是创建这一步
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const handleSubmit = async (values: CarFormValues) => {
+    setIsSubmitting(true);
+    try {
+      // 第一步：创建车辆，拿到真实的 carId
+      const car = await carsApi.create(values);
+      toast.success("Draft created!");
+
+      // 第二步：如果用户选过图片，用刚拿到的 carId 批量上传
+      if (localImages.length > 0) {
+        try {
+          await carsApi.uploadImagesBatch(
+            car.id,
+            localImages.map((img) => img.file),
+          );
+        } catch {
+          // 图片上传失败不影响车辆已创建这个事实，只提示用户去编辑页补传
+          toast.error(
+            "Draft created, but images failed to upload. You can add them on the next page.",
+          );
+        }
+      }
+
+      // 第三步：跳转编辑页（车辆一定已存在，图片传没传成功都可以在这里补）
+      navigate(`/cars/${car.id}/edit`);
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "Failed to create draft.",
+      );
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="mx-auto max-w-2xl space-y-6">
+      <h1 className="text-2xl font-bold">List Your Car</h1>
+
+      <ImagePicker images={localImages} onChange={setLocalImages} />
+
+      <CarForm
+        onSubmit={handleSubmit}
+        isSubmitting={isSubmitting}
+        submitLabel="Create Draft"
+      />
+    </div>
+  );
+}
+
+```
+
+#### 5. 测试并合并分支
+
+修改之后，创建车辆草稿时，能批量上传图片（预览+拖拽排序+删除）
+
+合并分支
+
+```tsx
+git add .
+git commit -m "fix: improve car listing UX, add images"
+git push origin fix/add-images-when-create-car
+
+git checkout develop
+git merge --no-ff fix/add-images-when-create-car \
+  -m "merge: fix/add-images-when-create-car into develop"
+git push origin develop
+
+git branch -d fix/add-images-when-create-car
+git push origin --delete fix/add-images-when-create-car
 ```
