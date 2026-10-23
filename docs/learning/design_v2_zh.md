@@ -1,0 +1,1862 @@
+# UUcars Marketplace V2 完整开发纲要
+
+> **目标：在 V1 REST API 基础上完善账户与交易功能，构建完整的 React 前端，并通过 Azure 云服务部署为可公开访问的全栈应用。**
+>
+> 原则：**功能逐步落地 · 前后端契约一致 · 安全配置隔离 · 测试与验证同步 · Git 流程规范**
+
+UUcars 是个人全栈 Portfolio Project，不属于实习或就业经历。
+
+V2 分为两个明确版本：
+
+- V2.0 完成核心后端升级、React 前端和 Azure 生产部署。
+- V2.1 完善视觉设计、响应式体验和车辆封面展示。
+
+---
+
+## 技术栈
+
+**后端：**
+
+- ASP.NET Core Web API
+- Entity Framework Core
+- SQL Server
+- Azure SQL Database
+- JWT Authentication
+- Resend
+- Cloudflare R2
+- AWS S3 SDK
+- xUnit
+- Testcontainers for SQL Server
+- Docker
+
+**前端：**
+
+- React 19
+- TypeScript 6
+- Vite 8
+- Tailwind CSS 4
+- shadcn/ui
+- React Router 7
+- Zustand
+- TanStack Query 5
+- React Hook Form
+- Zod
+- Axios
+- Sonner
+- Lucide React
+- Embla Carousel
+
+**生产部署：**
+
+- Azure SQL Database
+- Azure Container Apps
+- Azure Static Web Apps
+- GitHub Container Registry
+- GitHub Actions
+- Docker
+- Azure OIDC 身份认证
+
+---
+
+## 开发流程
+
+分支职责、提交约定和发布流程由当前的
+[开发与发布流程](../technical/development-workflow.md) 统一维护。本纲要只记录
+V2 的范围、实施顺序和验收边界。
+
+### V2 里程碑计划
+
+```text
+v2.0-backend  Step 41 完成
+              后端账户、邮件、图片、订单完成与评价功能就绪
+
+v2.0-frontend Step 55 完成
+              React 前端核心页面和完整业务流程就绪
+
+v2.0          Step 56 完成
+              Azure 生产部署和 CI/CD 就绪
+
+v2.1          Step 56b 完成
+              UI 设计系统、响应式体验和车辆封面展示完善
+```
+
+---
+
+# 第一阶段：V2 后端升级（Step 36–41）
+
+> **目标：完善跨域访问、邮件、邮箱验证、密码重置、真实图片存储、订单完成和评价能力。**
+>
+
+---
+
+## Step 36 · CORS 配置
+
+**产出：** 允许本地 React 开发服务器和生产前端安全访问后端 API。
+
+### 主要内容
+
+- 新建 `CorsExtensions`。
+- 从 `Cors:AllowedOrigins` 配置节读取允许的前端 Origin。
+- 在开发配置中加入本地 Vite 地址。
+- 使用 `WithOrigins` 限制允许访问 API 的前端地址。
+- 使用 `AllowAnyMethod` 允许所需 HTTP 方法。
+- 使用 `AllowAnyHeader` 允许 `Content-Type`、`Authorization` 等请求头。
+- 使用 `AllowCredentials` 允许凭据型跨域请求。
+- 不使用 `AllowAnyOrigin`，避免与 Credentials 配置冲突。
+- 将 CORS 中间件放在 Authentication 和 Authorization 之前。
+- 允许生产环境通过环境变量覆盖前端地址。
+
+### 知识点
+
+- 浏览器同源策略
+- CORS 的作用范围
+- Preflight `OPTIONS` 请求
+- `WithOrigins` 与 `AllowAnyOrigin`
+- Credentials 与通配 Origin 的限制
+- ASP.NET Core 中间件执行顺序
+- 开发与生产环境配置分离
+
+### 测试与验证
+
+- 使用 `curl` 发送 Preflight 请求。
+- 确认允许的 Origin 返回正确响应头。
+- 确认未配置的 Origin 不会获得跨域授权。
+
+### 验收标准
+
+- 允许的开发和生产 Origin 可以访问 API。
+- 未配置的 Origin 不会获得跨域授权。
+- CORS 中间件顺序正确，配置可由环境变量覆盖。
+
+---
+
+## Step 37 · 邮件服务基础设施
+
+**产出：** 建立统一的真实邮件发送能力，为邮箱验证和密码重置提供基础设施。
+
+### 主要内容
+
+- 集成 Resend。
+- 建立 `EmailSettings` 配置类。
+- 配置：
+  - `ApiKey`
+  - `FromEmail`
+  - `FromName`
+  - `BaseUrl`
+- 将 API Key 保存到 User Secrets 或生产环境变量。
+- 建立 `IEmailService`。
+- 实现 `ResendEmailService`。
+- 编写邮箱验证和密码重置 HTML 邮件模板。
+- 建立安全随机 Token 生成工具。
+- 使用 Base64 URL-safe 编码生成 Token。
+- 对邮件链接中的 Token 进行 URL 编码。
+- 使用扩展方法完成依赖注入注册。
+
+#### 服务接口
+
+```text
+IEmailService
+├── SendEmailVerificationAsync(email, token)
+└── SendPasswordResetAsync(email, token)
+```
+
+### 知识点
+
+- 第三方邮件服务的工作方式
+- 面向接口的服务设计
+- Options 配置绑定
+- User Secrets 与环境变量
+- HTML 邮件模板
+- 加密安全随机 Token
+- URL-safe Token
+- URL 编码
+
+### 测试与验证
+
+- 使用临时开发端点发送测试邮件。
+- 确认邮件内容和链接正确。
+- 验证完成后删除临时端点。
+- 运行后端构建检查。
+
+### 验收标准
+
+- 邮件服务通过接口注册并可替换测试实现。
+- 验证邮件和重置邮件链接正确且 Token 经过安全编码。
+- 邮件服务密钥不进入 Git。
+
+---
+
+## Step 38 · 邮箱验证注册
+
+**产出：** 形成完整的注册激活流程：
+
+```text
+用户注册
+→ 创建未验证账户
+→ 发送验证邮件
+→ 用户访问验证链接
+→ 激活账户
+→ 用户可以登录
+```
+
+### 主要内容
+
+#### 数据库变更
+
+向 `Users` 表加入：
+
+```text
+EmailConfirmationToken
+EmailConfirmationTokenExpiry
+```
+
+生成 EF Core Migration：
+
+```text
+AddEmailVerificationFields
+```
+
+#### API 端点
+
+```http
+GET  /auth/verify-email?token={token}
+POST /auth/resend-verification
+```
+
+- 注册时生成邮箱验证 Token。
+- 设置 Token 有效期。
+- 注册成功后发送验证邮件。
+- 登录时检查 `EmailConfirmed`。
+- 验证成功后：
+  - 将 `EmailConfirmed` 设为 `true`
+  - 清空验证 Token
+  - 清空 Token 过期时间
+- 支持重新发送验证邮件。
+- 防止已验证账户重复生成 Token。
+- 为无效或过期 Token 建立业务异常。
+- 更新 Fake Repository。
+- 建立 Fake Email Service。
+- 调整注册登录集成测试，使测试用户先完成邮箱验证。
+
+### 知识点
+
+- 注册与邮箱验证的职责边界
+- 邮箱验证 Token 与 JWT 的区别
+- Token 过期机制
+- 401 与 403 的语义
+- 一次性 Token
+- EF Core 增量 Migration
+- 可测试的外部服务设计
+
+### 测试与验证
+
+- 单元测试覆盖注册、验证、重复发送和登录限制。
+- 在 Docker 可用时运行 SQL Server Testcontainers 集成测试。
+- 使用 Scalar 验证完整账户激活流程。
+
+### 验收标准
+
+- 新账户在验证邮箱前不能登录。
+- 有效 Token 可以完成验证并立即失效。
+- 重新发送、无效 Token 和过期 Token 均有明确处理。
+
+---
+
+## Step 39 · 密码重置
+
+**产出：** 形成安全的忘记密码流程：
+
+```text
+提交邮箱
+→ 发送密码重置邮件
+→ 用户访问重置链接
+→ 设置新密码
+→ Token 失效
+```
+
+### 主要内容
+
+#### 数据库变更
+
+向 `Users` 表加入：
+
+```text
+ResetPasswordToken
+ResetPasswordTokenExpiry
+```
+
+生成 EF Core Migration：
+
+```text
+AddPasswordResetFields
+```
+
+#### API 端点
+
+```http
+POST /auth/forgot-password
+POST /auth/reset-password
+```
+
+- 建立 `ForgotPasswordRequest`。
+- 建立 `ResetPasswordRequest`。
+- 为已验证账户生成密码重置 Token。
+- 将密码重置有效期设置为较短时间。
+- 使用统一响应隐藏邮箱是否存在。
+- 不向未验证账户发送重置邮件。
+- 验证 Token 是否存在以及是否过期。
+- 使用 ASP.NET Core Password Hasher 保存新密码。
+- 重置成功后清空 Token 和过期时间。
+- 防止同一个 Token 重复使用。
+
+### 知识点
+
+- 防止账户枚举攻击
+- 密码哈希
+- 一次性 Token
+- Token 过期验证
+- 邮箱验证与密码重置的安全边界
+
+### 测试与验证
+
+- 测试不存在邮箱的静默响应。
+- 测试未验证账户不会收到重置邮件。
+- 测试有效、无效和过期 Token。
+- 测试旧密码失效、新密码可以登录。
+- 使用 Scalar 验证完整密码重置流程。
+
+### 验收标准
+
+- 忘记密码接口不会暴露账户是否存在。
+- 有效 Token 可以设置新密码且不能重复使用。
+- 重置后旧密码失效，新密码可以登录。
+
+---
+
+## Step 40 · Cloudflare R2 图片上传
+
+**产出：** 允许卖家直接上传车辆图片，并将图片保存到 Cloudflare R2。
+
+### 主要内容
+
+#### API 调整
+
+```http
+POST /cars/{carId}/images
+Content-Type: multipart/form-data
+```
+
+删除图片：
+
+```http
+DELETE /cars/{carId}/images/{imageId}
+```
+
+- 安装 AWS S3 SDK。
+- 建立 `StorageSettings`。
+- 建立 `IStorageService`。
+- 实现 `R2StorageService`。
+- 配置 Cloudflare R2 S3-compatible endpoint。
+- 使用 `IFormFile` 接收图片。
+- 使用 `[FromForm]` 绑定上传请求。
+- 验证文件不为空。
+- 限制单个文件不超过 5 MB。
+- 根据 MIME type 只允许 JPEG、PNG 和 WebP。
+- 读取原始文件扩展名，并使用 GUID 生成唯一存储文件名。
+- 将文件存储到 `cars/` 路径下。
+- 保存公开图片 URL。
+- 删除车辆图片时同步删除 R2 对象。
+- 限制只有车辆所有者可以管理图片。
+- 限制只有 Draft 状态的车辆可以添加或删除图片。
+
+### 知识点
+
+- `multipart/form-data`
+- `IFormFile`
+- 对象存储
+- S3-compatible API
+- MIME type 验证
+- 文件大小限制
+- GUID 文件名
+- 数据库记录与云端文件的一致性
+
+### 测试与验证
+
+- 上传合法图片。
+- 确认返回的 URL 可以公开访问。
+- 测试非法 MIME type。
+- 测试空文件和超大文件。
+- 测试非车主访问。
+- 测试非 Draft 状态车辆。
+- 测试删除数据库记录时同步删除 R2 文件。
+
+### 验收标准
+
+- 合法图片可上传至 R2 并保存公开 URL。
+- 文件大小、MIME type、车辆状态和所有权限制生效。
+- 删除图片时数据库记录与 R2 对象保持一致。
+
+---
+
+## Step 41 · 订单完成与用户评价
+
+**产出：** 完成交易闭环，并允许买家对已完成交易中的卖家进行评价。
+
+### 主要内容
+
+#### 订单端点
+
+```http
+POST /orders/{orderId}/complete
+```
+
+订单状态变化：
+
+```text
+Pending
+→ Completed
+```
+
+只有订单对应的卖家可以确认交易完成。
+
+#### 评价端点
+
+```http
+POST /reviews
+GET  /reviews/seller/{sellerId}
+```
+
+#### 数据库变更
+
+新增 `Reviews` 表：
+
+```text
+Id
+OrderId
+ReviewerId
+RevieweeId
+Rating
+Comment
+CreatedAt
+UpdatedAt
+```
+
+数据库结构：
+
+- `OrderId` 外键指向 `Orders`。
+- `ReviewerId` 外键指向买家。
+- `RevieweeId` 外键指向卖家。
+- `OrderId` 建立唯一索引。
+- 一个订单只能创建一条评价。
+- `Comment` 最大长度为 500 字符。
+- 删除相关订单或用户时使用 Restrict 行为。
+
+API 请求验证：
+
+- `OrderId` 必填。
+- Rating 必须在 1–5 之间。
+- Comment 可为空。
+- Comment 最长 500 字符。
+
+生成 EF Core Migration：
+
+```text
+AddReviewsTable
+```
+
+- 新增订单状态业务异常。
+- 在 `OrderService` 中实现 `CompleteAsync`。
+- 建立 Review 实体和关系映射。
+- 建立请求和响应 DTO。
+- 建立 `IReviewRepository` 与 `EfReviewRepository`。
+- 建立 `ReviewService`。
+- 验证评价人是订单买家。
+- 验证订单已经完成。
+- 防止重复评价。
+- 根据订单自动确定 `RevieweeId`。
+- 客户端不能自行指定被评价用户。
+- 提供卖家评价列表。
+- 计算卖家平均评分和评价数量。
+- 将评价查询保持为公开接口。
+
+### 知识点
+
+- 交易状态机
+- 多层权限验证
+- 数据库唯一索引
+- DTO 数据验证
+- 服务层业务规则
+- 聚合数据计算
+- 从可信业务对象派生关联用户
+
+### 测试与验证
+
+使用 Scalar 完成：
+
+```text
+卖家发布车辆
+→ Admin 审核
+→ 买家下单
+→ 卖家确认完成
+→ 买家提交评价
+→ 查询卖家评分
+```
+
+### 验收标准
+
+- 只有卖家可以完成 Pending 订单。
+- 只有买家可以评价已完成订单，且每个订单只能评价一次。
+- 卖家评价列表、平均评分和评价数量正确。
+
+---
+
+---
+
+# 第二阶段：前端工程基础（Step 42–44）
+
+> **目标：建立 React、TypeScript、Tailwind CSS、shadcn/ui、类型层和 Axios API 层。**
+>
+
+---
+
+## Step 42 · React 前端工程初始化
+
+**产出：** 建立可以运行、构建并连接本地后端 API 的 React + TypeScript 工程。
+
+### 主要内容
+
+- 使用 Vite 创建 React TypeScript 项目。
+- 清理模板示例代码。
+- 配置：
+  - ES2023 target
+  - Bundler module resolution
+  - `noUnusedLocals`
+  - `noUnusedParameters`
+  - `noFallthroughCasesInSwitch`
+  - `erasableSyntaxOnly`
+- 配置 `@/` 路径别名。
+- 配置 Vite 路径解析。
+- 建立 Vite 环境变量使用方式。
+- 使用 `VITE_API_BASE_URL` 配置本地后端地址。
+- 建立基础目录：
+
+```text
+src/
+├── api/
+├── components/
+├── hooks/
+├── lib/
+├── pages/
+├── stores/
+├── types/
+├── App.tsx
+└── main.tsx
+```
+
+### 知识点
+
+- Vite 工程结构
+- TypeScript 编译配置
+- 路径别名
+- 前端环境变量
+- 开发服务器与生产构建
+
+### 测试与验证
+
+```bash
+npm run dev
+npm run build
+```
+
+### 验收标准
+
+- React TypeScript 项目可以本地启动并完成生产构建。
+- 路径别名和环境变量读取正确。
+- 目录结构支持后续页面和 API 模块扩展。
+
+---
+
+## Step 43 · Tailwind CSS 与 shadcn/ui
+
+**产出：** 建立前端基础样式能力和可复用 UI 组件。
+
+### 主要内容
+
+- 使用 Tailwind CSS Vite 插件。
+- 在全局 CSS 中引入 Tailwind。
+- 初始化 shadcn/ui。
+- 建立 `cn()` 工具函数。
+- 初始安装：
+
+```text
+Button
+Input
+Card
+Label
+```
+
+- 后续组件在对应页面需要时按需添加。
+
+### 知识点
+
+- Utility-first CSS
+- Flexbox 与 Grid
+- 响应式断点
+- 条件 class 合并
+- `clsx`
+- `tailwind-merge`
+- shadcn/ui 的源码式组件管理方式
+
+### 测试与验证
+
+- 确认 Tailwind 样式生效。
+- 确认基础组件可以正常导入。
+- 运行前端构建检查。
+
+### 验收标准
+
+- Tailwind CSS 样式正常生效。
+- shadcn/ui 基础组件和 cn() 工具可正常使用。
+- 前端构建通过。
+
+---
+
+## Step 44 · TypeScript 类型层与 Axios API 层
+
+**产出：** 让前端数据类型与后端 DTO 对齐，并集中管理所有 HTTP 请求。
+
+### 主要内容
+
+#### 类型文件
+
+```text
+types/
+├── api.ts
+├── car.ts
+├── favorite.ts
+├── order.ts
+├── review.ts
+├── user.ts
+└── index.ts
+```
+
+主要类型：
+
+```text
+ApiResponse<T>
+PagedResponse<T>
+User
+LoginResponse
+Car
+CarDetail
+CarImage
+Order
+Review
+SellerRating
+Favorite
+```
+
+车辆和订单状态使用 const object 配合联合类型，避免额外的枚举运行时代码。
+
+#### API 模块
+
+```text
+api/
+├── client.ts
+├── auth.ts
+├── users.ts
+├── cars.ts
+├── favorites.ts
+├── orders.ts
+├── reviews.ts
+├── admin.ts
+└── index.ts
+```
+
+#### Axios 客户端
+
+统一配置：
+
+- `baseURL`
+- 请求超时
+- JSON 请求头
+- 请求拦截器
+- 响应错误处理
+
+请求拦截器：
+
+```text
+从 localStorage 读取 accessToken
+→ 添加 Authorization: Bearer {token}
+```
+
+响应拦截器：
+
+- 对 204 No Content 直接放行。
+- 读取后端 `ApiResponse<T>`。
+- 检查 `success`。
+- 将业务失败转换为 Error。
+- 提取 HTTP 错误中的后端消息。
+- 区分请求超时和网络错误。
+- 成功时保留完整 Axios response。
+
+各 API 模块负责返回业务数据：
+
+```ts
+const response =
+  await apiClient.get<ApiResponse<CarDetail>>(`/cars/${id}`);
+
+return response.data.data!;
+```
+
+### 知识点
+
+- TypeScript 泛型
+- 联合类型
+- 可选属性
+- DTO 对齐
+- Axios 泛型
+- 请求与响应拦截器
+- API envelope
+- HTTP 层与业务数据层的职责边界
+
+### 测试与验证
+
+- 确认各 API 模块具有正确类型推导。
+- 运行 TypeScript 和 Vite 构建检查。
+
+### 验收标准
+
+- 前端类型与后端 DTO 契约一致。
+- Axios 拦截器保留完整 Response，各 API 模块负责解包业务数据。
+- 超时、网络错误和后端业务错误得到统一处理。
+
+---
+
+---
+
+# 第三阶段：认证状态、路由与公开账户页面（Step 45–48）
+
+> **目标：建立认证状态和表单工具，完成登录、路由保护、注册、邮箱验证及密码重置页面。**
+>
+
+---
+
+## Step 45 · 安装认证与表单核心工具
+
+**产出：** 准备认证页面所需的状态管理和表单验证能力。
+
+### 主要内容
+
+#### 安装内容
+
+```text
+Zustand
+React Hook Form
+Zod
+@hookform/resolvers
+```
+
+#### Auth Store
+
+```ts
+interface AuthState {
+  user: User | null;
+  accessToken: string | null;
+  setAuth: (user: User, token: string) => void;
+  logout: () => void;
+  isAuthenticated: () => boolean;
+}
+```
+
+- 使用 Zustand 建立 `authStore`。
+- 使用 `persist` 保存 User 和 Access Token。
+- 使用 `auth-storage` 作为持久化 key。
+- `setAuth` 同时更新 Zustand 和独立的 `accessToken` localStorage 项。
+- `logout` 清除认证状态和 Token。
+- 配置 React Hook Form 与 Zod resolver。
+
+### 知识点
+
+- 全局客户端状态
+- Zustand store
+- persist middleware
+- localStorage
+- 非受控表单
+- Schema validation
+- 类型推导
+
+### 测试与验证
+
+- 认证状态可以写入、持久化和清除。
+- Access Token 同时满足 Zustand 恢复和 Axios 请求读取需求。
+- React Hook Form 与 Zod Resolver 可以正常工作。
+- 前端构建通过。
+
+### 验收标准
+
+- 认证状态可以持久化和清除。
+- Axios 可以从 localStorage 读取最新 Access Token。
+- React Hook Form 与 Zod 已准备好供认证页面使用。
+
+---
+
+## Step 46 · 登录页
+
+**产出：** 实现第一个完整的前端业务页面。
+
+### 主要内容
+
+#### 页面流程
+
+```text
+输入邮箱和密码
+→ 前端表单验证
+→ 调用登录 API
+→ 保存 User 和 Access Token
+→ 根据可选来源页或用户角色跳转
+```
+
+- 使用 React Hook Form 管理表单。
+- 使用 Zod 验证邮箱和密码。
+- 显示字段验证错误。
+- 显示后端返回的登录错误。
+- 登录期间禁用提交按钮。
+- 登录成功后调用 `setAuth`。
+- 使用 `useLocation` 读取可选的来源页状态。
+- 如果存在来源状态，则返回对应页面。
+- 普通用户没有来源状态时进入首页。
+- Admin 没有来源状态时进入管理页面。
+- 为注册和忘记密码页面预留链接。
+
+来源页状态由需要返回原页面的入口传入，例如车辆详情页的登录购买入口。
+
+### 知识点
+
+- React 函数组件
+- JSX
+- `useState`
+- `useForm`
+- `zodResolver`
+- 异步提交
+- 条件渲染
+- `useNavigate`
+- `useLocation`
+
+### 测试与验证
+
+- 空表单验证。
+- 非法邮箱验证。
+- 错误凭据提示。
+- 未验证邮箱提示。
+- 普通用户登录。
+- Admin 登录。
+- 带有来源状态的登录跳转。
+
+### 验收标准
+
+- 登录表单完成前端和后端错误反馈。
+- 认证资料和 Access Token 正确保存。
+- 普通用户、Admin 和来源页跳转符合规则。
+
+---
+
+## Step 47 · 基础路由与受保护路由
+
+**产出：** 将临时路由升级为可扩展的 SPA 路由结构，并保护需要登录的页面。
+
+### 主要内容
+
+#### 本步骤建立的路由
+
+```text
+/
+└── 首页占位内容
+
+/login
+└── 登录页
+
+/cars/new
+└── 受保护的车辆创建占位页面
+```
+
+- 将路由配置集中到 `router.tsx`。
+- 从临时 `BrowserRouter` 切换到 `createBrowserRouter`。
+- 使用 `RouterProvider`。
+- 建立 `ProtectedRoute`。
+- 未登录用户访问受保护路由时跳转 `/login`。
+- 使用 `Outlet` 渲染受保护的子路由。
+- 建立可以在后续页面中逐步扩展的路由结构。
+
+后续路由随着对应页面逐步加入：
+
+- Step 48：注册、邮箱验证和密码页面
+- Step 49：正式首页和 Layout
+- Step 51：车辆详情
+- Step 53：车辆编辑
+- Step 54：个人中心子路由
+- Step 55：Admin、404 和通配路由
+
+### 知识点
+
+- 客户端路由
+- History API
+- `createBrowserRouter`
+- `RouterProvider`
+- `Outlet`
+- `Navigate`
+- 父子路由
+- 路由权限边界
+
+---
+
+### 测试与验证
+
+- 公开路由可以直接访问。
+- 未登录访问受保护路由时跳转登录页。
+- 登录用户可以进入受保护路由。
+- 嵌套路由通过 Outlet 正确渲染。
+- 前端构建通过。
+
+### 验收标准
+
+- 路由集中配置并支持嵌套扩展。
+- 未登录用户无法访问受保护页面。
+- 登录用户可以正常进入受保护页面。
+
+---
+
+## Step 48 · 注册与密码相关页面
+
+**产出：** 完成全部公开认证页面。
+
+### 主要内容
+
+#### 页面范围
+
+```text
+RegisterPage
+VerifyEmailPage
+ForgotPasswordPage
+ResetPasswordPage
+```
+
+同时加入：
+
+```text
+/register
+/verify-email
+/forgot-password
+/reset-password
+```
+
+#### 注册页
+
+- 验证用户名长度。
+- 验证邮箱格式。
+- 验证密码强度。
+- 调用注册 API。
+- 注册成功后提示用户检查邮箱。
+
+#### 邮箱验证页
+
+- 使用 `useSearchParams` 读取 Token。
+- 页面加载时自动调用验证接口。
+- 使用 `useRef` 防止开发模式下重复触发验证请求。
+- 显示验证中、成功和失败状态。
+- 验证成功后显示登录入口。
+
+#### 忘记密码页
+
+- 提交邮箱。
+- 无论邮箱是否存在，都显示统一成功提示。
+- 避免暴露账户存在状态。
+
+#### 重置密码页
+
+- 从 URL 读取重置 Token。
+- 验证新密码强度。
+- 使用 Zod `refine` 验证两次密码一致。
+- 密码重置成功后自动跳转登录页。
+- 无效或过期 Token 显示后端错误信息。
+
+### 知识点
+
+- `useSearchParams`
+- `useEffect`
+- `useRef`
+- 页面状态机
+- Zod 链式验证
+- Zod `refine`
+- 异步状态反馈
+- 安全响应设计
+
+### 测试与验证
+
+手动验证：
+
+```text
+注册
+→ 收取验证邮件
+→ 验证账户
+→ 登录
+→ 忘记密码
+→ 重置密码
+→ 使用新密码登录
+```
+
+### 验收标准
+
+- 注册、邮箱验证、忘记密码和重置密码形成完整闭环。
+- 安全响应不会暴露账户是否存在。
+- 页面状态与 Token 错误反馈清晰。
+
+---
+
+---
+
+# 第四阶段：车辆浏览体验（Step 49–52）
+
+> **目标：完成车辆列表、URL 搜索过滤、车辆详情、收藏、下单和桌面导航。**
+>
+
+---
+
+## Step 49 · 首页车辆列表
+
+**产出：** 展示后端返回的 Published 车辆，并引入前端服务端状态管理。
+
+### 主要内容
+
+- 安装 TanStack Query。
+- 建立全局 `QueryClient`。
+- 使用 `QueryClientProvider` 包裹路由。
+- 建立基础 `Layout` 和导航栏。
+- 将 `/` 替换为正式首页。
+- 建立 `CarCard`。
+- 建立 `CarCardSkeleton`。
+- 使用 `useQuery` 请求车辆列表。
+- 处理加载、错误、空数据和成功状态。
+- 实现上一页和下一页分页。
+- 显示查询结果总数。
+
+#### Query 设计
+
+```ts
+queryKey: ["cars", { page, pageSize }]
+```
+
+### 知识点
+
+- 服务端状态与客户端状态的区别
+- `useQuery`
+- `queryKey`
+- `queryFn`
+- 缓存
+- `staleTime`
+- Skeleton
+- 组件 Props
+
+### 测试与验证
+
+- 首次加载骨架屏。
+- 数据加载成功。
+- 空列表状态。
+- API 错误状态。
+- 前后分页。
+- 缓存复用。
+
+### 验收标准
+
+- 首页只展示 Published 车辆。
+- 加载、错误、空列表和成功状态均有对应界面。
+- 分页和 Query 缓存正常工作。
+
+---
+
+## Step 50 · URL 搜索与过滤
+
+**产出：** 让搜索条件、分页和 URL 保持同步，使搜索结果可以通过链接复现。
+
+### 主要内容
+
+#### 支持的条件
+
+```text
+brand
+minPrice
+maxPrice
+page
+```
+
+- 建立 `CarFilters`。
+- 使用 `useSearchParams` 读写过滤条件。
+- 修改过滤条件时重置页码。
+- 建立泛型 `useDebounce` Hook。
+- 对品牌和价格输入进行防抖。
+- 将防抖后的值加入 Query key。
+- 将 URL 字符串转换为 API 所需数字。
+- 实现清除全部过滤条件。
+- 将分页状态统一保存到 URL。
+
+### 知识点
+
+- URL 作为页面状态
+- 查询参数
+- `useSearchParams`
+- `useEffect` 清理函数
+- 防抖
+- 自定义 Hook
+- Query key 驱动请求
+
+### 测试与验证
+
+- 输入停止后才发送查询。
+- 刷新页面后保留过滤条件。
+- 分享 URL 后复现同一结果。
+- 过滤与分页组合工作。
+- 清除过滤条件。
+
+### 验收标准
+
+- 过滤条件、分页和 URL 保持同步。
+- 防抖后才发送查询，刷新或分享 URL 可复现结果。
+- 清除过滤条件后恢复默认列表。
+
+---
+
+## Step 51 · 车辆详情、收藏与下单
+
+**产出：** 根据车辆和当前用户身份显示完整详情及可用操作。
+
+### 主要内容
+
+#### 用户状态
+
+```text
+未登录
+└── 显示登录购买入口
+
+普通买家
+├── 收藏车辆
+└── 创建订单
+
+车辆所有者
+└── 显示车辆管理入口
+
+Admin
+└── 不显示普通买家操作
+```
+
+- 加入 `/cars/:id` 路由。
+- 使用 `useParams` 读取车辆 ID。
+- 使用 `useQuery` 加载车辆详情。
+- 展示主图、车辆资料、价格、状态和卖家。
+- 安装 Sonner，并在根节点配置 Toaster。
+- 使用 `useMutation` 添加收藏。
+- 收藏成功后使 `favorites` 缓存失效。
+- 使用 Dialog 确认购买。
+- 下单成功后刷新车辆详情和公开列表。
+- 下单成功后跳转购买记录。
+- 车辆详情登录入口通过 location state 保存来源页。
+- 根据用户身份进行条件渲染。
+
+### 知识点
+
+- 动态路由参数
+- 条件查询
+- `useMutation`
+- `invalidateQueries`
+- Toast
+- 受控 Dialog
+- 权限驱动 UI
+
+### 测试与验证
+
+- 未登录状态。
+- 车主状态。
+- 普通买家状态。
+- Admin 状态。
+- 收藏成功与失败。
+- 下单成功与失败。
+- 下单后车辆状态刷新。
+- 登录后返回车辆详情。
+
+### 验收标准
+
+- 详情页根据用户身份显示正确操作。
+- 收藏成功后刷新收藏缓存。
+- 下单成功后车辆详情、公开列表和购买记录保持一致。
+
+---
+
+## Step 52 · 完善导航布局
+
+**产出：** 建立完整的桌面端应用导航。
+
+### 主要内容
+
+- 使用 `NavLink` 显示当前页面状态。
+- 为首页导航使用精确匹配。
+- 安装 Dropdown Menu。
+- 根据登录状态显示不同操作。
+- 普通用户显示：
+  - Sell a Car
+  - My Profile
+  - My Listings
+  - My Purchases
+- Admin 显示管理入口。
+- 未登录用户显示登录和注册入口。
+- 登出时清除认证状态并跳转登录页。
+
+### 知识点
+
+- `NavLink`
+- `isActive`
+- `end`
+- Dropdown Menu
+- 基于角色的导航
+- 共享 Layout
+
+### 测试与验证
+
+- 当前导航高亮。
+- 登录与未登录菜单。
+- 普通用户和 Admin 菜单。
+- 登出流程。
+
+### 验收标准
+
+- 导航高亮和 Dropdown Menu 正常工作。
+- 未登录用户、普通用户和 Admin 看到正确入口。
+- 登出后认证状态被清除并返回登录页。
+
+---
+
+---
+
+# 第五阶段：卖家功能与个人中心（Step 53–54）
+
+> **目标：完成车辆发布、编辑、图片管理以及用户业务管理页面。**
+>
+
+---
+
+## Step 53 · 发布、编辑与图片管理
+
+**产出：** 完成车辆从创建草稿到提交审核的卖家流程。
+
+### 主要内容
+
+#### 流程
+
+```text
+填写车辆资料
+→ 创建 Draft
+→ 跳转编辑页
+→ 上传车辆图片
+→ 修改车辆资料
+→ 提交 Admin 审核
+```
+
+- 建立共享 `CarForm`。
+- 使用 React Hook Form 和 Zod。
+- 使用 `valueAsNumber` 处理数字输入。
+- 建立 `CreateCarPage`。
+- 创建成功后跳转编辑页。
+- 建立 `/cars/:id/edit` 路由。
+- 建立 `EditCarPage`。
+- 加载车辆详情并填充默认值。
+- 建立 `ImageUploader`。
+- 使用文件 input 选择图片。
+- 使用 `URL.createObjectURL` 预览。
+- 使用 `URL.revokeObjectURL` 释放预览资源。
+- 上传图片。
+- 删除已有图片。
+- 只允许编辑 Draft 车辆。
+- 提交车辆进入 PendingReview 状态。
+
+### 知识点
+
+- 表单组件复用
+- 默认值
+- 数字输入转换
+- 文件 input
+- `useRef`
+- Object URL
+- 文件上传 mutation
+- 状态驱动业务权限
+
+### 测试与验证
+
+- 创建车辆草稿。
+- 编辑资料。
+- 上传图片。
+- 删除图片。
+- 非 Draft 状态保护。
+- 提交审核。
+
+### 验收标准
+
+- 车辆可以创建为 Draft、编辑、上传和删除图片并提交审核。
+- 只有车主可以管理车辆，且编辑和图片操作受 Draft 状态限制。
+- 对象 URL 在预览结束后正确释放。
+
+---
+
+## Step 54 · 个人中心
+
+**产出：** 建立统一的用户业务管理页面。
+
+### 主要内容
+
+#### 路由结构
+
+```text
+/profile
+├── listings
+├── favorites
+├── purchases
+└── sales
+```
+
+实际路由：
+
+```text
+/profile
+/profile/listings
+/profile/favorites
+/profile/purchases
+/profile/sales
+```
+
+#### My Listings
+
+- 显示用户发布的车辆。
+- 显示车辆状态。
+- 所有列表项可以查看车辆。
+- 只有 Draft 车辆显示：
+  - Edit
+  - Submit
+  - Delete
+
+#### My Favorites
+
+- 显示收藏车辆。
+- 支持取消收藏。
+- 操作成功后刷新 `favorites` 缓存。
+
+#### My Purchases
+
+- 显示买家订单。
+- 显示订单状态和锁定价格。
+- Pending 订单允许取消。
+
+#### My Sales
+
+- 显示卖家收到的订单。
+- Pending 订单允许确认交易完成。
+
+- 使用嵌套路由组织标签页。
+- 使用 `index: true` 设置默认页面。
+- 使用 `Outlet` 渲染当前标签。
+- 使用 `NavLink` 显示当前标签。
+- 为每类数据建立独立 Query key。
+- 操作完成后精准使相关缓存失效。
+- 使用 Badge 显示业务状态。
+- 使用 Toast 显示操作结果。
+
+### 知识点
+
+- Azure 资源与托管服务
+- Multi-stage Docker Build
+- GitHub Container Registry
+- Azure Container Apps
+- Azure Static Web Apps
+- GitHub Actions
+- OIDC Federated Credential
+- SPA Navigation Fallback
+- 生产环境配置与 Secret 管理
+
+### 测试与验证
+
+- 标签页切换。
+- 页面刷新后保持当前子路由。
+- Draft 车辆管理。
+- 非 Draft 车辆不显示编辑、提交或删除操作。
+- 取消收藏。
+- 取消购买订单。
+- 卖家确认交易完成。
+
+### 验收标准
+
+- 个人中心嵌套路由和默认页正确。
+- Listings、Favorites、Purchases 和 Sales 数据彼此独立。
+- 各项业务操作完成后精准刷新相关缓存。
+
+---
+
+---
+
+# 第六阶段：Admin 与通用错误体验（Step 55）
+
+> **目标：完成车辆审核后台、角色路由、404 页面和全局查询错误反馈。**
+>
+
+---
+
+## Step 55 · Admin 面板、404 与全局查询错误
+
+**产出：** 完成车辆审核后台，并建立基础的全局错误反馈。
+
+### 主要内容
+
+#### Admin 权限
+
+建立 `AdminRoute`：
+
+```text
+未登录
+→ /login
+
+已登录但不是 Admin
+→ /404
+
+Admin
+→ 渲染管理页面
+```
+
+#### Admin 路由
+
+```text
+/admin
+└── /admin/pending
+```
+
+- 建立 `AdminPage` 嵌套路由布局。
+- 安装 Table 组件。
+- 建立 `AdminPendingPage`。
+- 查询 PendingReview 车辆。
+- 对单辆车辆执行：
+  - Approve
+  - Reject
+  - Delete
+- 任一审核 mutation 处于 Pending 时，统一禁用当前表格中的审核操作按钮。
+- 操作成功后刷新 Admin 列表。
+- Approve 后同时刷新公开车辆列表。
+- 建立 `NotFoundPage`。
+- 配置 `/404`。
+- 配置 `*` 通配路由。
+- 在 `QueryClient` 中配置全局 `QueryCache`。
+- Query 请求失败时统一显示 Toast。
+
+### 知识点
+
+- 角色路由
+- 嵌套 Admin 页面
+- 数据表格
+- Mutation 状态
+- 防止并发提交
+- 精准缓存失效
+- 全局 Query 错误处理
+- 404 路由
+
+### 测试与验证
+
+- 未登录访问 Admin。
+- 普通用户访问 Admin。
+- Admin 查看待审核车辆。
+- Approve、Reject 和 Delete。
+- 操作期间按钮禁用。
+- 未知 URL 显示 404。
+- Query 请求失败显示全局 Toast。
+
+### 验收标准
+
+- 只有 Admin 可以进入审核页面。
+- Approve、Reject 和 Delete 均按单辆车辆执行并防止并发重复提交。
+- 404 和全局 Query 错误 Toast 正常工作。
+
+---
+
+---
+
+# 第七阶段：Azure 生产部署（Step 56）
+
+> **目标：使用 Azure、Docker 和 GitHub Actions 建立可公开访问的生产环境。**
+>
+
+---
+
+## Step 56 · Azure 云部署与 CI/CD
+
+**产出：** 将 UUcars 部署为可公开访问的全栈应用，并通过 GitHub Actions 自动发布。
+
+### 主要内容
+
+#### 生产架构
+
+```text
+Browser
+├── Azure Static Web Apps
+│   └── React 前端
+│
+└── Azure Container Apps
+    └── ASP.NET Core API Docker 容器
+        ├── Azure SQL Database
+        ├── Cloudflare R2
+        └── Resend
+```
+
+#### Azure 资源
+
+- Resource Group
+- Azure SQL Database
+- Azure Container Apps
+- Azure Static Web Apps
+- Azure App Registration
+- OIDC Federated Credential
+
+#### 后端部署
+
+- 使用根目录 Dockerfile 构建 API 镜像。
+- 使用 .NET SDK 镜像完成 restore 和 publish。
+- 使用 ASP.NET Core Runtime 镜像运行 API。
+- 容器监听 8080 端口。
+- 将镜像推送到 GitHub Container Registry。
+- Azure Container Apps 从 GHCR 部署镜像。
+- 通过环境变量配置：
+  - Azure SQL connection string
+  - JWT settings
+  - CORS origins
+  - Resend settings
+  - Cloudflare R2 settings
+- 设置生产环境 API 地址。
+
+#### 前端部署
+
+- 建立 `.env.production`。
+- 使用 `VITE_API_BASE_URL` 指向 Container Apps API。
+- 建立 `staticwebapp.config.json`。
+- 配置 SPA navigation fallback。
+- 排除静态资源路径。
+- 使用 Azure Static Web Apps 构建并发布 `uucars-web/dist`。
+- 将生产前端地址加入后端 CORS 配置。
+- 将生产前端地址加入邮件 `BaseUrl` 配置。
+
+#### Azure OIDC
+
+- 创建 Azure App Registration。
+- 建立 GitHub Actions Federated Credential。
+- 使用仓库、分支和 Azure 身份建立信任关系。
+- 为应用分配 `Container Apps Contributor` 权限。
+- GitHub Actions 使用 OIDC 登录 Azure。
+- 不创建或保存 Azure Client Secret。
+
+#### GitHub Actions
+
+后端工作流：
+
+```text
+push
+→ restore
+→ build
+→ unit tests
+→ build Docker image
+→ push GHCR
+→ Azure OIDC login
+→ deploy Container Apps
+```
+
+其中：
+
+- 单元测试 Job 在分支 push 时运行。
+- 单元测试排除需要 Docker 的 Integration tests。
+- Docker 构建和 Azure 部署仅在 `main` 分支执行。
+
+前端工作流：
+
+```text
+push to main
+→ build React application
+→ deploy Azure Static Web Apps
+```
+
+#### GitHub Secrets
+
+```text
+AZURE_CLIENT_ID
+AZURE_TENANT_ID
+AZURE_SUBSCRIPTION_ID
+AZURE_STATIC_WEB_APPS_API_TOKEN
+```
+
+Azure 和 Container Apps 环境保存生产服务配置，不将敏感值写入代码或 Git。
+
+### 知识点
+
+- 多阶段 Docker 构建与容器运行时配置
+- Azure Container Apps 与 Azure Static Web Apps 的职责边界
+- GitHub Actions 中构建、测试、镜像发布和部署的执行顺序
+- GitHub OIDC 联合身份认证与最小权限
+- 生产环境变量、Repository Secrets 与平台配置的边界
+- SPA 路由回退、CORS 与前后端生产地址配置
+
+### 测试与验证
+
+- 后端构建通过。
+- 启用的后端单元测试通过。
+- Docker 可用时运行 SQL Server Testcontainers 集成测试。
+- 前端 TypeScript 和 Vite 构建通过。
+- GitHub Actions 后端工作流通过。
+- Static Web Apps 部署通过。
+- 生产前端可以访问 Container Apps API。
+- CORS 正确。
+- Azure SQL 读写正常。
+- 邮箱验证链接指向生产前端。
+- R2 图片上传和访问正常。
+- 注册、登录、发布、审核、购买和完成订单的生产流程正常。
+
+### 验收标准
+
+- 后端通过 Container Apps、前端通过 Static Web Apps 对外提供服务。
+- GitHub Actions 使用 OIDC 完成自动构建和部署。
+- Azure SQL、R2、Resend、CORS 和完整生产业务流程正常。
+- 生产敏感配置不进入代码或 Git。
+
+---
+
+---
+
+# 第八阶段：V2.1 界面设计与车辆封面支持（Step 56b）
+
+> **目标：在保持核心业务流程不变的基础上，统一视觉语言、响应式布局和车辆展示体验。**
+>
+
+---
+
+## Step 56b · UI 重构与设计系统
+
+**产出：** 在保持 V2.0 核心业务流程的基础上，建立统一的视觉语言、响应式布局和更完整的车辆展示体验。
+
+### 主要内容
+
+#### 后端列表数据支持
+
+为车辆列表响应增加：
+
+```text
+CoverImageUrl
+```
+
+主要工作：
+
+- 车辆列表查询加载 Images。
+- 按 `SortOrder` 选择第一张车辆图片。
+- 将其映射为 `CoverImageUrl`。
+- 更新前端 `Car` 类型。
+- 让车辆卡片直接显示封面图片。
+
+#### 字体系统
+
+通过 Google Fonts 引入：
+
+- DM Sans
+- DM Serif Display
+
+字体用途：
+
+- DM Sans 用于正文、导航和界面文字。
+- DM Serif Display 用于主标题和展示性标题。
+- 使用 system-ui 和 Georgia 作为回退字体。
+
+#### 设计系统
+
+在全局 CSS 中建立：
+
+- Charcoal 主色
+- Crimson 强调色
+- 背景和表面颜色
+- 文字层级
+- 语义色
+- 圆角
+- 阴影
+- 字体层级
+- 动画时长
+- 卡片悬停效果
+- Shimmer 骨架屏动画
+
+重新定制：
+
+```text
+Button
+Input
+Card
+Badge
+Table
+```
+
+#### 导航与布局
+
+- 重构桌面导航。
+- 加入移动端菜单。
+- 加入用户头像式入口。
+- 加入导航底线动画。
+- 普通用户菜单加入 Saved Cars。
+- 建立 Footer。
+- 使用最小高度和 Flex 布局让 Footer 保持在页面底部。
+- 检查移动、平板和桌面布局。
+
+#### 首页体验
+
+建立：
+
+- `HeroBanner`
+- 品牌快捷入口
+- 搜索入口
+- `LatestCarousel`
+- 车辆进入动画
+- 数字分页
+- `SellerBanner`
+- 通用空状态组件
+
+#### 车辆展示组件
+
+建立或重构：
+
+```text
+CarCard
+CarCardHorizontal
+CarCardSkeleton
+ListingCard
+ImageGallery
+EmptyState
+LatestCarousel
+HeroBanner
+SellerBanner
+```
+
+#### 页面调整
+
+统一完善：
+
+- Home
+- Login
+- Register
+- Car Detail
+- Profile
+- My Listings
+- My Favorites
+- My Purchases
+- My Sales
+- Admin
+
+#### 静态资源
+
+- 加入首页 Hero 背景图。
+- 加入卖家区域背景图。
+- 建立新的 favicon。
+- 使用 Embla Carousel 完成车辆轮播。
+
+### 知识点
+
+- Design Token
+- 响应式布局
+- 组件视觉一致性
+- 图片封面映射
+- Carousel
+- 渐进式 UI 重构
+
+### 测试与验证
+
+- 车辆列表正确显示封面图片。
+- 首页轮播正常。
+- 无图片车辆显示占位状态。
+- 导航在不同屏幕尺寸下正常。
+- 卡片和 Skeleton 结构一致。
+- 登录、详情、个人中心和 Admin 页面风格统一。
+- 前端构建通过。
+- 后端构建通过。
+- 核心 V2.0 业务流程保持正常。
+
+### 验收标准
+
+- 车辆列表正确显示 CoverImageUrl。
+- 设计系统、导航、首页、车辆组件和主要业务页面风格统一。
+- 移动、平板和桌面布局正常。
+- 前后端构建通过且 V2.0 核心流程不受影响。
+
+---
+
+---
+
+# 完整路由总览
+
+```text
+/login
+/register
+/verify-email
+/forgot-password
+/reset-password
+
+/
+/cars/:id
+
+/cars/new
+/cars/:id/edit
+
+/profile
+/profile/listings
+/profile/favorites
+/profile/purchases
+/profile/sales
+
+/admin
+/admin/pending
+
+/404
+*
+```
+
+---
+
+# 完整步骤总览
+
+```text
+第一阶段  V2 后端升级
+Step 36–41
+6 步
+
+第二阶段  前端工程基础
+Step 42–44
+3 步
+
+第三阶段  认证状态、路由与公开账户页面
+Step 45–48
+4 步
+
+第四阶段  车辆浏览体验
+Step 49–52
+4 步
+
+第五阶段  卖家与个人中心
+Step 53–54
+2 步
+
+第六阶段  Admin 与错误体验
+Step 55
+1 步
+
+第七阶段  Azure 生产部署
+Step 56
+1 步
+
+────────────────────────────
+
+V2.0 共 21 步
+Step 36–56
+
+第八阶段  V2.1 界面设计与车辆封面支持
+Step 56b
+1 步
+```

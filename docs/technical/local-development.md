@@ -9,75 +9,48 @@
 - Cloudflare R2 credentials for real image operations
 - A Resend API key for real email delivery
 
-## Local infrastructure
+## Local configuration
 
-Create a root `.env` file with local-only values:
+Create an ignored root `.env` file:
 
 ```dotenv
 DB_PASSWORD=choose-a-strong-local-password
 JWT_SECRET=choose-a-long-random-secret
+GOOGLE_CLIENT_ID=your-google-client-id
+RESEND_API_KEY=your-resend-api-key
+RESEND_FROM_EMAIL=onboarding@resend.dev
+R2_ACCESS_KEY_ID=your-r2-access-key-id
+R2_SECRET_ACCESS_KEY=your-r2-secret-access-key
+R2_ACCOUNT_ID=your-r2-account-id
+R2_PUBLIC_URL=https://your-public-r2-domain
 ```
 
-Start SQL Server and Redis:
+`DB_PASSWORD` and `JWT_SECRET` are required. The Google, Resend and R2 values
+are required only when exercising their corresponding features.
+
+## Run the API and infrastructure
+
+Start the API, SQL Server and Redis together:
 
 ```bash
-docker compose up -d sqlserver redis
+docker compose up --build
 ```
 
-## API configuration
+The API is exposed on `http://localhost:8080`. SQL Server and Redis remain
+inside the Compose network and are not published on host ports. The API applies
+pending EF Core Migrations during startup.
 
-Use .NET User Secrets for sensitive local API configuration:
+## Run the frontend
 
-```bash
-dotnet user-secrets --project UUcars.API set \
-  "ConnectionStrings:DefaultConnection" \
-  "Server=localhost,1433;Database=UUcarsDB;User Id=sa;Password=YOUR_DB_PASSWORD;TrustServerCertificate=True"
-
-dotnet user-secrets --project UUcars.API set \
-  "ConnectionStrings:Redis" "localhost:6379"
-
-dotnet user-secrets --project UUcars.API set \
-  "JwtSettings:Secret" "YOUR_LONG_RANDOM_JWT_SECRET"
-
-dotnet user-secrets --project UUcars.API set \
-  "GoogleAuth:ClientId" "YOUR_GOOGLE_CLIENT_ID"
-
-dotnet user-secrets --project UUcars.API set \
-  "EmailSettings:ApiKey" "YOUR_RESEND_API_KEY"
-
-dotnet user-secrets --project UUcars.API set \
-  "StorageSettings:AccessKeyId" "YOUR_R2_ACCESS_KEY_ID"
-
-dotnet user-secrets --project UUcars.API set \
-  "StorageSettings:SecretAccessKey" "YOUR_R2_SECRET_ACCESS_KEY"
-
-dotnet user-secrets --project UUcars.API set \
-  "StorageSettings:AccountId" "YOUR_R2_ACCOUNT_ID"
-
-dotnet user-secrets --project UUcars.API set \
-  "StorageSettings:PublicUrl" "YOUR_R2_PUBLIC_URL"
-```
-
-Non-secret defaults are defined in `UUcars.API/appsettings.json`.
-
-## Run the applications
-
-Start the API:
-
-```bash
-dotnet restore
-dotnet run --project UUcars.API
-```
-
-The Development API listens on `http://localhost:5065` and applies pending EF
-Core Migrations during startup.
-
-Create `uucars-web/.env.local`:
+Create an ignored `uucars-web/.env.local` file:
 
 ```dotenv
-VITE_API_BASE_URL=http://localhost:5065
-VITE_GOOGLE_CLIENT_ID=YOUR_GOOGLE_CLIENT_ID
+VITE_API_BASE_URL=http://localhost:8080
+VITE_GOOGLE_CLIENT_ID=your-google-client-id
 ```
+
+The frontend Google client ID must match `GOOGLE_CLIENT_ID` in the root `.env`
+when Google sign-in is being tested.
 
 Start the frontend:
 
@@ -88,14 +61,3 @@ npm run dev
 ```
 
 The frontend listens on `http://localhost:5173`.
-
-## Dockerised API option
-
-To start SQL Server, Redis and the API together:
-
-```bash
-docker compose up --build
-```
-
-The containerised API is exposed on `http://localhost:8080`. Real email and R2
-operations still require their corresponding configuration.

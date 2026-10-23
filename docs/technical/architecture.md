@@ -118,6 +118,7 @@ The API uses a common `ApiResponse<T>` envelope.
 | Reviews | `POST /reviews`, `GET /reviews/seller/{sellerId}` |
 | Notifications | `GET /notifications`, `PUT /notifications/{id}/read`, `PUT /notifications/read-all` |
 | Admin | `GET /admin/stats`, `GET /admin/cars/pending`, moderation and audit-log routes |
+| Hangfire Dashboard | `/admin/hangfire/*` (Admin only) |
 | SignalR | `/hubs/notification` |
 
 Interactive Scalar documentation is available at
