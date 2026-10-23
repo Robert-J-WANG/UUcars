@@ -442,7 +442,7 @@ public async Task<(List<Car> Cars, int TotalCount)> GetPagedAsync(
 }
 ```
 
-完整更新后的 `GetPagedAsync`：
+完整更新后的 `GetBySellerAsync`：
 
 ```ts
 // UUcars.API/Repositories/EfCarRepository.cs
@@ -2242,7 +2242,7 @@ public static class RateLimitingExtensions
 
 
 
-#### 3.2 注册限流配置
+#### 3.3 注册限流配置
 
 打开 `UUcars.API/Program.cs`，调用扩展方法注册：
 
@@ -2250,7 +2250,7 @@ public static class RateLimitingExtensions
 builder.Services.AddRateLimiting();
 ```
 
-#### 3.3 在中间件管道里启用限流
+#### 3.4 在中间件管道里启用限流
 
 打开 `Program.cs` 中间件管道部分，加入 `UseRateLimiter()`：
 
@@ -2301,7 +2301,7 @@ builder.Services.AddRateLimiting();
 
 > **中间件顺序的本质：** ASP.NET Core 的中间件是一个管道，请求从上往下穿过每一层，响应从下往上返回。越靠前的中间件越早执行，越能在请求消耗任何资源之前就拦截掉它。限流放最前面，被拒绝的请求连认证处理都不需要跑。
 
-#### 3.4 在 Controller 上应用限流策略
+#### 3.5 在 Controller 上应用限流策略
 
 限流策略的应用，在controller上， 通过 ` [EnableRateLimiting("限流策略名")]`的形式。以注册接口限流为例：
 
@@ -2323,9 +2323,9 @@ public class AuthController : ControllerBase
 }
 ```
 
-#### 3.5 哪些些接口需要限流？
+#### 3.6 哪些接口需要限流？
 
-处理上面实例中的注册接口，我们项目的其他接口哪些还需要进行限流？使用什么算法？？
+除了上面示例中的注册接口，项目的其他接口哪些还需要限流？应使用什么算法？
 
 对于auth认证类的接口:
 
@@ -2338,7 +2338,7 @@ public class AuthController : ControllerBase
 - 读操作（`GET`）, 需要登录认证后操作的，不需要限流，而对于不需要登录的公共接口，需要限流，防止刷单，我们设置一个browse策略，统一配置公共的读操作的接口
 - 写操作（`POST/PUT/DELETE`）, 有些需要限流，比如 `POST /cars`, 限流可以防止批量创建车辆草稿刷库； 而有些不需要限流，比如 `POST /cars/{id}/submit` , 一辆车只能提交一次，状态机已限制， 因此无需限流。 对于写操作的限流，我们设置一个write策略，统一配置这些写操作的接口限流。
 
-完整的限流策策略算法和接口如下：
+完整的限流策略、算法和接口如下：
 
 ```
 策略名              算法      规则                    应用接口
@@ -2361,7 +2361,7 @@ write               令牌桶    每用户 30次/分           POST /cars
                                                      POST /reviews
 ```
 
-#### 3.6 集中管理策略名字符串
+#### 3.7 集中管理策略名字符串
 
 我们对策略名字符串集中管理，和 `CacheKeys` 的思路完全一样。防止在 配置限流策略和在Controller 里使用时，手写字符串拼错：
 
@@ -2385,7 +2385,7 @@ public static class RateLimitPolicies
 }
 ```
 
-#### 3.7 完整的限流策略配置
+#### 3.8 完整的限流策略配置
 
 补充上面扩展方法里的完整限流策略，并使用集中管理策略名字符串
 
@@ -2560,7 +2560,7 @@ public static class RateLimitingExtensions
 }
 ```
 
-#### 3.8 限流策略完整的应用
+#### 3.9 限流策略完整的应用
 
 给所有需要添加限流的接口使用对应的限流策略
 
@@ -4285,7 +4285,7 @@ public async Task Login_WithValidCredentials_ShouldReturnToken()
 
 ##### 修改四：AddServices 扩展方法
 
-测试是，我们不需要注册Hangfire框架以及相关的中间件，因此直接过滤掉
+测试时，我们不需要注册 Hangfire 框架以及相关的中间件，因此直接跳过。
 
 ```c#
 public static class HangfireExtensions
@@ -4334,7 +4334,7 @@ public static class HangfireExtensions
 
 Hangfire除了能实现异步队列（BackgroundJob.Enqueue）的功能外，也能实现定时任务（RecurringJob.AddOrUpdate）。
 
-我们使用Hangfire使用定期清除token的功能。
+我们使用 Hangfire 定期清理 Token。
 
 #### 6.1. 新建 TokenCleanupService
 
@@ -4788,7 +4788,7 @@ Dashboard 里能看到：
 - **Failed**：失败的任务（可以手动重试）
 - **Recurring**：定时任务列表
 
-#### 10.4 测试邮件异步化
+#### 9.4 测试邮件异步化
 
 用 Scalar（`http://localhost:5065/scalar`）或 curl 注册一个新用户：
 
@@ -4816,7 +4816,7 @@ curl -X POST http://localhost:5065/auth/register \
 
 3. 刷新 Hangfire Dashboard → **Enqueued** 或 **Succeeded** 里能看到 `SendEmailConfirmationAsync` 任务
 
-#### 10.5 测试 TokenCleanupService 定时任务
+#### 9.5 测试 TokenCleanupService 定时任务
 
 不需要等到凌晨验证。可以在 Hangfire Dashboard 里手动触发：
 
@@ -4827,7 +4827,7 @@ curl -X POST http://localhost:5065/auth/register \
 
 
 
-### 11. 编译和测试
+### 10. 编译和测试
 
 ```bash
 dotnet build
@@ -4856,7 +4856,7 @@ Test summary: total: XX, failed: 0, succeeded: XX
 
 
 
-### 12. Git 提交
+### 11. Git 提交
 
 ```bash
 # 确认所有修改
@@ -5495,7 +5495,7 @@ public class RefreshTokenService
 
 ### 6. 更新 AuthController
 
-我们现在需要把RefreshToken写入Cookie里，而Cookie 是 HTTP 协议层的概念，属于 Controller 的职责,。 因此，我们需要在controll层处理：
+我们现在需要把 RefreshToken 写入 Cookie，而 Cookie 是 HTTP 协议层的概念，属于 Controller 的职责。因此，我们需要在 Controller 层处理：
 
 ```
 Controller 层：处理 HTTP 请求和响应（Headers、Cookies、状态码）
@@ -5580,7 +5580,7 @@ public class AuthController : ControllerBase
 }
 ```
 
-从而实现 acess token和refresh token 区别传递的形式：
+从而实现 Access Token 和 Refresh Token 分别传递的形式：
 
 ```
 Response Body（Json）  ← Ok(ApiResponse<LoginResponse>) 这一行
@@ -5673,7 +5673,7 @@ public async Task<IActionResult> Refresh(CancellationToken cancellationToken)
 }
 ```
 
-#### 6.3 新增 Logout 接口
+#### 6.4 新增 Logout 接口
 
 ```csharp
 /// <summary>
@@ -5868,12 +5868,12 @@ apiClient.interceptors.response.use(
 
 问题：
 
-- 每次请求，都是从从 localStorage 直接读toke。accessToken 短期有效（60分钟），持久化意义不大，且存在 localStorage 里有 XSS 风险（JS 可以读取）
+- 每次请求都从 localStorage 直接读取 Token。Access Token 短期有效（60 分钟），持久化意义不大，且存在 localStorage 中有 XSS 风险（JavaScript 可以读取）。
 - 响应拦截器里，收到 401 就立即跳登录页，没有尝试用 RefreshToken 刷新。
 
 更新思路：
 
-- accessToken不再持久化到localStorage， 而是每次请确实，直接从 authStore 读取 （authStore 是唯一数据源，拦截器刷新后也会更新 authStore）
+- Access Token 不再持久化到 localStorage，而是每次请求时直接从 authStore 读取（authStore 是唯一数据源，拦截器刷新后也会更新 authStore）。
 - 响应拦截器里，对401的响应进行refresh token的处理，换取新的access token
 
 #### 10.2 更新 authStore
@@ -5951,22 +5951,22 @@ export const useAuthStore = create<AuthState>()(
 
 ```
 
-> **等一下：`partialize` 把 accessToken 排除在 localStorage 之外？**
->
-> 是的。这是一个权衡：
->
-> - 如果把 accessToken 存 localStorage → 刷新页面后立即可用，但有 XSS 风险
-> - 如果不存 → 刷新页面后 accessToken 是 null，需要先调 /auth/refresh 重新获取
->
-> 当用户刷新页面时：
->
-> 1. authStore 里 accessToken = null（没有存 localStorage）
-> 2. 第一个 API 请求发出 → 收到 401
-> 3. 拦截器触发 → 调 /auth/refresh（Cookie 里的 RefreshToken 还在）
-> 4. 刷新成功 → 拿到新 AccessToken → 重试原请求
-> 5. 用户无感知
->
-> 这个流程在网络好的情况下只有几十毫秒的额外延迟，但安全性大幅提升。 这是现代 SPA 认证的推荐做法。
+##### Access Token 的存储方式
+
+`partialize` 会把 Access Token 排除在 localStorage 之外。这项选择的权衡如下：
+
+- 如果把 Access Token 存入 localStorage，刷新页面后可以立即使用，但存在 XSS 风险。
+- 如果不存入，刷新页面后 Access Token 为 `null`，需要先调用 `/auth/refresh` 重新获取。
+
+当用户刷新页面时：
+
+1. authStore 中的 Access Token 为 `null`，因为它没有存入 localStorage。
+2. 第一个 API 请求发出后收到 401。
+3. 拦截器调用 `/auth/refresh`，浏览器会携带 Cookie 中的 Refresh Token。
+4. 刷新成功后取得新的 Access Token，并重试原请求。
+5. 用户无需重新登录。
+
+这个流程会产生一次额外的刷新请求，但避免了将 Access Token 持久化到 localStorage。
 
 #### 10.3 更新 Axios 拦截器
 
@@ -6338,7 +6338,7 @@ isAuthenticated: () => {
 
 核心思路：在`accessToken`被任何地方检查之前，先用refreshToken（cookie）主动换一次新的accessToken。
 
-比如，刷新页面后，先主动发送一次refreshToken，在渲染页面。
+刷新页面后，先主动发送一次 Refresh Token 请求，再渲染页面。
 
 ##### 修改**`authStore.ts`**
 
@@ -6353,7 +6353,7 @@ isAuthenticated: () => {
     - 不存在 → 直接结束
     - 最终都将`isInitializing`置为`false`
 
-- `isAuthenticated()同时检查`accessToken !== null && user !== null`（语义恢复正确）
+- `isAuthenticated()` 同时检查 `accessToken !== null && user !== null`（语义恢复正确）
 
 ```ts
 interface AuthState {
@@ -6414,7 +6414,7 @@ export const useAuthStore = create<AuthState>()(
 
 ```
 
-注意：调用端口时用原生 `axios` 而不是 `apiClient`
+注意：调用接口时使用原生 `axios` 而不是 `apiClient`
 
 ```typescript
 const response = await axios.post(
@@ -6424,7 +6424,7 @@ const response = await axios.post(
 );
 ```
 
-正`initialize()` 在 `apiClient` 拦截器之外运行，用原生 `axios` 避免循环触发拦截器。和拦截器里的刷新保持一致的写法。
+`initialize()` 在 `apiClient` 拦截器之外运行，使用原生 `axios` 避免循环触发拦截器，并与拦截器中的刷新逻辑保持一致。
 
 ##### **新建`AuthInitializer`组件**
 
@@ -8338,7 +8338,7 @@ public async Task AdminApprove_WhenSuccessful_CreatesAuditLogEntry()
     await Client.PostAsync($"/cars/{carId}/submit", null);
 
     // Admin 登录并审核
-    var adminToken = await LoginAsAdminAsync(); // 假设已有这个辅助方法，登录 Seed 的 Admin 账号
+    var adminToken = await LoginAsAdminAsync(); // 使用现有辅助方法登录 Seed 中的 Admin 账号
     Client.DefaultRequestHeaders.Authorization =
         new AuthenticationHeaderValue("Bearer", adminToken);
 
@@ -8354,7 +8354,7 @@ public async Task AdminApprove_WhenSuccessful_CreatesAuditLogEntry()
 }
 ```
 
-> 这个测试需要根据你实际的 `IntegrationTestBase` 辅助方法名调整（比如是否已有 `LoginAsAdminAsync` 这样的方法）。如果没有，需要先确认 Admin 测试账号的登录方式。
+Admin 测试账号由 `IntegrationTestBase` 中的 `LoginAsAdminAsync` 辅助方法登录。
 
 ```bash
 dotnet test
@@ -9417,7 +9417,7 @@ reorderImages: async (
 
 #### 7.1 新增一个本地的 `localImages` 状态
 
-拖拽这个交互要求"手一松开，图片立刻跳到新位置"，不能等后端接口返回了才更新界面（那样会有明显卡顿）。但在批量上传阶段，`images` prop 是直接拿来渲染的 `images` 是父组件传进来的 prop，组件自己不能直接修改它。
+拖拽这个交互要求"手一松开，图片立刻跳到新位置"，不能等后端接口返回了才更新界面（那样会有明显卡顿）。`images` 是父组件传入的 prop，当前直接用于渲染，子组件不能直接修改它。
 
 ```tsx
 {images.length > 0 && (
@@ -9496,7 +9496,7 @@ export default function ImageUploader({ carId, images }: ImageUploaderProps) {
 
 ##### 1. 拖拽感知容器
 
-`dnd-kit`提供了这个容器 `DndContext`，使用它包括需要拖动的区域，就能完成监听指针事件、维护"现在正在拖谁"这些状态。
+`dnd-kit` 提供了容器 `DndContext`，使用它包裹需要拖动的区域，就能监听指针事件并维护"现在正在拖谁"等状态。
 
 ```tsx
 import { DndContext } from "@dnd-kit/core";
@@ -9565,7 +9565,7 @@ const sensors = useSensors(
 );
 ```
 
-交组合后的传感器组交给 `DndContext`：
+将组合后的传感器组交给 `DndContext`：
 
 ```tsx
 <DndContext sensors={sensors}>
@@ -9593,9 +9593,9 @@ import { PointerSensor, useSensor, useSensors, closestCenter } from "@dnd-kit/co
 
 ##### 4. 拖拽完成后事件触发
 
-用户松开手，这个拖拽动作就算结束了，应该触发拖拽完成事件，进行一下操作，比如后面需要做的排序。
+用户松开手，这个拖拽动作就结束了，此时应触发拖拽完成事件，进行排序等后续操作。
 
-`DndContext`容器组件定义了这个是prop属性 `onDragEnd`， 用来挂载拖拽完成后执行的动作
+`DndContext` 容器组件定义了 `onDragEnd` prop，用来挂载拖拽完成后执行的动作。
 
 ```tsx
 <DndContext
@@ -10452,7 +10452,7 @@ git push -u origin feature/v3-draft-autosave-errorboundary
 
 1. 内容变化时，自动写入 localStorage
 2. 进入页面时，检测有没有未保存的草稿
-3. 提交成功后，清楚草稿
+3. 提交成功后，清除草稿
 
 RHF（react-hook-form） 的 `useForm`hook 提供了`watch(callback)` 方法可以订阅表单值的变化， 并可以把值通过callback回传出来，自行处理：
 
@@ -10588,7 +10588,7 @@ export default function CarForm({
 
 ```
 
-#### 4.2 检查本地操作，回填表格
+#### 4.2 检查本地草稿，回填表单
 
 解构出 `reset`方法， 检查本地草稿并回填表单数据：这个检测逻辑只应该在组件**第一次挂载**时跑一次，不能每次重新渲染都弹一次提示。用一个 `useRef` 做"是否已经检查过"的标记，比用 `useState` 更合适，因为这个标记本身不需要触发重新渲染，只是一个纯粹的"跑没跑过"的flag
 
@@ -10670,7 +10670,7 @@ export default function CarForm({
 
 如果用户已经成功提交了表单，`localStorage` 里那份草稿就变成了"过时数据"。下次用户再打开这个页面（比如又想新建一辆车），不应该被提示"要不要恢复"一份其实早就已经提交过的内容。
 
-提交完成后，需要立刻手动清清除， 新建提交成功的后的函数 `handleFormSubmit`， 包装之前的 事件函数`onSubmit`
+提交完成后，需要立即手动清除草稿。新建提交成功后的处理函数 `handleFormSubmit`，包装之前的事件函数 `onSubmit`。
 
 ```tsx
 const handleFormSubmit = async (values: CarFormValues) => {
@@ -11245,7 +11245,7 @@ useEffect(() => {
 
 现在按钮需要支持"收藏"和"取消收藏"两个方向，`mutationFn` 需要知道"这次点击到底要切换成哪个状态"。
 
-因此，把添加收藏和取消收藏的``mutation`分开，这样能让每个 `mutationFn` 保持"一个函数只做一件事， 比如：
+因此，把添加收藏和取消收藏的 `mutation` 分开，这样能让每个 `mutationFn` 保持"一个函数只做一件事"。例如：
 
 ```tsx
   /* ── 添加收藏 mutation ── */
@@ -11578,7 +11578,7 @@ V2 的搜索过滤有两个遗留问题：
 
 后端 `CarQueryRequest` 已经有 `MinYear`/`MaxYear` 参数，但前端 `CarFilters` 组件里没有对应的输入框，这个能力完全没有暴露给用户。
 
-当前的`CarFilters.tsx`只有有三个过滤器：Brand、Min Price、Max Price。它们都通过 `updateFilter` 函数同步到 URL 参数：
+当前的 `CarFilters.tsx` 只有三个过滤器：Brand、Min Price、Max Price。它们都通过 `updateFilter` 函数同步到 URL 参数：
 
 ```tsx
 const updateFilter = (key: string, value: string) => {
@@ -11753,7 +11753,7 @@ queryFn: () =>
   }),
 ```
 
-更新 isHomepage 判断**
+**更新 isHomepage 判断**
 
 ```tsx
 // 改之前
@@ -12005,7 +12005,7 @@ git push origin --delete feature/v3-search-ux
 
 ### 这一步做什么
 
-V1/V2 只有后端测试（xUnit + Testcontainers）。前端完全没有测试覆盖， 意味着任何一次组件改动、依赖升级、重构，都无法自动验证有没有破坏。现有功能，只能靠手动点一遍界面。
+V1/V2 只有后端测试（xUnit + Testcontainers）。前端完全没有测试覆盖，意味着任何一次组件改动、依赖升级或重构，都无法自动验证是否破坏现有功能，只能靠手动点一遍界面。
 
 这一步要解决的问题：给前端建立一套自动化验证机制。
 
@@ -12337,7 +12337,7 @@ userEvent.click(button)
      暴露的问题（比如某个 onBlur 校验逻辑）
 ```
 
-**因此，我们使用用 `userEvent`，不用 `fireEvent`。**
+**因此，我们使用 `userEvent`，不用 `fireEvent`。**
 
 
 
@@ -12401,8 +12401,6 @@ vi.mock("@/api", () => ({
 >   })),
 > }));
 > ```
->
-> （题外话，跟测试无关：这种不带 selector 的写法会让组件订阅 store 里所有字段的变化，只要 store 里任何一个字段更新，用这种写法的组件 都会重新渲染。以后如果 store 里字段变多，可能需要评估要不要改成 带 selector 的写法来减少不必要的渲染，但这不是现在要处理的问题。）
 
 #### 5.3 写 LoginPage 测试
 
@@ -13103,7 +13101,7 @@ GET http://localhost:5065/auth/test-verification-token?email=该邮箱
 
 ### 9. 编写核心 E2E 测试
 
-写 E2E 测试有个和 RTL 不一样的地方：RTL 测试里组件的 DOM 结构是自己写代码渲染出来，心里有数；但 E2E 测的是已经跑起来的真实页面，很多细节（页面跳转去了哪、状态用什么文字显示、容器是什么标签）**光靠读组件源码猜，猜错的概率不低**。所以这一步的实际过程是"写一个、跑一个、根据真实报错和真实页面行为修正假设、再继续下一个"——下面就按这个真实发生的顺序走一遍。
+与 RTL 不同，E2E 测试面向已经运行的真实页面。页面跳转目标、状态文字和容器标签都应依据真实 DOM 和实际页面行为确定，不应只根据组件源码推测。
 
 #### 9.1 先解决一个通用问题：POM 里"登录后跳去哪"不是写死的
 
@@ -13119,7 +13117,7 @@ async loginAndWait(email: string, password: string) {
 
 这里把"登录后跳转到哪"写死成了根路径 `"/"`。这个假设对普通用户 （卖家、买家）成立，但用 Admin 账号登录——而 `LoginPage.tsx` 的真实逻辑是 Admin 登录后跳转到 `/admin`，不是 `/`。如果不处理这个 差异，凡是 Admin 登录的测试都会在这一行死等一个永远不会发生的跳转， 直到 30 秒超时。
 
-修改`e2e/pages/LoginPage.ts,` 把这个参数开放出来
+修改 `e2e/pages/LoginPage.ts`，把这个参数开放出来。
 
 ```ts
 // e2e/pages/LoginPage.ts
@@ -13197,7 +13195,7 @@ npm run e2e:headed
 
 卖家发布车辆并提交审核:
 
-- 创建车辆时，车辆标题不易写成固定字符串，比如"2020 Toyota Corolla Test Car"， 每个测试要用 `uid` 生成独立数据、避免污染。 每跑一次测试，数据库里就会多一条标题完全相同的记录，等跑过几次之后，如果测试改用标题文字去定位这辆车，会因为匹配到多个 同名元素而报错
+- 创建车辆时，车辆标题不宜写成固定字符串，比如"2020 Toyota Corolla Test Car"。每个测试要用 `uid` 生成独立数据、避免污染。每跑一次测试，数据库里就会多一条标题完全相同的记录。等跑过几次之后，如果测试改用标题文字去定位这辆车，会因为匹配到多个同名元素而报错。
 - 草稿创建成功后跳到编辑页时，URL 里已经带了车辆的 id，顺手从 URL 里取出真实的 carId
 
 - 点击"Submit for review"之后，页面**跳转**去了 `/profile/listings?page=1`, 创建的车辆都是通过独立的组件`ListingCard`渲染的：
@@ -13990,7 +13988,7 @@ export default function NotificationBell() {
 
 把建立连接的逻辑写进副作用钩子 `useEffect`中， 这样组件初次挂载就执行一次。
 
-- signalR内置的`HubConnectionBuilder()` 方法可以创建一下连接对象 connection
+- SignalR 内置的 `HubConnectionBuilder()` 方法可以创建一个连接对象 `connection`
 - connection 对象 的 `start()`方法， 开始建立连接
 - connection 对象 的 `stop()`方法， 停止连接
 
@@ -14421,30 +14419,30 @@ public class NotificationHub : Hub
     ```tsx
     import { useAuthStore } from "@/stores/authStore";
     ...
-
+    
     export default function NotificationBell() {
       ...
-
+    
       useEffect(() => {
         // 创建了连接对象。
         const connection = new signalR.HubConnectionBuilder()
           .withUrl("http://localhost:5065/hubs/notification", {
-
+    
             // 告诉 SignalR 建立连接时带上 Token
             accessTokenFactory: () => useAuthStore.getState().accessToken ?? "",
           })
           .withAutomaticReconnect()
           .build();
-
+    
         // 开始连接
         ...
       }, []);
-
+    
       return (
        ...
       );
     }
-
+    
     ```
 
     >`accessTokenFactory` 是一个函数，而不是固定的 Token 值。
@@ -14496,7 +14494,7 @@ public class NotificationHub : Hub
                     {
                         ...
                     };
-
+    
                     // ===== 核心新增：配置 JwtBearer 事件响应以兼容 SignalR Query Token =====
                     options.Events = new JwtBearerEvents
                     {
@@ -14504,22 +14502,22 @@ public class NotificationHub : Hub
                         {
                             // 1. 从 URL Query 参数中尝试读取 access_token
                             var accessToken = context.Request.Query["access_token"];
-
+    
                             // 2. 获取当前请求的路径
                             var path = context.HttpContext.Request.Path;
-
+    
                             // 3. 判断：如果有 access_token 且请求路径指向 SignalR Hub
                             //  匹配具体的 Hub 路径，如 "/chatHub" 或以特定前缀开头的路径）
                             if (!string.IsNullOrEmpty(accessToken) &&
                                 path.StartsWithSegments("/hubs")) // 💡 根路由路径或根前缀
                              // 将 Token 赋给上下文，JwtBearer 中间件后续就会拿这个Token去做签名和合法性校验
                                 context.Token = accessToken;
-
+    
                             return Task.CompletedTask;
                         }
                     };
                 });
-
+    
             return services;
         }
     }
@@ -14692,7 +14690,7 @@ public class NotificationHub : Hub
 
 ##### 那如何发通知呢？
 
-asp.net core 提供了**`IHubContext`（服务端上下文）接口**：允许在 **Hub 外部**（如 API Controller、Service、后台定时任务）直接向客户端推送消息。把外部Hub传入接口之后，能获得当前hub的想下文对象 hubContext, 直接使用这个hubContext执行推送消息等操作。
+ASP.NET Core 提供了 **`IHubContext`（服务端上下文）接口**：允许在 **Hub 外部**（如 API Controller、Service、后台定时任务）直接向客户端推送消息。注入 `IHubContext` 后，可以获得当前 Hub 的上下文对象 `hubContext`，并使用它执行消息推送等操作。
 
 编写通知业务的接口和Service方法， 这样其他外部service都能直接引入使用， 不会和其他业务本身的逻辑耦合。
 
@@ -15050,7 +15048,7 @@ public class NotificationResponse
 - 写入数据库（写入库后可以推送通知）
 - 查询当前用户的未读通知
 - 标记单条通知已读
-- 全部全部标记已读
+- 全部标记为已读
 
 ```c#
 using UUcars.API.DTOs.Responses;
@@ -15194,7 +15192,7 @@ public class NotificationService : INotificationService
 }
 ```
 
-#### 5.5 NotificationsController端口
+#### 5.5 NotificationsController 接口
 
 新建 `UUcars.API/Controllers/NotificationsController.cs`：
 
@@ -15265,7 +15263,7 @@ public class NotificationsController : ControllerBase
 }
 ```
 
-注意： `NotificationService`里的`SendNotificationAsync`方法不需要使用一个api端口去调用触发，因为通知写入库并发送通知的逻辑并不需要单独的按钮或者action主动触发，而是在其他业务逻辑中附带执行的， 比如我们上面的实例中，管理员审核通过，附带执行通知入库并触发通知的推送。而其他逻辑需要客户端手动触发才能执行， 比如：
+注意：`NotificationService` 里的 `SendNotificationAsync` 方法不需要通过独立的 API 接口触发，因为通知入库和推送的逻辑会附带在其他业务流程中执行。例如，管理员审核通过时，会同时将通知写入数据库并推送给用户。而其他逻辑需要客户端操作触发，例如：
 
 - 用户登录成功，渲染通知铃铛组件，浏览器触发api，拉取未读通知
 - 用户手动点击某条未读通知，标记为已读
@@ -15826,7 +15824,7 @@ public static class NotificationTypes
 - 通知卖家有新订单
 - 通知卖家订单被取消
 
-#### 7.2 更新 AdminCarServic
+#### 7.2 更新 AdminCarService
 
 **在 `ApproveAsync` 的 `try` 块里，缓存清理之后加入：**
 
@@ -15892,7 +15890,7 @@ await _notificationService.SendNotificationAsync(
 
 ### 8. 通知详情跳转
 
-客户端查重通知详情后， 需要根据不同的通知类型，调转到不同的操作页面。
+客户端查看通知详情后，需要根据不同的通知类型，跳转到不同的操作页面。
 
 `NotificationBell`组件中定义辅助方法：
 
@@ -17694,7 +17692,7 @@ private static List<DailyRevenueDto> FillMissingDailyRevenue(
 }
 ```
 
-使用补零复杂方法实现完整的逻辑
+使用补零辅助方法实现完整逻辑。
 
 ```c#
 public class AdminStatsService
@@ -18874,8 +18872,6 @@ Legend                图例
 
 以每日新增车辆折线图 `dailyNewCars` 为例，后端返回：
 
-后端返回：
-
 ```
 dailyNewCars: [
   { date: "2026-08-01", count: 2 },
@@ -19323,7 +19319,7 @@ import {
 
 整理统计卡片数据数组：
 
-在两个 `useQuery()` 后：面加入：
+在两个 `useQuery()` 后面加入：
 
 ```tsx
 const statCards = stats
@@ -20236,10 +20232,6 @@ git push origin --delete feature/v3-admin-dashboard
 □ Service 单元测试
 □ API 集成测试
 ```
-
-
-
-以下为重新按 Step 71 风格整理的 Step 72 笔记草案。
 
 
 
@@ -21902,7 +21894,7 @@ public class ExternalLoginService
 
     ```c#
     namespace UUcars.API.Exceptions;
-
+    
     public class ExternalLoginConflictException : AppException
     {
         public ExternalLoginConflictException()
@@ -30611,7 +30603,7 @@ LCP 除了数值还要记录对应元素，才能判断变化来自 Hero、车�
 
 ### 3. 记录优化前 Baseline
 
-Baseline 要描述当前页面真实的加载状态，因此先保存构建产物，再查看模块组成，最后用同一份普通 Production Build 完成浏览器测量。下面的命令和配置需要实际执行，标记为 Baseline 记录的表格只填写执行后取得的结果；终端完整输出、请求清单和临时报告不用全部抄入笔记。路由导入和图片加载策略在整组记录完成前保持不变。
+Baseline 要描述当前页面真实的加载状态，因此先保存构建产物，再查看模块组成，最后用同一份普通 Production Build 完成浏览器测量。路由导入和图片加载策略在整组记录完成前保持不变，确保各项 Baseline 结果来自同一份代码和相同的测量条件。
 
 正式记录前先整理发布输入：删除没有代码引用的 `public/1.svg`，并通过 `prebuild` 调用一个不依赖第三方包的 Node.js 脚本，在每次 Production Build 前递归清理 `public` 下的 `.DS_Store`。这是因为 `.gitignore` 只能阻止 Git 跟踪文件，不能阻止 Vite 将 `public` 内容复制到 `dist`。使用 Node.js 24 重新构建后，发布目录中只保留预期文件；清理修改固定在 `1b4a8fa`，后续 Baseline 从该提交开始记录。
 
@@ -31868,6 +31860,651 @@ Step 74：完成
 ```
 
 
+## Step 75 · 生产就绪完善与 V3.3 最终发布
+
+### 这一步做什么
+
+Step 73 已建立真实 CI/CD 与生产发布路径，Step 74 已完成有测量依据的前端性能优化。Step 75 在此基础上完成 V3 的最后一次生产就绪检查、安全收尾和 `v3.3` 里程碑发布，不再扩展业务功能。
+
+本步骤基于 Step 74 已发布的版本检查真实生产行为，并完成四项范围明确的完善：补全 Hangfire Dashboard 的 Admin 访问链路、让 API Container 以非 Root 用户运行、将生产敏感配置改为 Secret 引用，以及把 `Microsoft.ApplicationInsights.AspNetCore` 从 `2.22.0` 升级到 `2.23.0`。这些修改不扩展业务功能或改变部署架构。
+
+最终发布继续使用现有 CI/CD、Release SHA、Image Digest 和 Production Smoke Test。只有同一发布提交通过必要的自动检查与非破坏性生产验收后，才能创建 `v3.3` Tag、同步长期分支并关闭 V3。
+
+这一步的实施边界如下：
+
+| 范围 | 技术选择与边界 |
+| --- | --- |
+| 生产状态 | 使用现有 Azure Container Apps、Application Insights 与 Hangfire 能力核对真实状态；只处理有证据的问题 |
+| 后台任务管理 | 保留 Hangfire 内置 Dashboard，以现有 JWT 和 Admin 角色补全浏览器访问链路；不重写任务管理页面 |
+| 容器安全 | 使用 .NET Runtime Image 已提供的非 Root 用户；不更换技术栈或引入新的容器编排工具 |
+| Health Probe | 核对现有平台 Probe 与运行结果；没有故障证据时不新增自定义探针体系 |
+| 配置与凭据 | 核对 Key、职责和保存位置；敏感值使用平台 Secret 引用，不读取、复制或记录真实值 |
+| 发布 | 复用现有 CI/CD、Release SHA、Image Digest 与 Production Smoke Test；不另建发布流程 |
+
+### 1. 切出功能分支
+
+开始前检查当前提交、分支和现有 Tag：
+
+```bash
+git log -1 --oneline --decorate
+git tag --sort=-version:refname
+```
+
+检查结果：
+
+- `main`、`develop`、`origin/main` 和 `origin/develop` 均指向 Step 74 发布 Merge Commit `648afd6`；
+- 当前最新 V3 Tag 是 `v3.2`，尚未创建 `v3.3`；
+- 因此 `648afd6` 是 Step 75 的开发起点，不是最终 `v3.3` 发布提交
+
+从上述基线建立收尾分支：
+
+```bash
+git switch -c feature/v3-production-readiness
+```
+
+### 2. 生产运行状态
+
+UUcars 的生产 API 允许正在运行的容器实例（Replica）在空闲时从 1 个缩减为 0 个，此时云端没有 API 进程持续占用资源。下一个请求到达后，Container Apps 再启动新实例；这种按需恢复称为冷启动，整套空闲缩容机制称为 Scale-to-zero。一次真实访问会依次触发冷启动、API 初始化和后台 Worker 恢复；请求完成后，运行过程还应当在 Application Insights 中留下遥测记录。
+
+#### 2.1 生产 API 冷启动
+
+请求到达时，生产环境没有正在运行的 Replica。Azure Container Apps 根据承接 100% 流量的 Revision `uucars-api--0000011` 创建新实例。Revision 保存一次部署使用的镜像和运行配置，相当于“应该运行什么”；Replica 才是按照这份配置真正启动的容器。该 Revision 使用 Image Digest 指向镜像内容的唯一哈希值，因此启动的是发布时确定的镜像，而不是可能被重新指向其他内容的可变 Tag。
+
+容器不会一启动就立即接收请求。何时接收流量由 Probe 控制：Startup Probe 给 .NET 启动和数据库 Migration 留出时间，Readiness Probe 在端口可用前阻止流量进入，Liveness Probe 则在运行期间判断进程是否需要重启。UUcars 现有的 TCP Probe 通过尝试连接 `8080` 端口判断 API 进程是否已经开始监听，它不会调用业务接口，也不会检查数据库内容。源码没有提供自定义 Health Endpoint，而现有 TCP Probe 已满足当前项目对进程可用性的判断，因此保持不变。
+
+当前项目的实际结果是 Replica 从 0 恢复到 `Ready 1/1`，请求成功进入 API，重启次数仍为 0。这说明当前镜像、端口和冷启动配置可以共同工作。
+
+#### 2.2 后台任务恢复
+
+Hangfire 与 API 运行在同一个 Container 中，所以 Replica 缩容到 0 时，后台 Worker 也会暂停；它不是一个能够独立唤醒 Container App 的外部服务。新 Replica 启动后的恢复顺序是：API 连接 SQL Server 并完成 Migration，注册 `cleanup-expired-tokens`，Hangfire Server 再启动 5 个 Worker 处理 `default` Queue。
+
+生产日志完整记录了这次恢复过程：Hangfire SQL 对象准备完成，Server 和 5 个 Worker 正常启动，Token 清理任务随后执行，并删除了 12 个过期或已撤销的 Refresh Token。这说明 Hangfire 的存储、调度和 Worker 都能够在 API 冷启动后恢复。
+
+清理任务晚于计划时间运行不会让过期 Token 重新有效。
+
+`RefreshTokenService` 在每次刷新时都会立即检查 `IsRevoked` 和 `ExpiresAt`；Hangfire 任务只负责删除已经失效的数据库记录。因此当前 Scale-to-zero 带来的调度延迟影响的是清理时间，不是认证正确性，现有配置符合这个个人项目的实际需要。
+
+后台任务已经能够恢复，但管理入口呈现出不同结果。生产环境直接打开 `/hangfire` 返回 `401 Unauthorized`，只能证明匿名请求被拦截，不能证明 Admin 拥有可用的访问方式。Worker 是否执行和 Dashboard 是否能够登录是两条独立链路：前者已经由生产日志确认，后者仍缺少浏览器能够携带的认证凭据。
+
+#### 2.3 Application Insights 版本修复
+
+同一次访问已经唤醒 Replica，API 日志也确认应用在 Production 环境监听 `8080`，但 Application Insights 中没有形成对应的 Request。项目已经通过 `AddApplicationInsightsTelemetry` 启用 ASP.NET Core 遥测，并由 Serilog Sink 使用同一个 Connection String；因此问题不在于功能未启用，而在于当前使用的 `Microsoft.ApplicationInsights.AspNetCore` 版本。
+
+生产版本使用的是 `Microsoft.ApplicationInsights.AspNetCore 2.22.0`。该版本在包含 Keyed Services 的新版依赖注入环境中存在 Telemetry Module 注册兼容问题，可能导致配置正确但遥测没有发送。`2.23.0` 修复了这项注册问题，因此项目把该依赖从 `2.22.0` 升级到 `2.23.0`：
+
+```bash
+dotnet add UUcars.API/UUcars.API.csproj package Microsoft.ApplicationInsights.AspNetCore --version 2.23.0
+```
+
+只进行升级版本，不改变现有 Connection String、Telemetry 注册方式或 Serilog 配置。
+
+升级后，检查编译和测试结果：
+
+```bash
+dotnet build UUcars.API/UUcars.API.csproj --no-restore
+
+dotnet test UUcars.Tests/UUcars.Tests.csproj --no-restore
+```
+
+
+
+### 3. 完善 Hangfire 管理入口
+
+第 2 节已经通过生产日志确认 Hangfire Server、Worker 和 Recurring Job 都能在冷启动后恢复。`/hangfire` 返回 401 并不影响这些后台任务继续执行，但它暴露了另一项不完整之处：系统虽然配置了“只允许 Admin”，浏览器却没有把 Admin 身份交给 Dashboard 的正常途径。
+
+#### 3.1 当前入口缺少浏览器认证
+
+Hangfire Dashboard 是 Hangfire 包提供的服务端页面。它由 `Program.cs` 中的 `UseHangfireDashboard` 挂载在 API 请求管道里:
+
+```c#
+if (backgroundJobsEnabled)
+        app.UseHangfireDashboard("/hangfire", new DashboardOptions
+        {
+            Authorization = app.Environment.IsDevelopment()
+                ? new[] { new HangfireLocalDevAuthorizationFilter() }
+                : new[] { new HangfireAdminAuthorizationFilter() }
+        });
+
+```
+
+它不经过 `AdminController`，也不是 React Router 管理的前端页面。当前请求链路是：
+
+```text
+浏览器打开 API 域名 /hangfire
+→ ASP.NET Core Authentication
+→ HangfireAdminAuthorizationFilter
+→ Hangfire 生成并返回 Dashboard HTML
+```
+
+`HangfireAdminAuthorizationFilter` 会检查 `HttpContext.User` 是否已经认证并具有 `Admin` 角色。这个判断本身没有问题，缺少的是在页面导航中建立 `HttpContext.User` 所需的 JWT。
+
+React 调用普通 API 时，Axios 请求拦截器会从 `authStore` 读取 Access Token，并主动加入请求头：
+
+```http
+Authorization: Bearer <access-token>
+```
+
+在地址栏打开 Dashboard 时，请求由浏览器直接发往 API，不会执行 React 代码和 Axios 拦截器。浏览器会自动携带符合域名、路径和安全规则的 Cookie，却不会读取 React 内存中的 Token，也不会自行构造 `Authorization` Header。因此 JWT Bearer 认证找不到 Token，授权过滤器看到的仍是匿名用户。
+
+现有 `refreshToken` Cookie 不能直接承担这项职责。Refresh Token 是数据库中可撤销、可轮换的长期凭据，只用于向 `/auth/refresh` 换取新的短期 Access Token；它本身不是包含用户和角色 Claims 的 JWT。让 Dashboard 直接使用 Refresh Token，会把“续签登录”和“访问管理页面”两种责任混在同一个凭据中。
+
+#### 3.2 让现有 JWT 支持页面导航
+
+UUcars 已经使用 JWT Bearer 验证身份和角色，不需要为一个管理页面再建立第二套登录体系。范围最小的做法是：登录和刷新成功后，除了把 Access Token 返回给 React，还把同一个短期 Token 写入专供 Dashboard 使用的 HttpOnly Cookie。
+
+HttpOnly Cookie 由浏览器保存和发送，但前端 JavaScript 无法读取。它在这里不是新的用户会话，也不会替代响应 Body 中供 Axios 使用的 Token，只是为同一份 JWT 增加一种适合页面导航的传递方式：
+
+```text
+React API 请求
+→ Axios 把 JWT 放入 Authorization Header
+
+Hangfire 页面导航
+→ 浏览器把同一 JWT 放入 Dashboard 专用 Cookie
+
+两条路径
+→ JWT Bearer 验证签名、有效期和 Claims
+→ Admin 角色检查
+```
+
+Dashboard Cookie 需要遵守以下边界：
+
+- `HttpOnly` 阻止前端脚本读取 Token；
+- 生产环境使用 `Secure`，只允许通过 HTTPS 发送；
+- `Path` 限制为 `/admin/hangfire`，普通 API 请求不会携带它；
+- Cookie 只保存短期 Access Token，Token 到期后 JWT 验证仍会拒绝访问；
+- `/auth/refresh` 签发新 Access Token 时覆盖旧值，`/auth/logout` 同时删除该 Cookie；
+- 生产环境的前端与 API 位于不同站点，Cookie 的 `SameSite` 属性需要与现有跨站登录方式保持一致；这个属性决定浏览器是否会在跨站请求中携带 Cookie；
+- Dashboard 自带的 Antiforgery 校验继续保护重试、删除等写操作：服务端先生成当前页面专用的校验值，修改状态的请求必须带回该值，从而阻止其他站点借用浏览器中的 Cookie 伪造操作。
+
+认证配置、Controller 和 `Program.cs` 都需要使用相同的 Cookie 名称与 Dashboard 路径，因此先把这两个固定值集中起来，避免三个位置各自保存一份字符串。新增 `UUcars.API/Auth/Hangfire/HangfireDashboardAccess.cs`：
+
+```csharp
+namespace UUcars.API.Auth.Hangfire;
+
+public class HangfireDashboardAccess
+{
+    public const string Path = "/admin/hangfire";
+    public const string CookieName = "uucars-hangfire-access";
+}
+```
+
+共享边界确定后，Dashboard Cookie 还要跟随现有认证生命周期创建、更新和删除。修改 `UUcars.API/Controllers/AuthController.cs`， 加入统一的 Cookie 配置与写入、删除方法。生产环境使用 `SameSite=None` 和 `Secure=true`，使 Static Web Apps 发起的跨站登录请求可以接收 Cookie；Development 和 E2E 使用本地 HTTP，因此沿用现有 Refresh Token Cookie 的本地规则：
+
+```csharp
+private CookieOptions CreateHangfireDashboardCookieOptions(
+    DateTimeOffset? expiresAt = null)
+{
+    var options = new CookieOptions
+    {
+        HttpOnly = true,
+        Secure = true,
+        SameSite = SameSiteMode.None,
+        Expires = expiresAt,
+        Path = HangfireDashboardAccess.Path
+    };
+
+    if (_environment.IsDevelopment() ||
+        _environment.IsEnvironment(AppEnvironments.E2E))
+    {
+        options.SameSite = SameSiteMode.Strict;
+        options.Secure = false;
+    }
+
+    return options;
+}
+
+private void SetHangfireDashboardCookie(
+    string accessToken,
+    DateTime expiresAt)
+{
+    Response.Cookies.Append(
+        HangfireDashboardAccess.CookieName,
+        accessToken,
+        CreateHangfireDashboardCookieOptions(expiresAt));
+}
+
+private void DeleteHangfireDashboardCookie()
+{
+    Response.Cookies.Delete(
+        HangfireDashboardAccess.CookieName,
+        CreateHangfireDashboardCookieOptions());
+}
+```
+
+邮箱登录与 Google 登录最终都会进入 `CompleteLoginAsync`，所以只需要在这个共用方法中写入一次 Dashboard Cookie。插入位置放在 `SetRefreshTokenCookie` 之后、返回登录响应之前：
+
+```csharp
+private async Task<IActionResult> CompleteLoginAsync(
+    LoginResponse result,
+    string message,
+    CancellationToken cancellationToken)
+{
+    var refreshToken =
+        await _refreshTokenService.CreateRefreshTokenAsync(
+            result.User.Id,
+            cancellationToken);
+    SetRefreshTokenCookie(
+        refreshToken.Token,
+        refreshToken.ExpiresAt);
+    
+    // 写入专供 Dashboard 使用的 HttpOnly Cookie
+    SetHangfireDashboardCookie(
+        result.Token,
+        result.ExpiresAt);
+
+    return Ok(
+        ApiResponse<LoginResponse>.Ok(
+            result,
+            message));
+}
+```
+
+刷新登录状态会签发新的 Access Token。`RefreshTokenService.RefreshAsync` 当前只返回 Token 字符串，没有单独返回它的到期时间，因此在 `Refresh` Action 中读取 JWT 已有的 `exp` 值，再覆盖 Dashboard Cookie：
+
+```csharp
+SetRefreshTokenCookie(newRefreshToken.Token, newRefreshToken.ExpiresAt);
+
+var accessTokenExpiresAt = new JwtSecurityTokenHandler()
+    .ReadJwtToken(newAccessToken)
+    .ValidTo;
+
+SetHangfireDashboardCookie(
+    newAccessToken,
+    accessTokenExpiresAt);
+```
+
+最后在 `Logout` Action 清除 `refreshToken` Cookie 后追加：
+
+```csharp
+DeleteHangfireDashboardCookie();
+```
+
+这样，邮箱登录和 Google 登录负责首次创建 Cookie，Token 刷新负责替换旧值，登出负责移除它；四条路径不会产生彼此不同的 Dashboard 登录状态。
+
+Cookie 能够随登录状态更新后，JWT Bearer 还需要知道如何从中取得 Token。修改 `UUcars.API/Extensions/AuthExtensions.cs`，先加入：
+
+```csharp
+using UUcars.API.Auth.Hangfire;
+```
+
+随后替换现有 `OnMessageReceived` 中只处理 SignalR 的路径判断。SignalR 的 Query Token 处理仍然保留，但只在请求不属于 Dashboard 时才进入该分支：
+
+```csharp
+if (path.StartsWithSegments(HangfireDashboardAccess.Path) &&
+    context.Request.Cookies.TryGetValue(
+        HangfireDashboardAccess.CookieName,
+        out var dashboardToken))
+{
+    context.Token = dashboardToken;
+}
+else if (!string.IsNullOrEmpty(accessToken) &&
+         path.StartsWithSegments("/hubs"))
+{
+    context.Token = accessToken;
+}
+```
+
+路径判断把 Cookie 认证限制在 Dashboard，不会使其他 API 开始接受 Cookie 中的 JWT。默认 API 认证方式仍是现有的 Bearer Header，SignalR 也继续使用已经建立的 Query Token 规则。
+
+#### 3.3 统一后台入口
+
+Dashboard 属于 API，因此新地址使用 API 域名下的 `/admin/hangfire`。这里的 `/admin` 表示它属于后台管理入口，并不意味着请求必须经过 `AdminController`。`Program.cs` 继续把请求交给 Hangfire 中间件，但开发和生产环境统一使用 `HangfireAdminAuthorizationFilter`。在 `UUcars.API/Program.cs` 中用共享路径替换原来的 `/hangfire` 注册，并移除按环境选择匿名过滤器的分支：
+
+```csharp
+if (backgroundJobsEnabled)
+        app.UseHangfireDashboard(
+            HangfireDashboardAccess.Path,
+            new DashboardOptions
+            {
+                Authorization =
+                [
+                    new HangfireAdminAuthorizationFilter()
+                ]
+            });
+```
+
+开发环境不再由 `HangfireLocalDevAuthorizationFilter` 匿名放行。完成统一授权后，`UUcars.API/Auth/Hangfire/HangfireLocalDevAuthorizationFilter.cs` 已不再被引用，应删除该文件，避免以后误以为本地 Dashboard 仍允许匿名访问。这样本地和生产只有地址中的主机不同，访问规则保持一致：用户先登录 Admin，再进入 Dashboard。
+
+```text
+本地 API：      http://localhost:5065/admin/hangfire
+生产 API：      https://<api-domain>/admin/hangfire
+```
+
+对前端页面来说，React Admin 页面只负责提供入口。`NavLink` 用于 React Router 内部路由，如果把 `/admin/hangfire` 交给它，生产请求会到达 Static Web Apps，而不是 Container Apps 中的 API。因此需要修改 `uucars-web/src/pages/AdminPage.tsx`，由 `VITE_API_BASE_URL` 组成完整后端地址，并使用普通链接打开 Hangfire 页面。
+
+先在现有图标 import 中加入 `Activity`，并在 `tabs` 后面建立后端地址：
+
+```tsx
+import { Activity, ClipboardList, LayoutDashboard } from "lucide-react";
+
+const hangfireUrl =
+  `${import.meta.env.VITE_API_BASE_URL}/admin/hangfire`;
+```
+
+再把入口放在 `<nav>` 内、现有 `tabs.map(...)` 之后。它使用 `<a>` 而不是 `<NavLink>`，因为这是离开 React 应用、前往 API 域名的完整页面导航；样式沿用现有 Tab，但不显示 React Router 的选中状态：
+
+```tsx
+<a
+  href={hangfireUrl}
+  target="_blank"
+  rel="noreferrer"
+  className="flex items-center gap-1.5 px-4 py-2.5 text-sm font-medium
+             transition-colors duration-150"
+  style={{
+    color: "var(--color-text-secondary)",
+    borderBottom: "2px solid transparent",
+    marginBottom: "-1px",
+  }}
+>
+  <Activity className="h-3.5 w-3.5" />
+  Hangfire Jobs
+</a>
+```
+
+完整访问链路由此变为：
+
+```text
+Admin 登录或恢复登录状态
+→ API 写入 Dashboard 专用 HttpOnly Cookie
+→ Admin 页面打开 API 域名 /admin/hangfire
+→ 浏览器自动携带 Cookie
+→ JWT Bearer 恢复用户 Claims
+→ HangfireAdminAuthorizationFilter 检查 Admin 角色
+→ Hangfire 返回 Dashboard
+```
+
+旧 `/hangfire` 不再挂载，避免同时保留两个含义相同的管理入口；只为开发环境匿名放行的过滤器也不再需要。
+
+#### 3.4 验证访问边界
+
+这项修改同时影响后端认证生命周期和前端 Admin 导航，验证需要覆盖凭据的创建、更新、清除和最终访问结果。
+
+| 场景 | 应有结果 |
+| --- | --- |
+| 未登录直接访问 `/admin/hangfire` | 请求被拒绝，不能看到任务和 Server 信息 |
+| 普通用户访问 `/admin/hangfire` | 角色检查失败，不能进入 Dashboard |
+| Admin 登录后从管理页面进入 | Dashboard 页面及其 CSS、JavaScript 子请求正常加载 |
+| Access Token 刷新后再次进入 | Dashboard Cookie 已被新 Token 覆盖，访问继续有效 |
+| Admin 登出后再次进入 | Dashboard Cookie 已删除，请求被拒绝 |
+| 访问旧 `/hangfire` | 不再匹配 Dashboard |
+
+`Testing` 和 `E2E` 环境不会注册真实 Hangfire Server 与 Dashboard，因此这些访问边界在连接本地 SQL Server 的 Development 环境中通过浏览器逐项验证。
+
+### 4. 让 API 以普通用户运行
+
+第 3 节处理的是 Hangfire 管理页面如何取得 Admin 身份，同一轮生产核查还暴露了 Container 自身的运行权限。冷启动日志显示 ASP.NET Core 把运行时密钥写入 `/root/.aspnet/DataProtection-Keys`；结合当前 `Dockerfile` 没有指定运行用户，可以确认生产 API 进程使用的是 Root 身份。
+
+Root 是 Linux 中权限最高的用户。Container 虽然限制了进程能够影响的主机范围，但其中的 Root 仍能修改应用目录和系统文件。UUcars 的 API 不需要这些权限，因此需要收紧 Container 内的运行身份。
+
+#### 4.1 确认 API 需要的文件权限
+
+当前根目录 `Dockerfile` 使用 `mcr.microsoft.com/dotnet/aspnet:10.0` 作为最终 Runtime Image。该 Image 已经内置普通用户 `app` 及其 Home 目录，所以不需要自行创建 Linux 用户。
+
+需要确认的是：切换用户后，API 在运行期间会读取和写入哪些位置？
+
+API 从 `/app` 读取发布后的 DLL 和配置；连接 SQL Server、Redis 以及执行 Hangfire Job 都通过网络完成；监听的 `8080` 也不是只有 Root 才能使用的低位端口。这些行为只需要读取应用文件，不要求 `/app` 归 `app` 所有。
+
+真正需要写入的是 Serilog 文件。`LoggingExtensions` 使用相对路径 `logs/uucars-.log`，而 `Dockerfile` 的 `WORKDIR` 是 `/app`，所以日志最终写入 `/app/logs`。这个目录当前由 Root 在构建 Image 时创建；如果只加入 `USER app` 而不调整目录所有权，Serilog 可能因没有写权限而导致 API 启动失败或无法保存文件日志。
+
+因此权限边界是：发布文件继续由 Root 持有并供 `app` 只读访问，只把 `/app/logs` 的所有权交给 `app`。ASP.NET Core 的用户级运行文件则写入 `app` 自己的 Home 目录。生产日志中的 Data Protection 路径会随运行用户改变，但 Container 重建后的密钥持久化属于另一项独立问题；当前没有相关功能故障证据，本次不增加额外密钥存储。
+
+#### 4.2 修改 Dockerfile 的运行阶段
+
+目标文件是仓库根目录的 `Dockerfile`，最终运行阶段只修改两处。
+
+第一处是在创建日志目录后立即把目录所有权交给 `app`。把：
+
+```dockerfile
+RUN mkdir -p /app/logs
+```
+
+替换为：
+
+```dockerfile
+RUN mkdir -p /app/logs \
+    && chown app:app /app/logs
+```
+
+第二处是在 `ENTRYPOINT` 前加入 `USER app`。`USER` 只影响它后面的 Container 运行命令，不会改变前面由 Root 完成的目录创建、文件复制和 Image 构建过程。修改后的完整 Runtime 阶段应为：
+
+```dockerfile
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS final
+WORKDIR /app
+
+# Serilog 需要在运行时写入这个目录。
+RUN mkdir -p /app/logs \
+    && chown app:app /app/logs
+
+COPY --from=build /app/publish .
+
+EXPOSE 8080
+ENV ASPNETCORE_HTTP_PORTS=8080
+
+# 从这里开始，API 进程使用普通用户运行。
+USER app
+ENTRYPOINT ["dotnet", "UUcars.API.dll"]
+```
+
+这里没有对整个 `/app` 执行 `chown`。`app` 可以读取 Root 复制进来的程序集，却不能在运行时改写这些文件；只有明确需要写入的日志目录获得了写权限。
+
+#### 4.3 确认 Image 中的用户和目录
+
+修改后先只构建 API Image，不启动数据库或应用。这样可以把“Image 是否正确设置用户”和“API 是否能够连接外部依赖”分开验证：
+
+```bash
+docker build -t uucars-api:step75 -f Dockerfile .
+
+docker image inspect uucars-api:step75 \
+  --format '{{.Config.User}}'
+
+docker run --rm --entrypoint /bin/sh uucars-api:step75 \
+  -c 'id && ls -ld /app /app/logs'
+```
+
+三项结果分别应当说明：Image 构建成功；默认用户是 `app`；运行用户的 UID 不是 Root 的 `0`。目录信息中 `/app` 可以继续归 Root 所有，但 `/app/logs` 必须归 `app` 所有。只要这层验证成立，API 按当前 Image 默认配置启动时就不会再使用 Root 身份。
+
+#### 4.4 确认 API 仍能完整启动
+
+权限正确并不等于应用一定可用。还需要通过现有 Compose 配置启动 SQL Server、Redis 和 API，确认普通用户能够完成 UUcars 的真实启动过程：
+
+```bash
+docker compose up -d --build
+docker compose ps
+docker compose logs --tail 100 api
+
+curl -i "http://localhost:8080/cars?page=1&pageSize=1"
+
+docker compose exec api /bin/sh \
+  -c 'id && ls -l /app/logs'
+```
+
+`docker compose ps` 应显示 API 正在运行，日志中不应出现 `Permission denied`，并应继续出现 Migration、Hangfire Server 和端口监听的启动记录。公开车辆请求用于确认 API 能够处理流量；Container 内的 `id` 再次确认实际进程环境不是 Root，`/app/logs` 中出现日志文件则证明 Serilog 仍有写入权限。
+
+
+
+### 5. 完善生产配置
+
+第 4 节限制了 API 进程在 Container 内能够执行的操作，但进程启动时仍然需要取得数据库连接串、JWT 签名密钥和外部服务凭据。需要确保这些配置能够安全正确地进入系统。
+
+#### 5.1 核对配置的保存位置
+
+同一个项目中的配置会在不同阶段进入系统：
+
+| 进入阶段 | UUcars 中的用途 | 保存位置 |
+| --- | --- | --- |
+| 前端 Build | API 地址、Google Client ID | `.env.production` |
+| GitHub Actions 部署 | Azure 目标资源、部署身份 | Repository Variables、Repository Secrets |
+| API Runtime | SQL、JWT、Redis、Resend、R2 | Container Apps 环境变量、Secret |
+
+前端 Build 变量会写入浏览器下载的 JavaScript，因此 `VITE_API_BASE_URL` 和 `VITE_GOOGLE_CLIENT_ID` 都必须是可以公开的标识。GitHub Actions 中的资源组和 Container App 名称只用于定位部署目标，Azure 登录凭据和部署 Token 已保存在 Repository Secrets。
+
+当前 Container App 的运行配置中：SQL 连接串、JWT Secret、Resend API Key、R2 Access Key 以及 Redis 连接串仍以 `Manual entry` 作为环境变量的直接值。它们确实没有进入 Git 或 Image，但 Container Apps 已经提供了专门的 Secret 存储，因此这些凭据不应继续作为普通环境变量值维护。
+
+#### 5.2 使用 Secret 保存敏感值
+
+ASP.NET Core 会把环境变量名称中的双下划线 `__` 转换成配置层级分隔符 `:`。例如，Container 中的 `ConnectionStrings__DefaultConnection` 会覆盖 `appsettings.json` 中的 `ConnectionStrings:DefaultConnection`。
+
+Container Apps Secret 用于保存实际凭据；环境变量的 `secretRef` 则保存 Secret 名称。Container 启动时，平台先解析引用，再把 Secret 的实际值注入原来的环境变量。因此这次修改可以保持 C# 配置读取方式不变，也不需要重新构建 Image：
+
+```text
+ConnectionStrings__DefaultConnection
+        │
+        └── secretref:sql-connection
+                    │
+                    └── SQL 连接串的实际值
+```
+
+需要建立的对应关系为：
+
+| API 环境变量 | Container Apps Secret |
+| --- | --- |
+| `ConnectionStrings__DefaultConnection` | `sql-connection` |
+| `JwtSettings__Secret` | `jwt-secret` |
+| `EmailSettings__ApiKey` | `resend-api-key` |
+| `StorageSettings__AccessKeyId` | `r2-access-key-id` |
+| `StorageSettings__SecretAccessKey` | `r2-secret-access-key` |
+| `ConnectionStrings__Redis` | `redis-connection` |
+
+Issuer、Audience、公开 URL、Bucket Name、Account ID 和 Client ID 不具备直接访问服务的能力，继续使用普通环境变量。
+
+#### 5.3 更新 Container App 配置
+
+先在 Azure Portal 的 Container App 中打开 **Secrets**，分别创建表格中的六个 Secret。Secret 的 Key 使用表格右列名称，Value 使用原环境变量中对应的实际值。
+
+使用 Azure Cloud Shell 只更新这六个环境变量，避免同时改动 Image、CPU 和 Memory 等无关配置：
+
+```bash
+az containerapp update \
+  --name uucars-api \
+  --resource-group uucars-rg \
+  --set-env-vars \
+    "ConnectionStrings__DefaultConnection=secretref:sql-connection" \
+    "JwtSettings__Secret=secretref:jwt-secret" \
+    "EmailSettings__ApiKey=secretref:resend-api-key" \
+    "StorageSettings__AccessKeyId=secretref:r2-access-key-id" \
+    "StorageSettings__SecretAccessKey=secretref:r2-secret-access-key" \
+    "ConnectionStrings__Redis=secretref:redis-connection" \
+  --query "properties.latestRevisionName" \
+  --output tsv
+```
+
+`secretref:` 告诉 Container Apps 这里填写的是 Secret 引用，而不是要直接交给 API 的文本。命令只改变列出的环境变量，输出的新 Revision 名称将为 `uucars-api--0000012`。
+
+Revision 是 Container Apps 对某一组 Image 与运行配置生成的不可变版本。即使 Image 没有变化，环境变量的更新也会产生新 Revision，让 Azure 可以启动新 Replica 并切换 Traffic，而不覆盖原 Revision 的内容。
+
+#### 5.4 确认新配置正常运行
+
+先查询新 Revision 实际使用的 Image 和 Secret 引用，避免只根据 Portal 表单判断配置已经生效：
+
+```bash
+az containerapp revision show \
+  --name uucars-api \
+  --resource-group uucars-rg \
+  --revision uucars-api--0000012 \
+  --query "properties.template.containers[0].{Image:image,SecretRefs:env[?secretRef!=null].{Variable:name,Secret:secretRef}}" \
+  --output jsonc
+```
+
+查询结果应显示六个环境变量都指向预期的 Secret。Azure Portal 中，`uucars-api--0000012` 获得 `100%` Traffic，Replica 为 `Ready 1/1`、`Running`，Restart 次数为 `0`；生产车辆查询继续返回 `success: true` 和分页数据。这次变更是在原生产版本上完善运行配置，没有重新构建或发布代码。
+
+### 6. 完成检查并发布
+
+#### 6.1 提交前检查
+
+运行本地检查：
+
+```bash
+dotnet build
+dotnet test
+
+cd uucars-web
+npm run lint
+npm test -- --run
+npm run build
+```
+
+后端必须完成编译并通过全部测试；前端必须通过 Lint、组件测试和 Production Build。检查工作区，确认提交中没有 Secret、构建产物或临时诊断文件：
+
+```bash
+cd ..
+git status --short
+```
+
+#### 6.2 通过 CI/CD 发布
+
+提交本步骤最后的 Application Insights 修复与文档同步：
+
+```bash
+git add .
+git commit -m "feat: production config down"
+git push -u origin feature/v3-production-readiness
+```
+
+确认功能分支的 Backend、Frontend 和 E2E 三个 CI Job 全部通过。使用 `--no-ff` 合并到 `develop`，推送并再次确认 `develop` CI 通过。
+
+```bash
+git switch develop
+git pull --ff-only origin develop
+git merge --no-ff feature/v3-production-readiness -m "merge: production readiness into develop"
+git push origin develop
+```
+
+发布使用 `develop → main` Pull Request。PR 必须通过 Validate Release Source、Backend、Frontend 和 E2E，再使用 **Create a merge commit** 合并。`main` 的 CI 成功后，CD 会基于同一个 Release SHA 构建前端 Artifact 和后端 Image，并将 Image Digest 部署到 Azure Container Apps。
+
+#### 6.3 生产验收
+
+CD 中的 Production Smoke Test 必须确认公开车辆接口、前端入口和 `release.json` 正常。人工验收覆盖以下生产行为：
+
+| 验收项 | 通过条件 |
+| --- | --- |
+| Hangfire Dashboard | 未登录和普通用户不能进入；Admin 登录后可以打开 `/admin/hangfire` |
+| API Container | 进程使用 `app` 用户，`/app/logs` 可以生成 Serilog 日志 |
+| Application Insights | 访问生产 `/cars` 后能够查询到对应的新 Request |
+| 发布一致性 | 前端 `release.json`、后端 Image 和 CD Run 对应同一个 Release SHA |
+
+生产验收不运行会创建车辆、订单或改变审核状态的完整 E2E。任何一项失败都保留当前 Revision 和日志进行定位，不创建 `v3.3` Tag。
+
+#### 6.4 创建 V3.3 里程碑
+
+全部生产验收通过后，在 `main` 的发布 Merge Commit 上创建并推送 Tag：
+
+```bash
+git switch main
+git pull --ff-only origin main
+git tag -a v3.3 -m "release: v3.3"
+git push origin v3.3
+```
+
+将该发布提交快进同步回 `develop`。
+
+```bash
+git switch develop
+git pull --ff-only origin develop
+git merge --ff-only main
+git push origin develop
+```
+
+确认本地与远程的 `main`、`develop` 都包含 `v3.3` 后，删除功能分支
+
+```bash
+git branch -d feature/v3-production-readiness
+git push origin --delete feature/v3-production-readiness
+```
+
+
+
+### Step 75 完成状态
+
+```text
+生产运行状态：验证完成
+Hangfire Dashboard 管理入口：生产验证完成
+API Container 非 Root：生产验证完成
+生产配置与 Secret Reference：验证完成
+Application Insights 遥测：生产验证完成
+CI/CD 与 v3.3 发布：完成
+```
+
+
 ## 后续修复记录
 
 ### Fix 1 · 并发 Refresh Token 请求竞态条件（Refresh Token Rotation Race Condition）
@@ -31972,7 +32609,7 @@ export const useAuthStore = create<AuthState>()(
 
 #### 5. 测试并合并分支
 
-用户登录成功后，在当期页面连续刷新，Dev tools后台工具的Network里观察到只发送一次refresh请求。
+用户登录成功后，在当前页面连续刷新，在 DevTools 的 Network 面板中观察到只发送一次 Refresh 请求。
 
 合并回主分支
 
@@ -32057,14 +32694,14 @@ var cookieOptions = new CookieOptions
     Secure=false
     ```
 
-- 生成环境
+- 生产环境
 
     ```bash
     SameSite=None
     Secure=true
     ```
 
-修改``AuthController.cs`里的`SetRefreshTokenCookie` 方法：
+修改 `AuthController.cs` 里的 `SetRefreshTokenCookie` 方法：
 
 ```c#
 
@@ -32323,7 +32960,7 @@ function SortableImageItem({
 
 **添加图片按钮 `Add Images`的布局优化：**
 
-优化`ImageUploader`组件， 把原来三个独立区块（已上传图片网格、待上传预览网格、按钮区块）合并成一个 `flex flex-wrap` 容器， 这样三个功能快在同一行横向依次显示
+优化 `ImageUploader` 组件，把原来三个独立区块（已上传图片网格、待上传预览网格、按钮区块）合并成一个 `flex flex-wrap` 容器，让三个功能块在同一行横向依次显示。
 
 ```tsx
 ...
@@ -32456,7 +33093,7 @@ export default function ImageUploader({ carId, images }: ImageUploaderProps) {
 
 ```
 
-**格外的一个小改动**：
+**调整图片区域的位置**：
 
 现在的 `Edit Car`页面中，"文本表单 + Save Changes 按钮"在上面、"Images + Add Images 按钮"在下面，非常自然地会以为"是不是要先点 Save Changes，图片才会跟着车辆信息一起保存"。而实际上，`Save Changes` 只负责保存**文本字段**（Title/Brand/Model 这些），跟图片完全无关——图片是选中即上传、每张独立立刻持久化的，不需要点 `Save Changes` 才生效。
 
@@ -32604,7 +33241,7 @@ export default function CreateCarPage() {
 - 没有 `useMutation`
 - 没有 `useQueryClient`
 
-但需要选择、删除、拖拽这三件事， 他们全部只是纯数组操作。同时`ImagePicker` 只负责"展示 + 触发变化",不自己拥有状态,这是标准的**受控组件**模式,跟 `CarForm` 的 `onSubmit`/`defaultValues` 是同一个思路。
+但需要选择、删除、拖拽这三件事，它们都只是纯数组操作。同时，`ImagePicker` 只负责"展示 + 触发变化"，不自己拥有状态，这是标准的**受控组件**模式，跟 `CarForm` 的 `onSubmit`/`defaultValues` 是同一个思路。
 
 ```tsx
 interface ImagePickerProps {

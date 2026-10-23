@@ -333,6 +333,41 @@ This comprehension pass does not justify exhaustive background material. Add
 only the missing explanation required to follow the current causal narrative,
 then remove details that do not improve that understanding.
 
+### Apply the section-level narrative gate
+
+Every new or revised learning-note section must pass the following eleven-point
+gate in addition to the five-part editorial gate below:
+
+1. use one real project behaviour, request, failure, decision or implementation
+   problem as the narrative carrier for the whole section;
+2. progress through observation, cause, mechanism, implementation and
+   validation in a natural causal order, omitting a stage only when it genuinely
+   does not apply;
+3. connect to facts already established immediately before the section so the
+   topic does not change abruptly or require an unexplained jump;
+4. explain every unfamiliar concept at its first use through the actual UUcars
+   context, including what it is, how it behaves, why it is needed and how it
+   relates to the surrounding implementation;
+5. make code and commands serve the explanation: introduce their purpose and
+   expected effect first, and never let the section become a runbook or command
+   catalogue;
+6. remove all semantic traces of discussion, correction, drafting, rejected
+   alternatives and the process used to arrive at the final text;
+7. remove repeated conclusions, templated paragraphs, generic background and
+   any detail that does not advance the current narrative;
+8. remain within the current knowledge boundary and do not introduce, hint at
+   or depend on a later section, decision or result;
+9. never present an unexecuted command, test, deployment or manual check as a
+   successful result;
+10. use concise, natural headings that describe the current stage of the
+    narrative rather than awkward questions, slogans or technology labels; and
+11. re-read the complete changed section from the learner's position, then
+    verify all eleven requirements and the five-part editorial gate before
+    presenting or saving it.
+
+Failure of any item means the section is not ready and must be revised before it
+is presented as complete.
+
 ### Run the five-part editorial gate
 
 Before saving learning-note changes, verify all five conditions:

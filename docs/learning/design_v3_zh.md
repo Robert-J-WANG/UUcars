@@ -1,0 +1,1495 @@
+# UUcars Marketplace V3 完整开发纲要
+
+> **目标：在 V1/V2 已完成的全栈 Marketplace 基础上，进一步完善性能、基础设施、认证安全、前端体验、自动化测试、实时通知与生产工程能力。**
+>
+> 原则：**解决真实问题 · 每步有明确产出 · 代码与测试同步 · Git 流程规范 · 保持架构适度**
+
+---
+
+## 技术栈
+
+**后端：**
+
+- ASP.NET Core
+- Entity Framework Core
+- SQL Server
+- ASP.NET Core Rate Limiting
+- Hangfire + Hangfire.SqlServer
+- Redis
+- SignalR
+- Application Insights
+- Serilog
+- JWT Authentication
+- Refresh Token Rotation
+- xUnit
+
+**前端：**
+
+- React + TypeScript
+- Vite
+- Tailwind CSS + shadcn/ui
+- React Router
+- Zustand
+- TanStack Query
+- Axios
+- React Hook Form + Zod
+- dnd-kit
+- Vitest
+- React Testing Library
+- Playwright
+- SignalR JavaScript Client
+- Recharts
+
+**文件和缓存服务：**
+
+- Cloudflare R2
+- Upstash Redis
+
+**生产部署：**
+
+- Azure SQL Database
+- Azure Static Web Apps
+- Azure Container Apps
+- Docker
+- GitHub Actions
+
+---
+
+## 开发流程
+
+分支职责、提交约定和发布流程由当前的
+[开发与发布流程](../technical/development-workflow.md) 统一维护。本纲要只记录
+V3 的范围、实施顺序和验收边界。
+
+### V3 里程碑计划
+
+```text
+v3.1  Step 63 完成
+      性能、缓存、后台任务、认证、并发与安全
+
+v3.2  Step 69 完成
+      前端体验与自动化测试体系
+
+v3.3  Step 75 完成
+      实时通知、Admin 数据面板、OAuth、工程优化与 V3 收尾
+```
+
+---
+
+# 第一阶段：性能、基础设施与安全（Step 57–63）
+
+> **目标：优化数据库访问，建立缓存、限流和后台任务基础设施，并完善认证、并发控制与安全审计。**
+>
+> 每个 Step 使用独立 Feature 分支，完成验证后合并回 `develop`。
+
+---
+
+## Step 57 · 数据库查询诊断与索引优化
+
+**产出：** 优化车辆、收藏和订单的主要只读查询，为数据量增长做好准备。
+
+### 主要内容
+
+1. 检查以下 Repository 的查询：
+   - `EfCarRepository`
+   - `EfFavoriteRepository`
+   - `EfOrderRepository`
+2. 查找不必要的 EF Core Tracking、实体完整加载、内存筛选和导航属性加载。
+3. 在 `Cars` 表增加复合索引：
+   ```text
+   Status + CreatedAt
+   Status + Brand
+   Status + Price
+   SellerId + Status + CreatedAt
+   ```
+4. 创建 Migration：
+   ```text
+   AddCarIndexes
+   ```
+5. 对只读列表查询使用 `AsNoTracking()`。
+6. 对列表查询使用 `Select` 投影，只读取响应所需字段。
+7. 检查 EF Core 生成的 SQL，确认筛选和分页在数据库端执行。
+
+### 知识点
+
+- 单列索引与复合索引
+- 索引字段顺序
+- EF Core Change Tracking
+- DTO Projection
+- 数据库端分页
+
+### 测试与验证
+
+- 检查 Migration 只包含目标索引。
+- 运行现有 Repository、Service 和 API 测试。
+- 检查查询生成的 SQL。
+- 确认优化前后 API 返回结果一致。
+
+### 验收标准
+
+- 4 个复合索引配置正确。
+- 只读列表查询使用 `AsNoTracking()`。
+- 列表查询使用投影。
+- 现有业务行为和测试不受影响。
+
+---
+
+## Step 58 · Redis 缓存层
+
+**产出：** 使用 Redis 缓存高频车辆列表，并在 Redis 不可用时自动回退数据库。
+
+### 主要内容
+
+1. 定义 `ICacheService`：
+   ```csharp
+   Task<T> GetOrSetAsync<T>(
+       string key,
+       Func<Task<T>> factory,
+       TimeSpan expiration,
+       CancellationToken cancellationToken = default);
+
+   Task RemoveAsync(
+       string key,
+       CancellationToken cancellationToken = default);
+
+   Task RemoveByPrefixAsync(
+       string prefix,
+       CancellationToken cancellationToken = default);
+   ```
+2. 实现 `RedisCacheService`：
+   - JSON 序列化和反序列化
+   - TTL
+   - 完整 Key 删除
+   - Prefix 批量删除
+   - Redis 异常日志
+   - Redis 故障时回退数据库
+3. 新增 `CacheKeys`，管理 Published Cars 和 Pending Cars。
+4. Published Cars 缓存 Key 包含：
+   ```text
+   Page
+   PageSize
+   Brand
+   MinPrice
+   MaxPrice
+   MinYear
+   MaxYear
+   ```
+5. Pending Cars 缓存 Key 包含：
+   ```text
+   Page
+   PageSize
+   ```
+6. 在 `GetPublishedCarsAsync` 和 `GetPendingCarsAsync` 中使用 Cache-Aside。
+7. 在以下业务数据变化后清理相关缓存：
+   - 提交车辆审核
+   - 审核通过
+   - 审核拒绝
+   - Admin 删除车辆
+   - 创建订单并改变车辆状态
+   - 取消订单并恢复车辆状态
+8. 新增 `FakeCacheService`，供单元测试和集成测试使用。
+9. Docker Compose 增加本地 Redis。
+10. 生产环境使用 Upstash Redis，通过环境变量管理连接信息。
+
+### 知识点
+
+- Cache-Aside
+- Cache Key 设计
+- TTL
+- 主动缓存失效
+- Prefix Invalidation
+- 缓存降级
+
+### 测试与验证
+
+- 缓存未命中时查询数据库并写入缓存。
+- 缓存命中时直接返回缓存数据。
+- 不同筛选条件使用不同 Key。
+- 数据变化后相关缓存失效。
+- Redis 不可用时业务回退数据库。
+- 测试环境不依赖真实 Redis。
+
+### 验收标准
+
+- Published 和 Pending 列表支持缓存。
+- 缓存 Key 与真实查询参数一致。
+- Redis 故障不会中断主要业务。
+- 缓存失效规则与业务状态变化一致。
+
+---
+
+## Step 59 · API 限流
+
+**产出：** 对认证、邮件、浏览和写操作应用不同的限流策略，并统一处理 429。
+
+### 主要内容
+
+1. 定义 6 个策略：
+   ```text
+   Login
+   Register
+   ForgotPassword
+   ResendVerification
+   Browse
+   Write
+   ```
+2. Login：固定窗口，按 IP 分区，每分钟 20 次。
+3. Register：固定窗口，按 IP 分区，每小时 20 次。
+4. Forgot Password：固定窗口，按 IP 分区，每小时 3 次。
+5. Resend Verification：固定窗口，按 IP 分区，每小时 3 次。
+6. Browse 使用 Token Bucket：
+   ```text
+   已登录用户：按 UserId 分区，每分钟 120 次
+   未登录用户：按 IP 分区，每分钟 60 次
+   ```
+7. Write 使用 Token Bucket，按 UserId 分区，每分钟 30 次。
+8. 被限流时统一返回：
+   - `429 Too Many Requests`
+   - `Retry-After`
+   - 项目统一的 `ApiResponse`
+9. Axios 响应拦截器读取 `Retry-After`，显示 toast 并返回标准 Error。
+10. 中间件顺序：
+    ```text
+    CORS
+    → Rate Limiter
+    → Authentication
+    → Authorization
+    ```
+11. 测试环境注册相同策略名称，保证带有限流特性的 Controller 正常启动。
+
+### 知识点
+
+- Fixed Window
+- Token Bucket
+- IP Partition
+- User Partition
+- `Retry-After`
+- 中间件顺序
+
+### 测试与验证
+
+- 每个策略应用到正确接口。
+- 超限后返回 429 和统一错误结构。
+- 响应包含 `Retry-After`。
+- 前端显示等待提示。
+- 集成测试正常启动。
+
+### 验收标准
+
+- 6 个限流策略可用。
+- 认证、邮件、浏览和写操作使用合适额度。
+- 前后端能够统一处理 429。
+
+---
+
+## Step 60 · Hangfire 后台任务与 Application Insights
+
+**产出：** 将邮件发送转为后台任务，定期清理过期 Token，并建立生产遥测能力。
+
+### 主要内容
+
+1. 安装：
+   - `Hangfire`
+   - `Hangfire.SqlServer`
+   - `Microsoft.ApplicationInsights.AspNetCore`
+   - `Serilog.Sinks.ApplicationInsights`
+2. 配置 Hangfire：
+   - 复用 SQL Server
+   - Queue Poll Interval 15 秒
+   - Sliding Invisibility Timeout 5 分钟
+   - Worker Count 5
+   - 使用 `default` Queue
+3. Testing 环境跳过真实 Hangfire SQL Server 初始化。
+4. 使用 `IBackgroundJobClient.Enqueue` 异步发送：
+   - 注册验证邮件
+   - 重发验证邮件
+   - 密码重置邮件
+5. 新增 `TokenCleanupService`，清理：
+   - 过期密码重置 Token
+   - 过期 Refresh Token
+   - 已撤销 Refresh Token
+6. 注册每日任务：
+   ```text
+   Job ID: cleanup-expired-tokens
+   Cron: Cron.Daily
+   Time Zone: UTC
+   执行时间：UTC 00:00
+   ```
+7. 挂载 `/hangfire`。
+8. Dashboard 授权：
+   - Development 环境允许本地查看
+   - 其他环境要求已认证 Admin
+9. Application Insights 记录：
+   - ASP.NET Core 请求
+   - 异常
+   - Dependency
+   - 请求耗时
+   - Serilog 结构化日志
+10. Application Insights 未配置时，应用仍能正常启动。
+11. Azure Container Apps 通过环境变量提供 Connection String。
+
+### 知识点
+
+- Fire-and-Forget Job
+- Recurring Job
+- Hangfire Worker
+- Dashboard Authorization
+- Application Insights
+- Structured Logging
+- UTC 定时任务
+
+### 测试与验证
+
+- 三种邮件操作创建后台任务。
+- HTTP 请求不等待真实邮件发送。
+- Token Cleanup 删除符合条件的数据。
+- Testing 环境使用 Fake Job Client。
+- Dashboard 权限正确。
+- Application Insights 可以接收生产遥测。
+
+### 验收标准
+
+- 邮件发送不阻塞 HTTP 请求。
+- Dashboard 可以查看任务状态。
+- Token Cleanup 每天 UTC 00:00 执行。
+- 测试环境不依赖 Hangfire 数据库。
+- 生产日志可以进入 Application Insights。
+
+---
+
+## Step 61 · Refresh Token 机制
+
+**产出：** 使用 Refresh Token Rotation 和 HttpOnly Cookie 自动续期用户会话。
+
+### 主要内容
+
+1. 新增 `RefreshTokens` 表：
+   ```text
+   Id
+   Token
+   UserId
+   ExpiresAt
+   IsRevoked
+   CreatedAt
+   ```
+2. 创建 `AddRefreshTokensTable` Migration。
+3. 登录成功后：
+   - Access Token 放在响应 Body
+   - Refresh Token 写入 HttpOnly Cookie
+   - Refresh Token 保存到数据库
+   - 默认有效期 7 天
+4. 新增 `POST /auth/refresh`。
+5. Refresh 时执行 Token Rotation：
+   ```text
+   读取 Cookie
+   → 验证 Refresh Token
+   → 撤销旧 Token
+   → 创建新 Access Token
+   → 创建新 Refresh Token
+   → 更新 Cookie
+   → 返回 Access Token
+   ```
+6. Logout 时撤销当前 Refresh Token、删除 Cookie 并清理前端状态。
+7. Cookie 配置：
+
+   **生产环境：**
+   ```text
+   HttpOnly = true
+   Secure = true
+   SameSite = None
+   ```
+
+   **开发环境：**
+   ```text
+   HttpOnly = true
+   Secure = false
+   SameSite = Strict
+   ```
+8. 删除 Cookie 时使用与创建 Cookie 匹配的属性。
+9. CORS 指定前端 Origin 并启用 `AllowCredentials()`。
+10. `authStore` 保存 User、Access Token 和初始化状态。
+11. Access Token 只保存在内存中，不写入 `localStorage`。
+12. 页面刷新后通过 `/auth/refresh` 恢复认证状态。
+13. 使用模块级 `initializePromise` 避免重复初始化请求。
+14. Axios 请求拦截器从 Zustand 读取最新 Access Token。
+15. Axios 收到 401 后：
+    - 使用 `_retry` 防止无限重试
+    - 调用 Refresh
+    - 更新 Access Token
+    - 重试原请求
+    - Refresh 失败后清理状态并跳转登录页
+16. Axios 开启 `withCredentials: true`。
+17. 考虑 Azure Container Apps 冷启动，将请求 timeout 设置为 30 秒。
+18. Step 60 的定时任务同时清理无效 Refresh Token。
+
+### 知识点
+
+- Access Token 与 Refresh Token
+- HttpOnly Cookie
+- Refresh Token Rotation
+- SameSite 与跨站 Cookie
+- CORS Credentials
+- 内存状态与持久化状态
+- Axios Interceptor
+- 认证状态初始化
+
+### 测试与验证
+
+- 运行后端编译和现有测试。
+- 在浏览器中检查 Refresh Token Cookie 属性。
+- 临时缩短 Access Token 有效期，验证自动 Refresh。
+- 在数据库中检查旧 Token 被撤销、新 Token 生效。
+- 验证 Logout 后 Cookie 被删除，旧 Token 不能继续使用。
+- 验证页面刷新后可以恢复认证状态。
+
+### 验收标准
+
+- Access Token 可以自动续期。
+- Refresh Token 不能被前端 JavaScript 读取。
+- 每次 Refresh 都轮换 Token。
+- Logout 后 Token 失效。
+- Azure 跨站 Cookie 正常工作。
+
+---
+
+## Step 62 · 乐观锁与并发安全
+
+**产出：** 使用 SQL Server RowVersion 防止车辆状态被并发请求静默覆盖。
+
+### 主要内容
+
+1. 为 `Car` 增加：
+   ```csharp
+   [Timestamp]
+   public byte[] RowVersion { get; set; } = [];
+   ```
+2. 在 EF Core 中将其配置为 RowVersion/Concurrency Token。
+3. 创建 `AddCarRowVersion` Migration，仅修改 `Cars` 表。
+4. Admin 审核车辆时通过 `Car.RowVersion` 检测并发修改。
+5. 创建订单时会同时把车辆从 Published 改为 Sold，通过 `Car.RowVersion` 防止两个 Buyer 同时购买同一辆车。
+6. 捕获 `DbUpdateConcurrencyException` 并转换为项目统一的 `ConcurrencyException`。
+7. 全局异常处理返回 `409 Conflict`。
+8. Axios 统一处理 409：
+   - 显示资源已被其他操作修改
+   - 建议刷新后重试
+   - 将 Error 返回调用方
+
+### 知识点
+
+- Optimistic Concurrency
+- SQL Server RowVersion
+- Concurrency Token
+- Lost Update
+- `DbUpdateConcurrencyException`
+- HTTP 409
+
+### 测试与验证
+
+- `ApproveAsync_WhenConcurrencyConflict_ThrowsConcurrencyException`
+- `RejectAsync_WhenConcurrencyConflict_ThrowsConcurrencyException`
+- 手动验证正常审核和下单流程不受影响。
+- 检查 API 的 409 统一响应。
+
+### 验收标准
+
+- `Cars` 表包含 RowVersion。
+- Admin 审核冲突不会静默覆盖。
+- 同一车辆的并发购买通过车辆 RowVersion 受到保护。
+- 后端统一返回 409，前端显示明确提示。
+
+---
+
+## Step 63 · 安全加固与审计日志
+
+**产出：** 增加 JWT 算法限制、安全响应头和 Admin 操作审计。
+
+### 主要内容
+
+1. JWT Validation 明确配置 `ValidAlgorithms`。
+2. 继续验证 Issuer、Audience、Lifetime 和 Signing Key。
+3. 增加安全响应头：
+   ```text
+   X-Content-Type-Options: nosniff
+   X-Frame-Options: DENY
+   Referrer-Policy: no-referrer
+   ```
+4. 新增 `AuditLogs` 表：
+   ```text
+   Id
+   AdminId
+   Action
+   EntityType
+   EntityId
+   Detail
+   CreatedAt
+   ```
+5. 定义 Admin 操作 Action：
+   - CarApproved
+   - CarRejected
+   - CarDeleted
+6. 新增 `AuditLogService`，统一写入审计记录。
+7. 在 Approve、Reject 和 Delete 成功后写入日志。
+8. 新增 `GET /admin/audit-logs`：
+   - 按时间倒序
+   - 支持分页
+   - 仅允许 Admin 访问
+
+### 知识点
+
+- JWT Algorithm Restriction
+- Security Headers
+- Audit Trail
+- 业务日志与技术日志的区别
+- Admin 授权
+
+### 测试与验证
+
+- 运行现有后端测试，确认安全改动不破坏已有功能。
+- 验证 API 返回安全响应头。
+- 手动以 Admin 执行 Approve、Reject 和 Delete。
+- 通过数据库或 `/admin/audit-logs` 检查审计记录。
+- 验证非 Admin 无法访问审计接口。
+- 验证分页和倒序结果。
+
+### 验收标准
+
+- JWT 只接受指定算法。
+- 基础安全响应头存在。
+- Admin 关键操作可以追踪。
+- 审计接口受到 Admin 授权保护。
+
+---
+
+# 第二阶段：前端功能与体验优化（Step 64–67）
+
+> **目标：完善车辆图片、表单可靠性、收藏交互和搜索体验。**
+
+---
+
+## Step 64 · 图片批量上传与拖拽排序
+
+**产出：** 支持多图选择、预览、上传失败重试、创建前排序和已有图片排序。
+
+### 主要内容
+
+1. 后端批量上传接口：
+   ```text
+   POST /cars/{carId}/images/batch
+   ```
+2. 上传限制：
+   - 每辆车最多 10 张
+   - 每张最大 5 MB
+   - JPEG、PNG、WebP
+   - 每个文件单独验证
+3. 上传前验证用户身份、车辆存在性和车辆归属。
+4. 文件上传到 Cloudflare R2，并创建带 `DisplayOrder` 的 `CarImage`。
+5. 前端文件输入支持 `multiple`。
+6. 每张图片显示本地预览及等待、上传、成功或失败状态。
+7. 单张失败不影响其他图片，并支持单独重试。
+8. 创建车辆前：
+   ```text
+   选择图片
+   → 本地预览
+   → 本地排序
+   → 创建车辆
+   → 获得 carId
+   → 按顺序上传图片
+   ```
+9. 编辑已有车辆时直接管理服务器图片。
+10. 使用 `@dnd-kit/core` 和 `@dnd-kit/sortable`。
+11. 支持拖动完整图片卡片。
+12. 后端排序接口：
+    ```text
+    PUT /cars/{carId}/images/reorder
+    ```
+13. 验证图片属于目标车辆、ID 不重复、用户有权限且排序集合有效。
+14. 排序后的第一张图片作为封面。
+
+### 知识点
+
+- Multipart Form Data
+- 多文件上传
+- Object URL
+- 独立上传状态和 Retry
+- Drag and Drop
+- DisplayOrder
+- 文件归属验证
+
+### 测试与验证
+
+- 批量上传合法图片。
+- 超过 10 张、非法类型或超过大小限制时拒绝。
+- 非 Owner 不能上传或排序。
+- 非本车辆图片不能参与排序。
+- 单张失败可以重试。
+- 创建前顺序可以保留到上传阶段。
+
+### 验收标准
+
+- 图片上传前可预览和排序。
+- 单张失败不影响其他图片。
+- 已有图片可以重新排序。
+- 第一张图片作为封面。
+- 权限验证正确。
+
+---
+
+## Step 65 · 草稿自动保存与 ErrorBoundary
+
+**产出：** 自动保存车辆表单内容，并在 React 渲染异常时提供可恢复界面。
+
+### 主要内容
+
+1. 草稿保存 Brand、Model、Year、Price、Mileage 和 Description 等可序列化字段。
+2. 图片 File 和 Object URL 不写入 `localStorage`。
+3. 表单变化后使用 2 秒 debounce 保存草稿。
+4. 页面加载时检查并恢复草稿，显示提示。
+5. 车辆创建成功后清除草稿，提交失败时保留草稿。
+6. 提供主动清除草稿操作。
+7. 使用 `react-error-boundary` 提供的 ErrorBoundary。
+8. 创建项目统一的 `ErrorFallback` 和包装组件。
+9. Fallback 提供错误说明和重新尝试按钮。
+10. 只在 Development 环境显示具体错误内容。
+
+### 知识点
+
+- localStorage
+- Debounce
+- 表单恢复
+- File 不可持久化问题
+- `react-error-boundary`
+- `FallbackComponent`
+- `resetErrorBoundary`
+
+### 测试与验证
+
+- 表单变化后保存草稿。
+- 刷新后恢复草稿。
+- 创建成功后删除草稿。
+- 创建失败后保留草稿。
+- 图片不写入 localStorage。
+- 子组件抛出异常后显示 fallback。
+
+### 验收标准
+
+- 表单内容不会因刷新意外丢失。
+- 草稿恢复有明确提示。
+- 图片文件不会被错误持久化。
+- React 渲染错误不会产生无提示白屏。
+
+---
+
+## Step 66 · 收藏功能乐观更新
+
+**产出：** 收藏按钮立即响应，在请求失败时恢复原状态，并在请求结束后与服务器重新同步。
+
+### 主要内容
+
+1. 查询当前车辆收藏状态：
+   ```text
+   GET /favorites/{carId}
+   ```
+2. 未登录用户不发送收藏状态请求。
+3. 使用本地 `isFavorited` 控制按钮，服务器结果返回后同步本地状态。
+4. 添加收藏：
+   ```text
+   POST /favorites/{carId}
+   ```
+5. 取消收藏：
+   ```text
+   DELETE /favorites/{carId}
+   ```
+6. `onMutate`：
+   - 取消相关查询
+   - 保存收藏列表缓存快照
+   - 保存旧按钮状态
+   - 立即切换 UI
+7. `onError`：
+   - 显示错误提示
+   - 恢复按钮状态
+   - 恢复缓存快照
+8. `onSettled` 调用统一失效函数，使 Favorites 列表和单辆车收藏状态重新同步。
+9. Mutation 进行中限制重复点击。
+10. Query Key：
+    ```text
+    ["favorite", carId]
+    ["favorites", ...]
+    ```
+
+### 知识点
+
+- Optimistic Update
+- Mutation Lifecycle
+- Cache Snapshot
+- Rollback
+- Query Invalidation
+- 本地 UI State 与服务器 State
+
+### 测试与验证
+
+- 添加和取消收藏时按钮立即变化。
+- 请求失败时恢复原状态。
+- 请求结束后相关查询被正确失效。
+- 未登录用户不查询收藏状态。
+- 重复点击不会产生冲突请求。
+
+### 验收标准
+
+- 收藏交互无需等待服务器响应。
+- 添加和取消均支持失败回滚。
+- 最终状态可以与服务器重新同步。
+
+---
+
+## Step 67 · 搜索体验优化
+
+**产出：** 增加 Year 范围筛选、品牌搜索词高亮和完整 URL 状态同步。
+
+### 主要内容
+
+1. 增加 Min Year 和 Max Year。
+2. 后端 `CarQueryRequest` 支持 `MinYear` 和 `MaxYear`。
+3. 首页使用 `brand` 作为品牌搜索和筛选参数。
+4. URL 同步：
+   ```text
+   brand
+   minPrice
+   maxPrice
+   minYear
+   maxYear
+   page
+   ```
+5. PageSize 使用首页固定常量，不写入 URL。
+6. 页面刷新时从 URL 恢复筛选。
+7. Brand、Price 和 Year 输入使用 debounce。
+8. 后端对 Brand 执行不区分大小写的模糊匹配。
+9. CarCard 在 `Brand` 和 `Title` 中高亮当前品牌搜索词。
+10. 高亮逻辑转义正则特殊字符，不注入未经处理的 HTML。
+11. 筛选变化后返回第一页，翻页时保留其他参数。
+12. 清除筛选时同步清理 URL。
+
+### 知识点
+
+- Query String
+- `useSearchParams`
+- Debounce
+- 正则表达式转义
+- 搜索结果高亮
+- 可分享 URL
+
+### 测试与验证
+
+- Year 范围正确传给后端。
+- MinYear 和 MaxYear 可以独立使用。
+- 刷新和分享 URL 后筛选条件保留。
+- Brand 和 Title 中的匹配文字正确高亮。
+- 特殊字符不会破坏高亮逻辑。
+- 修改筛选后回到第一页。
+
+### 验收标准
+
+- Year 范围筛选可用。
+- 品牌搜索词正确高亮。
+- 筛选状态与 URL 一致。
+- 输入不会产生过多请求。
+
+---
+
+# 第三阶段：测试体系（Step 68–69）
+
+> **目标：建立前端单元测试和完整业务流程的端到端测试。**
+
+---
+
+## Step 68 · Vitest 与 React Testing Library
+
+**产出：** 建立前端单元测试环境，并覆盖关键组件和认证路由。
+
+### 主要内容
+
+1. 配置 Vitest：
+   - jsdom
+   - Setup File
+   - Path Alias
+   - Coverage
+2. 安装 React Testing Library、jest-dom、user-event 和 Coverage Provider。
+3. 在 Vitest 配置中排除 `e2e/**`，Playwright 测试只由 Playwright 执行。
+4. npm scripts：
+   ```json
+   {
+     "test": "vitest",
+     "test:coverage": "vitest --coverage"
+   }
+   ```
+5. 一次性运行：
+   ```bash
+   npm test -- --run
+   ```
+6. CarCard：4 个测试
+   - 基础信息
+   - 无图片 fallback
+   - 正确显示图片
+   - 品牌搜索词高亮
+7. LoginPage：4 个测试
+   - 空表单验证
+   - 无效邮箱验证
+   - 正确提交登录
+   - API 错误提示
+8. ProtectedRoute：2 个测试
+   - 未认证用户跳转登录
+   - 已认证用户看到受保护内容
+9. 保留 1 个测试环境 Sanity Test。
+10. 测试关注用户行为，不依赖组件内部实现。
+11. 测试文件不保留临时 `screen.debug`。
+
+### 知识点
+
+- Unit Test 与 Component Test
+- jsdom
+- Accessible Query
+- `userEvent`
+- Mock
+- Coverage
+- Vitest 与 Playwright 的职责边界
+
+### 测试与验证
+
+- `npm test -- --run`
+- `npm run test:coverage`
+- 确认 4 个测试文件、11 个测试通过。
+- 确认 Vitest 不再扫描 Playwright 文件。
+- 确认测试输出没有临时 DOM 调试内容。
+
+### 验收标准
+
+- Vitest 和 RTL 配置完成。
+- 11 个基础测试通过。
+- Coverage 报告可以生成。
+- 单元测试不依赖真实 API。
+- Vitest 与 Playwright 测试范围互不冲突。
+
+---
+
+## Step 69 · Playwright 端到端测试
+
+**产出：** 使用真实前后端和数据库验证五条核心用户流程。
+
+### 主要内容
+
+1. 配置 Playwright：
+   - Chromium
+   - Base URL
+   - Screenshot on failure
+   - Trace
+   - Retry 关闭
+   - 单 Worker
+2. E2E 使用本地 React、ASP.NET Core API、SQL Server 和 Redis。
+3. 创建 `LoginPage` Page Object。
+4. 使用 Playwright Request API 创建测试前置数据。
+5. Development 环境提供测试所需的邮箱验证 Token 获取接口，生产环境不暴露。
+6. 使用时间戳生成唯一邮箱和测试数据。
+7. 五条核心用户旅程：
+   1. 用户注册并看到验证提示
+   2. Seller 登录、发布车辆并提交审核
+   3. Admin 审核车辆通过
+   4. Buyer 浏览车辆并下单
+   5. Seller 查看收到的销售订单
+8. 失败时保留 Screenshot、Trace、Playwright Report 和 Test Results。
+9. npm scripts：
+   ```json
+   {
+     "e2e": "playwright test",
+     "e2e:ui": "playwright test --ui",
+     "e2e:headed": "playwright test --headed"
+   }
+   ```
+10. GitHub Actions 建立 E2E Job 骨架：
+    - 安装 Chromium
+    - 配置测试产物上传
+    - 保留完整测试环境尚未接入时的占位任务
+11. 本步骤验证本地 E2E；Step 73 再将同一流程接入 GitHub Runner 的临时环境。
+
+### 知识点
+
+- End-to-End Test
+- Page Object Model
+- API Setup
+- 测试数据隔离
+- 浏览器自动化
+- 本地 E2E 与 CI 测试环境
+
+### 测试与验证
+
+- 五条流程可以连续通过。
+- 重复运行不会因数据冲突失败。
+- 测试接口只在 Development 可用。
+- 失败时生成截图和报告。
+- Vitest 不加载 E2E 文件。
+
+### 验收标准
+
+- 本地 Playwright 流程稳定。
+- 核心业务由真实前后端共同验证。
+- 测试数据能够隔离。
+- CI 占位任务与本地真实测试的完成状态明确区分。
+
+---
+
+# 第四阶段：实时功能与后台管理（Step 70–71）
+
+> **目标：实现实时通知，并通过 Admin 数据面板展示平台核心业务数据。**
+
+---
+
+## Step 70 · SignalR 实时通知与通知持久化
+
+**产出：** 订单和车辆审核事件可以持久化为通知，并实时推送给目标用户。
+
+### 主要内容
+
+1. 新增 `Notification`：
+   ```text
+   Id
+   UserId
+   Type
+   Message
+   RelatedId
+   IsRead
+   CreatedAt
+   ```
+2. `Message` 最大长度 300。
+3. 定义通知类型：
+   ```text
+   NewOrder
+   OrderCancelled
+   CarApproved
+   CarRejected
+   ```
+4. 创建 EF Core Configuration、DbSet 和 `AddNotificationsTable` Migration。
+5. 为 `UserId + IsRead + CreatedAt` 配置复合索引。
+6. 新增 SignalR Hub：
+   ```text
+   /hubs/notification
+   ```
+7. Hub 要求 JWT 认证。
+8. 前端通过 `accessTokenFactory` 提供 Access Token。
+9. 后端只在 Hub 路径读取 Query String 中的 `access_token`。
+10. 统一 Group 名称：
+    ```csharp
+    public static string ForUser(int userId)
+        => $"user-{userId}";
+    ```
+11. `OnConnectedAsync`：
+    - 从 JWT 身份读取 UserIdentifier
+    - 转换成整数 UserId
+    - 非法身份终止连接
+    - 将 Connection 加入用户 Group
+12. 同一用户的多个 Connection 加入同一个 Group。
+13. `INotificationService`：
+    ```text
+    写数据库
+    → 保存
+    → 推送 ReceiveNotification
+    ```
+14. SignalR 推送失败只记录 Warning，不影响已经成功的业务操作。
+15. 业务事件：
+    - 创建订单 → Seller
+    - 取消订单 → Seller
+    - 审核通过 → Seller
+    - 审核拒绝 → Seller
+16. REST API：
+    ```text
+    GET /notifications
+    PUT /notifications/{id}/read
+    PUT /notifications/read-all
+    ```
+17. `GET /notifications` 返回当前用户全部未读通知。
+18. 用户只能操作自己的通知。
+19. `read-all` 使用 `ExecuteUpdateAsync`。
+20. 前端 Query Key 包含 UserId。
+21. 通知逻辑保留在 `NotificationBell`：
+    - 查询未读通知
+    - 显示角标和列表
+    - 单条或全部标记已读
+    - 建立 SignalR 连接
+    - 监听 `ReceiveNotification`
+    - 收到事件后使通知查询失效
+    - 卸载时停止连接
+22. SignalR 使用自动重连，每次连接或重连从 Zustand 读取最新 Token。
+
+### 知识点
+
+- SignalR Hub
+- WebSocket
+- JWT Query String
+- ConnectionId
+- User Group
+- 多标签页连接
+- 自动重连
+- 通知持久化
+- 实时事件与 REST 查询结合
+
+### 测试与验证
+
+AdminCarService：
+
+- Approve 发送 `CarApproved`。
+- Reject 发送 `CarRejected`。
+
+OrderService：
+
+- 创建订单发送 `NewOrder`。
+- 取消订单发送 `OrderCancelled`。
+
+使用 `FakeNotificationService` 验证：
+
+- 接收用户
+- 通知类型
+- `RelatedId`
+- 业务失败时不发送成功通知
+
+手动验证：
+
+- Seller 实时收到通知。
+- 多标签页同时收到通知。
+- 断线重连后重新加入 Group。
+- 离线后重新登录仍可读取未读通知。
+- 单条已读和全部已读正确。
+
+### 验收标准
+
+- 四类通知可以持久化。
+- 在线用户可以实时接收。
+- 离线用户可以读取未读通知。
+- 多标签页连接正常。
+- 用户只能操作自己的通知。
+- 后端通知测试通过。
+
+---
+
+## Step 71 · Admin 数据面板
+
+**产出：** Admin 可以查看平台核心指标、趋势图表和审计日志。
+
+### 主要内容
+
+1. 在受 Controller 级 Admin 角色授权保护的 `AdminController` 中新增 `GET /admin/stats`。
+2. 使用 `AdminStatsResponse` 一次返回：
+   ```text
+   totalCars
+   pendingCars
+   publishedCars
+   totalUsers
+   monthlyOrders
+   monthlyRevenue
+   dailyNewCars
+   dailyRevenue
+   brandDistribution
+   ```
+3. 6 个核心指标使用明确的业务口径：
+   - `totalCars`：除 `Deleted` 外的全部车辆。
+   - `pendingCars`：`PendingReview` 车辆。
+   - `publishedCars`：仅 `Published` 车辆，不包含 `Sold`。
+   - `totalUsers`：全部用户，包括 Admin Seed。
+   - `monthlyOrders`：当前 UTC 月内按 `CreatedAt` 创建的全部订单。
+   - `monthlyRevenue`：当前 UTC 月内按 `UpdatedAt` 完成的订单，只统计 `Completed`，金额使用订单快照 `Order.Price`。
+4. 月度查询使用 UTC 半开区间：
+   ```text
+   timestamp >= startOfMonth
+   timestamp < startOfNextMonth
+   ```
+5. `dailyNewCars` 和 `dailyRevenue` 返回包含今天在内的最近 30 个 UTC 日期：
+   - `dailyNewCars` 按 `Car.CreatedAt` 分组，保留后来变成 `Deleted` 的历史创建事件。
+   - `dailyRevenue` 按 Completed 订单的 `UpdatedAt` 分组并汇总 `Order.Price`。
+   - Repository 只返回数据库实际存在的日期，Service 补齐缺失日期并填入 `0`。
+   - 日期桶使用 `DateOnly`，避免前端时区转换造成日期偏移。
+6. 品牌分布只统计 `Published + Sold`，先按数量降序、品牌名升序稳定排序，再取前 10。
+7. 使用 `TimeProvider` 获取当前 UTC 时间，使 30 天时间窗口可以在单元测试中固定。
+8. 使用 `Controller → Service → Repository` 分层：
+   - `EfAdminStatsRepository` 执行 `Count`、`Sum` 和 `GroupBy`。
+   - `AdminStatsService` 计算时间边界、补齐日期并组合 Dashboard DTO。
+   - 聚合查询直接在数据库执行，不先加载 Entity，也不需要额外使用 `AsNoTracking()`。
+9. 使用 Cache-Aside 缓存完整的 `AdminStatsResponse`：
+   - 缓存常量为 `CacheKeys.AdminStats`。
+   - TTL 为 5 分钟。
+   - 所有 Admin 共用同一个统计结果。
+   - 本步骤接受最多 5 分钟延迟，不为车辆、订单和用户写操作增加主动失效。
+10. 新增 `/admin/dashboard` 页面，并将 `/admin` 默认重定向到 Dashboard。
+11. Stats 和 Audit Logs 使用两个独立的 TanStack Query：
+   - Stats 使用固定 Query Key。
+   - Audit Logs 的 Query Key 包含 `page` 和 `pageSize`。
+   - 日志翻页不会重新请求 Stats。
+12. Admin Dashboard 渲染：
+   - 6 个统计卡片
+   - 每日新增车辆折线图
+   - 每日成交额折线图
+   - 品牌分布饼图
+   - 审计日志表格和分页
+13. 使用 Recharts 的 `ResponsiveContainer`、`LineChart` 和 `PieChart`，并为图表父容器设置明确高度。
+14. Stats 与 Audit Logs 分别处理 Loading、Error 和 Success 状态，审计日志额外处理 Empty 状态。
+15. 使用新西兰格式显示数据：
+    - 数字：`en-NZ`
+    - 金额：`en-NZ` + `NZD`
+    - UTC 日期桶：直接按 `yyyy-MM-dd` 字符串格式化，不创建本地 `Date`
+    - 审计日志时间：转换为用户本地时间后使用 `en-NZ`
+16. 审计日志继续复用 Step 63 已实现的 `GET /admin/audit-logs`，不为 Dashboard 重复实现日志接口。
+
+### 知识点
+
+- SQL Aggregate
+- `Count`、`Sum` 和 `GroupBy`
+- UTC 半开时间区间
+- `DateOnly` 日期桶
+- 时间序列补零
+- Dashboard DTO
+- `TimeProvider`
+- Cache-Aside 与短期 TTL
+- TanStack Query Key
+- Recharts
+- 新西兰数字、金额和日期格式
+
+### 测试与验证
+
+- Service 单元测试使用固定 UTC 时间，验证最近 30 天的起止日期、连续 30 项和缺失日期补零。
+- API 集成测试使用真实 SQL Server，验证：
+  - `Deleted` 不进入 `totalCars`。
+  - 月度订单和月度成交额使用正确边界与统计口径。
+  - 每日新增车辆包含历史创建后被删除的车辆。
+  - 每日成交额只汇总 Completed 订单。
+  - 品牌分布只返回稳定排序后的前 10。
+- API 集成测试验证普通用户访问 `GET /admin/stats` 返回 403。
+- 通过真实 Redis 日志手动验证首次请求 Cache MISS 并执行 SQL，第二次请求 Cache HIT 且不再执行统计 SQL。
+- 手动验证 6 张统计卡片、两个折线图、一个饼图及审计日志分页正确渲染。
+- 运行后端测试、前端 lint 和 build；本步骤不新增 Dashboard 前端自动化测试。
+
+### 验收标准
+
+- Admin 可以查看 6 个核心指标。
+- 月度统计使用正确的 UTC 边界和业务口径。
+- 两组趋势数据连续返回最近 30 个 UTC 日期。
+- 品牌分布只包含 Published 和 Sold，并返回前 10。
+- 两个折线图和一个饼图正常显示。
+- 审计日志可以分页查看。
+- 非 Admin 无法访问统计接口或 Dashboard。
+- 完整统计结果缓存 5 分钟，缓存命中时不再执行统计查询。
+
+---
+
+# 第五阶段：认证扩展、交付优化与总结（Step 72–75）
+
+> **目标：增加基于 OAuth 2.0 / OpenID Connect 的 Google 第三方登录，优化 CI/CD 和前端性能，并完成 V3 文档与版本收尾。**
+
+---
+
+## Step 72 · Google OpenID Connect（OIDC）第三方登录
+
+**产出：** 在保留本地 Email + Password 登录的基础上，用户可以使用 Google 账号注册或登录；系统验证 Google 的 OIDC ID Token，并复用现有 Access Token、Refresh Token 和 HttpOnly Cookie 会话体系。
+
+> **范围说明：** 本步骤学习 OAuth 2.0 基础上的 OpenID Connect 身份认证，不授权 UUcars 访问 Google Calendar、Drive 等第三方资源。因此不保存 Google Access Token 或 Refresh Token，也不实现第三方 API 的授权码资源访问流程。
+
+### 主要内容
+
+1. 在 Google Cloud Console 创建 Web application OAuth 2.0 Client，并配置本地与 Azure Static Web Apps 的 Authorized JavaScript origins。
+2. 前端安装 `@react-oauth/google`，在应用根部配置 `GoogleOAuthProvider`。
+3. 登录页和注册页使用同一个 `Continue with Google` 按钮：用户不需要区分注册或登录。
+4. 前端使用 `GoogleLogin` popup callback 接收 `credential` ID Token，并调用后端 `POST /auth/google`；不使用 Google API Access Token 作为登录凭证。
+5. 后端使用 Google 官方 .NET 验证库验证 ID Token 的签名、Issuer、Audience、Expiry、Subject 和 Email Verified；不得信任前端自行解析出的用户资料。
+6. 新增 Google 专属的 `IGoogleIdTokenValidator`，将已验证结果转换为通用 `ExternalIdentity`（Provider、Subject、Email、EmailVerified、DisplayName），以便单元测试替换外部验证。
+7. 新增 `ExternalLogins` 表：
+   ```text
+   Id
+   UserId
+   Provider
+   ProviderSubject
+   CreatedAt
+   ```
+   - `Provider + ProviderSubject` 必须唯一。
+   - `UserId` 建立索引并关联 `Users`。
+   - `Users.PasswordHash` 改为可空；Google-only 用户没有 UUcars 本地密码。
+8. 新增通用 `ExternalLoginService` 处理已经验证的第三方身份：
+   ```text
+   先按 Provider + ProviderSubject 查找 ExternalLogin
+   → 找到：登录关联的 UUcars User
+
+   找不到，再按已验证 Email 查找 User
+   → 找到：为该 User 自动新增 Google ExternalLogin，并登录原账号
+
+   两者都找不到
+   → 创建新 User（PasswordHash = null，EmailConfirmed = true）
+   → 创建 Google ExternalLogin
+   → 登录
+   ```
+   Google 验证的 Email 可作为邮箱所有权证明；若命中未验证的本地账号，则完成邮箱确认并清除旧的验证 Token。
+9. 无论本地密码登录还是 Google 登录，均由后端签发现有 `LoginResponse`、创建 Refresh Token，并写入现有 HttpOnly Cookie；`POST /auth/google` 使用现有 Login 限流策略，且不得记录 ID Token。
+10. Google-only 用户不能通过本地密码登录或 UUcars 忘记密码流程设置密码；未来若需要“添加本地密码”，作为独立的账户安全功能处理。
+11. 用户名使用 Google Display Name；若缺失则使用受约束的 Email local-part 生成后备值，保持现有 `Username` 非空约束。
+12. Client ID 分别配置为：
+   ```text
+   前端：VITE_GOOGLE_CLIENT_ID
+   后端：GoogleAuth__ClientId
+   ```
+   两者值相同，用于前端初始化和后端 Audience 验证。Client ID 是公开标识，不是 Client Secret；本步骤不需要 Client Secret。
+13. 本地前端值放入 `.env.local`，Azure Static Web Apps 配置前端环境变量，Azure Container Apps 配置后端环境变量；真实配置不进入 Git。
+14. 当前只实现 Google。未来 Apple 和 Meta 分别新增 `POST /auth/apple`、`POST /auth/facebook` 及各自的凭证验证器，再复用 `ExternalIdentity`、`ExternalLoginService`、`ExternalLogins`、JWT 和 Refresh Token 核心流程。
+
+### 知识点
+
+- OAuth 2.0 与 OpenID Connect 的职责区别
+- OAuth Client、Authorized JavaScript Origin
+- OIDC Identity Provider 与 Relying Party
+- ID Token
+- Issuer、Audience、Subject、Email Verified
+- External Login
+- Just-in-Time Provisioning
+- 外部身份与本地 User 的关联
+- 第三方身份与本地 JWT
+
+### 测试与验证
+
+- 有效 Google ID Token 可以登录；错误签名、Issuer、Audience、过期 Token 或未验证 Email 被拒绝。
+- 已有关联的 Google Subject 返回原 UUcars User，不会重复创建账号。
+- 同 Email 的本地账号首次使用 Google 登录后进入原账号，并创建唯一的 ExternalLogin 关联。
+- 新 Google 用户自动创建 User 与 ExternalLogin，`EmailConfirmed = true` 且 `PasswordHash = null`。
+- Google-only 用户无法使用本地密码登录或密码重置流程。
+- Google 登录获得正常 Access/Refresh Token 与 Refresh Token Cookie。
+- `Provider + ProviderSubject` 不能关联到两个 UUcars User。
+- 普通注册、邮箱验证、密码登录、密码重置和 Refresh Token 流程不受影响。
+- 前端组件测试覆盖 Google 成功、取消和 API 失败反馈；后端单元与集成测试使用 Fake Google Token Validator，不依赖真实 Google。
+
+### 验收标准
+
+- 用户可在登录页或注册页使用同一个 Google 按钮完成注册或登录。
+- 已有 Google 用户和同 Email 的本地用户均进入正确的同一 UUcars 账号。
+- Google-only 用户不获得不存在的本地密码登录能力。
+- 外部身份关联模型可在未来接入 Apple 或 Meta 时复用，无需重构 Users、JWT 或 Refresh Token 体系。
+- 复用现有 Token 体系，真实配置不进入 Git。
+
+---
+
+## Step 73 · 运行时升级与 CI/CD 完善
+
+**产出：** 沿本地运行、构建与测试 → Docker 构建与启动 → GitHub Actions 自动验证 → 受门禁的 Azure 生产发布的顺序，完善现有应用的交付流程，使同一提交的前后端产物经过完整 CI 后再发布和冒烟验证。
+
+### 主要内容
+
+1. **确认升级与交付基线**
+   - 以 Step 72 完成后的代码和配置为起点，核对当前运行时版本、构建入口、测试范围与部署配置。
+2. **理解项目的交付流程**
+   - 结合实际文件说明本地、Docker、GitHub Runner 和 Azure 的分工，明确源码、构建产物和镜像的关系。
+   - 阅读现有两个 Workflow，解释 YAML、Job、Step、`push`、PR 和 `needs`；后续小节严格按运行场景向前推进。
+3. **完善本地运行配置**
+   - 从启动需求引入 .NET 10、配套 NuGet 依赖和 Node.js 24，确认本地 SQL Server 与 Redis。
+   - 明确后端基础配置、Development、User Secrets、环境变量和前端 Vite 本地变量的来源，维护配置示例与忽略规则。
+4. **整理 API 启动流程**
+   - 沿入口代码解释配置读取、日志、注册、数据库准备和请求处理。
+   - 允许适度重构，统一合理的配置读取、绑定、客户端创建和连接管理方式，保留各服务必要的差异。
+   - 按模块验证，整理 Migration 与 Hangfire 顺序、中间件依赖和启动失败退出状态。
+5. **验证本地构建**
+   - 验证后端 Restore、Build 和前端 Production Build，处理实际构建问题。
+   - 核对前端构建变量，统一 Static Web Apps 配置来源并检查 `dist`，通过本地预览验证应用能打开。
+6. **运行本地核心测试**
+   - 依次验证后端单元测试、集成测试、前端 Lint 和组件测试。
+   - 在集成测试环节明确 Testing 环境常量、Factory 配置和 Fake；保留真实数据库、JWT 与 API 核心链路。
+7. **运行本地 E2E 测试**
+   - 按现有 Playwright 测试准备独立 E2E 数据库、测试账号、地址及数据清理或重建方式。
+   - 在需要时引入 E2E 环境，配置测试辅助接口、本地 Cookie 和必要的任务客户端，停止无关后台执行。
+   - 验证核心流程及失败诊断信息，完成本地阶段记录与提交。
+8. **构建 Docker 镜像**
+   - 沿 Dockerfile 说明构建上下文、SDK 发布和 Runtime Image，匹配已经验证的 .NET 版本。
+   - 确保本地 Secret 不进入构建上下文，重新构建并检查 API Image。
+9. **配置并启动 Docker 容器**
+   - 明确容器地址、环境变量和根目录 `.env` 的关系，完善 Compose 及配置示例。
+   - 验证 SQL Server、Redis、API 启动和基础响应，完成阶段提交；不扩展外部服务的完整业务验收。
+10. **完善 GitHub Actions 构建与测试**
+    - 按本地要求准备 Runner、运行时、Actions 和依赖，明确测试配置来源。
+    - Backend 执行 Restore、Build、单元及集成测试；Frontend 执行依赖安装、Lint、Vitest 和 Production Build，两者并行。
+    - 推送功能分支，通过实际 Workflow 结果验证。
+11. **建立受 CI 门禁的生产发布**
+    - 使用 `develop → main` 发布 PR，要求发布来源、Backend、Frontend 和真实 E2E 检查通过后才合并。
+    - `main` CI 成功后由独立 CD Workflow 读取同一 Commit，并行生成前端 Artifact 与后端 GHCR 镜像 Digest。
+    - 先部署 Azure Container Apps 后端，再上传预构建的 Azure Static Web Apps 前端，最后从公网验证 API、页面与 `release.json`。
+    - Azure 资源名称使用 GitHub Repository Variables，敏感 ID 和 Deployment Token 使用 Repository Secrets；Container App 继续保留生产运行时变量。
+    - 验证 Google OAuth 生产前端 Origin、前端 `VITE_GOOGLE_CLIENT_ID` 和后端 `GoogleAuth__ClientId` 使用同一 Client ID，并以新 Google 账号检查首次创建和重复登录不会创建重复用户。
+12. **最终收尾**
+    - 清理生成文件，核对 Workflow、配置示例和 Secret 边界。
+    - 同步项目文档并执行最终本地验证。
+    - 完成功能分支、`develop`、发布 PR、生产检查和分支清理。
+
+### 知识点
+
+- 本地开发、容器运行、CI 与生产部署的职责
+- .NET、Node.js 与各场景的版本兼容
+- 配置来源、覆盖顺序、ASP.NET Core Environment 与 Vite Mode
+- DI 注册、配置检查、客户端创建与连接时机
+- 单元测试、集成测试、组件测试与 E2E 的范围
+- Docker 多阶段构建、Compose 网络和构建上下文
+- GitHub Actions 触发条件、Job 依赖与临时测试环境
+- `workflow_run`、Release SHA、Artifact 与不可变镜像 Digest
+- GitHub Repository Variables、Repository Secrets 与 Azure Container Apps 运行时变量的边界
+- Lock File、下载缓存、Docker Build Cache 和失败诊断
+- 功能分支、阶段提交、发布 PR、生产冒烟与分支回同步
+
+### 测试与验证
+
+- 本地前后端运行正常，构建通过，前端产物可预览且包含唯一来源的 Static Web Apps 配置。
+- 后端单元及集成测试、前端 Lint 和组件测试通过。
+- 本地 E2E 在独立测试数据环境中通过，重新准备数据后可以再次运行。
+- Docker Image 构建成功，Compose 中 SQL Server、Redis 与 API 能正常运行并提供基础响应。
+- 功能分支中的 Backend、Frontend 和真实 E2E 通过，合并后的 `develop` 通过同样的必要检查。
+- `main` CI 成功后的 CD 从同一 Commit 部署前后端，并通过生产冒烟与浏览器手动验证。
+- 生产 Google 登录能创建新用户，重复使用同一 Google 账号不会生成重复用户。
+- 配置示例不含真实 Secret，本地 Secret 不进入 Git 或 Docker Build Context。
+- 已采用的缓存能够合理命中并根据输入变化更新，测试失败时能够查看诊断信息。
+- 文档链接、代码围栏与 `git diff --check` 完成检查，未执行的验证不记录为通过。
+
+### 验收标准
+
+- 学习与实施顺序为本地 → Docker → GitHub Actions，版本及配置调整在对应场景引入。
+- 每节先解释当前问题和原因，再增量操作与验证，不一次性给出最终完整实现。
+- API 启动与模块职责清楚，重构解决现有问题，保持核心业务行为。
+- 本地核心测试和 E2E 先通过，再在 Runner 中重现。
+- `develop` 通过部署前检查，`main` 通过后部署到 Azure Static Web Apps 与 Azure Container Apps。
+- `needs` 仅描述同一 Workflow 内的依赖；没有配置的强制分支规则不写成既成事实。
+- Step 73 建立并实际验证生产 CI/CD，代码、配置和文档保持一致。
+
+---
+
+## Step 74 · Bundle 优化与 Web Vitals
+
+**产出：** 基于 Step 73 已验证的构建和测试流程，先测量前端 Bundle 和页面加载情况，再实施解决实际问题的最小优化。本步骤聚焦前端性能及其可验证结果。
+
+### 主要内容
+
+1. 运行当前 Production Build，记录优化前的入口 Bundle、主要静态资源和 Lighthouse 结果。
+2. 核对分析工具与当前 Vite、Rolldown 的兼容性，选用适合现有项目的工具生成 Bundle 报告。
+3. 根据报告确认大型依赖、页面代码和重复模块在入口 Bundle 中的实际占比。
+4. 根据报告判断同步导入的页面是否增大首屏负担；需要时逐步采用 `React.lazy()` 动态导入，按路由拆分页面 Chunk。
+5. 引入懒加载时使用 `Suspense` 提供简单的加载反馈，优先复用现有 Loading UI。
+6. 在浏览器 Network 中检查首屏必要的共享代码与页面 Chunk，以及跳转时对应页面代码的按需加载。
+7. 只有 Bundle 报告证明存在问题时，才调整 Recharts、dnd-kit、SignalR 或其他依赖的导入方式；不提前替换库或添加复杂的手动分包规则。
+8. 根据图片在页面中的位置选择加载策略：
+   - 首屏以下的列表图片使用 `loading="lazy"`
+   - 可能成为 LCP 的 Hero 或首屏关键图片不使用 Lazy Loading
+   - 只有确认关键图片后才使用 `fetchPriority="high"`
+9. 保持图片稳定宽高比或明确尺寸，减少图片加载造成的 CLS。
+10. 在一致的测试条件下比较 Bundle、请求瀑布图及 Lighthouse 的加载、布局指标；交互响应结合 DevTools 中的实际操作观察，不把 Lighthouse 分数当作真实用户 INP。
+11. Lighthouse 结果作为本地诊断数据，不增加 Lighthouse CI，也不把单次本地分数当作真实用户数据。
+
+### 知识点
+
+- Bundle Analysis
+- Vite 8 与 Rolldown
+- Code Splitting
+- Route-level Lazy Loading
+- Tree Shaking
+- Dynamic Import
+- `Suspense` Fallback
+- 图片加载优先级
+- LCP、CLS、INP
+- Lab Data 与 Real User Data
+
+### 测试与验证
+
+- Production Build 成功并生成 Bundle 报告。
+- 根据测量实施分包时，确认入口体积变化、页面 Chunk 加载、直接访问和跳转行为。
+- 引入懒加载时，确认 Loading fallback 在慢速网络模拟下正常显示。
+- 首屏关键图片不会被错误地 Lazy Load，非首屏图片按需加载。
+- 相关 RTL Tests 和可运行的 E2E Tests 继续通过。
+- Lighthouse 和 Network 数据能够解释优化是否产生实际效果。
+
+### 验收标准
+
+- 能从 Bundle 报告说明入口文件主要由哪些模块组成。
+- 路由和图片优化由测量结果支持；无明确收益的改动不作为必做项。
+- 图片加载策略根据页面位置和 LCP 角色决定，而不是统一处理。
+- 优化建立在前后测量结果上，没有为了分包而增加不必要配置。
+- 能解释主要 Web Vitals 指标和本地 Lighthouse 的局限。
+
+---
+
+## Step 75 · 生产就绪完善与 V3.3 最终发布
+
+**产出：** 以真实生产状态为依据补全后台任务管理入口并完成有限的容器安全完善，核对最终实现、配置和文档，通过既有 CI/CD 路径发布并验证 `v3.3`。
+
+### 主要内容
+
+1. 从已经同步的 `develop` 建立 Step 75 收尾分支，以源代码、EF Core Migration、Model Snapshot、运行配置、自动测试、生产日志和 Git 历史作为事实来源；本步骤不增加新的业务功能或部署架构。
+2. 检查当前 Azure Container Apps Revision、启动日志、Application Insights、Hangfire Worker、Recurring Job、Dashboard 管理访问方式和现有 Health Probe 状态；将 `Microsoft.ApplicationInsights.AspNetCore` 从 `2.22.0` 升级到 `2.23.0`，恢复生产请求遥测。只处理能够由代码、日志或生产行为证明的问题；没有故障证据时不新增自定义 Health Endpoint、探针体系或监控平台。
+3. 补全 Hangfire Dashboard 的实际管理入口：保留 Hangfire 内置页面和现有 JWT Bearer 验证，将短期 Access Token 通过仅限 Dashboard 路径的 HttpOnly Cookie 交给浏览器导航，统一使用 `/admin/hangfire`，并由现有 Admin 角色规则控制访问；不重写任务管理页面，也不把 Refresh Token 改作页面凭据。
+4. 完成一项范围明确的容器安全完善：使用 .NET Runtime Image 已提供的非 Root 用户运行 API，正确设置应用和日志目录权限，并验证容器仍能启动、连接现有依赖和写入日志。不引入新的容器编排或基础设施工具。
+5. 核对公开构建变量、GitHub Actions Variables 与 Secrets、Azure Container Apps Runtime Variables 的 Key、用途和保存位置，不读取或记录真实 Secret 值；保留已经验证的 Release SHA、Image Digest、部署并发控制和 Production Smoke Test 设计。
+6. 按最终代码有针对性地更新 `README.md`、`docs/design/v3.md`、`docs/technical/database-schema.md` 和存在真实差异的 Technical Documentation。`AGENTS.md` 仅在长期协作规则确实变化时修改；不把学习笔记作为当前系统事实来源。
+7. 根据实际变更范围完成本地验证，再通过既有流程合并到 `develop`。发布 PR 必须通过 Validate Release Source、Backend、Frontend 和真实 E2E Checks，随后使用 Merge Commit 发布到 `main`。
+8. 确认 main CI、CD、Azure 部署、自动 Smoke Test 和 `release.json` 全部对应同一个发布提交，并执行非破坏性的页面、路由刷新、登录、API、日志和后台任务人工检查。
+9. 在生产验收通过后，为已验证的 main Merge Commit 创建 `v3.3` Tag，将该提交同步回 `develop`，删除收尾功能分支并记录最终发布结果。
+
+### 知识点
+
+- Evidence-based Production Readiness
+- Browser Navigation 与 JWT 传递边界
+- Least-privilege Container
+- Source of Truth 与 Documentation as Code
+- Release Gate 与 Smoke Testing
+- Semantic Versioning、Git Release 与 Tag
+
+### 测试与验证
+
+- 验证 Hangfire Dashboard 专用 Cookie 在登录、刷新和登出过程中的创建、覆盖和删除，并确认匿名用户、普通用户和 Admin 的访问边界。
+- 构建最终 Docker Image，确认运行用户不是 Root，并在完整运行配置下验证 API 启动和日志写入。
+- 运行 `dotnet build`、`dotnet test` 以及前端 Lint、Build、组件测试和本地 E2E；在 Development 环境实际打开 Hangfire Dashboard，确认内置页面和静态资源能够加载。
+- 检查 Markdown 链接、Code Fence 和版本状态，并将数据库文档与 Migration、`AppDbContextModelSnapshot` 对照。
+- 检查最终变更范围，确认没有 Secret、Token、真实凭据、临时报告或构建产物进入 Git。
+- 确认功能分支、`develop`、发布 PR 和 `main` 的完整 CI 结果真实通过。
+- 核对 CD 使用已验证提交的 Frontend Artifact 和 Backend Image Digest，确认自动 Production Smoke Test 通过。
+- 在生产环境执行非破坏性人工验收，不运行会创建车辆、订单或修改审核状态的完整 E2E。
+
+### 验收标准
+
+- API Container 以非 Root 用户运行，能够正常启动、连接现有依赖并输出日志。
+- Admin 能够从现有管理页面进入 API 域名下的 `/admin/hangfire`，匿名用户和普通用户不能查看 Dashboard；普通 API 继续使用现有 Bearer Header，不扩大 Cookie 的适用路径。
+- 没有为了未发生的极端情况引入自定义探针体系、IaC 平台、第二套登录体系或后台任务架构重构。
+- V3 文档、README、数据库参考和生产配置说明与最终实现一致，仓库不包含真实配置值或凭据。
+- 最终变更通过相应本地检查以及完整的 Backend、Frontend 和 E2E CI 门禁。
+- Azure 部署、自动 Smoke Test 和人工生产验收均对应同一个已验证的 main 发布提交。
+- `main` 包含完整 V3 实现，该提交已创建 `v3.3` Tag，并已同步回 `develop`；收尾功能分支已经删除。
+- 项目定位、已实现能力、已知限制和真实生产架构描述准确可信。
+
+---
+
+# 完整步骤总览
+
+```text
+第一阶段：性能、基础设施与安全             Step 57–63
+  Step 57  数据库查询诊断与索引优化
+  Step 58  Redis 缓存层
+  Step 59  API 限流
+  Step 60  Hangfire 后台任务与 Application Insights
+  Step 61  Refresh Token 机制
+  Step 62  乐观锁与并发安全
+  Step 63  安全加固与审计日志
+  里程碑：v3.1
+
+第二阶段：前端功能与体验优化               Step 64–67
+  Step 64  图片批量上传与拖拽排序
+  Step 65  草稿自动保存与 ErrorBoundary
+  Step 66  收藏功能乐观更新
+  Step 67  搜索体验优化
+
+第三阶段：测试体系                        Step 68–69
+  Step 68  Vitest 与 React Testing Library
+  Step 69  Playwright 端到端测试
+  里程碑：v3.2
+
+第四阶段：实时功能与后台管理               Step 70–71
+  Step 70  SignalR 实时通知与通知持久化
+  Step 71  Admin 数据面板
+
+第五阶段：认证扩展、交付优化与总结          Step 72–75
+  Step 72  Google OIDC 第三方登录
+  Step 73  运行时升级与 CI/CD 完善
+  Step 74  Bundle 优化与 Web Vitals
+  Step 75  V3 发布检查与里程碑
+  里程碑：v3.3
+```
+
+共 19 步：Step 57–75。
