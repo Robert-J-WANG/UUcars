@@ -1,6 +1,8 @@
 // src/pages/AdminPage.tsx
 import { NavLink, Outlet } from "react-router-dom";
-import { ClipboardList, LayoutDashboard } from "lucide-react";
+import { Activity, ClipboardList, LayoutDashboard } from "lucide-react";
+
+const hangfireUrl = `${import.meta.env.VITE_API_BASE_URL}/admin/hangfire`;
 
 const tabs = [
   { to: "/admin/dashboard", label: "Dashboard", icon: LayoutDashboard },
@@ -53,6 +55,23 @@ export default function AdminPage() {
               </NavLink>
             );
           })}
+
+          {/* hangfire dashboard */}
+          <a
+            href={hangfireUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="flex items-center gap-1.5 px-4 py-2.5 text-sm font-medium
+             transition-colors duration-150"
+            style={{
+              color: "var(--color-text-secondary)",
+              borderBottom: "2px solid transparent",
+              marginBottom: "-1px",
+            }}
+          >
+            <Activity className="h-3.5 w-3.5" />
+            Hangfire Jobs
+          </a>
         </nav>
       </div>
 
