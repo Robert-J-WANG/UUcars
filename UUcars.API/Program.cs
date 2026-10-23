@@ -178,12 +178,15 @@ try
     app.UseAuthorization();
 
     if (backgroundJobsEnabled)
-        app.UseHangfireDashboard("/hangfire", new DashboardOptions
-        {
-            Authorization = app.Environment.IsDevelopment()
-                ? new[] { new HangfireLocalDevAuthorizationFilter() }
-                : new[] { new HangfireAdminAuthorizationFilter() }
-        });
+        app.UseHangfireDashboard(
+            HangfireDashboardAccess.Path,
+            new DashboardOptions
+            {
+                Authorization =
+                [
+                    new HangfireAdminAuthorizationFilter()
+                ]
+            });
 
     // =============================================
     // Endpoints

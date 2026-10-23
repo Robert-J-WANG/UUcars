@@ -4323,7 +4323,7 @@ cd ..
 
 
 
-### 12. 此时的目录变化
+### 13. 此时的目录变化
 
 ```
 UUcars.API/
@@ -4347,7 +4347,7 @@ UUcars.Tests/
 
 
 
-### 13. Git 提交
+### 14. Git 提交
 
 ```bash
 git add .
@@ -12638,41 +12638,6 @@ git push origin feature/tests
 
 
 
-好，先把这两个问题讨论清楚，再生成最终版本。
-
-
-
-### 选择哪种方式
-
-**SQLite 的问题：**
-
-虽然比 InMemory 好，但 SQLite 和 SQL Server 之间仍然存在方言差异。项目里用了 `decimal(18,2)`、`nvarchar`、SQL Server 特有的字符串比较行为——SQLite 处理这些的方式不一样，仍然可能出现"测试通过但生产报错"的情况。
-
-**Docker + Testcontainers 的优势：**
-
-你的项目本来就已经在用 Docker 跑 SQL Server，对 Docker 不陌生。`Testcontainers` 库会在测试时自动拉起一个真实的 SQL Server 容器，测试结束自动销毁——完全真实的数据库环境，和生产环境一模一样，没有任何行为差异。
-
-**结论：用 Testcontainers + SQL Server。**
-
-理由：已经有 Docker 基础、下一步就是 Docker 部署、这是企业级项目的标准做法，学了直接能用到真实工作里。
-
-
-
-### 关于 CI/CD
-
-Step 35 是 Docker 部署，V1 的部署目标是把 API 打包成 Docker 镜像跑起来。CI/CD 用 **GitHub Actions** 是最自然的选择——代码已经在 GitHub 上了，Actions 配置简单，免费额度够用。
-
-V1 的 CI/CD 目标定为：
-
-```
-push 到 develop → 自动跑所有测试（单元 + 集成）
-push 到 main / 打 tag → 自动构建 Docker 镜像
-```
-
-这个内容放在 Step 35 里一起实现，Step 34 专注把集成测试做好。
-
-
-
 ## Step 34 · 集成测试
 
 ### 这一步做什么
@@ -12680,6 +12645,12 @@ push 到 main / 打 tag → 自动构建 Docker 镜像
 Step 33 完善了单元测试。这一步做集成测试，一种和单元测试完全不同的测试方式。
 
 在写代码之前，先把集成测试的概念、原理、和单元测试的关系理解清楚。
+
+#### 数据库方案选择
+
+SQLite 虽然比 EF Core InMemory 更接近关系型数据库，但它与 SQL Server 仍然存在类型系统、SQL 方言和字符串比较行为等差异，可能出现测试通过而 SQL Server 运行失败的情况。
+
+项目本地开发已经使用 Docker SQL Server，因此集成测试选择 Testcontainers 自动创建临时 SQL Server 容器。它能验证 SQL Server 特有的数据库行为，比 InMemory 或 SQLite 更接近项目的实际运行环境；容器版本、资源规格和平台配置仍可能与生产环境不同。
 
 
 
@@ -12770,7 +12741,7 @@ WebApplicationFactory：
 
 
 
-### 4. Testcontainers是什么
+### 4. Testcontainers 是什么
 
 集成测试需要连接数据库，但不能用生产数据库（会污染数据）。
 
@@ -13536,7 +13507,7 @@ Docker 解决的核心问题是：**把应用和它所需的所有运行环境�
 有 Docker：
   开发机：运行 uucars-api 镜像
   服务器：运行同一个 uucars-api 镜像
-  结果：完全一致，无环境差异
+  结果：应用运行时更一致，显著减少环境差异
 ```
 
 
@@ -13616,8 +13587,8 @@ COPY --from=build /app/publish .
 # 声明应用监听 8080 端口（容器内部端口）
 EXPOSE 8080
 
-# 告诉 ASP.NET Core 监听 8080 端口
-ENV ASPNETCORE_HTTP_PORTS=8080
+# V1.0 发布时使用 ASPNETCORE_URLS 监听 8080 端口
+ENV ASPNETCORE_URLS=http://+:8080
 
 # 容器启动时执行的命令
 ENTRYPOINT ["dotnet", "UUcars.API.dll"]
@@ -13767,31 +13738,15 @@ cp .env.example .env
 
 ```csharp
 // 自动执行 Migration（V1 学习项目用法）
-// 生产环境建议改为独立的部署脚本，不在应用启动时执行
+// 生产环境建议改为独立的部署步骤，不在应用启动时执行
 using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-    var retries = 5;
-    while (retries > 0)
-    {
-        try
-        {
-            await db.Database.MigrateAsync();
-            break;
-        }
-        catch (Exception)
-        {
-            retries--;
-            if (retries == 0) throw;
-            // SQL Server 健康检查刚通过，但有时仍需几秒才能真正接受连接
-            // 等待 3 秒后重试，最多重试 5 次
-            await Task.Delay(3000);
-        }
-    }
+    await db.Database.MigrateAsync();
 }
 ```
 
-> **为什么要加 retry？** `docker-compose` 里虽然配置了 `depends_on: condition: service_healthy`，但 SQL Server 的健康检查通过（能执行 `SELECT 1`）和"完全就绪可接受应用连接"之间仍可能有几秒的窗口期。不加 retry，这个时间窗口会导致 API 容器启动失败然后循环重启。加 retry 是防御性编程的基本习惯。
+V1.0 发布时只执行一次 `MigrateAsync()`。启动竞态的重试处理是在发布后补充的，记录在本 Step 的“发布后的运行修正”部分。
 
 ### 7. 验证 Docker 构建
 
@@ -13867,7 +13822,7 @@ push 到任意分支 → 自动跑单元测试
 push 到 main   → 自动构建 Docker 镜像并推送到 GitHub Container Registry
 ```
 
-> **不需要手动创建任何 Token。** GitHub Actions 有内置的 `GITHUB_TOKEN`，每次 workflow 运行时自动生成，有效期只到本次运行结束。它天然具备推送镜像到 ghcr.io 所需的权限，只需要在 workflow 里显式声明即可。用 Personal Access Token（PAT）是旧做法——PAT 绑定在个人账号上，人走了或 token 过期整个 CI 就断了。
+V1.0 发布时，workflow 使用仓库 Secret `REGISTRY_TOKEN` 保存 Personal Access Token，并用它登录 GitHub Container Registry。发布后才改为权限范围更小、无需人工维护的内置 `GITHUB_TOKEN`，对应修正记录在后文。
 
 创建 GitHub Actions 配置文件：
 
@@ -13900,7 +13855,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
       - name: Setup .NET 9
         uses: actions/setup-dotnet@v4
@@ -13929,28 +13884,16 @@ jobs:
     needs: test           # 必须 test job 通过才执行
     if: github.ref == 'refs/heads/main'   # 只在 main 分支触发
 
-    # 声明权限：使用内置 GITHUB_TOKEN 推送镜像到 ghcr.io
-    # 不需要手动创建任何 Secret 或 PAT
-    permissions:
-      contents: read
-      packages: write
-
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}   # 内置 Token，自动注入，无需手动配置
-
-      # setup-buildx 必须在 build-push 之前
-      # 原因：type=gha 缓存依赖 BuildKit 的 buildx driver
-      # 默认的 docker driver 不支持缓存导出，会报错
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+          password: ${{ secrets.REGISTRY_TOKEN }}
 
       - name: Extract metadata for Docker
         id: meta
@@ -13960,13 +13903,13 @@ jobs:
           tags: |
             # push 到 main 时打 latest 标签
             type=raw,value=latest,enable={{is_default_branch}}
-            # 如果是 tag push（v1.0 这种），同时打版本标签
+            # 预留 SemVer 标签规则；当前触发器不处理 tag push
             type=semver,pattern={{version}}
             # 永远带上 commit SHA，方便回溯
             type=sha,prefix=sha-
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v5
         with:
           context: .
           push: true
@@ -13978,6 +13921,8 @@ jobs:
 ```
 
 > **GitHub Container Registry（ghcr.io）是什么？** GitHub 提供的容器镜像仓库，免费，和 GitHub 仓库无缝集成。构建好的镜像推送到这里，任何有权限的机器都可以拉取并运行，不需要额外配置 Docker Hub 账号。
+
+> **版本镜像标签说明：** 这个 V1.0 workflow 只监听分支 push，而且构建任务只允许 `refs/heads/main`。因此推送 `v1.0` Git Tag 不会触发镜像构建，`type=semver` 在该版本中不会生成 `v1.0` 镜像标签。V1.0 发布时生成的是 `latest` 和 commit SHA 标签。
 
 > **为什么 CI 里只跑单元测试，不跑集成测试？** 集成测试需要 Docker（Testcontainers 会自动启动容器），GitHub Actions 的 `ubuntu-latest` runner 已经安装了 Docker，技术上可以跑集成测试。但 Testcontainers 拉取 SQL Server 镜像需要时间，会让 CI 变慢。V1 阶段的权衡是：单元测试在 CI 里跑（快），集成测试在本地跑（慢但完整）。如果要在 CI 里跑集成测试，可以在 `ci.yml` 里加一个独立的 job，用 `services` 启动 SQL Server，这是 V2 可以扩展的内容。
 
@@ -14023,12 +13968,74 @@ push 到 main 后，GitHub Actions 会自动触发 `build-and-push` job：
 ```
 ✅ Unit Tests     → 通过
 ✅ Build & Push   → 构建 Docker 镜像，推送到 ghcr.io
-                    标签：latest、v1.0、sha-xxxxxxx
+                    标签：latest、sha-xxxxxxx
 ```
 
 打开 GitHub 仓库的 Packages 页面，可以看到推送成功的镜像。
 
-### 12. 此时的目录变化
+### 12. V1.0 发布后的运行修正
+
+`v1.0` Tag 完成后，针对容器启动和镜像发布流程补充了三项修正。这些内容属于发布后的改进，不包含在 `v1.0` Tag 中。
+
+#### 12.1 更新容器监听端口配置
+
+Dockerfile 将监听端口配置改为：
+
+```dockerfile
+ENV ASPNETCORE_HTTP_PORTS=8080
+```
+
+#### 12.2 为启动时 Migration 添加有限重试
+
+SQL Server 健康检查通过后，仍可能短暂无法接受应用连接。修正后的启动逻辑最多重试五次，每次等待三秒；重试耗尽后继续抛出异常，避免隐藏真实故障。
+
+```csharp
+using (var scope = app.Services.CreateScope())
+{
+    var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+    var retries = 5;
+
+    while (retries > 0)
+    {
+        try
+        {
+            await db.Database.MigrateAsync();
+            break;
+        }
+        catch (Exception)
+        {
+            retries--;
+            if (retries == 0) throw;
+            await Task.Delay(3000);
+        }
+    }
+}
+```
+
+#### 12.3 改用内置 `GITHUB_TOKEN`
+
+workflow 移除 `REGISTRY_TOKEN`，为构建任务声明最小权限，并在使用 GitHub Actions 缓存前显式配置 Buildx：
+
+```yaml
+permissions:
+  contents: read
+  packages: write
+
+steps:
+  - name: Log in to GitHub Container Registry
+    uses: docker/login-action@v3
+    with:
+      registry: ${{ env.REGISTRY }}
+      username: ${{ github.actor }}
+      password: ${{ secrets.GITHUB_TOKEN }}
+
+  - name: Set up Docker Buildx
+    uses: docker/setup-buildx-action@v3
+```
+
+这次修正同时把 `actions/checkout` 更新到 v5、`docker/build-push-action` 更新到 v6。workflow 的 Tag 触发限制没有在这次修正中改变，因此仍然不会生成 `v1.0` 镜像标签。
+
+### 13. 此时的目录变化
 
 ```
 UUcars/
@@ -14052,12 +14059,12 @@ UUcars/
 ✅ docker-compose.yml（API + SQL Server，健康检查，数据持久化）
 ✅ 理解服务名访问和双下划线环境变量注入
 ✅ .env.example 模板（敏感配置不进 Git）
-✅ Program.cs 添加自动 Migration（含 retry 防止启动竞态）
+✅ Program.cs 添加自动 Migration，发布后补充有限重试
 ✅ 本地 docker compose up 验证成功
 ✅ GitHub Actions CI/CD 配置（测试 + 构建推送镜像）
-✅ 理解 ghcr.io 和内置 GITHUB_TOKEN 的正确用法
+✅ V1.0 使用 REGISTRY_TOKEN 推送镜像，发布后改用内置 GITHUB_TOKEN
 ✅ 理解 CI 里只跑单元测试的权衡
-✅ v1.0 tag 打完，镜像推送到 GitHub Container Registry
+✅ v1.0 Git Tag 完成，latest 和 SHA 镜像推送到 GitHub Container Registry
 ```
 
 ### V1 完成

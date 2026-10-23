@@ -2,6 +2,7 @@ using System.Text;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.IdentityModel.Tokens;
 using UUcars.API.Auth;
+using UUcars.API.Auth.Hangfire;
 
 namespace UUcars.API.Extensions;
 
@@ -77,10 +78,17 @@ public static class AuthExtensions
                         // 2. 获取当前请求的路径
                         var path = context.HttpContext.Request.Path;
 
+                        //  hangfire Dashboard 时 Dashboard
+                        if (path.StartsWithSegments(HangfireDashboardAccess.Path) &&
+                            context.Request.Cookies.TryGetValue(
+                                HangfireDashboardAccess.CookieName,
+                                out var dashboardToken))
+                            context.Token = dashboardToken;
+
                         // 3. 判断：如果有 access_token 且请求路径指向 SignalR Hub
                         //  匹配具体的 Hub 路径，如 "/chatHub" 或以特定前缀开头的路径）
-                        if (!string.IsNullOrEmpty(accessToken) &&
-                            path.StartsWithSegments("/hubs")) // 💡 根路由路径或根前缀
+                        else if (!string.IsNullOrEmpty(accessToken) &&
+                                 path.StartsWithSegments("/hubs")) // 💡 根路由路径或根前缀
                             // 将 Token 赋给上下文，JwtBearer 中间件后续就会拿这个 Token 去做签名和合法性校验
                             context.Token = accessToken;
 

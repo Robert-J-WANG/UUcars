@@ -51,6 +51,16 @@ services:
       ConnectionStrings__Redis: "redis:6379"
       # JWT 配置
       JwtSettings__Secret: "${JWT_SECRET}"
+      # 本地前端与外部服务配置；未提供真实凭据时保留占位值，相关功能不可用
+      Cors__AllowedOrigins__0: "http://localhost:5173"
+      GoogleAuth__ClientId: "${GOOGLE_CLIENT_ID:-PLACEHOLDER_OVERRIDE_IN_REAL_ENVIRONMENTS}"
+      EmailSettings__ApiKey: "${RESEND_API_KEY:-PLACEHOLDER_OVERRIDE_IN_REAL_ENVIRONMENTS}"
+      EmailSettings__FromEmail: "${RESEND_FROM_EMAIL:-onboarding@resend.dev}"
+      EmailSettings__BaseUrl: "http://localhost:5173"
+      StorageSettings__AccessKeyId: "${R2_ACCESS_KEY_ID:-PLACEHOLDER_OVERRIDE_IN_REAL_ENVIRONMENTS}"
+      StorageSettings__SecretAccessKey: "${R2_SECRET_ACCESS_KEY:-PLACEHOLDER_OVERRIDE_IN_REAL_ENVIRONMENTS}"
+      StorageSettings__AccountId: "${R2_ACCOUNT_ID:-PLACEHOLDER_OVERRIDE_IN_REAL_ENVIRONMENTS}"
+      StorageSettings__PublicUrl: "${R2_PUBLIC_URL:-PLACEHOLDER_OVERRIDE_IN_REAL_ENVIRONMENTS}"
       # 使用 Production 环境
       ASPNETCORE_ENVIRONMENT: Production
     depends_on:

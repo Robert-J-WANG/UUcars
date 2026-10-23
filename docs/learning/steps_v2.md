@@ -316,10 +316,6 @@ git push origin feature/v2-backend
 
 
 
-好，重新生成之前先把所有涉及第三方库的用法查证一遍。官方文档确认完毕。现在生成完整的 Step 37。
-
-
-
 ## Step 37 · 邮件服务基础设施
 
 ### 这一步做什么
@@ -652,7 +648,7 @@ public class TokenGenerator
 >- RandomNumberGenerator 是 .NET 内置的加密安全随机数生成器
 >- 32 字节 = 256 位随机性，碰撞概率可以忽略不计
 >- 使用 WebEncoders，它将字节直接转为 URL 安全的字符串（Base64url标准）：自动把 + 换成 -，把 / 换成 _，并去掉末尾的 =
->- 放进 URL 时不需要 格外的转义
+>- 放进 URL 时不需要额外转义
 
 **注意：如果是Base64 可能含有 +、/、= 字符，放进 URL 时需要 Uri.EscapeDataString 转义**
 
@@ -864,7 +860,7 @@ Build succeeded.
 
 ### 10. 手动验证邮件能发出去
 
-进入 下一步 之前，先验证邮件服务本身是不是通的。
+进入下一步之前，先验证邮件服务本身是不是通的。
 
 打开 `UUcars.API/Controllers/AuthController.cs`，临时添加一个测试端点：
 
@@ -979,7 +975,9 @@ V1 的注册接口创建用户时 `EmailConfirmed = false`，但从来不检查�
   账号激活，可以登录
 ```
 
-v1版的注册接口只做了阶段一——创建账号、发邮件。
+### 2. 为什么登录必须检查 EmailConfirmed
+
+V1 版的注册接口只做了阶段一——创建账号、发邮件。
 
 **它不知道这个邮箱是否真实存在**，也不知道用户有没有收到邮件。任何人都可以用 `abc@假域名.com` 这种不存在的邮箱注册，账号创建会成功，但邮件永远送不出去。
 
@@ -1179,12 +1177,12 @@ public class EmailNotConfirmedException : AppException
 - 注册：用户点击注册（调用RegisterAsync方法），服务端先保存用户，再发验证邮件（IEmailService里的SendEmailVerificationAsync方法）
 - 激活：用户点击验证邮件激活（需要调用一个新的方法：VerifyEmailAsync），服务端匹配token，并更新EmailConfirmed字段为true，激活成功，清空token
 - 重发激活邮件： 如果某些原因，没有收到验证邮件，用户点击重新发送验证邮件（需要调用一个新的方法：ResendVerificationAsync），服务端生成新的token，再发验证邮件（IEmailService里的SendEmailVerificationAsync方法）
-- 登录：用户点击登录（调用LoginAsync方法），服务端需要格外检查邮件是否已经激活（EmailConfirmed=true），否则返回403，前端收到 403 后可以显示"请先验证邮箱，或重新发送验证邮件"的提示
+- 登录：用户点击登录（调用 `LoginAsync` 方法），服务端需要额外检查邮箱是否已经激活（`EmailConfirmed=true`），否则返回 403，前端收到 403 后可以显示“请先验证邮箱，或重新发送验证邮件”的提示
 
 因此，对 UserService的更新包含：
 
 - 更新注册逻辑（RegisterAsync）：注册后发验证邮件
-- 更新登录逻辑（LoginAsync）：外检查邮件是否已经激活
+- 更新登录逻辑（LoginAsync）：额外检查邮箱是否已经激活
 - 新增激活邮件的逻辑（VerifyEmailAsync）
 - 新增重发激活邮件的逻辑（ResendVerificationAsync）
 
@@ -1430,7 +1428,7 @@ controller的更新包含：
 - 注册接口（Register）：更新注册提示文字
 - 登录接口 （Login）：不用改变
 - 新增：激活验证邮件接口（ VerifyEmail ）
-- 新增：充分激活验证邮件接口 （ResendVerification）
+- 新增：重发验证邮件接口（ResendVerification）
 
 打开 `UUcars.API/Controllers/AuthController.cs`，更新注册提示文字，添加两个新端点：
 
@@ -2070,7 +2068,7 @@ RegisterAsync()
 
 整个过程里，业务代码（`UserService`、`AuthController`）一行都没变，走的是完全真实的代码路径。只是 `IEmailService` 的实现被替换了。
 
-只改一个测试测试用例：唯一一个手动写了注册+登录、没走 `RegisterAndLoginAsync` 的测试
+只改一个测试用例：唯一一个手动写了注册和登录、没有走 `RegisterAndLoginAsync` 的测试
 
 ```c#
 // CoreFlowIntegrationTests.cs
@@ -3148,7 +3146,7 @@ cd ..
 cd UUcars.API && dotnet user-secrets list && cd ..
 ```
 
-应该能看到 `EmailSettings:ApiKey` 已经设置。
+应该能看到 `StorageSettings:AccessKeyId`、`StorageSettings:SecretAccessKey`、`StorageSettings:AccountId` 和 `StorageSettings:PublicUrl` 已经设置。
 
 
 
@@ -5645,7 +5643,7 @@ git push origin --delete feature/frontend-setup
 
 ### 这一步做什么
 
-登录页需要三样东西：**管理表单**（React Hook Form + Zod）、**管理全局状态**（Zustand）。这一步把这三个工具装好、配置好，下一步做登录页时直接用。
+登录页需要四个工具：Zustand 管理全局状态，React Hook Form 管理表单，Zod 定义验证规则，`@hookform/resolvers` 连接 React Hook Form 和 Zod。这一步先完成安装和基础配置，下一步做登录页时直接使用。
 
 
 
@@ -5698,13 +5696,13 @@ store（状态容器）
 
 #### 3.2 创建 Store
 
-Zustand提供一个函数 :**
+Zustand 提供了一个 `create` 函数：
 
 ```ts
 create<T>(initializer: (set, get) => T): UseBoundStore<T>
 ```
 
-**create函数的**参数：初始化函数（initializer）**
+**`create` 函数的参数：初始化函数（initializer）**
 
 Zustand 调用这个初始化函数时会注入两个参数：set、get。 并进行数据初始化
 
@@ -5847,7 +5845,7 @@ const useAuthStore = create<AuthState>((set) => ({
 // 刷新页面 → 内存清空 → token 没了 → 用户被迫重新登录
 ```
 
-使用Zustand 内置的**中间件`persist` **，能够把 store 的数据自动同步到 localStorage，页面刷新后数据不丢失。
+使用 Zustand 内置的 **`persist` 中间件**，能够把 store 的数据自动同步到 localStorage，页面刷新后数据不丢失。
 
 **如何使用persist？**
 
@@ -5873,7 +5871,7 @@ const useAuthStore = create<AuthState>()(
 )
 ```
 
-> persist 做了什么??
+> **`persist` 做了什么？**
 >
 > ```bash
 > 第一次登录
@@ -5893,7 +5891,7 @@ const useAuthStore = create<AuthState>()(
 >
 > 
 
-**只持久化部分字段?**
+**只持久化部分字段？**
 
 persist 默认会把所有 state 都存进 localStorage，但 action 函数不需要存，可以用 `partialize` 过滤：
 
@@ -6181,7 +6179,7 @@ git push origin feature/auth-pages
 
 实现第一个真实可用的页面——登录。完成后用户可以输入邮箱密码，点击登录，Token 存入 localStorage，跳转到首页。
 
-这是前端最核心的一步。做完这步，就掌握了后续所有页面的开发模式: 
+这是前端最核心的一步。做完这步，就掌握了后续所有页面的开发模式：
 
 - 表单验证
 - API调用
@@ -6213,7 +6211,7 @@ import App from './App.tsx'
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    {/* 包裹rowserRouter组件 */}
+    {/* 使用 BrowserRouter 包裹应用 */}
     <BrowserRouter>
       <App />
     </BrowserRouter>
@@ -7685,12 +7683,12 @@ import VerifyEmailPage from '@/pages/VerifyEmailPage'
 
 **测试：** 注册后收到验证邮件，点击邮件里的链接，页面先短暂显示 "Verifying..."，然后跳转到 "Email verified!" 成功状态。
 
-> **注意：由于使用了严格模式:**
+> **注意：项目启用了严格模式：**
 >
 > ```tsx
 > createRoot(document.getElementById("root")!).render(
 >   <StrictMode>
->     {/* 包裹rowserRouter组件 */}
+>     {/* 使用 RouterProvider 渲染路由 */}
 >     <RouterProvider router={router} />
 >   </StrictMode>,
 > );
@@ -7706,7 +7704,7 @@ import VerifyEmailPage from '@/pages/VerifyEmailPage'
 >            → 再次挂载 → useEffect 再次执行 → verify() 发出第二次请求
 > ```
 >
-> 对于邮箱验证这种**一次性操作**，第一次请求成功后 token 已经被消费（数据库里清空了），第二次请求用同一个 token 去验证，后端找不到, 发送验证请求返回
+> 对于邮箱验证这种**一次性操作**，第一次请求成功后 Token 已经被消费（数据库里已清空）。第二次请求继续使用同一个 Token 时，后端找不到已经被消费的 Token，因此验证请求返回错误：
 >
 > ```json
 > {
@@ -7717,14 +7715,14 @@ import VerifyEmailPage from '@/pages/VerifyEmailPage'
 > }
 > ```
 >
-> 从而让status='error', 导致前端渲染错误提示内容。
+> 从而使 `status = 'error'`，导致前端渲染错误提示内容。
 >
-> 解决方案：使用useRef hook函数
+> 解决方案：使用 `useRef` Hook。
 >
-> - 直接删除严格模式 ： 导致无法使用严格模式发现其他副作用潜在的问题
-> - 使用useRef hook函数
+> - 直接删除严格模式：会失去 Strict Mode 对其他潜在副作用的检查
+> - 使用 `useRef` Hook 避免重复请求
 
-#### 2.6 使用useRef hook函数优化
+#### 2.6 使用 `useRef` Hook 优化
 
 `useRef` 返回一个容器对象 `{ current: value }`，这个对象保存在 React 内部的 **Fiber 节点**上，不在函数作用域里：
 
@@ -7750,7 +7748,7 @@ useState → 值在 Fiber 节点，变化触发重新渲染
 useRef   → 值在 Fiber 节点，变化不触发重新渲染  ← 适合做标志位
 ```
 
-useRef 的两种用途:
+`useRef` 的两种用途：
 
 ```tsx
 // 用途一：获取 DOM 引用（最常见）
@@ -8490,7 +8488,7 @@ loading/error → 自动管理，不需要手写 useState
 后台刷新      → 展示缓存数据的同时，后台悄悄刷新
 ```
 
-它封装了2个主要Hook:
+它封装了两个主要 Hook：
 
 ```bash
 useQuery  → 获取数据（GET 请求）
@@ -8887,7 +8885,7 @@ export default function HomePage() {
 
 **`Array.from({ length: PAGE_SIZE }).map((_, i) => ...)`** 是什么？
 
-这是 JavaScript 生成固定数量元素的常用写法。`Array.from({ length: PAGE_SIZE })` 创建一个有 PAGE_SIZE(比如10 )个空元素的数组，`.map()` 遍历它，`_` 表示我们不关心元素的值（占位符），`i` 是索引，用作 `key`。
+这是 JavaScript 生成固定数量元素的常用写法。`Array.from({ length: PAGE_SIZE })` 创建一个有 `PAGE_SIZE`（比如 10）个空元素的数组，`.map()` 遍历它，`_` 表示我们不关心元素的值（占位符），`i` 是索引，用作 `key`。
 
 
 
@@ -8949,10 +8947,6 @@ git push origin feature/browse-pages
 ✅ 测试通过（骨架屏 → 数据 → 分页 → 缓存）
 ✅ Git commit 完成
 ```
-
-
-
-好，先核查 Step 50 的内容。
 
 
 
@@ -9198,7 +9192,7 @@ export default function CarFilters() {
 >
 >为什么要转？因为 `searchParams` 不能直接修改，需要先转成普通对象再操作。
 >
->`delete`是什么？？？
+> **`delete` 是什么？**
 >
 >`delete` 是 JavaScript **内置运算符**，不是方法，专门用来删除对象的属性：
 >
@@ -9299,7 +9293,7 @@ return (
 }
 ```
 
-注意：<Input/>里使用value而不是defaultValue，**否则，清空过滤后输入框不会清空**
+注意：`<Input />` 中使用 `value` 而不是 `defaultValue`，**否则清空过滤条件后，输入框不会同步清空**。
 
 ```tsx
 // defaultValue：非受控输入，只设置初始值，之后 React 不管它
@@ -10366,7 +10360,7 @@ npx shadcn@latest add dropdown-menu
 
 ### 3. 完善 Layout 组件
 
-打开 `src/components/Layout.tsx
+打开 `src/components/Layout.tsx`。
 
 先想清楚导航栏需要什么
 
@@ -10768,7 +10762,7 @@ const carSchema = z.object({
 export type CarFormValues = z.infer<typeof carSchema>
 ```
 
-> **`z.number({ error: '...' })` 是什么？** HTML 的 `<input type="number">` 在用户没有输入时，返回的是空字符串 `""`，不是数字。Zod 默认的 `z.number()` 在收到字符串时会显示 "Expected number, received string" 这样不友好的错误。error` 让你自定义这种情况的错误信息。
+> **`z.number({ error: '...' })` 是什么？** HTML 的 `<input type="number">` 在用户没有输入时，返回的是空字符串 `""`，不是数字。Zod 默认的 `z.number()` 在收到字符串时会显示 "Expected number, received string" 这样不友好的错误。`error` 让你自定义这种情况下的错误信息。
 >
 > 但还有一个问题：`<input>` 返回的始终是字符串，即使用户输入了数字。需要在 RHF 的配置里告诉它把这些字段的值转成数字，稍后会处理。
 
@@ -11318,7 +11312,7 @@ export default function EditCarPage() {
 }
 ```
 
-**数据回填; 渲染UI（复用车辆表单组件`CarForm`)**
+**数据回填并渲染 UI（复用车辆表单组件 `CarForm`）**
 
 ```tsx
 export default function EditCarPage() {
@@ -12660,13 +12654,13 @@ git push origin --delete feature/seller-pages
 
 完成最后两个功能模块：
 
-Admin 面板（待审核列表 + 审核通过/拒绝/删除）
-404页面
-通用错误处理（已有 toast，够用）
+- Admin 面板（待审核列表 + 审核通过/拒绝/删除）
+- 404 页面
+- 通用错误处理（沿用已有 toast）
 
 
 
-### 1. admin角色的功能
+### 1. Admin 角色的功能
 
 先切出新的分支
 
@@ -12676,7 +12670,7 @@ git checkout -b feature/admin-and-polish
 git push -u origin feature/admin-and-polish
 ```
 
-admin角色功能用于对发表车辆的审核删除等操作，**admin不能实现**：
+Admin 角色负责审核和删除待处理车辆，**不能使用以下普通用户功能**：
 
 - ~~sell a car~~
 - ~~Buy now~~
@@ -12822,7 +12816,7 @@ export default function Layout() {
 
 - 从详情页登录：跳转到来源页， 使用 `useLocation`动态获取
 
-    `useLocation`返回当前路由的信息，其中state 是路由跳转时附带的格外数据，类型默认是unknown。 
+    `useLocation` 返回当前路由的信息，其中 `state` 是路由跳转时附带的额外数据，类型默认是 `unknown`。
 
     比如从详情页跳转到登录页时， 会传递这样的state:
 
@@ -13084,8 +13078,6 @@ import AdminPendingPage from '@/pages/AdminPendingPage'
 },
 ```
 
-### 
-
 ### 4. 安装 Table 组件
 
 待审核列表用表格展示，更清晰：
@@ -13170,7 +13162,7 @@ export default function AdminPendingPage() {
 
 ```
 
-**第二步：**定义操作
+**第二步：定义操作**
 
 ```tsx
 ...
@@ -13451,17 +13443,6 @@ git checkout develop
 ✅ feature/admin-and-polish 合并回 develop
 ✅ v2.0-frontend 里程碑 tag 打完
 ```
-
-
-
-手册读完了。内容整体是正确的，有几处需要核查和修正：
-
-1. **Step 4（前端部署）里的 git 操作有问题**：`.env.production` 和 `staticwebapp.config.json` 应该在 feature 分支上提交，不应该直接在 develop 上操作，不符合之前建立的分支策略。
-2. **Static Web Apps 的 workflow 文件**：Azure 会自动在仓库里创建一个 `.github/workflows/azure-static-web-apps-xxx.yml`，这个文件需要手动调整 `app_location` 路径，手册里没有提到这一步。
-3. **手册的顺序**：先配置前端环境变量（.env.production）再部署 Static Web Apps 是正确的，但实际上前端 URL 在 Static Web Apps 创建之前是不知道的，所以 CORS 和 EmailSettings 的更新必须在前端部署之后，这个顺序手册里是对的。
-4. **GitHub Secrets 手册里只列了 3 个**（CLIENT_ID、TENANT_ID、SUBSCRIPTION_ID），但这三个就够了，OIDC 不需要 Client Secret，这是正确的。
-
-现在生成步骤笔记。
 
 
 
@@ -14094,7 +14075,7 @@ git push origin v2.0
 
 ### 这一步做什么
 
-V2 完成后的界面用的是 shadcn/ui 默认的 Slate 配色 + Tailwind 原始工具类拼凑的布局。每个页面 都能用，但缺乏设计语言——没有品牌感，没有视觉层次，组件之间的风格不统一。
+V2 完成后的界面用的是 shadcn/ui 默认的 Slate 配色 + Tailwind 原始工具类拼凑的布局。每个页面都能用，但缺乏设计语言——没有品牌感，没有视觉层次，组件之间的风格不统一。
 
 这一步的目标是：**在不改变任何功能逻辑的前提下，建立完整的设计系统，让 UUcars 从"能用" 变成"好看"。**
 
@@ -15355,7 +15336,7 @@ export default function CarCard({ car }: CarCardProps) {
 
 #### 5.3 骨架屏重做
 
-和carCard的尺寸保持一致
+和 `CarCard` 的尺寸保持一致。
 
 ```tsx
 // src/components/CarCardSkeleton.tsx
@@ -15523,7 +15504,7 @@ import EmptyState from '@/components/EmptyState'
 
 #### 6.1 重构首页
 
-重做后分三个区块：HeroBanner 区、轮播图、SellerBanner区、车辆过滤和车辆列表。
+重做后分为四个区块：`HeroBanner`、车辆轮播、`SellerBanner`，以及车辆过滤和车辆列表。
 
 ```tsx
 // src/pages/HomePage.tsx
@@ -15679,7 +15660,7 @@ export default function HomePage() {
 
 ```
 
-##### 新增HeroBanner组件
+##### 新增 `HeroBanner` 组件
 
 职责：品牌定位 + 搜索框 + 热门品牌标签
 背景：用户提供的图片 + 主题色蒙层压在上面，文字在最顶层
@@ -15999,7 +15980,7 @@ export default function CarCardHorizontal({ car }: CarCardHorizontalProps) {
 
 ```
 
-##### 新增 *SellerBanner* 组件
+##### 新增 `SellerBanner` 组件
 
 ```tsx
 // src/components/SellerBanner.tsx
@@ -17051,37 +17032,37 @@ export default function ListingCard({
 
 ```
 
-##### MyPurchase 
+##### `MyPurchasesPage`
 
-...
+购买订单继续使用现有查询和取消操作，只统一卡片、状态徽章、价格信息与操作按钮的视觉层级。空列表使用 `<EmptyState />`，加载和错误状态沿用设计系统。
 
-##### MySales
+##### `MySalesPage`
 
-...
+销售订单保留确认完成的现有业务流程，使用统一的卡片间距、状态徽章和按钮样式，让订单状态与可执行操作更容易识别。
 
-##### SavedCars
+##### `MyFavoritesPage`
 
-...
+收藏页继续复用 `CarCard` 展示车辆，并保留移除收藏后的缓存刷新行为。空状态、网格间距和分页样式与其他车辆列表保持一致。
 
-#### 重构管理员面板
+#### 6.4 重构管理员面板
 
-##### AdminPage
+##### `AdminPage`
 
-...
+Admin 布局沿用普通页面的字体、颜色和间距 Token，并保留原有嵌套路由和权限边界。
 
-##### AdminPendingPage
+##### `AdminPendingPage`
 
-...
+待审核车辆表格统一标题、状态、操作按钮和空状态样式；审核、拒绝和删除逻辑保持不变。
 
 ### 7. 认证页面重构
 
 #### 7.1 登录页
 
-...
+登录页使用统一的背景光晕、表单卡片、输入框、错误提示和加载状态，不改变原有验证、登录及登录后跳转逻辑。
 
 #### 7.2 注册页
 
-...
+注册页与登录页使用同一套认证页面布局和表单样式，保留密码验证、注册请求和注册成功后的邮箱验证提示。
 
 
 
@@ -17127,20 +17108,19 @@ export default function ListingCard({
 - iPad（768px）：两列卡片
 - 桌面（1280px）：三列卡片，完整导航
 
-#### 8.3 类型修复
+#### 8.3 类型与静态资源
 
-如果 `CarCard.tsx` 里用到了 `car.images`，需要确认 `Car` 类型定义（`src/types/index.ts`） 里有 `images?: CarImage[]` 字段。如果详情接口返回图片但列表接口不返回， 在 `CarCard` 里要做 optional chaining 保护：
+列表接口通过 `Car.coverImageUrl` 返回封面图，`CarCard` 直接读取该字段；详情接口使用 `CarDetail.images` 返回完整图片列表。这两个类型在 `src/types/car.ts` 中分别定义，避免列表页为了封面图加载全部图片。
 
 ```tsx
-// 安全地访问图片
-{car.images && car.images.length > 0 ? (
-  <img src={car.images[0].imageUrl} ... />
+{car.coverImageUrl ? (
+  <img src={car.coverImageUrl} alt={car.title} />
 ) : (
-  // 占位
+  <div aria-label="No image available">...</div>
 )}
 ```
 
-静态资源图片放置在 src/assets 里， 使用时导入使用
+静态资源图片放在 `src/assets` 中，通过模块导入使用：
 
 ```tsx
 
@@ -17199,7 +17179,7 @@ Step 56b 建立了设计语言，后续做其他页面改造时只需要遵守�
 
 
 
-### Git 提交
+### 10. Git 提交
 
 ```bash
 git add .
@@ -17244,6 +17224,3 @@ git push origin v2.1
 ✅ 响应式检查通过（移动/平板/桌面）
 ✅ Git commit 完成
 ```
-
-
-

@@ -34,7 +34,9 @@ FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS final
 WORKDIR /app
 
 # 创建日志目录（Serilog 写文件时需要）
-RUN mkdir -p /app/logs
+# 创建日志目录后立即把目录所有权交给 `app`
+RUN mkdir -p /app/logs \
+    && chown app:app /app/logs
 
 # 只从第一阶段复制发布产物，不包含源代码和 SDK
 COPY --from=build /app/publish .
@@ -45,5 +47,7 @@ EXPOSE 8080
 # 告诉 ASP.NET Core 监听 8080 端口
 ENV ASPNETCORE_HTTP_PORTS=8080
 
+# 从这里开始，API 进程使用普通用户运行。
+USER app
 # 容器启动时执行的命令
 ENTRYPOINT ["dotnet", "UUcars.API.dll"]

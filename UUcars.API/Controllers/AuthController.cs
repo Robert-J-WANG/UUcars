@@ -1,6 +1,8 @@
+using System.IdentityModel.Tokens.Jwt;
 using Google.Apis.Auth;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
+using UUcars.API.Auth.Hangfire;
 using UUcars.API.Configurations;
 using UUcars.API.DTOs;
 using UUcars.API.DTOs.Requests;
@@ -152,6 +154,14 @@ public class AuthController : ControllerBase
         // 更新 Cookie（新的 RefreshToken 覆盖旧的）
         SetRefreshTokenCookie(newRefreshToken.Token, newRefreshToken.ExpiresAt);
 
+        var accessTokenExpiresAt = new JwtSecurityTokenHandler()
+            .ReadJwtToken(newAccessToken)
+            .ValidTo;
+
+        SetHangfireDashboardCookie(
+            newAccessToken,
+            accessTokenExpiresAt);
+
         var response = new RefreshTokenResponse
         {
             AccessToken = newAccessToken
@@ -181,6 +191,8 @@ public class AuthController : ControllerBase
             SameSite = SameSiteMode.None, // 必须和 Set-Cookie 时的属性一致才能删掉
             Secure = true
         });
+        // 清除  Hangfire token
+        DeleteHangfireDashboardCookie();
 
         return Ok(ApiResponse<object>.Ok("Logged out successfully"));
     }
@@ -265,11 +277,56 @@ public class AuthController : ControllerBase
         SetRefreshTokenCookie(
             refreshToken.Token,
             refreshToken.ExpiresAt);
+        // 写入专供 Dashboard 使用的 HttpOnly Cookie
+        SetHangfireDashboardCookie(
+            result.Token,
+            result.ExpiresAt);
 
         // Body 返回 Access Token 和用户资料，不包含 Refresh Token
         return Ok(
             ApiResponse<LoginResponse>.Ok(
                 result,
                 message));
+    }
+
+
+    // fireDashboard
+    private CookieOptions CreateHangfireDashboardCookieOptions(
+        DateTimeOffset? expiresAt = null)
+    {
+        var options = new CookieOptions
+        {
+            HttpOnly = true,
+            Secure = true,
+            SameSite = SameSiteMode.None,
+            Expires = expiresAt,
+            Path = HangfireDashboardAccess.Path
+        };
+
+        if (_environment.IsDevelopment() ||
+            _environment.IsEnvironment(AppEnvironments.E2E))
+        {
+            options.SameSite = SameSiteMode.Strict;
+            options.Secure = false;
+        }
+
+        return options;
+    }
+
+    private void SetHangfireDashboardCookie(
+        string accessToken,
+        DateTime expiresAt)
+    {
+        Response.Cookies.Append(
+            HangfireDashboardAccess.CookieName,
+            accessToken,
+            CreateHangfireDashboardCookieOptions(expiresAt));
+    }
+
+    private void DeleteHangfireDashboardCookie()
+    {
+        Response.Cookies.Delete(
+            HangfireDashboardAccess.CookieName,
+            CreateHangfireDashboardCookieOptions());
     }
 }
