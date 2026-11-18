@@ -4,6 +4,10 @@ UUcars is an independently designed and developed full-stack portfolio project
 that models a C2C used-car marketplace. It combines an ASP.NET Core API, a React
 frontend and an Azure production deployment.
 
+The released portfolio milestone is [v3.3](https://github.com/Robert-J-WANG/UUcars/tree/v3.3),
+published on 24 October 2026 (New Zealand time). It includes .NET 10, real
+Playwright CI, CI-gated Azure delivery and frontend loading improvements.
+
 ## Implemented capabilities
 
 - Email/password and Google sign-in, email verification, password reset, JWT
@@ -11,10 +15,11 @@ frontend and an Azure production deployment.
 - User and Admin authorisation, ownership checks, rate limiting, security
   headers and administrative audit logs
 - Vehicle drafts, image upload and ordering, moderation, public browsing,
-  pagination, filtering and search
+  pagination, price/year filters and brand-substring search
 - Favourites, orders, order completion, reviews and seller rating summaries
 - Persistent notifications with real-time SignalR delivery
 - Admin analytics with cached metrics, trends and brand distribution
+- Route-level lazy loading, selective image loading and opt-in bundle analysis
 - Redis cache-aside, Hangfire background jobs, an Admin-protected Hangfire
   Dashboard, structured logging and Application Insights production telemetry
 - Backend unit and integration tests, frontend component tests and real
@@ -66,7 +71,7 @@ Exact dependency versions are defined by the project and package manifests.
 
 ## Get started
 
-The local system requires the .NET SDK, Node.js and a Docker-compatible runtime.
+The local system requires the .NET 10 SDK, Node.js 24 and a Docker-compatible runtime.
 The API, SQL Server and Redis run through Docker Compose using an ignored root
 `.env` file. The frontend runs locally with an ignored `.env.local` file.
 

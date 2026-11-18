@@ -1,6 +1,10 @@
-@UUcars.API_HostAddress = http://localhost:5065
+# Default Compose API. Use http://localhost:5065 for the native http profile.
+@UUcars.API_HostAddress = http://localhost:8080
 
-GET {{UUcars.API_HostAddress}}/weatherforecast/
+### Public listing query
+GET {{UUcars.API_HostAddress}}/cars?page=1&pageSize=5
 Accept: application/json
 
-###
+### Public brand and price filters
+GET {{UUcars.API_HostAddress}}/cars?brand=Toyota&minPrice=5000&maxPrice=30000
+Accept: application/json

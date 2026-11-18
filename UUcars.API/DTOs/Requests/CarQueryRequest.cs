@@ -18,7 +18,7 @@ public class CarQueryRequest
     // 过滤条件是可选的——不传 Brand 表示"不限品牌"，
     // 用 nullable 类型，Service 层可以用 null 判断是否需要应用这个过滤条件
 
-    // 品牌过滤：精确匹配（BMW、Toyota 等）
+    // 品牌过滤：子字符串匹配；具体查询由 EfCarRepository 实现。
     public string? Brand { get; set; }
 
     // 价格区间：minPrice / maxPrice 都是可选的，

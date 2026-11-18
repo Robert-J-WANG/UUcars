@@ -22,13 +22,13 @@ export interface Car {
   year: number;
   price: number;
   mileage: number;
-  description?: string;
+  description?: string | null;
   status: CarStatus;
   sellerId: number;
   sellerUsername: string;
   createdAt: string;
   updatedAt: string;
-  coverImageUrl?: string;
+  coverImageUrl?: string | null;
 }
 
 // 对应后端 CarDetailResponse（含图片列表）
