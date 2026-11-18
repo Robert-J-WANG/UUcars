@@ -22,7 +22,7 @@ const apiClient = axios.create({
 // =============================================
 // 请求拦截器：自动附加 JWT Token
 // =============================================
-// 每次请求发出前，从 localStorage 取出 Token 附加到请求头
+// 每次请求发出前，从 authStore 内存读取 Access Token 并附加到请求头
 // 这样所有需要认证的接口不需要手动传 Token
 apiClient.interceptors.request.use((config) => {
   // ✅ 从 authStore 读取 accessToken
@@ -48,7 +48,7 @@ apiClient.interceptors.response.use(
 
     // 请求成功（HTTP 2xx）
     // 后端所有接口都用 ApiResponse<T> 包装
-    // 直接解包返回 data 字段，调用方不需要每次都写 response.data.data
+    // 此处只检查 success；各功能 API 模块通过 response.data.data 解包
     const apiResponse = response.data as ApiResponse<unknown>;
 
     if (!apiResponse.success) {

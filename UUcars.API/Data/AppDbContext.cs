@@ -49,7 +49,7 @@ public class AppDbContext : DbContext
 
 
         // 使用预先计算好的固定 hash，而不是在这里动态生成
-        // 原因：PasswordHasher 每次调用会用随机 salt，导致 EF Core 9 每次
+        // 原因：PasswordHasher 每次调用会用随机 salt，导致 EF Core 每次
         // 扫描模型时发现值不同，误判为"有未提交的变更"
         const string adminPasswordHash =
             "AQAAAAIAAYagAAAAEHCDDS0DL8S0+v4RJ8Xbotyu+8ZvjCEg7EODicW0j/KfCC6beDga+cX+eYM2TkRiRg==";

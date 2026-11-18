@@ -66,7 +66,7 @@ public static class RateLimitingExtensions
 
             // ── 策略2：注册接口 ───────────────────────────
             // 算法：固定窗口
-            // 规则：同一 IP，每小时最多 5 次
+            // 规则：同一 IP，每小时最多 20 次
             // 原因：防止批量注册垃圾账号
             options.AddPolicy(RateLimitPolicies.Register, httpContext =>
             {

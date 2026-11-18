@@ -71,7 +71,7 @@ public class CarConfiguration : IEntityTypeConfiguration<Car>
         //   WHERE Status = 'Published' AND Brand LIKE 'BMW%'
         // 注意：LIKE '%BMW%' 无法利用索引，但 LIKE 'BMW%'（前缀匹配）可以
         // 这个索引对前缀搜索有效，对包含搜索（Contains）无效
-        // Step 65 会用全文索引彻底解决，现在先加着
+        // 当前仓储仍使用 Brand.Contains；没有实现全文索引。
         builder.HasIndex(c => new { c.Status, c.Brand })
             .HasDatabaseName("IX_Cars_Status_Brand");
 

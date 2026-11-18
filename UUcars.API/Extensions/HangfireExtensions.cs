@@ -37,7 +37,7 @@ public static class HangfireExtensions
                 // 超时后重新放回队列（防止 Worker 崩溃导致任务永久丢失）
                 SlidingInvisibilityTimeout = TimeSpan.FromMinutes(5), // 官方推荐显式设置
 
-                // 自动删除已完成的任务（保留 7 天，避免数据库无限增长）
+                // 每小时扫描过期任务；此选项不设置任务保留天数。
                 JobExpirationCheckInterval = TimeSpan.FromHours(1)
             })
             // 使用结构化日志（接入已有的 Serilog）
