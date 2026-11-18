@@ -133,7 +133,7 @@ export default function HeroBanner() {
                 />
                 <input
                   type="text"
-                  placeholder="Search by brand, model..."
+                  placeholder="Search by brand..."
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
                   className="flex-1 bg-transparent text-sm outline-none placeholder:opacity-60"
