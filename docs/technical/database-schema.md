@@ -6,7 +6,9 @@ truth for exact implementation details.
 
 ## Overview
 
-The database contains ten application tables:
+The EF Core model contains ten application tables. `__EFMigrationsHistory` and
+Hangfire-owned SQL objects are infrastructure storage, not additional domain
+entities in this list:
 
 | Table | Purpose | Introduced |
 |---|---|---|
@@ -131,7 +133,8 @@ tokens are not stored.
 
 ### AuditLogs
 
-`AuditLogs` is an append-only record of sensitive Admin actions. It stores the
+`AuditLogs` records sensitive Admin actions. The application exposes no audit
+update/delete API; the table does not enforce database-level immutability. It stores the
 Admin user, action, entity type, entity ID, optional detail and creation time.
 `EntityType` and `EntityId` are generic references rather than foreign keys.
 The `(Action, CreatedAt)` index supports operational review.

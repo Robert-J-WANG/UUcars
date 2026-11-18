@@ -21,10 +21,18 @@ Playwright end-to-end suite for the configured branch pushes and pull requests.
 
 Production releases use a `develop`-to-`main` pull request after the release
 source, backend, frontend and end-to-end checks pass. After a successful `main`
-CI run, CD builds both release artefacts from the same commit, publishes the API
-image to GHCR by immutable digest, deploys it to Azure Container Apps, uploads
+CI run, CD builds both release artefacts from the same commit, publishes a SHA-tagged
+API image to GHCR, deploys it to Azure Container Apps by immutable digest, uploads
 the pre-built frontend to Azure Static Web Apps and performs public read-only
-smoke checks.
+smoke checks. The checks validate the public car-list response, frontend HTML
+entry and frontend `release.json` commit. They do not perform sign-in, image
+upload, purchases or a full browser acceptance suite in production.
+
+The frontend build reads the tracked `uucars-web/.env.production`, containing
+only a public API URL and public Google client ID. These are browser-visible
+configuration, not secrets. Keep local overrides in ignored files; never put
+backend credentials in a `VITE_*` value. CI uses an explicit Google client ID for
+its Vite E2E server, which does not load the production env file.
 
 See [Development and release workflow](development-workflow.md) for branch and
 release responsibilities.
@@ -42,7 +50,13 @@ variables. Runtime credentials are not stored in the image or repository.
 The Admin-only Hangfire Dashboard is served by the API at
 `/admin/hangfire`. Browser navigation uses the existing short-lived access token
 through an HttpOnly cookie restricted to that path; normal API requests continue
-to use the JWT Bearer header.
+to use the JWT Bearer header. This cookie is Secure/SameSite=None in Production;
+Development and E2E use the local HTTP settings defined in `AuthController`.
+The Dashboard is not mounted in Testing or E2E.
+
+Hangfire shares the API replica lifecycle. When a replica scales to zero, its
+workers stop; they resume after the API starts again. Do not describe token
+cleanup as a continuously running external scheduler.
 
 ## Google sign-in configuration
 
